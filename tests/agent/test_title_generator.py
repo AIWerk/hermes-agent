@@ -134,7 +134,9 @@ class TestAutoTitleSession:
 
         with patch("agent.title_generator.generate_title", return_value="New Title"):
             auto_title_session(db, "sess-1", "hi", "hello")
-            db.set_session_title.assert_called_once_with("sess-1", "New Title")
+            db.set_session_title.assert_called_once_with(
+                "sess-1", "New Title", source="auto_initial", turn_index=1
+            )
 
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
@@ -148,7 +150,9 @@ class TestAutoTitleSession:
                 "hi there",
                 title_callback=seen.append,
             )
-        db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
+        db.set_session_title.assert_called_once_with(
+            "sess-1", "Readable Session", source="auto_initial", turn_index=1
+        )
         assert seen == ["Readable Session"]
 
     def test_skips_if_generation_fails(self):

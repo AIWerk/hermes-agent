@@ -1448,7 +1448,14 @@ def run_doctor(args):
             }
             if base_url_host_matches(base, "api.kimi.com"):
                 headers["User-Agent"] = "claude-code/0.1.0"
-            r = httpx.get(url, headers=headers, timeout=10)
+            # Gemini API keys are not Bearer tokens on the native Google
+            # Generative Language API; they must be sent as the `key` query
+            # parameter. The generic Bearer check returns 401 even for a valid
+            # Gemini API key, which caused false "invalid API key" doctor output.
+            if pname == "gemini" and url and "generativelanguage.googleapis.com" in url:
+                r = httpx.get(url, params={"key": key}, headers={"User-Agent": _HERMES_USER_AGENT}, timeout=10)
+            else:
+                r = httpx.get(url, headers=headers, timeout=10)
             if (
                 pname == "Alibaba/DashScope"
                 and not base

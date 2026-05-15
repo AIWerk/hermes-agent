@@ -4492,6 +4492,73 @@ class AIAgent:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 msg["content"] = override
 
+
+    def _record_incremental_session_notes(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+        final_response: str = None,
+    ) -> None:
+        """Best-effort deterministic note capture after a persisted turn."""
+        if not self._session_db or not self.session_id:
+            return
+        try:
+            from agent.session_notes import record_session_event
+            start_idx = len(conversation_history) if conversation_history else 0
+            turn_messages = messages[start_idx:]
+            turn_index = getattr(self, "_user_turn_count", None)
+            for msg in turn_messages:
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") == "tool":
+                    content = msg.get("content")
+                    text = content if isinstance(content, str) else str(content or "")
+                    tool_name = msg.get("tool_name") or msg.get("name") or "tool"
+                    record_session_event(
+                        self._session_db,
+                        self.session_id,
+                        "tool_result",
+                        {
+                            "summary": text[:500],
+                            "tool_name": tool_name,
+                        },
+                        turn_index=turn_index,
+                    )
+            tool_turns = sum(
+                1 for msg in turn_messages
+                if isinstance(msg, dict) and (
+                    msg.get("role") == "tool" or msg.get("tool_calls")
+                )
+            )
+            if tool_turns and final_response:
+                record_session_event(
+                    self._session_db,
+                    self.session_id,
+                    "turn_note",
+                    {
+                        "summary": str(final_response)[:500],
+                        "current_goal": "Continue the current user task",
+                        "tool_turns": tool_turns,
+                    },
+                    turn_index=turn_index,
+                )
+            if final_response:
+                try:
+                    from agent.title_generator import maybe_retitle_session
+                    maybe_retitle_session(
+                        self._session_db,
+                        self.session_id,
+                        messages,
+                        conversation_history,
+                        turn_index=turn_index,
+                        failure_callback=getattr(self, "_emit_auxiliary_failure", None),
+                        main_runtime={"provider": self.provider, "model": self.model},
+                    )
+                except Exception:
+                    logger.debug("mid-session retitle scheduling failed", exc_info=True)
+        except Exception as exc:
+            logger.debug("incremental session note capture failed: %s", exc, exc_info=True)
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
@@ -15542,6 +15609,7 @@ class AIAgent:
         # same empty-response loop again.
         self._drop_trailing_empty_response_scaffolding(messages)
         self._persist_session(messages, conversation_history)
+        self._record_incremental_session_notes(messages, conversation_history, final_response)
 
         # ── Turn-exit diagnostic log ─────────────────────────────────────
         # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -15723,6 +15791,23 @@ class AIAgent:
                 and "skill_manage" in self.valid_tool_names):
             _should_review_skills = True
             self._iters_since_skill = 0
+
+        # Update compact session summary. Interactive/gateway turns run this in
+        # the background; quiet one-shot mode waits so the summary is committed
+        # before process exit.
+        if final_response and not interrupted and self._session_db:
+            try:
+                from agent.session_summarizer import maybe_update_session_summary
+                maybe_update_session_summary(
+                    self._session_db,
+                    self.session_id,
+                    main_runtime={"provider": self.provider, "model": self.model},
+                    synchronous=bool(self.quiet_mode),
+                    timeout=45.0,
+                    final_title_refinement=bool(self.quiet_mode),
+                )
+            except Exception as exc:
+                logger.debug("session summary update scheduling failed: %s", exc, exc_info=True)
 
         # External memory provider: sync the completed turn + queue next prefetch.
         self._sync_external_memory_for_turn(
