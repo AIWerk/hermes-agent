@@ -273,8 +273,20 @@ CREATE TABLE IF NOT EXISTS session_scratchpads (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_stack (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL REFERENCES sessions(id),
+    side_session_id TEXT NOT NULL REFERENCES sessions(id),
+    title TEXT,
+    pushed_at REAL NOT NULL,
+    popped_at REAL,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
 CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_session_stack_active ON session_stack(source, status, id DESC);
 
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
@@ -751,6 +763,64 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def push_side_session(
+        self,
+        source: str,
+        parent_session_id: str,
+        side_session_id: str,
+        title: Optional[str] = None,
+    ) -> int:
+        """Record an active topic-parking side session for *source*.
+
+        The newest active row is the target for ``/back``. Older active rows
+        remain as a stack so nested side sessions can be supported later.
+        """
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                """INSERT INTO session_stack
+                   (source, parent_session_id, side_session_id, title, pushed_at, status)
+                   VALUES (?, ?, ?, ?, ?, 'active')""",
+                (source, parent_session_id, side_session_id, title, now),
+            )
+            return int(cur.lastrowid)
+
+        return self._execute_write(_do)
+
+    def get_active_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
+        """Return the newest active side-session stack entry for *source*."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM session_stack
+                   WHERE source = ? AND status = 'active'
+                   ORDER BY id DESC LIMIT 1""",
+                (source,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def pop_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
+        """Mark and return the newest active side-session stack entry."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT * FROM session_stack
+                   WHERE source = ? AND status = 'active'
+                   ORDER BY id DESC LIMIT 1""",
+                (source,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE session_stack SET status = 'popped', popped_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            return dict(row)
+
+        return self._execute_write(_do)
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
