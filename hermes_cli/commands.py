@@ -83,6 +83,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("side", "Start a clean temporary side session and park the current one", "Session",
+               args_hint="[name]"),
+    CommandDef("back", "Return from the active side session", "Session",
+               aliases=("return",)),
     CommandDef("compress", "Manually compress conversation context", "Session",
                args_hint="[focus topic]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
@@ -1000,6 +1004,16 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
+
+    # Reserve common short aliases before the 50-command clamp so documented
+    # gateway muscle-memory commands stay first-class Slack slashes.
+    priority_aliases = {"btw", "bg", "reset", "q"}
+    for cmd in COMMAND_REGISTRY:
+        if not _is_gateway_available(cmd, overrides):
+            continue
+        for alias in cmd.aliases:
+            if alias in priority_aliases:
+                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:

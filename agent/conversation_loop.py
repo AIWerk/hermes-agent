@@ -73,6 +73,74 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _record_incremental_session_notes(
+    agent,
+    messages: List[Dict],
+    conversation_history: Optional[List[Dict]] = None,
+    final_response: Optional[str] = None,
+) -> None:
+    """Best-effort deterministic note capture after a persisted turn."""
+    if not agent._session_db or not agent.session_id:
+        return
+    try:
+        from agent.session_notes import record_session_event
+
+        start_idx = len(conversation_history) if conversation_history else 0
+        turn_messages = messages[start_idx:]
+        turn_index = getattr(agent, "_user_turn_count", None) or 0
+        for msg in turn_messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "tool":
+                content = msg.get("content")
+                text = content if isinstance(content, str) else str(content or "")
+                tool_name = msg.get("tool_name") or msg.get("name") or "tool"
+                record_session_event(
+                    agent._session_db,
+                    agent.session_id,
+                    "tool_result",
+                    {
+                        "summary": text[:500],
+                        "tool_name": tool_name,
+                    },
+                    turn_index=turn_index,
+                )
+        tool_turns = sum(
+            1 for msg in turn_messages
+            if isinstance(msg, dict) and (
+                msg.get("role") == "tool" or msg.get("tool_calls")
+            )
+        )
+        if tool_turns and final_response:
+            record_session_event(
+                agent._session_db,
+                agent.session_id,
+                "turn_note",
+                {
+                    "summary": str(final_response)[:500],
+                    "current_goal": "Continue the current user task",
+                    "tool_turns": tool_turns,
+                },
+                turn_index=turn_index,
+            )
+        if final_response:
+            try:
+                from agent.title_generator import maybe_retitle_session
+                maybe_retitle_session(
+                    agent._session_db,
+                    agent.session_id,
+                    messages,
+                    conversation_history,
+                    turn_index=turn_index,
+                    failure_callback=getattr(agent, "_emit_auxiliary_failure", None),
+                    main_runtime={"provider": agent.provider, "model": agent.model},
+                )
+            except Exception:
+                logger.debug("mid-session retitle scheduling failed", exc_info=True)
+    except Exception as exc:
+        logger.debug("incremental session note capture failed: %s", exc, exc_info=True)
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -3787,6 +3855,7 @@ def run_conversation(
     # same empty-response loop again.
     agent._drop_trailing_empty_response_scaffolding(messages)
     agent._persist_session(messages, conversation_history)
+    _record_incremental_session_notes(agent, messages, conversation_history, final_response)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.

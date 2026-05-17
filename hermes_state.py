@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -214,6 +214,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_source TEXT,
+    title_updated_at REAL,
+    title_turn_index INTEGER,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -238,6 +241,52 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_reasoning_items TEXT,
     codex_message_items TEXT
 );
+
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    short_summary TEXT NOT NULL,
+    outline_json TEXT NOT NULL DEFAULT '[]',
+    topics_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_index INTEGER,
+    event_type TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'runtime',
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_scratchpads (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    current_goal TEXT,
+    decisions_json TEXT NOT NULL DEFAULT '[]',
+    artifacts_json TEXT NOT NULL DEFAULT '[]',
+    open_items_json TEXT NOT NULL DEFAULT '[]',
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_stack (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL REFERENCES sessions(id),
+    side_session_id TEXT NOT NULL REFERENCES sessions(id),
+    title TEXT,
+    pushed_at REAL NOT NULL,
+    popped_at REAL,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_session_stack_active ON session_stack(source, status, id DESC);
 
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
@@ -714,6 +763,64 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def push_side_session(
+        self,
+        source: str,
+        parent_session_id: str,
+        side_session_id: str,
+        title: Optional[str] = None,
+    ) -> int:
+        """Record an active topic-parking side session for *source*.
+
+        The newest active row is the target for ``/back``. Older active rows
+        remain as a stack so nested side sessions can be supported later.
+        """
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                """INSERT INTO session_stack
+                   (source, parent_session_id, side_session_id, title, pushed_at, status)
+                   VALUES (?, ?, ?, ?, ?, 'active')""",
+                (source, parent_session_id, side_session_id, title, now),
+            )
+            return int(cur.lastrowid)
+
+        return self._execute_write(_do)
+
+    def get_active_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
+        """Return the newest active side-session stack entry for *source*."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM session_stack
+                   WHERE source = ? AND status = 'active'
+                   ORDER BY id DESC LIMIT 1""",
+                (source,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def pop_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
+        """Mark and return the newest active side-session stack entry."""
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT * FROM session_stack
+                   WHERE source = ? AND status = 'active'
+                   ORDER BY id DESC LIMIT 1""",
+                (source,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE session_stack SET status = 'popped', popped_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            return dict(row)
+
+        return self._execute_write(_do)
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
@@ -1012,30 +1119,47 @@ class SessionDB:
 
         return cleaned
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        source: str = "manual",
+        turn_index: Optional[int] = None,
+    ) -> bool:
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
+
+        ``source`` tracks the title lifecycle: manual titles are protected from
+        later automatic initial/mid/final retitles, while auto titles may be
+        refined as the conversation evolves.
         """
-        title = self.sanitize_title(title)
+        clean_title = self.sanitize_title(title)
+        source = str(source or "manual")[:40]
+        now = time.time()
         def _do(conn):
-            if title:
+            if clean_title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
                     "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
+                    (clean_title, session_id),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
                     raise ValueError(
-                        f"Title '{title}' is already in use by session {conflict['id']}"
+                        f"Title '{clean_title}' is already in use by session {conflict['id']}"
                     )
             cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
+                """
+                UPDATE sessions
+                SET title = ?, title_source = ?, title_updated_at = ?, title_turn_index = ?
+                WHERE id = ?
+                """,
+                (clean_title, source if clean_title else None, now if clean_title else None, turn_index, session_id),
             )
             return cursor.rowcount
         rowcount = self._execute_write(_do)
@@ -1049,6 +1173,18 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return row["title"] if row else None
+
+    def get_session_title_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return title plus lifecycle metadata for automatic retitling."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT title, title_source, title_updated_at, title_turn_index
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
@@ -1309,6 +1445,10 @@ class SessionDB:
                 s["preview"] = text + ("..." if len(raw) > 60 else "")
             else:
                 s["preview"] = ""
+            summary = self.get_session_summary(s["id"])
+            if summary:
+                s["summary"] = summary["short_summary"]
+                s["topics"] = summary["topics"]
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -1383,6 +1523,254 @@ class SessionDB:
         else:
             s["preview"] = ""
         return s
+
+
+    # =========================================================================
+    # Incremental session notes and summaries
+    # =========================================================================
+
+    _SESSION_EVENT_TYPES = {
+        "turn_note",
+        "decision",
+        "artifact",
+        "tool_result",
+        "user_correction",
+        "open_question",
+        "candidate",
+        "checkpoint",
+    }
+
+    @staticmethod
+    def _json_list(value: Any) -> str:
+        if not isinstance(value, list):
+            value = []
+        return json.dumps(value)
+
+    @staticmethod
+    def _loads_list(value: Any) -> List[Any]:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def add_session_event(
+        self,
+        session_id: str,
+        event_type: str,
+        content: Dict[str, Any],
+        turn_index: int = None,
+        source: str = "runtime",
+    ) -> int:
+        """Append one structured incremental note event for a session."""
+        event_type = str(event_type or "").strip()
+        if event_type not in self._SESSION_EVENT_TYPES:
+            raise ValueError(f"unsupported session event type: {event_type}")
+        if not isinstance(content, dict):
+            raise ValueError("session event content must be a dict")
+        content_json = json.dumps(content, ensure_ascii=False)
+        now = time.time()
+
+        def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"session does not exist: {session_id}")
+            cursor = conn.execute(
+                """
+                INSERT INTO session_events (
+                    session_id, turn_index, event_type, content_json, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, turn_index, event_type, content_json, source or "runtime", now),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def get_session_events(self, session_id: str, limit: int = None) -> List[Dict[str, Any]]:
+        """Return session events in chronological order; limit returns newest N, re-sorted."""
+        sql = "SELECT * FROM session_events WHERE session_id = ? ORDER BY id"
+        params: list[Any] = [session_id]
+        if limit is not None:
+            sql = """
+                SELECT * FROM (
+                    SELECT * FROM session_events WHERE session_id = ? ORDER BY id DESC LIMIT ?
+                ) ORDER BY id
+            """
+            params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        events: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["content"] = json.loads(item.pop("content_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["content"] = {}
+            events.append(item)
+        return events
+
+    def set_session_scratchpad(self, session_id: str, scratchpad: Dict[str, Any]) -> bool:
+        """Upsert the mutable compact scratchpad for an active session."""
+        if not isinstance(scratchpad, dict):
+            scratchpad = {}
+        now = time.time()
+        current_goal = scratchpad.get("current_goal")
+        decisions_json = self._json_list(scratchpad.get("decisions"))
+        artifacts_json = self._json_list(scratchpad.get("artifacts"))
+        open_items_json = self._json_list(scratchpad.get("open_items"))
+        candidates_json = self._json_list(scratchpad.get("candidates"))
+
+        def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute(
+                """
+                INSERT INTO session_scratchpads (
+                    session_id, current_goal, decisions_json, artifacts_json,
+                    open_items_json, candidates_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    current_goal = excluded.current_goal,
+                    decisions_json = excluded.decisions_json,
+                    artifacts_json = excluded.artifacts_json,
+                    open_items_json = excluded.open_items_json,
+                    candidates_json = excluded.candidates_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id, current_goal, decisions_json, artifacts_json,
+                    open_items_json, candidates_json, now,
+                ),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def get_session_scratchpad(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the mutable session scratchpad, or None if absent."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_scratchpads WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        return {
+            "session_id": data["session_id"],
+            "current_goal": data.get("current_goal"),
+            "decisions": self._loads_list(data.get("decisions_json")),
+            "artifacts": self._loads_list(data.get("artifacts_json")),
+            "open_items": self._loads_list(data.get("open_items_json")),
+            "candidates": self._loads_list(data.get("candidates_json")),
+            "updated_at": data.get("updated_at"),
+        }
+
+    def set_session_summary(
+        self,
+        session_id: str,
+        *,
+        short_summary: str,
+        outline: List[str] = None,
+        topics: List[str] = None,
+        model: str = None,
+    ) -> bool:
+        """Upsert the compact searchable final summary for one session."""
+        now = time.time()
+        outline_json = self._json_list(outline or [])
+        topics_json = self._json_list(topics or [])
+
+        def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            created = conn.execute(
+                "SELECT created_at FROM session_summaries WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            created_at = created["created_at"] if created else now
+            conn.execute(
+                """
+                INSERT INTO session_summaries (
+                    session_id, short_summary, outline_json, topics_json,
+                    model, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    short_summary = excluded.short_summary,
+                    outline_json = excluded.outline_json,
+                    topics_json = excluded.topics_json,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, short_summary, outline_json, topics_json, model, created_at, now),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def get_session_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return compact final summary for one session, if present."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_summaries WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        return {
+            "session_id": data["session_id"],
+            "short_summary": data["short_summary"],
+            "outline": self._loads_list(data.get("outline_json")),
+            "topics": self._loads_list(data.get("topics_json")),
+            "model": data.get("model"),
+            "created_at": data.get("created_at"),
+            "updated_at": data.get("updated_at"),
+        }
+
+    def search_session_summaries(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Simple compact-summary search used as an adjunct to message FTS."""
+        if limit is None:
+            limit = 20
+        limit = max(1, min(int(limit), 100))
+        needle = f"%{str(query or '').lower()}%"
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.id AS session_id, ss.short_summary, ss.outline_json,
+                       ss.topics_json, ss.model, ss.updated_at
+                FROM session_summaries ss
+                JOIN sessions s ON s.id = ss.session_id
+                WHERE lower(ss.short_summary) LIKE ?
+                   OR lower(ss.outline_json) LIKE ?
+                   OR lower(ss.topics_json) LIKE ?
+                ORDER BY ss.updated_at DESC
+                LIMIT ?
+                """,
+                (needle, needle, needle, int(limit)),
+            ).fetchall()
+        results = []
+        for row in rows:
+            data = dict(row)
+            results.append({
+                "session_id": data["session_id"],
+                "role": "summary",
+                "content": data["short_summary"],
+                "short_summary": data["short_summary"],
+                "outline": self._loads_list(data.get("outline_json")),
+                "topics": self._loads_list(data.get("topics_json")),
+                "model": data.get("model"),
+                "timestamp": data.get("updated_at"),
+            })
+        return results
 
     # =========================================================================
     # Message storage
@@ -2299,6 +2687,9 @@ class SessionDB:
                 (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_scratchpads WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
 
@@ -2352,6 +2743,9 @@ class SessionDB:
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_events WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_scratchpads WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)

@@ -1160,6 +1160,16 @@ class AIAgent:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 msg["content"] = override
 
+    def _record_incremental_session_notes(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]] = None,
+        final_response: Optional[str] = None,
+    ) -> None:
+        """Forwarder — see ``agent.conversation_loop._record_incremental_session_notes``."""
+        from agent.conversation_loop import _record_incremental_session_notes
+        return _record_incremental_session_notes(self, messages, conversation_history, final_response)
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 

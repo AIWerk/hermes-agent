@@ -1,0 +1,8 @@
+name: temporal_context
+version: 0.1.0
+description: Neutral, configurable ephemeral temporal context injection before LLM calls.
+author: AIWerk
+kind: standalone
+provides_hooks:
+  - pre_llm_call
+  - transform_llm_output
