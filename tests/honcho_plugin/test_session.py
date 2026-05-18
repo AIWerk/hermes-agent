@@ -879,9 +879,16 @@ class TestDialecticCadenceDefaults:
         from unittest.mock import patch, MagicMock
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid")
+        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid", raw={"injection": {"includeDialectic": True}})
         if cfg_extra:
+            raw_extra = cfg_extra.get("raw") if isinstance(cfg_extra.get("raw"), dict) else None
             defaults.update(cfg_extra)
+            if raw_extra is not None:
+                merged_raw = {"injection": {"includeDialectic": True}}
+                merged_raw.update(raw_extra)
+                if isinstance(raw_extra.get("injection"), dict):
+                    merged_raw["injection"] = {"includeDialectic": True, **raw_extra["injection"]}
+                defaults["raw"] = merged_raw
         cfg = HonchoClientConfig(**defaults)
         provider = HonchoMemoryProvider()
         mock_manager = MagicMock()
@@ -912,27 +919,49 @@ class TestDialecticCadenceDefaults:
 
 
 class TestBaseContextSummary:
-    """Base context injection should include session summary when available."""
+    """Base context injection should default to cards-only and keep noisy derived fields opt-in."""
 
-    def test_format_includes_summary(self):
-        """Session summary should appear first in the formatted context."""
+    def test_format_defaults_to_cards_only(self):
         provider = HonchoMemoryProvider()
         ctx = {
             "summary": "Testing Honcho tools and dialectic depth.",
             "representation": "Eri is a developer.",
             "card": "Name: Eri Barrett",
+            "ai_representation": "Old self-observation noise.",
+            "ai_card": "Hermes identity is minimal.",
+        }
+        formatted = provider._format_first_turn_context(ctx)
+        assert "## Session Summary" not in formatted
+        assert "## User Representation" not in formatted
+        assert "## AI Self-Representation" not in formatted
+        assert "## User Peer Card" in formatted
+        assert "## AI Identity Card" in formatted
+
+    def test_format_includes_opt_in_summary_and_representation(self):
+        class Cfg:
+            raw = {"injection": {
+                "includeSummary": True,
+                "includeUserRepresentation": True,
+                "includeAiRepresentation": True,
+                "includeUserCard": True,
+                "includeAiCard": True,
+            }}
+            host = "hermes"
+
+        provider = HonchoMemoryProvider()
+        provider._config = Cfg()  # type: ignore[assignment]
+        ctx = {
+            "summary": "Testing Honcho tools and dialectic depth.",
+            "representation": "Eri is a developer.",
+            "card": "Name: Eri Barrett",
+            "ai_representation": "AI rep",
+            "ai_card": "AI card",
         }
         formatted = provider._format_first_turn_context(ctx)
         assert "## Session Summary" in formatted
+        assert "## User Representation" in formatted
+        assert "## AI Self-Representation" in formatted
         assert formatted.index("Session Summary") < formatted.index("User Representation")
-
-    def test_format_without_summary(self):
-        """No summary key means no summary section."""
-        provider = HonchoMemoryProvider()
-        ctx = {"representation": "Eri is a developer.", "card": "Name: Eri"}
-        formatted = provider._format_first_turn_context(ctx)
-        assert "Session Summary" not in formatted
-        assert "User Representation" in formatted
 
     def test_format_empty_summary_skipped(self):
         """Empty summary string should not produce a section."""
@@ -940,6 +969,84 @@ class TestBaseContextSummary:
         ctx = {"summary": "", "representation": "rep", "card": "card"}
         formatted = provider._format_first_turn_context(ctx)
         assert "Session Summary" not in formatted
+
+
+class TestSessionSwitchRuntimeCache:
+    """Session switches must not carry stale formatted injection context forward."""
+
+    def test_session_switch_flushes_and_clears_injection_cache(self):
+        from unittest.mock import patch
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="hybrid",
+            raw={"injection": {"includeDialectic": False}},
+        )
+        provider = HonchoMemoryProvider()
+        old_manager = MagicMock()
+        new_manager = MagicMock()
+        old_session = MagicMock()
+        new_session = MagicMock()
+        old_session.messages = []
+        new_session.messages = []
+        old_manager.get_or_create.return_value = old_session
+        new_manager.get_or_create.return_value = new_session
+
+        with patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg), \
+             patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
+             patch("plugins.memory.honcho.session.HonchoSessionManager", side_effect=[old_manager, new_manager]), \
+             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
+            provider.initialize(session_id="old-session")
+            _settle_prewarm(provider)
+            provider._base_context_cache = "## Session Summary\nstale\n\n## User Representation\nstale"
+            provider._prefetch_result = "stale dialectic"
+            provider._prefetch_result_fired_at = 1
+            provider._turn_count = 7
+
+            provider.on_session_switch("new-session", reset=True)
+
+        old_manager.flush_all.assert_called()
+        old_manager.shutdown.assert_called_once()
+        assert provider._manager is new_manager
+        assert provider._session_initialized is True
+        assert provider._session_key
+        assert provider._base_context_cache is None
+        assert provider._prefetch_result == ""
+        assert provider._prefetch_result_fired_at == -999
+        assert provider._turn_count == 0
+
+    def test_late_prefetch_result_from_old_generation_is_dropped(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._session_generation = 1
+        import time
+
+        provider._manager = MagicMock()
+        provider._run_dialectic_depth = MagicMock(
+            side_effect=lambda query: (time.sleep(0.05), "stale old-session context")[1]
+        )
+        provider._session_key = "old-session"
+        provider._config = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            timeout=0.01,
+            raw={"injection": {"includeDialectic": True}},
+        )
+        provider._prefetch_thread_started_at = 0.0
+        provider._last_dialectic_turn = -999
+        provider._dialectic_cadence = 1
+        provider._turn_count = 1
+
+        provider.queue_prefetch("meaningful query")
+        prefetch_thread = provider._prefetch_thread
+        provider._reset_runtime_context_cache()
+        if prefetch_thread:
+            prefetch_thread.join(timeout=1.0)
+
+        assert provider._prefetch_result == ""
 
 
 class TestDialecticDepth:
@@ -950,9 +1057,16 @@ class TestDialecticDepth:
         from unittest.mock import patch, MagicMock
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid")
+        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid", raw={"injection": {"includeDialectic": True}})
         if cfg_extra:
+            raw_extra = cfg_extra.get("raw") if isinstance(cfg_extra.get("raw"), dict) else None
             defaults.update(cfg_extra)
+            if raw_extra is not None:
+                merged_raw = {"injection": {"includeDialectic": True}}
+                merged_raw.update(raw_extra)
+                if isinstance(raw_extra.get("injection"), dict):
+                    merged_raw["injection"] = {"includeDialectic": True, **raw_extra["injection"]}
+                defaults["raw"] = merged_raw
         cfg = HonchoClientConfig(**defaults)
         provider = HonchoMemoryProvider()
         mock_manager = MagicMock()
@@ -1177,6 +1291,7 @@ class TestDialecticCadenceAdvancesOnSuccess:
 
         cfg = HonchoClientConfig(
             api_key="test-key", enabled=True, recall_mode="hybrid", dialectic_depth=1,
+            raw={"injection": {"includeDialectic": True}},
         )
         provider = HonchoMemoryProvider()
         mock_manager = MagicMock()
@@ -1258,9 +1373,16 @@ class TestSessionStartDialecticPrewarm:
         from unittest.mock import patch, MagicMock
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid")
+        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid", raw={"injection": {"includeDialectic": True}})
         if cfg_extra:
+            raw_extra = cfg_extra.get("raw") if isinstance(cfg_extra.get("raw"), dict) else None
             defaults.update(cfg_extra)
+            if raw_extra is not None:
+                merged_raw = {"injection": {"includeDialectic": True}}
+                merged_raw.update(raw_extra)
+                if isinstance(raw_extra.get("injection"), dict):
+                    merged_raw["injection"] = {"includeDialectic": True, **raw_extra["injection"]}
+                defaults["raw"] = merged_raw
         cfg = HonchoClientConfig(**defaults)
         provider = HonchoMemoryProvider()
         mock_manager = MagicMock()
@@ -1330,9 +1452,16 @@ class TestDialecticLiveness:
         from unittest.mock import patch, MagicMock
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid", timeout=2.0)
+        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid", timeout=2.0, raw={"injection": {"includeDialectic": True}})
         if cfg_extra:
+            raw_extra = cfg_extra.get("raw") if isinstance(cfg_extra.get("raw"), dict) else None
             defaults.update(cfg_extra)
+            if raw_extra is not None:
+                merged_raw = {"injection": {"includeDialectic": True}}
+                merged_raw.update(raw_extra)
+                if isinstance(raw_extra.get("injection"), dict):
+                    merged_raw["injection"] = {"includeDialectic": True, **raw_extra["injection"]}
+                defaults["raw"] = merged_raw
         cfg = HonchoClientConfig(**defaults)
         provider = HonchoMemoryProvider()
         mock_manager = MagicMock()
@@ -1476,9 +1605,17 @@ class TestDialecticLifecycleSmoke:
             api_key="test-key", enabled=True, recall_mode="hybrid",
             dialectic_reasoning_level="low", reasoning_heuristic=True,
             reasoning_level_cap="high", dialectic_depth=1,
+            raw={"injection": {"includeDialectic": True}},
         )
         if cfg_extra:
+            raw_extra = cfg_extra.get("raw") if isinstance(cfg_extra.get("raw"), dict) else None
             defaults.update(cfg_extra)
+            if raw_extra is not None:
+                merged_raw = {"injection": {"includeDialectic": True}}
+                merged_raw.update(raw_extra)
+                if isinstance(raw_extra.get("injection"), dict):
+                    merged_raw["injection"] = {"includeDialectic": True, **raw_extra["injection"]}
+                defaults["raw"] = merged_raw
         cfg = HonchoClientConfig(**defaults)
         provider = HonchoMemoryProvider()
         mock_manager = MagicMock()
