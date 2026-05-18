@@ -154,3 +154,54 @@ class TestCmdStatus:
         out = capsys.readouterr().out
         assert "FAILED (Invalid API key)" in out
         assert "Connection... OK" not in out
+
+    def test_show_peer_cards_splits_stored_state_from_active_injection(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+        import plugins.memory.honcho.session as honcho_session
+
+        class FakeConfig:
+            raw = {
+                "injection": {
+                    "includeSummary": False,
+                    "includeUserRepresentation": False,
+                    "includeAiRepresentation": False,
+                    "includeUserCard": True,
+                    "includeAiCard": True,
+                    "includeDialectic": False,
+                }
+            }
+            host = "hermes"
+
+            def resolve_session_name(self):
+                return "session-one"
+
+        class FakeManager:
+            def __init__(self, honcho, config):
+                pass
+
+            def get_or_create(self, session_key):
+                return object()
+
+            def get_peer_card(self, session_key):
+                return ["User prefers concise replies"]
+
+            def get_ai_peer_card(self, session_key):
+                return ["Hermes identity stays minimal"]
+
+            def get_ai_representation(self, session_key):
+                return {"representation": "## Explicit Observations\nold noisy AI self-representation"}
+
+        monkeypatch.setattr(honcho_session, "HonchoSessionManager", FakeManager)
+
+        honcho_cli._show_peer_cards(FakeConfig(), object())
+
+        out = capsys.readouterr().out
+        assert "Stored memory state" in out
+        assert "User peer card (stored, 1 facts):" in out
+        assert "AI peer representation (stored, excluded from injection):" in out
+        assert "old noisy AI self-representation" in out
+        assert "Active injected context" in out
+        assert "User Peer Card: included" in out
+        assert "AI Identity Card: included" in out
+        assert "AI Self-Representation: excluded" in out
+        assert "Dialectic: excluded" in out

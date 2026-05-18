@@ -707,12 +707,45 @@ def cmd_status(args) -> None:
         print(f"\n  Not connected ({reason})\n")
 
 
+def _honcho_injection_flag(hcfg, name: str, default: bool) -> bool:
+    """Resolve a host-aware Honcho injection flag without making LLM calls."""
+    try:
+        raw = getattr(hcfg, "raw", None) or {}
+        root_candidate = raw.get("injection")
+        root_injection = root_candidate if isinstance(root_candidate, dict) else {}
+        hosts = raw.get("hosts") or {}
+        host_block = hosts.get(getattr(hcfg, "host", ""), {}) if isinstance(hosts, dict) else {}
+        host_candidate = host_block.get("injection") if isinstance(host_block, dict) else None
+        host_injection = host_candidate if isinstance(host_candidate, dict) else {}
+        if name in host_injection:
+            return bool(host_injection[name])
+        if name in root_injection:
+            return bool(root_injection[name])
+    except Exception:
+        pass
+    return default
+
+
+def _print_fact_list(label: str, facts: list[str], qualifier: str = "stored", limit: int = 10) -> None:
+    print(f"\n  {label} ({qualifier}, {len(facts)} facts):")
+    for fact in facts[:limit]:
+        print(f"    - {fact}")
+    if len(facts) > limit:
+        print(f"    ... and {len(facts) - limit} more")
+
+
+def _print_injection_line(label: str, included: bool, reason: str) -> None:
+    state = "included" if included else "excluded"
+    print(f"    - {label}: {state} ({reason})")
+
+
 def _show_peer_cards(hcfg, client) -> None:
-    """Fetch and display peer cards for the active profile.
+    """Fetch and display stored state separately from active injection state.
 
     Uses get_or_create to ensure the session exists with peers configured.
-    This is idempotent -- if the session already exists on the server it's
-    just retrieved, not duplicated.
+    This is idempotent -- if the session already exists on the server it is
+    just retrieved, not duplicated. The active injection preview is fully
+    deterministic: config flags plus already fetched card data, no LLM calls.
     """
     try:
         from plugins.memory.honcho.session import HonchoSessionManager
@@ -720,25 +753,75 @@ def _show_peer_cards(hcfg, client) -> None:
         session_key = hcfg.resolve_session_name()
         mgr.get_or_create(session_key)
 
-        # User peer card
         card = mgr.get_peer_card(session_key)
-        if card:
-            print(f"\n  User peer card ({len(card)} facts):")
-            for fact in card[:10]:
-                print(f"    - {fact}")
-            if len(card) > 10:
-                print(f"    ... and {len(card) - 10} more")
-
-        # AI peer representation
         ai_rep = mgr.get_ai_representation(session_key)
-        ai_text = ai_rep.get("representation", "")
-        if ai_text:
-            # Truncate to first 200 chars
-            display = ai_text[:200] + ("..." if len(ai_text) > 200 else "")
-            print(f"\n  AI peer representation:")
-            print(f"    {display}")
+        ai_text = ai_rep.get("representation", "") if isinstance(ai_rep, dict) else ""
+        ai_card_text = ai_rep.get("card", "") if isinstance(ai_rep, dict) else ""
+        ai_card = [line.strip("- ").strip() for line in ai_card_text.splitlines() if line.strip()]
+        ai_card_getter = getattr(mgr, "get_ai_peer_card", None)
+        if not ai_card and callable(ai_card_getter):
+            fetched_ai_card = ai_card_getter(session_key)
+            if isinstance(fetched_ai_card, list):
+                ai_card = fetched_ai_card
 
-        if not card and not ai_text:
+        print("\n  Stored memory state")
+        if card:
+            _print_fact_list("User peer card", card)
+        else:
+            print("    - User peer card: none stored")
+
+        if ai_card:
+            _print_fact_list("AI peer card", ai_card)
+        else:
+            print("    - AI peer card: none stored")
+
+        if ai_text:
+            display = ai_text[:200] + ("..." if len(ai_text) > 200 else "")
+            print("\n  AI peer representation (stored, excluded from injection):")
+            print(f"    {display}")
+        else:
+            print("    - AI peer representation: none stored")
+
+        include_user_card = _honcho_injection_flag(hcfg, "includeUserCard", True)
+        include_ai_card = _honcho_injection_flag(hcfg, "includeAiCard", True)
+        include_summary = _honcho_injection_flag(hcfg, "includeSummary", False)
+        include_user_rep = _honcho_injection_flag(hcfg, "includeUserRepresentation", False)
+        include_ai_rep = _honcho_injection_flag(hcfg, "includeAiRepresentation", False)
+        include_dialectic = _honcho_injection_flag(hcfg, "includeDialectic", False)
+
+        print("\n  Active injected context")
+        _print_injection_line(
+            "User Peer Card",
+            bool(card) and include_user_card,
+            "includeUserCard true" if include_user_card else "includeUserCard false",
+        )
+        _print_injection_line(
+            "AI Identity Card",
+            bool(ai_card) and include_ai_card,
+            "includeAiCard true" if include_ai_card else "includeAiCard false",
+        )
+        _print_injection_line(
+            "Session Summary",
+            include_summary,
+            "includeSummary true" if include_summary else "includeSummary false",
+        )
+        _print_injection_line(
+            "User Representation",
+            include_user_rep,
+            "includeUserRepresentation true" if include_user_rep else "includeUserRepresentation false",
+        )
+        _print_injection_line(
+            "AI Self-Representation",
+            bool(ai_text) and include_ai_rep,
+            "includeAiRepresentation true" if include_ai_rep else "includeAiRepresentation false",
+        )
+        _print_injection_line(
+            "Dialectic",
+            include_dialectic,
+            "includeDialectic true" if include_dialectic else "includeDialectic false",
+        )
+
+        if not card and not ai_text and not ai_card:
             print("\n  No peer data yet (accumulates after first conversation)")
 
         print()
