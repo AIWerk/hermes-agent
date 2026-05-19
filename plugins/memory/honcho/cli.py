@@ -739,6 +739,194 @@ def _print_injection_line(label: str, included: bool, reason: str) -> None:
     print(f"    - {label}: {state} ({reason})")
 
 
+def _estimate_tokens(text: str) -> int:
+    """Cheap local token estimate for preview output. No LLM call."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _section_line_count(text: str) -> int:
+    return len([line for line in (text or "").splitlines() if line.strip()])
+
+
+def _build_injection_preview(hcfg, ctx: dict, *, wrapped: bool = False) -> dict:
+    """Build a side-effect-free preview of Honcho prompt injection.
+
+    This mirrors HonchoMemoryProvider._format_first_turn_context but returns
+    structured diagnostics and can optionally wrap the raw provider context in
+    the same memory-context fence used by MemoryManager. It never calls Honcho
+    reasoning, never writes, and never consumes prefetch caches.
+    """
+    sections = [
+        (
+            "Session Summary",
+            "summary",
+            "## Session Summary",
+            _honcho_injection_flag(hcfg, "includeSummary", False),
+            "includeSummary",
+        ),
+        (
+            "User Representation",
+            "representation",
+            "## User Representation",
+            _honcho_injection_flag(hcfg, "includeUserRepresentation", False),
+            "includeUserRepresentation",
+        ),
+        (
+            "User Peer Card",
+            "card",
+            "## User Peer Card",
+            _honcho_injection_flag(hcfg, "includeUserCard", True),
+            "includeUserCard",
+        ),
+        (
+            "AI Self-Representation",
+            "ai_representation",
+            "## AI Self-Representation",
+            _honcho_injection_flag(hcfg, "includeAiRepresentation", False),
+            "includeAiRepresentation",
+        ),
+        (
+            "AI Identity Card",
+            "ai_card",
+            "## AI Identity Card",
+            _honcho_injection_flag(hcfg, "includeAiCard", True),
+            "includeAiCard",
+        ),
+    ]
+
+    included: list[dict] = []
+    excluded: list[dict] = []
+    raw_parts: list[str] = []
+
+    for label, key, heading, enabled, flag_name in sections:
+        value = (ctx or {}).get(key, "")
+        if isinstance(value, list):
+            value = "\n".join(str(item) for item in value if str(item).strip())
+        value = str(value or "").strip()
+        if value and enabled:
+            rendered = f"{heading}\n{value}"
+            raw_parts.append(rendered)
+            included.append(
+                {
+                    "label": label,
+                    "flag": flag_name,
+                    "reason": f"{flag_name} true",
+                    "lines": _section_line_count(value),
+                    "chars": len(value),
+                }
+            )
+        else:
+            reason = f"{flag_name} false" if not enabled else "no stored content"
+            excluded.append(
+                {
+                    "label": label,
+                    "flag": flag_name,
+                    "reason": reason,
+                    "has_content": bool(value),
+                }
+            )
+
+    include_dialectic = _honcho_injection_flag(hcfg, "includeDialectic", False)
+    excluded.append(
+        {
+            "label": "Dialectic",
+            "flag": "includeDialectic",
+            "reason": (
+                "includeDialectic false"
+                if not include_dialectic
+                else "not included in deterministic preview"
+            ),
+            "has_content": False,
+        }
+    )
+
+    raw_context = "\n\n".join(raw_parts)
+    prompt_text = raw_context
+    if wrapped and raw_context:
+        from agent.memory_manager import build_memory_context_block
+        prompt_text = build_memory_context_block(raw_context)
+
+    return {
+        "included": included,
+        "excluded": excluded,
+        "raw_context": raw_context,
+        "prompt_text": prompt_text,
+        "line_count": _section_line_count(prompt_text),
+        "word_count": len(prompt_text.split()) if prompt_text else 0,
+        "estimated_tokens": _estimate_tokens(prompt_text),
+        "wrapped": wrapped,
+    }
+
+
+def _print_injection_preview(preview: dict, hcfg, session_key: str) -> None:
+    print("\nHoncho injection preview\n" + "─" * 40)
+    print("\n  Session")
+    print(f"    Host: {getattr(hcfg, 'host', '(unknown)')}")
+    print(f"    Workspace: {getattr(hcfg, 'workspace_id', '(unknown)')}")
+    print(f"    Session: {session_key}")
+    print(f"    Recall mode: {getattr(hcfg, 'recall_mode', '(unknown)')}")
+    print(f"    Context budget: {getattr(hcfg, 'context_tokens', None) or '(Honcho default)'} tokens")
+
+    print("\n  Included sections")
+    if preview["included"]:
+        for item in preview["included"]:
+            print(f"    - {item['label']}: included ({item['reason']}, {item['lines']} lines)")
+    else:
+        print("    - none")
+
+    print("\n  Excluded sections")
+    for item in preview["excluded"]:
+        print(f"    - {item['label']}: excluded ({item['reason']})")
+
+    print("\n  Approx size")
+    print(f"    Lines: {preview['line_count']}")
+    print(f"    Words: {preview['word_count']}")
+    print(f"    Tokens: about {preview['estimated_tokens']}")
+    print("\n  Exact prompt text: hermes honcho injection-preview --raw")
+    print()
+
+
+def cmd_injection_preview(args) -> None:
+    """Show the Honcho context that would be injected into the next prompt."""
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
+
+        hcfg = HonchoClientConfig.from_global_config()
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+            print("\n  Honcho not connected. Run: hermes honcho status\n")
+            return
+
+        client = get_honcho_client(hcfg)
+        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = hcfg.resolve_session_name() or getattr(hcfg, "host", "hermes") or "hermes"
+        mgr.get_or_create(session_key)
+        ctx = mgr.get_prefetch_context(session_key) or {}
+        preview = _build_injection_preview(hcfg, ctx, wrapped=bool(getattr(args, "raw", False)))
+
+        if getattr(args, "json", False):
+            payload = {
+                "host": getattr(hcfg, "host", ""),
+                "workspace": getattr(hcfg, "workspace_id", ""),
+                "session": session_key,
+                "recallMode": getattr(hcfg, "recall_mode", ""),
+                "contextTokens": getattr(hcfg, "context_tokens", None),
+                **preview,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+
+        if getattr(args, "raw", False):
+            print(preview["prompt_text"])
+            return
+
+        _print_injection_preview(preview, hcfg, session_key)
+    except Exception as e:
+        print(f"\n  Honcho injection preview unavailable: {e}\n")
+
+
 def _show_peer_cards(hcfg, client) -> None:
     """Fetch and display stored state separately from active injection state.
 
@@ -1405,6 +1593,8 @@ def honcho_command(args) -> None:
         cmd_status(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "injection-preview":
+        cmd_injection_preview(args)
     elif sub == "peers":
         cmd_peers(args)
     elif sub == "sessions":
@@ -1431,7 +1621,7 @@ def honcho_command(args) -> None:
         cmd_sync(args)
     else:
         print(f"  Unknown honcho command: {sub}")
-        print("  Available: status, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync\n")
+        print("  Available: status, injection-preview, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync\n")
 
 
 def register_cli(subparser) -> None:
@@ -1457,6 +1647,17 @@ def register_cli(subparser) -> None:
     )
     status_parser.add_argument(
         "--all", action="store_true", help="Show config overview across all profiles",
+    )
+
+    preview_parser = subs.add_parser(
+        "injection-preview",
+        help="Preview Honcho context that would be injected into the next prompt",
+    )
+    preview_parser.add_argument(
+        "--raw", action="store_true", help="Print the exact memory-context prompt block",
+    )
+    preview_parser.add_argument(
+        "--json", action="store_true", help="Print structured preview data as JSON",
     )
 
     subs.add_parser("peers", help="Show peer identities across all profiles")

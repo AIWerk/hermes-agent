@@ -205,3 +205,111 @@ class TestCmdStatus:
         assert "AI Identity Card: included" in out
         assert "AI Self-Representation: excluded" in out
         assert "Dialectic: excluded" in out
+
+class TestInjectionPreview:
+    def test_build_preview_includes_only_enabled_sections(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        class FakeConfig:
+            raw = {
+                "injection": {
+                    "includeSummary": False,
+                    "includeUserRepresentation": False,
+                    "includeAiRepresentation": False,
+                    "includeUserCard": True,
+                    "includeAiCard": True,
+                    "includeDialectic": False,
+                }
+            }
+            host = "hermes"
+
+        preview = honcho_cli._build_injection_preview(
+            FakeConfig(),
+            {
+                "summary": "Old session summary",
+                "representation": "Noisy user representation",
+                "card": "Name: Attila\nPrefers concise replies",
+                "ai_representation": "Noisy AI self representation",
+                "ai_card": "Hermes identity stays minimal",
+            },
+        )
+
+        assert "## User Peer Card" in preview["raw_context"]
+        assert "Name: Attila" in preview["raw_context"]
+        assert "## AI Identity Card" in preview["raw_context"]
+        assert "Hermes identity stays minimal" in preview["raw_context"]
+        assert "Old session summary" not in preview["raw_context"]
+        assert "Noisy user representation" not in preview["raw_context"]
+        assert "Noisy AI self representation" not in preview["raw_context"]
+        assert preview["included"][0]["label"] == "User Peer Card"
+        assert preview["included"][1]["label"] == "AI Identity Card"
+        assert any(item["label"] == "Session Summary" for item in preview["excluded"])
+        assert any(item["label"] == "AI Self-Representation" for item in preview["excluded"])
+
+    def test_build_preview_wraps_raw_prompt_when_requested(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        class FakeConfig:
+            raw = {"injection": {"includeUserCard": True, "includeAiCard": False}}
+            host = "hermes"
+
+        preview = honcho_cli._build_injection_preview(
+            FakeConfig(),
+            {"card": "Prefers direct answers", "ai_card": "Should be excluded"},
+            wrapped=True,
+        )
+
+        assert preview["prompt_text"].startswith("<memory-context>")
+        assert "[System note: The following is recalled memory context" in preview["prompt_text"]
+        assert "## User Peer Card" in preview["prompt_text"]
+        assert "Should be excluded" not in preview["prompt_text"]
+
+    def test_cmd_injection_preview_does_not_pop_cached_prefetch(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+        import plugins.memory.honcho.session as honcho_session
+
+        class FakeConfig:
+            enabled = True
+            api_key = "local"
+            base_url = "http://localhost:8000"
+            workspace_id = "hermes"
+            host = "hermes"
+            ai_peer = "hermes"
+            peer_name = "attila"
+            recall_mode = "hybrid"
+            context_tokens = 800
+            raw = {"injection": {"includeUserCard": True, "includeAiCard": True}}
+
+            def resolve_session_name(self):
+                return "session-one"
+
+        class FakeManager:
+            def __init__(self, honcho, config):
+                pass
+
+            def get_or_create(self, session_key):
+                return object()
+
+            def get_prefetch_context(self, session_key):
+                return {"card": "Prefers concise replies", "ai_card": "Minimal identity"}
+
+            def pop_context_result(self, session_key):
+                raise AssertionError("preview must not pop cached prefetch context")
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: object(),
+        )
+        monkeypatch.setattr(honcho_session, "HonchoSessionManager", FakeManager)
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=False, json=False))
+
+        out = capsys.readouterr().out
+        assert "Honcho injection preview" in out
+        assert "User Peer Card: included" in out
+        assert "AI Identity Card: included" in out
+        assert "Approx size" in out
