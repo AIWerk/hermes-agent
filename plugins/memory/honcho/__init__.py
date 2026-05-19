@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
+from agent.memory_router import should_mirror_to_honcho
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1282,6 +1283,13 @@ class HonchoMemoryProvider(MemoryProvider):
         stays focused on the 7-PR consolidation and its review follow-ups.
         """
         if action != "add" or target != "user" or not content:
+            return
+        ok, route = should_mirror_to_honcho(content, target=target, metadata=metadata)
+        if not ok:
+            logger.debug(
+                "Honcho memory mirror skipped by router: destination=%s reason=%s",
+                [d.value for d in route.destinations], route.reason,
+            )
             return
         if self._cron_skipped:
             return

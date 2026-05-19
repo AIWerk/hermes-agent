@@ -34,6 +34,8 @@ from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
 from utils import atomic_replace
+from agent.memory_router import should_write_builtin_memory
+from hermes_cli.config import cfg_get, load_config
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -459,6 +461,30 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+def _memory_router_enabled() -> bool:
+    """Return whether prompt-injected memory write routing is enabled."""
+    try:
+        cfg = load_config()
+        return bool(cfg_get(cfg, "memory", "router", "enabled", default=True)) and bool(
+            cfg_get(cfg, "memory", "router", "block_non_inject_writes", default=True)
+        )
+    except Exception:
+        return True
+
+
+def _router_block_response(content: str, target: str) -> Optional[str]:
+    if not _memory_router_enabled():
+        return None
+    ok, route = should_write_builtin_memory(content, target=target)
+    if ok:
+        return None
+    return json.dumps({
+        "success": False,
+        "error": "Memory router blocked this write from prompt-injected memory.",
+        "route": route.to_dict(),
+    }, ensure_ascii=False)
+
+
 def memory_tool(
     action: str,
     target: str = "memory",
@@ -480,6 +506,9 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
+        blocked = _router_block_response(content, target)
+        if blocked is not None:
+            return blocked
         result = store.add(target, content)
 
     elif action == "replace":
@@ -487,6 +516,9 @@ def memory_tool(
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
+        blocked = _router_block_response(content, target)
+        if blocked is not None:
+            return blocked
         result = store.replace(target, old_text, content)
 
     elif action == "remove":
@@ -525,6 +557,10 @@ MEMORY_SCHEMA = {
         "The most valuable memory prevents the user from having to repeat themselves.\n\n"
         "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
         "state to memory; use session_search to recall those from past transcripts.\n"
+        "Router policy: credentials and raw dumps are discarded; customer-specific facts "
+        "go to isolated tenant-private memory; durable AIWerk product/architecture/SOP/strategy "
+        "knowledge goes to sanitized wiki; reusable procedures go to skills; only stable user "
+        "preferences and stable environment/tooling facts belong in prompt-injected memory.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"

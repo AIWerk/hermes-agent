@@ -1134,6 +1134,14 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Deterministic routing guard for prompt-injected memory writes.
+        # Blocks credentials, raw dumps, customer-private facts, wiki-worthy
+        # product knowledge, reusable procedures, and transient session progress
+        # from being written into base injected memory.
+        "router": {
+            "enabled": True,
+            "block_non_inject_writes": True,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
