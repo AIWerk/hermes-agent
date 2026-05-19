@@ -888,6 +888,46 @@ def _print_injection_preview(preview: dict, hcfg, session_key: str) -> None:
     print()
 
 
+def build_injection_preview_summary(*, fail_quietly: bool = True) -> str:
+    """Return a compact read-only Honcho injection preview summary.
+
+    This is intended for in-session reset notices such as /new and /clear.
+    It reuses the same deterministic preview builder as the explicit CLI command
+    and intentionally avoids subprocesses, LLM calls, writes, and prefetch-cache
+    consumption.
+    """
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
+
+        hcfg = HonchoClientConfig.from_global_config()
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+            return ""
+
+        client = get_honcho_client(hcfg)
+        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = hcfg.resolve_session_name() or getattr(hcfg, "host", "hermes") or "hermes"
+        mgr.get_or_create(session_key)
+        ctx = mgr.get_prefetch_context(session_key) or {}
+        preview = _build_injection_preview(hcfg, ctx, wrapped=True)
+
+        included = ", ".join(item["label"] for item in preview["included"]) or "none"
+        excluded = ", ".join(item["label"] for item in preview["excluded"]) or "none"
+        return "\n".join(
+            [
+                "Honcho injection preview for next turn",
+                f"  Included: {included}",
+                f"  Excluded: {excluded}",
+                f"  Approx: {preview['estimated_tokens']} tokens, {preview['line_count']} lines",
+                "  Exact: hermes honcho injection-preview --raw",
+            ]
+        )
+    except Exception as e:
+        if fail_quietly:
+            return ""
+        return f"Honcho injection preview unavailable: {e}"
+
+
 def cmd_injection_preview(args) -> None:
     """Show the Honcho context that would be injected into the next prompt."""
     try:

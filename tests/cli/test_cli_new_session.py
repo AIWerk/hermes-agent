@@ -280,3 +280,40 @@ def test_new_session_with_duplicate_title_surfaces_error(capsys):
     captured = capsys.readouterr()
     assert "New session started: Dup" not in captured.out
     assert "New session started!" in captured.out
+
+
+def test_new_command_prints_honcho_preview_after_session_switch(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    calls = []
+    cli._print_honcho_reset_injection_preview = lambda event="new_session": calls.append((event, cli.session_id))
+
+    cli.process_command("/new")
+
+    assert calls == [("new_session", cli.session_id)]
+    assert calls[0][1] != old_session_id
+
+
+def test_reset_command_prints_honcho_preview_after_session_switch(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    calls = []
+    cli._print_honcho_reset_injection_preview = lambda event="new_session": calls.append((event, cli.session_id))
+
+    cli.process_command("/reset")
+
+    assert calls == [("new_session", cli.session_id)]
+    assert calls[0][1] != old_session_id
+
+
+def test_clear_command_prints_honcho_preview_after_redraw(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    calls = []
+    cli.console = MagicMock()
+    cli.console.clear.side_effect = lambda: calls.append("clear")
+    cli.show_banner = MagicMock(side_effect=lambda: calls.append("banner"))
+    cli._print_honcho_reset_injection_preview = lambda event="new_session": calls.append(f"preview:{event}")
+
+    cli.process_command("/clear")
+
+    assert calls == ["clear", "banner", "preview:clear"]

@@ -1267,7 +1267,16 @@ DEFAULT_CONFIG = {
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
-    "honcho": {},
+    "honcho": {
+        "injection_preview": {
+            # Show a compact, read-only summary after interactive session-reset
+            # slash commands. The preview uses stored Honcho context only: no LLM
+            # calls, no writes, no prefetch-cache consumption.
+            "on_new_session": True,
+            "on_clear": True,
+            "fail_quietly": True,
+        },
+    },
 
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
     # Empty string means use server-local time.

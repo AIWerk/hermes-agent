@@ -313,3 +313,67 @@ class TestInjectionPreview:
         assert "User Peer Card: included" in out
         assert "AI Identity Card: included" in out
         assert "Approx size" in out
+
+    def test_build_injection_preview_summary_is_compact_and_read_only(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        import plugins.memory.honcho.session as honcho_session
+
+        class FakeConfig:
+            enabled = True
+            api_key = "local"
+            base_url = "http://localhost:8000"
+            workspace_id = "hermes"
+            host = "hermes"
+            recall_mode = "hybrid"
+            context_tokens = 800
+            raw = {
+                "injection": {
+                    "includeSummary": False,
+                    "includeUserRepresentation": False,
+                    "includeUserCard": True,
+                    "includeAiRepresentation": False,
+                    "includeAiCard": True,
+                    "includeDialectic": False,
+                }
+            }
+
+            def resolve_session_name(self):
+                return "session-one"
+
+        class FakeManager:
+            def __init__(self, honcho, config):
+                pass
+
+            def get_or_create(self, session_key):
+                return object()
+
+            def get_prefetch_context(self, session_key):
+                return {
+                    "summary": "Should not appear in compact reset notice",
+                    "card": "Prefers concise replies",
+                    "ai_card": "Minimal identity",
+                }
+
+            def pop_context_result(self, session_key):
+                raise AssertionError("summary preview must not pop cached context")
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: object(),
+        )
+        monkeypatch.setattr(honcho_session, "HonchoSessionManager", FakeManager)
+
+        summary = honcho_cli.build_injection_preview_summary()
+
+        assert "Honcho injection preview for next turn" in summary
+        assert "Included: User Peer Card, AI Identity Card" in summary
+        assert "Excluded: Session Summary" in summary
+        assert "Approx:" in summary
+        assert "Exact: hermes honcho injection-preview --raw" in summary
+        assert "Prefers concise replies" not in summary
+        assert "Minimal identity" not in summary
+        assert "Should not appear" not in summary
