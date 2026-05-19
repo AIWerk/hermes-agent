@@ -638,8 +638,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 old_text=function_args.get("old_text"),
                 store=agent._memory_store,
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
+            # Bridge: notify external memory provider only after confirmed built-in writes.
+            if (
+                agent._memory_manager
+                and function_args.get("action") in {"add", "replace"}
+                and agent._memory_write_succeeded(function_result)
+            ):
                 try:
                     agent._memory_manager.on_memory_write(
                         function_args.get("action", ""),

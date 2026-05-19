@@ -49,6 +49,20 @@ def test_customer_facts_route_to_tenant_private_only():
     assert route.shared_wiki_allowed is False
 
 
+def test_customer_private_address_never_routes_to_wiki_or_injection():
+    route = classify_memory_route(
+        "Customer private address is Bahnhofstrasse 1, Zurich.",
+        target="memory",
+        metadata={"customer_id": "customer-1"},
+    )
+
+    assert route.has(MemoryDestination.TENANT_PRIVATE)
+    assert not route.has(MemoryDestination.WIKI_CANDIDATE)
+    assert not route.has(MemoryDestination.INJECT)
+    assert route.shared_wiki_allowed is False
+    assert route.inject_allowed is False
+
+
 def test_aiwerk_architecture_routes_to_wiki_candidate_not_memory():
     ok, route = should_write_builtin_memory(
         "AIWerk architecture: Smart Website is the customer-facing surface.",
@@ -83,6 +97,19 @@ def test_session_progress_routes_to_session_index():
     assert route.target_hint == "session_search"
 
 
+def test_raw_conversation_dump_routes_to_session_index_or_discard_only():
+    route = classify_memory_route(
+        "Full raw transcript conversation dump from a private customer setup call.",
+        target="memory",
+    )
+
+    assert route.has(MemoryDestination.SESSION_INDEX)
+    assert route.has(MemoryDestination.DISCARD)
+    assert not route.has(MemoryDestination.INJECT)
+    assert route.inject_allowed is False
+    assert route.honcho_store_allowed is False
+
+
 def test_stable_environment_fact_can_route_to_builtin_memory():
     ok, route = should_write_builtin_memory(
         "Project uses pytest with xdist for parallel test runs.",
@@ -109,3 +136,28 @@ def test_honcho_mirror_uses_same_high_signal_boundary():
     )
     assert ok is False
     assert route.has(MemoryDestination.SESSION_INDEX)
+
+
+def test_profile_metadata_does_not_override_customer_private_routing():
+    route = classify_memory_route(
+        "Customer private address is Bahnhofstrasse 1, Zurich.",
+        target="memory",
+        metadata={"profile": "cody", "customer_id": "customer-1"},
+    )
+
+    assert route.has(MemoryDestination.TENANT_PRIVATE)
+    assert not route.has(MemoryDestination.INJECT)
+    assert route.inject_allowed is False
+    assert route.target_hint == "tenant_private"
+
+
+def test_profile_metadata_does_not_create_specialist_memory_route():
+    ok, route = should_write_builtin_memory(
+        "User prefers concise replies.",
+        target="user",
+        metadata={"profile": "data"},
+    )
+
+    assert ok is True
+    assert route.has(MemoryDestination.INJECT)
+    assert route.target_hint == "user"

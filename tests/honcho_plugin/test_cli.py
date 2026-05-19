@@ -206,6 +206,43 @@ class TestCmdStatus:
         assert "AI Self-Representation: excluded" in out
         assert "Dialectic: excluded" in out
 
+    def test_status_snapshot_json_splits_stored_and_injected_state(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        class FakeConfig:
+            host = "hermes"
+            workspace_id = "hermes"
+            recall_mode = "hybrid"
+            context_tokens = 800
+            raw = {
+                "injection": {
+                    "includeSummary": False,
+                    "includeUserRepresentation": False,
+                    "includeAiRepresentation": False,
+                    "includeUserCard": True,
+                    "includeAiCard": True,
+                    "includeDialectic": False,
+                }
+            }
+
+        snapshot = honcho_cli._build_status_snapshot(
+            FakeConfig(),
+            session_key="session-one",
+            user_card=["User prefers concise replies"],
+            ai_card=["Hermes identity stays minimal"],
+            ai_representation="old noisy AI self-representation",
+        )
+
+        assert snapshot["deterministic"] is True
+        assert snapshot["llmCall"] is False
+        assert snapshot["stored"]["userPeerCard"]["count"] == 1
+        assert snapshot["stored"]["aiPeerCard"]["count"] == 1
+        assert snapshot["stored"]["aiRepresentation"]["present"] is True
+        assert snapshot["injected"]["sections"]["User Peer Card"]["included"] is True
+        assert snapshot["injected"]["sections"]["AI Identity Card"]["included"] is True
+        assert snapshot["injected"]["sections"]["Session Summary"]["included"] is False
+        assert snapshot["injected"]["sections"]["AI Self-Representation"]["included"] is False
+
 class TestInjectionPreview:
     def test_build_preview_includes_only_enabled_sections(self):
         import plugins.memory.honcho.cli as honcho_cli
@@ -245,6 +282,55 @@ class TestInjectionPreview:
         assert preview["included"][1]["label"] == "AI Identity Card"
         assert any(item["label"] == "Session Summary" for item in preview["excluded"])
         assert any(item["label"] == "AI Self-Representation" for item in preview["excluded"])
+
+    def test_default_injection_flags_are_safe_and_card_only(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        class FakeConfig:
+            raw = {}
+            host = "hermes"
+
+        preview = honcho_cli._build_injection_preview(
+            FakeConfig(),
+            {
+                "summary": "Old session summary",
+                "representation": "Noisy user representation",
+                "card": "User card fact",
+                "ai_representation": "Noisy AI self representation",
+                "ai_card": "Minimal identity",
+            },
+        )
+
+        assert "User card fact" in preview["raw_context"]
+        assert "Minimal identity" in preview["raw_context"]
+        assert "Old session summary" not in preview["raw_context"]
+        assert "Noisy user representation" not in preview["raw_context"]
+        assert "Noisy AI self representation" not in preview["raw_context"]
+
+    def test_host_injection_flags_override_root_defaults(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        class FakeConfig:
+            host = "hermes.specialist"
+            raw = {
+                "injection": {"includeUserCard": True},
+                "hosts": {
+                    "hermes.specialist": {
+                        "injection": {"includeUserCard": False, "includeAiCard": False}
+                    }
+                },
+            }
+
+        preview = honcho_cli._build_injection_preview(
+            FakeConfig(),
+            {"card": "Should not inject", "ai_card": "Should also not inject"},
+        )
+
+        assert preview["raw_context"] == ""
+        assert any(
+            item["label"] == "User Peer Card" and item["reason"] == "includeUserCard false"
+            for item in preview["excluded"]
+        )
 
     def test_build_preview_wraps_raw_prompt_when_requested(self):
         import plugins.memory.honcho.cli as honcho_cli

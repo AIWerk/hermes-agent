@@ -23,6 +23,7 @@ class MemoryDestination(str, Enum):
     WIKI_CANDIDATE = "wiki_candidate"
     SKILL_CANDIDATE = "skill_candidate"
     TENANT_PRIVATE = "tenant_private"
+
     DISCARD = "discard"
 
 
@@ -126,7 +127,6 @@ _RAW_DUMP_RE = re.compile(
     r"memory-context|credentials dump|private dump)\b",
     re.IGNORECASE,
 )
-
 
 _PRIORITY_DESTINATION = {
     MemoryDestination.DISCARD: 100,

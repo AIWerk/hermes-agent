@@ -655,6 +655,16 @@ def cmd_status(args) -> None:
         print(f"  Config error: {e}\n")
         return
 
+    if getattr(args, "json", False):
+        try:
+            client = get_honcho_client(hcfg)
+            snapshot = _collect_peer_status_snapshot(hcfg, client)
+            snapshot["connection"] = {"ok": True}
+            print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        except Exception as e:
+            print(json.dumps({"connection": {"ok": False, "error": str(e)}}, indent=2, ensure_ascii=False))
+        return
+
     api_key = hcfg.api_key or ""
     masked = f"...{api_key[-8:]}" if len(api_key) > 8 else ("set" if api_key else "not set")
 
@@ -737,6 +747,69 @@ def _print_fact_list(label: str, facts: list[str], qualifier: str = "stored", li
 def _print_injection_line(label: str, included: bool, reason: str) -> None:
     state = "included" if included else "excluded"
     print(f"    - {label}: {state} ({reason})")
+
+
+def _status_section(included: bool, reason: str) -> dict:
+    return {"included": bool(included), "reason": reason}
+
+
+def _build_status_snapshot(
+    hcfg,
+    *,
+    session_key: str,
+    user_card: list[str],
+    ai_card: list[str],
+    ai_representation: str = "",
+) -> dict:
+    include_user_card = _honcho_injection_flag(hcfg, "includeUserCard", True)
+    include_ai_card = _honcho_injection_flag(hcfg, "includeAiCard", True)
+    include_summary = _honcho_injection_flag(hcfg, "includeSummary", False)
+    include_user_rep = _honcho_injection_flag(hcfg, "includeUserRepresentation", False)
+    include_ai_rep = _honcho_injection_flag(hcfg, "includeAiRepresentation", False)
+    include_dialectic = _honcho_injection_flag(hcfg, "includeDialectic", False)
+
+    return {
+        "host": getattr(hcfg, "host", ""),
+        "workspace": getattr(hcfg, "workspace_id", ""),
+        "session": session_key,
+        "recallMode": getattr(hcfg, "recall_mode", ""),
+        "contextTokens": getattr(hcfg, "context_tokens", None),
+        "deterministic": True,
+        "llmCall": False,
+        "stored": {
+            "userPeerCard": {"count": len(user_card or []), "present": bool(user_card)},
+            "aiPeerCard": {"count": len(ai_card or []), "present": bool(ai_card)},
+            "aiRepresentation": {"present": bool(ai_representation)},
+        },
+        "injected": {
+            "sections": {
+                "User Peer Card": _status_section(
+                    bool(user_card) and include_user_card,
+                    "includeUserCard true" if include_user_card else "includeUserCard false",
+                ),
+                "AI Identity Card": _status_section(
+                    bool(ai_card) and include_ai_card,
+                    "includeAiCard true" if include_ai_card else "includeAiCard false",
+                ),
+                "Session Summary": _status_section(
+                    include_summary,
+                    "includeSummary true" if include_summary else "includeSummary false",
+                ),
+                "User Representation": _status_section(
+                    include_user_rep,
+                    "includeUserRepresentation true" if include_user_rep else "includeUserRepresentation false",
+                ),
+                "AI Self-Representation": _status_section(
+                    bool(ai_representation) and include_ai_rep,
+                    "includeAiRepresentation true" if include_ai_rep else "includeAiRepresentation false",
+                ),
+                "Dialectic": _status_section(
+                    include_dialectic,
+                    "includeDialectic true" if include_dialectic else "includeDialectic false",
+                ),
+            }
+        },
+    }
 
 
 def _estimate_tokens(text: str) -> int:
@@ -965,6 +1038,33 @@ def cmd_injection_preview(args) -> None:
         _print_injection_preview(preview, hcfg, session_key)
     except Exception as e:
         print(f"\n  Honcho injection preview unavailable: {e}\n")
+
+
+def _collect_peer_status_snapshot(hcfg, client) -> dict:
+    from plugins.memory.honcho.session import HonchoSessionManager
+
+    mgr = HonchoSessionManager(honcho=client, config=hcfg)
+    session_key = hcfg.resolve_session_name()
+    mgr.get_or_create(session_key)
+
+    card = mgr.get_peer_card(session_key)
+    ai_rep = mgr.get_ai_representation(session_key)
+    ai_text = ai_rep.get("representation", "") if isinstance(ai_rep, dict) else ""
+    ai_card_text = ai_rep.get("card", "") if isinstance(ai_rep, dict) else ""
+    ai_card = [line.strip("- ").strip() for line in ai_card_text.splitlines() if line.strip()]
+    ai_card_getter = getattr(mgr, "get_ai_peer_card", None)
+    if not ai_card and callable(ai_card_getter):
+        fetched_ai_card = ai_card_getter(session_key)
+        if isinstance(fetched_ai_card, list):
+            ai_card = fetched_ai_card
+
+    return _build_status_snapshot(
+        hcfg,
+        session_key=session_key,
+        user_card=card or [],
+        ai_card=ai_card or [],
+        ai_representation=ai_text or "",
+    )
 
 
 def _show_peer_cards(hcfg, client) -> None:
@@ -1687,6 +1787,9 @@ def register_cli(subparser) -> None:
     )
     status_parser.add_argument(
         "--all", action="store_true", help="Show config overview across all profiles",
+    )
+    status_parser.add_argument(
+        "--json", action="store_true", help="Print structured stored/injected status as JSON",
     )
 
     preview_parser = subs.add_parser(
