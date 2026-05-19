@@ -655,6 +655,16 @@ def cmd_status(args) -> None:
         print(f"  Config error: {e}\n")
         return
 
+    if getattr(args, "json", False):
+        try:
+            client = get_honcho_client(hcfg)
+            snapshot = _collect_peer_status_snapshot(hcfg, client)
+            snapshot["connection"] = {"ok": True}
+            print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        except Exception as e:
+            print(json.dumps({"connection": {"ok": False, "error": str(e)}}, indent=2, ensure_ascii=False))
+        return
+
     api_key = hcfg.api_key or ""
     masked = f"...{api_key[-8:]}" if len(api_key) > 8 else ("set" if api_key else "not set")
 
@@ -707,12 +717,363 @@ def cmd_status(args) -> None:
         print(f"\n  Not connected ({reason})\n")
 
 
+def _honcho_injection_flag(hcfg, name: str, default: bool) -> bool:
+    """Resolve a host-aware Honcho injection flag without making LLM calls."""
+    try:
+        raw = getattr(hcfg, "raw", None) or {}
+        root_candidate = raw.get("injection")
+        root_injection = root_candidate if isinstance(root_candidate, dict) else {}
+        hosts = raw.get("hosts") or {}
+        host_block = hosts.get(getattr(hcfg, "host", ""), {}) if isinstance(hosts, dict) else {}
+        host_candidate = host_block.get("injection") if isinstance(host_block, dict) else None
+        host_injection = host_candidate if isinstance(host_candidate, dict) else {}
+        if name in host_injection:
+            return bool(host_injection[name])
+        if name in root_injection:
+            return bool(root_injection[name])
+    except Exception:
+        pass
+    return default
+
+
+def _print_fact_list(label: str, facts: list[str], qualifier: str = "stored", limit: int = 10) -> None:
+    print(f"\n  {label} ({qualifier}, {len(facts)} facts):")
+    for fact in facts[:limit]:
+        print(f"    - {fact}")
+    if len(facts) > limit:
+        print(f"    ... and {len(facts) - limit} more")
+
+
+def _print_injection_line(label: str, included: bool, reason: str) -> None:
+    state = "included" if included else "excluded"
+    print(f"    - {label}: {state} ({reason})")
+
+
+def _status_section(included: bool, reason: str) -> dict:
+    return {"included": bool(included), "reason": reason}
+
+
+def _build_status_snapshot(
+    hcfg,
+    *,
+    session_key: str,
+    user_card: list[str],
+    ai_card: list[str],
+    ai_representation: str = "",
+) -> dict:
+    include_user_card = _honcho_injection_flag(hcfg, "includeUserCard", True)
+    include_ai_card = _honcho_injection_flag(hcfg, "includeAiCard", True)
+    include_summary = _honcho_injection_flag(hcfg, "includeSummary", False)
+    include_user_rep = _honcho_injection_flag(hcfg, "includeUserRepresentation", False)
+    include_ai_rep = _honcho_injection_flag(hcfg, "includeAiRepresentation", False)
+    include_dialectic = _honcho_injection_flag(hcfg, "includeDialectic", False)
+
+    return {
+        "host": getattr(hcfg, "host", ""),
+        "workspace": getattr(hcfg, "workspace_id", ""),
+        "session": session_key,
+        "recallMode": getattr(hcfg, "recall_mode", ""),
+        "contextTokens": getattr(hcfg, "context_tokens", None),
+        "deterministic": True,
+        "llmCall": False,
+        "stored": {
+            "userPeerCard": {"count": len(user_card or []), "present": bool(user_card)},
+            "aiPeerCard": {"count": len(ai_card or []), "present": bool(ai_card)},
+            "aiRepresentation": {"present": bool(ai_representation)},
+        },
+        "injected": {
+            "sections": {
+                "User Peer Card": _status_section(
+                    bool(user_card) and include_user_card,
+                    "includeUserCard true" if include_user_card else "includeUserCard false",
+                ),
+                "AI Identity Card": _status_section(
+                    bool(ai_card) and include_ai_card,
+                    "includeAiCard true" if include_ai_card else "includeAiCard false",
+                ),
+                "Session Summary": _status_section(
+                    include_summary,
+                    "includeSummary true" if include_summary else "includeSummary false",
+                ),
+                "User Representation": _status_section(
+                    include_user_rep,
+                    "includeUserRepresentation true" if include_user_rep else "includeUserRepresentation false",
+                ),
+                "AI Self-Representation": _status_section(
+                    bool(ai_representation) and include_ai_rep,
+                    "includeAiRepresentation true" if include_ai_rep else "includeAiRepresentation false",
+                ),
+                "Dialectic": _status_section(
+                    include_dialectic,
+                    "includeDialectic true" if include_dialectic else "includeDialectic false",
+                ),
+            }
+        },
+    }
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap local token estimate for preview output. No LLM call."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _section_line_count(text: str) -> int:
+    return len([line for line in (text or "").splitlines() if line.strip()])
+
+
+def _build_injection_preview(hcfg, ctx: dict, *, wrapped: bool = False) -> dict:
+    """Build a side-effect-free preview of Honcho prompt injection.
+
+    This mirrors HonchoMemoryProvider._format_first_turn_context but returns
+    structured diagnostics and can optionally wrap the raw provider context in
+    the same memory-context fence used by MemoryManager. It never calls Honcho
+    reasoning, never writes, and never consumes prefetch caches.
+    """
+    sections = [
+        (
+            "Session Summary",
+            "summary",
+            "## Session Summary",
+            _honcho_injection_flag(hcfg, "includeSummary", False),
+            "includeSummary",
+        ),
+        (
+            "User Representation",
+            "representation",
+            "## User Representation",
+            _honcho_injection_flag(hcfg, "includeUserRepresentation", False),
+            "includeUserRepresentation",
+        ),
+        (
+            "User Peer Card",
+            "card",
+            "## User Peer Card",
+            _honcho_injection_flag(hcfg, "includeUserCard", True),
+            "includeUserCard",
+        ),
+        (
+            "AI Self-Representation",
+            "ai_representation",
+            "## AI Self-Representation",
+            _honcho_injection_flag(hcfg, "includeAiRepresentation", False),
+            "includeAiRepresentation",
+        ),
+        (
+            "AI Identity Card",
+            "ai_card",
+            "## AI Identity Card",
+            _honcho_injection_flag(hcfg, "includeAiCard", True),
+            "includeAiCard",
+        ),
+    ]
+
+    included: list[dict] = []
+    excluded: list[dict] = []
+    raw_parts: list[str] = []
+
+    for label, key, heading, enabled, flag_name in sections:
+        value = (ctx or {}).get(key, "")
+        if isinstance(value, list):
+            value = "\n".join(str(item) for item in value if str(item).strip())
+        value = str(value or "").strip()
+        if value and enabled:
+            rendered = f"{heading}\n{value}"
+            raw_parts.append(rendered)
+            included.append(
+                {
+                    "label": label,
+                    "flag": flag_name,
+                    "reason": f"{flag_name} true",
+                    "lines": _section_line_count(value),
+                    "chars": len(value),
+                }
+            )
+        else:
+            reason = f"{flag_name} false" if not enabled else "no stored content"
+            excluded.append(
+                {
+                    "label": label,
+                    "flag": flag_name,
+                    "reason": reason,
+                    "has_content": bool(value),
+                }
+            )
+
+    include_dialectic = _honcho_injection_flag(hcfg, "includeDialectic", False)
+    excluded.append(
+        {
+            "label": "Dialectic",
+            "flag": "includeDialectic",
+            "reason": (
+                "includeDialectic false"
+                if not include_dialectic
+                else "not included in deterministic preview"
+            ),
+            "has_content": False,
+        }
+    )
+
+    raw_context = "\n\n".join(raw_parts)
+    prompt_text = raw_context
+    if wrapped and raw_context:
+        from agent.memory_manager import build_memory_context_block
+        prompt_text = build_memory_context_block(raw_context)
+
+    return {
+        "included": included,
+        "excluded": excluded,
+        "raw_context": raw_context,
+        "prompt_text": prompt_text,
+        "line_count": _section_line_count(prompt_text),
+        "word_count": len(prompt_text.split()) if prompt_text else 0,
+        "estimated_tokens": _estimate_tokens(prompt_text),
+        "wrapped": wrapped,
+    }
+
+
+def _print_injection_preview(preview: dict, hcfg, session_key: str) -> None:
+    print("\nHoncho injection preview\n" + "─" * 40)
+    print("\n  Session")
+    print(f"    Host: {getattr(hcfg, 'host', '(unknown)')}")
+    print(f"    Workspace: {getattr(hcfg, 'workspace_id', '(unknown)')}")
+    print(f"    Session: {session_key}")
+    print(f"    Recall mode: {getattr(hcfg, 'recall_mode', '(unknown)')}")
+    print(f"    Context budget: {getattr(hcfg, 'context_tokens', None) or '(Honcho default)'} tokens")
+
+    print("\n  Included sections")
+    if preview["included"]:
+        for item in preview["included"]:
+            print(f"    - {item['label']}: included ({item['reason']}, {item['lines']} lines)")
+    else:
+        print("    - none")
+
+    print("\n  Excluded sections")
+    for item in preview["excluded"]:
+        print(f"    - {item['label']}: excluded ({item['reason']})")
+
+    print("\n  Approx size")
+    print(f"    Lines: {preview['line_count']}")
+    print(f"    Words: {preview['word_count']}")
+    print(f"    Tokens: about {preview['estimated_tokens']}")
+    print("\n  Exact prompt text: hermes honcho injection-preview --raw")
+    print()
+
+
+def build_injection_preview_summary(*, fail_quietly: bool = True) -> str:
+    """Return a compact read-only Honcho injection preview summary.
+
+    This is intended for in-session reset notices such as /new and /clear.
+    It reuses the same deterministic preview builder as the explicit CLI command
+    and intentionally avoids subprocesses, LLM calls, writes, and prefetch-cache
+    consumption.
+    """
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
+
+        hcfg = HonchoClientConfig.from_global_config()
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+            return ""
+
+        client = get_honcho_client(hcfg)
+        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = hcfg.resolve_session_name() or getattr(hcfg, "host", "hermes") or "hermes"
+        mgr.get_or_create(session_key)
+        ctx = mgr.get_prefetch_context(session_key) or {}
+        preview = _build_injection_preview(hcfg, ctx, wrapped=True)
+
+        included = ", ".join(item["label"] for item in preview["included"]) or "none"
+        excluded = ", ".join(item["label"] for item in preview["excluded"]) or "none"
+        return "\n".join(
+            [
+                "Honcho injection preview for next turn",
+                f"  Included: {included}",
+                f"  Excluded: {excluded}",
+                f"  Approx: {preview['estimated_tokens']} tokens, {preview['line_count']} lines",
+                "  Exact: hermes honcho injection-preview --raw",
+            ]
+        )
+    except Exception as e:
+        if fail_quietly:
+            return ""
+        return f"Honcho injection preview unavailable: {e}"
+
+
+def cmd_injection_preview(args) -> None:
+    """Show the Honcho context that would be injected into the next prompt."""
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
+
+        hcfg = HonchoClientConfig.from_global_config()
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+            print("\n  Honcho not connected. Run: hermes honcho status\n")
+            return
+
+        client = get_honcho_client(hcfg)
+        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = hcfg.resolve_session_name() or getattr(hcfg, "host", "hermes") or "hermes"
+        mgr.get_or_create(session_key)
+        ctx = mgr.get_prefetch_context(session_key) or {}
+        preview = _build_injection_preview(hcfg, ctx, wrapped=bool(getattr(args, "raw", False)))
+
+        if getattr(args, "json", False):
+            payload = {
+                "host": getattr(hcfg, "host", ""),
+                "workspace": getattr(hcfg, "workspace_id", ""),
+                "session": session_key,
+                "recallMode": getattr(hcfg, "recall_mode", ""),
+                "contextTokens": getattr(hcfg, "context_tokens", None),
+                **preview,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+
+        if getattr(args, "raw", False):
+            print(preview["prompt_text"])
+            return
+
+        _print_injection_preview(preview, hcfg, session_key)
+    except Exception as e:
+        print(f"\n  Honcho injection preview unavailable: {e}\n")
+
+
+def _collect_peer_status_snapshot(hcfg, client) -> dict:
+    from plugins.memory.honcho.session import HonchoSessionManager
+
+    mgr = HonchoSessionManager(honcho=client, config=hcfg)
+    session_key = hcfg.resolve_session_name()
+    mgr.get_or_create(session_key)
+
+    card = mgr.get_peer_card(session_key)
+    ai_rep = mgr.get_ai_representation(session_key)
+    ai_text = ai_rep.get("representation", "") if isinstance(ai_rep, dict) else ""
+    ai_card_text = ai_rep.get("card", "") if isinstance(ai_rep, dict) else ""
+    ai_card = [line.strip("- ").strip() for line in ai_card_text.splitlines() if line.strip()]
+    ai_card_getter = getattr(mgr, "get_ai_peer_card", None)
+    if not ai_card and callable(ai_card_getter):
+        fetched_ai_card = ai_card_getter(session_key)
+        if isinstance(fetched_ai_card, list):
+            ai_card = fetched_ai_card
+
+    return _build_status_snapshot(
+        hcfg,
+        session_key=session_key,
+        user_card=card or [],
+        ai_card=ai_card or [],
+        ai_representation=ai_text or "",
+    )
+
+
 def _show_peer_cards(hcfg, client) -> None:
-    """Fetch and display peer cards for the active profile.
+    """Fetch and display stored state separately from active injection state.
 
     Uses get_or_create to ensure the session exists with peers configured.
-    This is idempotent -- if the session already exists on the server it's
-    just retrieved, not duplicated.
+    This is idempotent -- if the session already exists on the server it is
+    just retrieved, not duplicated. The active injection preview is fully
+    deterministic: config flags plus already fetched card data, no LLM calls.
     """
     try:
         from plugins.memory.honcho.session import HonchoSessionManager
@@ -720,25 +1081,75 @@ def _show_peer_cards(hcfg, client) -> None:
         session_key = hcfg.resolve_session_name()
         mgr.get_or_create(session_key)
 
-        # User peer card
         card = mgr.get_peer_card(session_key)
-        if card:
-            print(f"\n  User peer card ({len(card)} facts):")
-            for fact in card[:10]:
-                print(f"    - {fact}")
-            if len(card) > 10:
-                print(f"    ... and {len(card) - 10} more")
-
-        # AI peer representation
         ai_rep = mgr.get_ai_representation(session_key)
-        ai_text = ai_rep.get("representation", "")
-        if ai_text:
-            # Truncate to first 200 chars
-            display = ai_text[:200] + ("..." if len(ai_text) > 200 else "")
-            print(f"\n  AI peer representation:")
-            print(f"    {display}")
+        ai_text = ai_rep.get("representation", "") if isinstance(ai_rep, dict) else ""
+        ai_card_text = ai_rep.get("card", "") if isinstance(ai_rep, dict) else ""
+        ai_card = [line.strip("- ").strip() for line in ai_card_text.splitlines() if line.strip()]
+        ai_card_getter = getattr(mgr, "get_ai_peer_card", None)
+        if not ai_card and callable(ai_card_getter):
+            fetched_ai_card = ai_card_getter(session_key)
+            if isinstance(fetched_ai_card, list):
+                ai_card = fetched_ai_card
 
-        if not card and not ai_text:
+        print("\n  Stored memory state")
+        if card:
+            _print_fact_list("User peer card", card)
+        else:
+            print("    - User peer card: none stored")
+
+        if ai_card:
+            _print_fact_list("AI peer card", ai_card)
+        else:
+            print("    - AI peer card: none stored")
+
+        if ai_text:
+            display = ai_text[:200] + ("..." if len(ai_text) > 200 else "")
+            print("\n  AI peer representation (stored, excluded from injection):")
+            print(f"    {display}")
+        else:
+            print("    - AI peer representation: none stored")
+
+        include_user_card = _honcho_injection_flag(hcfg, "includeUserCard", True)
+        include_ai_card = _honcho_injection_flag(hcfg, "includeAiCard", True)
+        include_summary = _honcho_injection_flag(hcfg, "includeSummary", False)
+        include_user_rep = _honcho_injection_flag(hcfg, "includeUserRepresentation", False)
+        include_ai_rep = _honcho_injection_flag(hcfg, "includeAiRepresentation", False)
+        include_dialectic = _honcho_injection_flag(hcfg, "includeDialectic", False)
+
+        print("\n  Active injected context")
+        _print_injection_line(
+            "User Peer Card",
+            bool(card) and include_user_card,
+            "includeUserCard true" if include_user_card else "includeUserCard false",
+        )
+        _print_injection_line(
+            "AI Identity Card",
+            bool(ai_card) and include_ai_card,
+            "includeAiCard true" if include_ai_card else "includeAiCard false",
+        )
+        _print_injection_line(
+            "Session Summary",
+            include_summary,
+            "includeSummary true" if include_summary else "includeSummary false",
+        )
+        _print_injection_line(
+            "User Representation",
+            include_user_rep,
+            "includeUserRepresentation true" if include_user_rep else "includeUserRepresentation false",
+        )
+        _print_injection_line(
+            "AI Self-Representation",
+            bool(ai_text) and include_ai_rep,
+            "includeAiRepresentation true" if include_ai_rep else "includeAiRepresentation false",
+        )
+        _print_injection_line(
+            "Dialectic",
+            include_dialectic,
+            "includeDialectic true" if include_dialectic else "includeDialectic false",
+        )
+
+        if not card and not ai_text and not ai_card:
             print("\n  No peer data yet (accumulates after first conversation)")
 
         print()
@@ -1322,6 +1733,8 @@ def honcho_command(args) -> None:
         cmd_status(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "injection-preview":
+        cmd_injection_preview(args)
     elif sub == "peers":
         cmd_peers(args)
     elif sub == "sessions":
@@ -1348,7 +1761,7 @@ def honcho_command(args) -> None:
         cmd_sync(args)
     else:
         print(f"  Unknown honcho command: {sub}")
-        print("  Available: status, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync\n")
+        print("  Available: status, injection-preview, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync\n")
 
 
 def register_cli(subparser) -> None:
@@ -1374,6 +1787,20 @@ def register_cli(subparser) -> None:
     )
     status_parser.add_argument(
         "--all", action="store_true", help="Show config overview across all profiles",
+    )
+    status_parser.add_argument(
+        "--json", action="store_true", help="Print structured stored/injected status as JSON",
+    )
+
+    preview_parser = subs.add_parser(
+        "injection-preview",
+        help="Preview Honcho context that would be injected into the next prompt",
+    )
+    preview_parser.add_argument(
+        "--raw", action="store_true", help="Print the exact memory-context prompt block",
+    )
+    preview_parser.add_argument(
+        "--json", action="store_true", help="Print structured preview data as JSON",
     )
 
     subs.add_parser("peers", help="Show peer identities across all profiles")

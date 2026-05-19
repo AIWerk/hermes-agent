@@ -245,7 +245,37 @@ class TestMemoryToolDispatcher:
         assert result["success"] is False
 
     def test_add_via_tool(self, store):
-        result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
+        result = json.loads(memory_tool(action="add", target="memory", content="Project uses pytest with xdist.", store=store))
+        assert result["success"] is True
+
+    def test_router_blocks_wiki_candidate_from_injected_memory(self, store):
+        result = json.loads(memory_tool(
+            action="add",
+            target="memory",
+            content="AIWerk architecture: Smart Website is the customer-facing surface.",
+            store=store,
+        ))
+        assert result["success"] is False
+        assert "Memory router blocked" in result["error"]
+        assert result["route"]["target_hint"] == "wiki_candidate"
+
+    def test_router_blocks_session_progress_from_injected_memory(self, store):
+        result = json.loads(memory_tool(
+            action="add",
+            target="memory",
+            content="Implemented PR #123 and completed phase 4 today.",
+            store=store,
+        ))
+        assert result["success"] is False
+        assert result["route"]["target_hint"] == "session_search"
+
+    def test_router_allows_user_profile_fact(self, store):
+        result = json.loads(memory_tool(
+            action="add",
+            target="user",
+            content="User prefers concise terminal responses.",
+            store=store,
+        ))
         assert result["success"] is True
 
     def test_replace_requires_old_text(self, store):

@@ -1142,6 +1142,15 @@ class AIAgent:
             tool_call_id=tool_call_id,
         )
 
+    @staticmethod
+    def _memory_write_succeeded(result: Any) -> bool:
+        """Return True only when the built-in memory tool actually wrote."""
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            return False
+        return isinstance(payload, dict) and payload.get("success") is True
+
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
 

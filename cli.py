@@ -5985,6 +5985,41 @@ class HermesCLI:
             else:
                 print("(^_^)v New session started!")
 
+    def _honcho_injection_preview_config(self, event: str) -> tuple[bool, bool]:
+        """Return (enabled, fail_quietly) for automatic Honcho reset preview."""
+        try:
+            honcho_cfg = (getattr(self, "config", None) or {}).get("honcho", {}) or {}
+            preview_cfg = honcho_cfg.get("injection_preview")
+            if preview_cfg is None:
+                preview_cfg = honcho_cfg.get("injectionPreview")
+            preview_cfg = preview_cfg if isinstance(preview_cfg, dict) else {}
+            key = "on_clear" if event == "clear" else "on_new_session"
+            camel_key = "onClear" if event == "clear" else "onNewSession"
+            enabled = preview_cfg.get(key, preview_cfg.get(camel_key, True))
+            fail_quietly = preview_cfg.get("fail_quietly", preview_cfg.get("failQuietly", True))
+            return bool(enabled), bool(fail_quietly)
+        except Exception:
+            return True, True
+
+    def _print_honcho_reset_injection_preview(self, event: str = "new_session") -> None:
+        """Print the compact Honcho injection preview after session-reset slash commands."""
+        enabled, fail_quietly = self._honcho_injection_preview_config(event)
+        if not enabled:
+            return
+        try:
+            from plugins.memory.honcho.cli import build_injection_preview_summary
+            summary = build_injection_preview_summary(fail_quietly=fail_quietly)
+        except Exception as e:
+            if fail_quietly:
+                return
+            summary = f"Honcho injection preview unavailable: {e}"
+        if not summary:
+            return
+        try:
+            self._console_print(summary)
+        except Exception:
+            print(summary)
+
     def _handle_handoff_command(self, cmd_original: str) -> bool:
         """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.
 
@@ -7974,6 +8009,7 @@ class HermesCLI:
                     self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
                 except Exception:
                     pass
+            self._print_honcho_reset_injection_preview("clear")
         elif canonical == "history":
             self.show_history()
         elif canonical == "title":
@@ -8040,6 +8076,7 @@ class HermesCLI:
             ) is None:
                 return
             self.new_session(title=title)
+            self._print_honcho_reset_injection_preview("new_session")
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
         elif canonical == "sessions":
