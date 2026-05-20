@@ -119,8 +119,8 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
             return _cli_mod.HermesCLI(**kwargs)
 
 
-def _prepare_cli_with_active_session(tmp_path):
-    cli = _make_cli()
+def _prepare_cli_with_active_session(tmp_path, config_overrides=None):
+    cli = _make_cli(config_overrides=config_overrides)
     cli._session_db = SessionDB(db_path=tmp_path / "state.db")
     cli._session_db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
 
@@ -292,6 +292,19 @@ def test_new_command_prints_honcho_preview_after_session_switch(tmp_path):
 
     assert calls == [("new_session", cli.session_id)]
     assert calls[0][1] != old_session_id
+
+
+def test_new_command_skips_honcho_preview_when_honcho_disabled(tmp_path):
+    cli = _prepare_cli_with_active_session(
+        tmp_path,
+        config_overrides={"honcho": {"enabled": False}},
+    )
+
+    enabled, fail_quietly = cli._honcho_injection_preview_config("new_session")
+    assert enabled is False
+    assert fail_quietly is True
+
+    cli.process_command("/new")
 
 
 def test_reset_command_prints_honcho_preview_after_session_switch(tmp_path):

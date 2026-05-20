@@ -6118,6 +6118,8 @@ class HermesCLI:
         """Return (enabled, fail_quietly) for automatic Honcho reset preview."""
         try:
             honcho_cfg = (getattr(self, "config", None) or {}).get("honcho", {}) or {}
+            if honcho_cfg.get("enabled") is False:
+                return False, True
             preview_cfg = honcho_cfg.get("injection_preview")
             if preview_cfg is None:
                 preview_cfg = honcho_cfg.get("injectionPreview")
