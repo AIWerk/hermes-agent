@@ -1,0 +1,313 @@
+"""OpenAI Codex OAuth upstream adapter.
+
+This adapter lets the local Hermes proxy expose a small OpenAI-compatible
+surface backed by the ChatGPT Codex OAuth endpoint. It is intentionally scoped
+for auxiliary/backend consumers such as Honcho:
+
+- each Hermes profile owns its own auth store and therefore its own Codex login
+- no Hermes agent loop is invoked
+- no tools are forwarded through the chat shim
+- request bodies are not stored by Hermes
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, FrozenSet, Optional
+
+from hermes_cli.auth import DEFAULT_CODEX_BASE_URL, resolve_codex_runtime_credentials
+from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+
+logger = logging.getLogger(__name__)
+
+_ALLOWED_PATHS: FrozenSet[str] = frozenset({
+    "/chat/completions",
+    "/responses",
+    "/models",
+})
+
+
+def _jwt_claims(token: str) -> Dict[str, Any]:
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        claims = json.loads(decoded.decode("utf-8"))
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def _codex_headers(access_token: str) -> Dict[str, str]:
+    headers = {
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent Proxy)",
+        "originator": "codex_cli_rs",
+    }
+    claims = _jwt_claims(access_token)
+    account_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        headers["ChatGPT-Account-ID"] = account_id.strip()
+    return headers
+
+
+def _token_expiry_iso(access_token: str) -> Optional[str]:
+    exp = _jwt_claims(access_token).get("exp")
+    if isinstance(exp, (int, float)) and exp > 0:
+        try:
+            return datetime.fromtimestamp(float(exp), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return None
+    return None
+
+
+def _convert_content_for_responses(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content) if content else ""
+    converted: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            converted.append({"type": "input_text", "text": part.get("text", "")})
+        elif ptype == "image_url":
+            image_data = part.get("image_url") or {}
+            url = image_data.get("url") if isinstance(image_data, dict) else None
+            if isinstance(url, str) and url:
+                converted.append({"type": "input_image", "image_url": url})
+    return converted or ""
+
+
+def chat_payload_to_responses_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a chat.completions body into a no-tools Responses body."""
+    messages = payload.get("messages") or []
+    if not isinstance(messages, list):
+        messages = []
+
+    instructions_parts: list[str] = []
+    input_messages: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user")
+        content = msg.get("content") or ""
+        if role == "system":
+            instructions_parts.append(content if isinstance(content, str) else str(content))
+            continue
+        if role == "tool":
+            # The proxy is a no-tools boundary. Tool results from a caller are
+            # treated as inert user text rather than function-call state.
+            role = "user"
+        if role not in {"user", "assistant", "developer"}:
+            role = "user"
+        input_messages.append({
+            "role": role,
+            "content": _convert_content_for_responses(content),
+        })
+
+    out: Dict[str, Any] = {
+        "model": str(payload.get("model") or "").strip(),
+        "instructions": "\n\n".join(instructions_parts) or "You are a helpful assistant.",
+        "input": input_messages or [{"role": "user", "content": ""}],
+        "store": False,
+        "stream": True,
+    }
+
+    reasoning = payload.get("reasoning")
+    extra_body = payload.get("extra_body")
+    if not isinstance(reasoning, dict) and isinstance(extra_body, dict):
+        maybe_reasoning = extra_body.get("reasoning")
+        if isinstance(maybe_reasoning, dict):
+            reasoning = maybe_reasoning
+    if isinstance(reasoning, dict) and reasoning.get("enabled") is not False:
+        effort = reasoning.get("effort") or "low"
+        if effort == "minimal":
+            effort = "low"
+        out["reasoning"] = {"effort": effort, "summary": "auto"}
+        out["include"] = ["reasoning.encrypted_content"]
+
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict):
+        fmt_type = response_format.get("type")
+        if fmt_type == "json_object":
+            out["text"] = {"format": {"type": "json_object"}}
+        elif fmt_type == "json_schema":
+            schema_cfg = response_format.get("json_schema")
+            if isinstance(schema_cfg, dict):
+                fmt: Dict[str, Any] = {
+                    "type": "json_schema",
+                    "name": schema_cfg.get("name") or "response",
+                    "schema": schema_cfg.get("schema") or {},
+                }
+                if "strict" in schema_cfg:
+                    fmt["strict"] = bool(schema_cfg.get("strict"))
+                out["text"] = {"format": fmt}
+
+    return out
+
+
+def responses_stream_to_payload(raw: bytes) -> Dict[str, Any]:
+    """Collapse a Codex Responses SSE stream into one Responses payload."""
+    text_parts: list[str] = []
+    terminal: Optional[Dict[str, Any]] = None
+    output_items: list[Any] = []
+    usage: Optional[Dict[str, Any]] = None
+    response_id = ""
+
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = str(event.get("type") or "")
+        if etype == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                text_parts.append(delta)
+        elif etype == "response.output_item.done":
+            item = event.get("item")
+            if item is not None:
+                output_items.append(item)
+        elif etype in {"response.completed", "response.incomplete", "response.failed"}:
+            response = event.get("response")
+            if isinstance(response, dict):
+                terminal = response
+                if isinstance(response.get("usage"), dict):
+                    usage = response.get("usage")
+                if isinstance(response.get("id"), str):
+                    response_id = response["id"]
+        elif etype == "error":
+            message = event.get("message") or event.get("error") or "Codex stream emitted error"
+            raise RuntimeError(str(message))
+
+    if terminal is None:
+        terminal = {"id": response_id or f"resp-codex-proxy-{int(time.time())}", "object": "response"}
+    if output_items and not terminal.get("output"):
+        terminal["output"] = output_items
+    if text_parts and not terminal.get("output"):
+        terminal["output"] = [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "".join(text_parts)}],
+        }]
+    if text_parts and not terminal.get("output_text"):
+        terminal["output_text"] = "".join(text_parts)
+    if usage is not None and not terminal.get("usage"):
+        terminal["usage"] = usage
+    return terminal
+
+
+def responses_payload_to_chat_completion(payload: Dict[str, Any], model: str) -> Dict[str, Any]:
+    text_parts: list[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"output_text", "text"}:
+                text = part.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+    if not text_parts:
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str):
+            text_parts.append(output_text)
+
+    raw_usage = payload.get("usage")
+    usage_in: Dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+    prompt_tokens = int(usage_in.get("input_tokens") or usage_in.get("prompt_tokens") or 0)
+    completion_tokens = int(usage_in.get("output_tokens") or usage_in.get("completion_tokens") or 0)
+    total_tokens = int(usage_in.get("total_tokens") or (prompt_tokens + completion_tokens))
+
+    return {
+        "id": payload.get("id") or f"chatcmpl-codex-proxy-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "".join(text_parts),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+class OpenAICodexAdapter(UpstreamAdapter):
+    """Proxy upstream for the OpenAI Codex ChatGPT OAuth backend."""
+
+    @property
+    def name(self) -> str:
+        return "openai-codex"
+
+    @property
+    def display_name(self) -> str:
+        return "OpenAI Codex OAuth"
+
+    @property
+    def allowed_paths(self) -> FrozenSet[str]:
+        return _ALLOWED_PATHS
+
+    def is_authenticated(self) -> bool:
+        try:
+            from hermes_cli.auth import _read_codex_tokens
+            data = _read_codex_tokens()
+            tokens = data.get("tokens") if isinstance(data, dict) else None
+            return bool(isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token"))
+        except Exception:
+            return False
+
+    def get_credential(self) -> UpstreamCredential:
+        try:
+            creds = resolve_codex_runtime_credentials()
+        except Exception as exc:
+            raise RuntimeError(
+                "Not logged into OpenAI Codex. Run hermes login --provider openai-codex first."
+            ) from exc
+        access_token = str(creds.get("api_key") or "").strip()
+        if not access_token:
+            raise RuntimeError(
+                "OpenAI Codex auth did not return an access token. Run hermes login --provider openai-codex."
+            )
+        base_url = str(creds.get("base_url") or DEFAULT_CODEX_BASE_URL).strip().rstrip("/")
+        return UpstreamCredential(
+            bearer=access_token,
+            base_url=base_url,
+            expires_at=_token_expiry_iso(access_token),
+            headers=_codex_headers(access_token),
+        )
+
+
+__all__ = [
+    "OpenAICodexAdapter",
+    "chat_payload_to_responses_payload",
+    "responses_payload_to_chat_completion",
+    "responses_stream_to_payload",
+]

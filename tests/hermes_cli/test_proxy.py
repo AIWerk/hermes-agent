@@ -15,6 +15,12 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.openai_codex import (
+    OpenAICodexAdapter,
+    chat_payload_to_responses_payload,
+    responses_payload_to_chat_completion,
+    responses_stream_to_payload,
+)
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
@@ -25,6 +31,7 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 def test_registry_lists_nous():
     assert "nous" in ADAPTERS
+    assert "openai-codex" in ADAPTERS
 
 
 def test_registry_lists_xai():
@@ -35,6 +42,9 @@ def test_get_adapter_returns_instance():
     adapter = get_adapter("nous")
     assert isinstance(adapter, NousPortalAdapter)
     assert isinstance(adapter, UpstreamAdapter)
+    codex_adapter = get_adapter("openai-codex")
+    assert isinstance(codex_adapter, OpenAICodexAdapter)
+    assert isinstance(codex_adapter, UpstreamAdapter)
 
 
 def test_get_adapter_returns_xai_instance():
@@ -51,7 +61,110 @@ def test_get_adapter_case_insensitive():
 
 def test_get_adapter_unknown_provider_raises():
     with pytest.raises(ValueError, match="anthropic"):
-        get_adapter("anthropic")  # not yet implemented
+        get_adapter("anthropic")  # not implemented
+
+
+# ---------------------------------------------------------------------------
+# OpenAICodexAdapter + chat shim translation
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_auth_store(hermes_home: Path) -> Path:
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                },
+                "auth_mode": "chatgpt",
+            }
+        },
+    }))
+    return auth_path
+
+
+def test_codex_adapter_metadata():
+    adapter = OpenAICodexAdapter()
+    assert adapter.name == "openai-codex"
+    assert adapter.display_name == "OpenAI Codex OAuth"
+    assert "/chat/completions" in adapter.allowed_paths
+    assert "/responses" in adapter.allowed_paths
+    assert "/models" in adapter.allowed_paths
+
+
+def test_codex_adapter_authentication_from_hermes_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert not OpenAICodexAdapter().is_authenticated()
+    _write_codex_auth_store(tmp_path)
+    assert OpenAICodexAdapter().is_authenticated()
+
+
+def test_codex_adapter_get_credential_uses_runtime_resolver(monkeypatch):
+    with patch(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        return_value={
+            "api_key": "codex-access-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+    ):
+        cred = OpenAICodexAdapter().get_credential()
+    assert cred.bearer == "codex-access-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.headers is not None
+    assert cred.headers["originator"] == "codex_cli_rs"
+    assert "Authorization" not in cred.headers
+
+
+def test_chat_payload_to_responses_payload_is_no_tools_boundary():
+    payload = chat_payload_to_responses_payload({
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "hi"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "unsafe"}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "Result", "schema": {"type": "object"}, "strict": True},
+        },
+    })
+    assert payload["model"] == "gpt-5.4-mini"
+    assert payload["instructions"] == "Be concise."
+    assert payload["input"] == [{"role": "user", "content": "hi"}]
+    assert "tools" not in payload
+    assert payload["store"] is False
+    assert payload["stream"] is True
+    assert payload["text"]["format"]["type"] == "json_schema"
+
+
+def test_responses_payload_to_chat_completion_extracts_text_and_usage():
+    chat = responses_payload_to_chat_completion({
+        "id": "resp_123",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "hello"}],
+        }],
+        "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    }, model="gpt-5.4-mini")
+    assert chat["object"] == "chat.completion"
+    assert chat["choices"][0]["message"]["content"] == "hello"
+    assert chat["usage"]["total_tokens"] == 5
+
+
+def test_responses_stream_to_payload_collapses_sse_text():
+    payload = responses_stream_to_payload(
+        b'data: {"type":"response.output_text.delta","delta":"proxy"}\n\n'
+        b'data: {"type":"response.output_text.delta","delta":" ok"}\n\n'
+        b'data: {"type":"response.completed","response":{"id":"resp_stream","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3},"output":[]}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    chat = responses_payload_to_chat_completion(payload, model="gpt-5.4-mini")
+    assert payload["id"] == "resp_stream"
+    assert chat["choices"][0]["message"]["content"] == "proxy ok"
+    assert chat["usage"]["total_tokens"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -467,18 +580,19 @@ class FakeAdapter(UpstreamAdapter):
     """A test adapter that returns a fixed credential without touching disk."""
 
     def __init__(self, base_url: str, bearer: str = "test-bearer",
-                 allowed=None, raise_on_credential=False,
+                 allowed=None, raise_on_credential=False, name="fake",
                  retry_bearer: str | None = None):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
         self._raise = raise_on_credential
+        self._name = name
         self._retry_bearer = retry_bearer
         self.calls = 0
         self.retry_calls = 0
 
     @property
-    def name(self): return "fake"
+    def name(self): return self._name
 
     @property
     def display_name(self): return "Fake Provider"
@@ -541,9 +655,28 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
         await resp.write_eof()
         return resp
 
+    async def responses(request):
+        body = await request.read()
+        captured["requests"].append({
+            "method": request.method,
+            "path": request.path,
+            "auth": request.headers.get("Authorization"),
+            "originator": request.headers.get("originator"),
+            "body": body.decode("utf-8") if body else "",
+        })
+        return web.json_response({
+            "id": "resp_fake",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "codex ok"}],
+            }],
+            "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+        }, headers={"x-oai-request-id": "req_fake_123"})
+
     app = web.Application()
     app.router.add_route("*", "/v1/chat/completions", echo)
     app.router.add_route("*", "/v1/embeddings", echo)
+    app.router.add_route("*", "/v1/responses", responses)
     app.router.add_route("*", "/v1/sse", sse)
     return app
 
@@ -597,6 +730,55 @@ def test_server_forwards_chat_completions():
     asyncio.run(run())
 
 
+def test_server_codex_chat_completions_translates_to_responses():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            bearer="codex-token",
+            allowed=["/chat/completions", "/responses", "/models"],
+            name="openai-codex",
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={
+                        "model": "gpt-5.4-mini",
+                        "messages": [
+                            {"role": "system", "content": "Be concise."},
+                            {"role": "user", "content": "hi"},
+                        ],
+                        "tools": [{"type": "function", "function": {"name": "blocked"}}],
+                    },
+                    headers={"Authorization": "Bearer client-dummy-key"},
+                ) as resp:
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["object"] == "chat.completion"
+                    assert data["choices"][0]["message"]["content"] == "codex ok"
+                    assert data["usage"]["total_tokens"] == 6
+
+            assert len(captured["requests"]) == 1
+            req = captured["requests"][0]
+            assert req["path"] == "/v1/responses"
+            assert req["auth"] == "Bearer codex-token"
+            forwarded = json.loads(req["body"])
+            assert forwarded["instructions"] == "Be concise."
+            assert forwarded["input"] == [{"role": "user", "content": "hi"}]
+            assert "tools" not in forwarded
+            assert forwarded["store"] is False
+            assert forwarded["stream"] is True
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
 def test_server_retries_once_with_adapter_retry_credential_on_401():
     async def run():
         captured: Dict[str, Any] = {"requests": []}
@@ -630,6 +812,54 @@ def test_server_retries_once_with_adapter_retry_credential_on_401():
             await upstream_runner.cleanup()
 
     asyncio.run(run())
+
+
+def test_server_codex_chat_completions_writes_safe_proxy_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            bearer="codex-token-secret",
+            allowed=["/chat/completions", "/responses", "/models"],
+            name="openai-codex",
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={
+                        "model": "gpt-5.4-mini",
+                        "messages": [{"role": "user", "content": "private prompt must not be logged"}],
+                    },
+                    headers={"Authorization": "Bearer client-secret"},
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.json()
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+    log_path = tmp_path / "logs" / "proxy.log"
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["method"] == "POST"
+    assert event["path"] == "/chat/completions"
+    assert event["provider"] == "openai-codex"
+    assert event["model"] == "gpt-5.4-mini"
+    assert event["status"] == 200
+    assert event["usage"] == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+    assert event["upstream_request_id"] == "req_fake_123"
+    assert "latency_ms" in event
+    assert "private prompt" not in lines[0]
+    assert "client-secret" not in lines[0]
+    assert "codex-token-secret" not in lines[0]
 
 
 def test_server_rejects_disallowed_path():
