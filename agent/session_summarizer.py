@@ -2,6 +2,12 @@
 
 This is deliberately small: a session summary is a search/index aid, not
 memory, not a wiki page, and not a raw transcript archive.
+
+The module is intentionally inert unless a caller invokes
+``maybe_update_session_summary`` or ``update_session_summary`` explicitly.
+It must not be wired into session-end, reset, or gateway lifecycle paths without
+an explicit product decision, because doing so creates background LLM calls,
+latency, and cost at session boundaries.
 """
 
 from __future__ import annotations
