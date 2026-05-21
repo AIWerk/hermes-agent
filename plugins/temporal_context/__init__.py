@@ -30,6 +30,10 @@ _DEFAULT_WARNING = (
     "Relative time/daypart claims require an explicit timestamp from tools, "
     "messages, or provided context."
 )
+_TIMESTAMP_RE = re.compile(
+    r"(\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}\.\d{2}\b|"
+    r"\b\d{1,2}\s*(?:AM|PM|am|pm)\b|\bUTC\b|\bCEST\b|\bCET\b|\bGMT\b|[+-]\d{4}\b)"
+)
 
 
 def _load_plugin_config() -> dict[str, Any]:
@@ -122,13 +126,35 @@ def pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     return {"context": context}
 
 
+def _has_explicit_timestamp(text: str) -> bool:
+    return bool(_TIMESTAMP_RE.search(text))
+
+
+def _regex_flags(item: Mapping[str, Any]) -> int:
+    raw = item.get("flags")
+    names: list[str]
+    if isinstance(raw, str):
+        names = [part.strip().lower() for part in raw.split("|")]
+    elif isinstance(raw, list):
+        names = [str(part).strip().lower() for part in raw]
+    else:
+        names = []
+    flags = 0
+    if "ignorecase" in names or "i" in names:
+        flags |= re.IGNORECASE
+    if "multiline" in names or "m" in names:
+        flags |= re.MULTILINE
+    return flags
+
+
 def transform_llm_output(text: str | None = None, **kwargs: Any) -> str:
     """Optional conservative output transform configured entirely by the user.
 
     Defaults to no-op. Hermes calls this hook with ``response_text=...``;
     tests may pass ``text`` positionally. If enabled, applies literal/regex
     replacements supplied under ``temporal_context.output_guard.replacements``.
-    This keeps policy and language choices out of the public plugin code.
+    By default the guard skips rewrites when the answer already contains an
+    explicit timestamp, so grounded temporal claims are preserved.
     """
 
     source_text = text if text is not None else str(kwargs.get("response_text") or "")
@@ -136,6 +162,8 @@ def transform_llm_output(text: str | None = None, **kwargs: Any) -> str:
     settings = _settings(cfg)
     guard = settings.get("output_guard") or {}
     if not _truthy(guard.get("enabled"), default=False):
+        return source_text
+    if _truthy(guard.get("skip_if_explicit_timestamp"), default=True) and _has_explicit_timestamp(source_text):
         return source_text
     replacements = guard.get("replacements")
     if not isinstance(replacements, list):
@@ -151,7 +179,7 @@ def transform_llm_output(text: str | None = None, **kwargs: Any) -> str:
             continue
         if _truthy(item.get("regex"), default=False):
             try:
-                result = re.sub(pattern, replacement, result)
+                result = re.sub(pattern, replacement, result, flags=_regex_flags(item))
             except re.error:
                 continue
         else:
