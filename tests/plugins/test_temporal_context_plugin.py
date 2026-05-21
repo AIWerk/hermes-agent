@@ -58,6 +58,21 @@ def test_transform_llm_output_is_noop_unless_configured():
     assert transform_llm_output(text, config={}) == text
 
 
+def test_transform_llm_output_is_noop_when_guard_disabled_with_replacements():
+    text = "ma délelőtt csináltuk, mára ennyi"
+    config = {
+        "output_guard": {
+            "enabled": False,
+            "replacements": [
+                {"pattern": r"\bma délelőtt\b", "replacement": "korábban", "regex": True},
+                {"pattern": r"\bmára ennyi\b", "replacement": "itt megállok", "regex": True},
+            ],
+        }
+    }
+
+    assert transform_llm_output(text, config=config) == text
+
+
 def test_transform_llm_output_uses_configured_replacements_only():
     text = "I'll stop here."
     config = {
@@ -70,3 +85,33 @@ def test_transform_llm_output_uses_configured_replacements_only():
     }
 
     assert transform_llm_output(response_text=text, config=config) == "I will pause here."
+
+
+def test_transform_llm_output_rewrites_rocky_temporal_guard_samples():
+    text = "ma délelőtt csináltuk, mára ennyi"
+    config = {
+        "output_guard": {
+            "enabled": True,
+            "replacements": [
+                {"pattern": r"\bma délelőtt\b", "replacement": "korábban", "regex": True},
+                {"pattern": r"\bmára ennyi\b", "replacement": "itt megállok", "regex": True},
+            ],
+        }
+    }
+
+    assert transform_llm_output(response_text=text, config=config) == "korábban csináltuk, itt megállok"
+
+
+def test_transform_llm_output_preserves_temporal_claims_with_explicit_timestamp():
+    text = "ma délelőtt 2026-05-21 10:15 CEST csináltuk, mára ennyi"
+    config = {
+        "output_guard": {
+            "enabled": True,
+            "replacements": [
+                {"pattern": r"\bma délelőtt\b", "replacement": "korábban", "regex": True},
+                {"pattern": r"\bmára ennyi\b", "replacement": "itt megállok", "regex": True},
+            ],
+        }
+    }
+
+    assert transform_llm_output(response_text=text, config=config) == text

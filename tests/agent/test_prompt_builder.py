@@ -1178,6 +1178,13 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
+    def test_guidance_allows_temporal_context_for_coarse_time_classification(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "trusted temporal_context" in text
+        assert "coarse relative-time classification" in text
+        assert "morning/afternoon" in text
+        assert "operational decision" in text
+
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
