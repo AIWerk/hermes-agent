@@ -118,6 +118,34 @@ def test_codex_adapter_get_credential_uses_runtime_resolver(monkeypatch):
     assert "Authorization" not in cred.headers
 
 
+def test_codex_adapter_falls_back_to_pooled_credential(monkeypatch):
+    class Entry:
+        provider = "openai-codex"
+        runtime_api_key = "pooled-codex-token"
+        runtime_base_url = "https://chatgpt.com/backend-api/codex"
+        source = "oauth:codex"
+        last_refresh = "2026-05-21T00:00:00Z"
+
+    class Pool:
+        _entries = [Entry()]
+
+        def peek(self):
+            return self._entries[0]
+
+    with patch(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        side_effect=RuntimeError("stale token store"),
+    ), patch("agent.credential_pool.load_pool", return_value=Pool()):
+        adapter = OpenAICodexAdapter()
+        assert adapter.is_authenticated()
+        cred = adapter.get_credential()
+
+    assert cred.bearer == "pooled-codex-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.headers is not None
+    assert cred.headers["originator"] == "codex_cli_rs"
+
+
 def test_chat_payload_to_responses_payload_is_no_tools_boundary():
     payload = chat_payload_to_responses_payload({
         "model": "gpt-5.4-mini",
