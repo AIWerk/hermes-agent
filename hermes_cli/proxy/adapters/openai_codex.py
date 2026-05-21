@@ -22,6 +22,45 @@ from typing import Any, Dict, FrozenSet, Optional
 from hermes_cli.auth import DEFAULT_CODEX_BASE_URL, resolve_codex_runtime_credentials
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
+
+def _pooled_codex_credential() -> dict[str, Any]:
+    """Return the active OpenAI Codex credential from the pooled auth store.
+
+    Some installations keep valid Codex OAuth entries only in the credential
+    pool while providers.openai-codex.tokens is empty or stale. The normal
+    Hermes chat path already handles that. The proxy must do the same so
+    OpenAI-compatible clients such as Honcho can use the working OAuth route.
+    """
+    try:
+        from agent.credential_pool import load_pool
+    except Exception as exc:  # pragma: no cover - import/env failure
+        raise RuntimeError("OpenAI Codex credential pool is not available") from exc
+
+    pool = load_pool("openai-codex")
+    entries = list(getattr(pool, "_entries", []) or [])
+    now = time.time()
+
+    def _score(entry: Any) -> tuple[int, int]:
+        token = str(getattr(entry, "runtime_api_key", "") or "")
+        claims = _jwt_claims(token)
+        exp = claims.get("exp")
+        valid = isinstance(exp, (int, float)) and float(exp) > now + 120
+        return (1 if valid else 0, int(float(exp)) if isinstance(exp, (int, float)) else 0)
+
+    candidates = [e for e in entries if str(getattr(e, "runtime_api_key", "") or "").strip()]
+    candidates.sort(key=_score, reverse=True)
+    entry = candidates[0] if candidates else pool.peek()
+    if entry is None or not entry.runtime_api_key:
+        raise RuntimeError("No usable OpenAI Codex pooled credential found")
+    return {
+        "provider": "openai-codex",
+        "base_url": entry.runtime_base_url or DEFAULT_CODEX_BASE_URL,
+        "api_key": entry.runtime_api_key,
+        "source": entry.source,
+        "last_refresh": entry.last_refresh,
+        "auth_mode": "chatgpt",
+    }
+
 logger = logging.getLogger(__name__)
 
 _ALLOWED_PATHS: FrozenSet[str] = frozenset({
@@ -277,20 +316,24 @@ class OpenAICodexAdapter(UpstreamAdapter):
 
     def is_authenticated(self) -> bool:
         try:
-            from hermes_cli.auth import _read_codex_tokens
-            data = _read_codex_tokens()
-            tokens = data.get("tokens") if isinstance(data, dict) else None
-            return bool(isinstance(tokens, dict) and tokens.get("access_token") and tokens.get("refresh_token"))
+            creds = self._resolve_credentials()
+            return bool(str(creds.get("api_key") or "").strip())
         except Exception:
             return False
 
-    def get_credential(self) -> UpstreamCredential:
+    def _resolve_credentials(self) -> dict[str, Any]:
         try:
-            creds = resolve_codex_runtime_credentials()
-        except Exception as exc:
-            raise RuntimeError(
-                "Not logged into OpenAI Codex. Run hermes login --provider openai-codex first."
-            ) from exc
+            return resolve_codex_runtime_credentials()
+        except Exception:
+            try:
+                return _pooled_codex_credential()
+            except Exception as second_exc:
+                raise RuntimeError(
+                    "Not logged into OpenAI Codex. Run hermes login --provider openai-codex first."
+                ) from second_exc
+
+    def get_credential(self) -> UpstreamCredential:
+        creds = self._resolve_credentials()
         access_token = str(creds.get("api_key") or "").strip()
         if not access_token:
             raise RuntimeError(
