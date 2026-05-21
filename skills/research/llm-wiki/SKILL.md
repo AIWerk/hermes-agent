@@ -254,6 +254,21 @@ a `_meta/topic-map.md` that groups pages by theme for faster navigation.
 
 ## Core Operations
 
+### AIWerk wiki-worthiness threshold
+
+For AIWerk runtime/persona/template use, autonomous wiki writes are allowed only when the material passes a strict threshold. This prevents wiki noise while still preserving durable product, strategy, architecture, SOP, offer, onboarding, runtime, and memory-policy knowledge.
+
+Before writing to the wiki, apply this compact filter:
+- Is it durable beyond this week?
+- Is it AIWerk-relevant or explicitly within the wiki domain?
+- Would it help future decisions, onboarding, architecture, SOP, offer design, rollout safety, or operator behavior?
+- Can it be written as a sanitized synthesis without customer/private/raw details?
+- Is there an existing page to update instead of creating a new page?
+
+Write only when the durable value is clear and the material is safe/sanitized. Do not write routine task progress, one-off decisions, temporary debugging notes, PR/issue/commit references, implementation minutiae, raw transcripts, credentials, private customer data, addresses, or facts likely to become stale within 7 days. If the material is not clearly wiki-worthy, do nothing.
+
+Use staged candidate notes only for important but ambiguous or low-confidence material, non-AIWerk topics, automation digests, or cases where the content cannot be safely sanitized yet. Candidate-only notes are not the default fallback for clearly durable AIWerk knowledge.
+
 ### 1. Ingest
 
 When the user provides a source (URL, file, paste), integrate it into the wiki:
