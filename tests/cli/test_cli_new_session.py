@@ -50,6 +50,7 @@ class _FakeAgent:
         self.session_cost_status = "estimated"
         self.session_cost_source = "openrouter"
         self.context_compressor = _FakeCompressor()
+        self.ephemeral_system_prompt = None
 
     def reset_session_state(self):
         """Mirror the real AIAgent.reset_session_state()."""
@@ -330,3 +331,61 @@ def test_clear_command_prints_honcho_preview_after_redraw(tmp_path):
     cli.process_command("/clear")
 
     assert calls == ["clear", "banner", "preview:clear"]
+
+
+def test_fresh_command_starts_new_session_with_read_only_carryover_context(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    cli.conversation_history = [
+        {"role": "user", "content": "old one"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "tool", "content": "hidden tool output"},
+        {"role": "user", "content": "keep this"},
+        {"role": "assistant", "content": "and this"},
+    ]
+    cli.agent.ephemeral_system_prompt = "Global prompt"
+
+    cli.process_command("/fresh 2")
+
+    assert cli.session_id != old_session_id
+    assert cli.conversation_history == []
+    assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
+    new_session = cli._session_db.get_session(cli.session_id)
+    assert new_session is not None
+    assert new_session["system_prompt"] is None
+
+    prompt = cli.agent.ephemeral_system_prompt
+    assert prompt.startswith("Global prompt")
+    assert "[Hermes /fresh carryover context]" in prompt
+    assert f"Source session: {old_session_id}" in prompt
+    assert "Carried messages: 2" in prompt
+    assert "keep this" in prompt
+    assert "and this" in prompt
+    assert "old one" not in prompt
+    assert "hidden tool output" not in prompt
+
+
+def test_fresh_command_redacts_secrets_in_carryover_context(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli.conversation_history = [
+        {"role": "user", "content": "token sk-abcdefghijklmnopqrstuvwxyz123456"},
+    ]
+
+    cli.process_command("/fresh 1")
+
+    prompt = cli.agent.ephemeral_system_prompt
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in prompt
+    assert "sk-" in prompt
+
+
+def test_new_command_clears_prior_fresh_carryover_but_keeps_global_ephemeral_prompt(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli.agent.ephemeral_system_prompt = "Global prompt"
+    cli.conversation_history = [{"role": "user", "content": "carried"}]
+    cli.process_command("/fresh 1")
+    assert "carried" in cli.agent.ephemeral_system_prompt
+
+    cli.conversation_history = [{"role": "user", "content": "next"}]
+    cli.process_command("/new")
+
+    assert cli.agent.ephemeral_system_prompt == "Global prompt"
