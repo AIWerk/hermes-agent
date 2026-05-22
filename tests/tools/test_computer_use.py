@@ -155,6 +155,56 @@ class TestDispatch:
         click_kw = next(c[1] for c in noop_backend.calls if c[0] == "click")
         assert click_kw["button"] == "right"
 
+    def test_type_action_routes_to_type_text_backend(self, noop_backend):
+        """type action must call backend.type_text, not type_text_chars (issue #24170, bug 3)."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "type", "text": "hello"})
+        parsed = json.loads(out)
+        assert "error" not in parsed
+        call_names = [c[0] for c in noop_backend.calls]
+        assert "type" in call_names
+        type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
+        assert type_kw["text"] == "hello"
+
+    def test_drag_action_routes_to_backend_by_coordinate(self, noop_backend):
+        """drag action must dispatch to backend.drag with coordinates (issue #24170, bug 4)."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({
+            "action": "drag",
+            "from_coordinate": [100, 200],
+            "to_coordinate": [400, 500],
+        })
+        parsed = json.loads(out)
+        assert "error" not in parsed
+        call_names = [c[0] for c in noop_backend.calls]
+        assert "drag" in call_names
+        drag_kw = next(c[1] for c in noop_backend.calls if c[0] == "drag")
+        assert drag_kw["from_xy"] == (100, 200)
+        assert drag_kw["to_xy"] == (400, 500)
+
+    def test_drag_action_routes_to_backend_by_element(self, noop_backend):
+        """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({
+            "action": "drag",
+            "from_element": 1,
+            "to_element": 5,
+        })
+        parsed = json.loads(out)
+        assert "error" not in parsed
+        call_names = [c[0] for c in noop_backend.calls]
+        assert "drag" in call_names
+        drag_kw = next(c[1] for c in noop_backend.calls if c[0] == "drag")
+        assert drag_kw["from_element"] == 1
+        assert drag_kw["to_element"] == 5
+
+    def test_drag_action_requires_coordinates_or_elements(self, noop_backend):
+        """drag without from/to must return an error."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "drag"})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
 
 # ---------------------------------------------------------------------------
 # Safety guards (type / key block lists)
@@ -679,3 +729,332 @@ class TestUniversality:
         source = inspect.getsource(entry.check_fn)
         assert "anthropic" not in source.lower()
         assert "openai" not in source.lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for bugs 2 & 5 from issue #24170 (cua-driver v0.1.6)
+# ---------------------------------------------------------------------------
+
+class TestElementLabelParsing:
+    """Bug 5: element labels stripped in capture results (cua-driver v0.1.6 format).
+
+    cua-driver ≥0.1.6 emits ``[N] AXRole (order) id=Label`` instead of
+    ``  - [N] AXRole "label"``.  _parse_elements_from_tree must handle both.
+    """
+
+    def test_classic_quoted_label_format(self):
+        from tools.computer_use.cua_backend import _parse_elements_from_tree
+        tree = (
+            '  - [14] AXButton "One"\n'
+            '  - [15] AXButton "Two"\n'
+            '  - [16] AXTextField ""\n'
+        )
+        els = _parse_elements_from_tree(tree)
+        assert len(els) == 3
+        assert els[0].index == 14
+        assert els[0].role == "AXButton"
+        assert els[0].label == "One"
+        assert els[1].label == "Two"
+        assert els[2].label == ""  # empty quoted label
+
+    def test_new_id_eq_format(self):
+        """cua-driver v0.1.6 format: [N] AXRole (order) id=Label"""
+        from tools.computer_use.cua_backend import _parse_elements_from_tree
+        tree = (
+            "[14] AXButton (1) id=One\n"
+            "[15] AXButton (2) id=Two\n"
+            "[16] AXTextField (3) id=\n"
+        )
+        els = _parse_elements_from_tree(tree)
+        assert len(els) == 3
+        assert els[0].index == 14
+        assert els[0].role == "AXButton"
+        assert els[0].label == "One"
+        assert els[1].label == "Two"
+        assert els[2].label == ""  # empty id= value
+
+    def test_mixed_formats_in_single_tree(self):
+        """Gracefully handles trees that mix old and new line formats."""
+        from tools.computer_use.cua_backend import _parse_elements_from_tree
+        tree = (
+            '  - [1] AXWindow "Main Window"\n'
+            "[14] AXButton (1) id=One\n"
+            '  - [15] AXTextField "Search"\n'
+        )
+        els = _parse_elements_from_tree(tree)
+        assert len(els) == 3
+        labels = {e.index: e.label for e in els}
+        assert labels[1] == "Main Window"
+        assert labels[14] == "One"
+        assert labels[15] == "Search"
+
+
+class TestCaptureAfterAppContext:
+    """Bug 2: capture_after=True loses app context after actions.
+
+    _maybe_follow_capture must re-target the same app that was set by
+    the preceding capture/focus_app call, rather than the frontmost window.
+    """
+
+    def test_capture_after_uses_last_app(self):
+        """capture_after=True should pass _last_app to the follow-up capture."""
+        from tools.computer_use.backend import ActionResult, CaptureResult
+        from tools.computer_use import tool as cu_tool
+
+        captured_app_args = []
+
+        class TrackingBackend:
+            _last_app = "Calculator"  # simulates a previous focus_app call
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def is_available(self):
+                return True
+
+            def capture(self, mode="som", app=None):
+                captured_app_args.append(app)
+                return CaptureResult(
+                    mode=mode, width=100, height=100,
+                    png_b64=None, elements=[],
+                    app=app or "Calculator", window_title="",
+                )
+
+            def click(self, **kw):
+                return ActionResult(ok=True, action="click")
+
+            def drag(self, **kw):
+                return ActionResult(ok=True, action="drag")
+
+            def scroll(self, **kw):
+                return ActionResult(ok=True, action="scroll")
+
+            def type_text(self, text):
+                return ActionResult(ok=True, action="type")
+
+            def key(self, keys):
+                return ActionResult(ok=True, action="key")
+
+            def list_apps(self):
+                return []
+
+            def focus_app(self, app, raise_window=False):
+                return ActionResult(ok=True, action="focus_app")
+
+            def set_value(self, value, element=None):
+                return ActionResult(ok=True, action="set_value")
+
+            def wait(self, seconds=1.0):
+                return ActionResult(ok=True, action="wait")
+
+        backend = TrackingBackend()
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = backend
+
+        cu_tool.handle_computer_use({"action": "click", "element": 14, "capture_after": True})
+
+        # The follow-up capture must have been called with app="Calculator"
+        assert len(captured_app_args) == 1
+        assert captured_app_args[0] == "Calculator", (
+            f"Expected follow-up capture with app='Calculator', got {captured_app_args[0]!r}"
+        )
+
+    def test_capture_after_without_prior_app_uses_none(self):
+        """When no app context is set, follow-up capture uses app=None (frontmost)."""
+        from tools.computer_use.backend import ActionResult, CaptureResult
+        from tools.computer_use import tool as cu_tool
+
+        captured_app_args = []
+
+        class NoContextBackend:
+            _last_app = None  # no prior context
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def is_available(self):
+                return True
+
+            def capture(self, mode="som", app=None):
+                captured_app_args.append(app)
+                return CaptureResult(
+                    mode=mode, width=100, height=100,
+                    png_b64=None, elements=[],
+                    app="Finder", window_title="",
+                )
+
+            def click(self, **kw):
+                return ActionResult(ok=True, action="click")
+
+            def drag(self, **kw):
+                return ActionResult(ok=True, action="drag")
+
+            def scroll(self, **kw):
+                return ActionResult(ok=True, action="scroll")
+
+            def type_text(self, text):
+                return ActionResult(ok=True, action="type")
+
+            def key(self, keys):
+                return ActionResult(ok=True, action="key")
+
+            def list_apps(self):
+                return []
+
+            def focus_app(self, app, raise_window=False):
+                return ActionResult(ok=True, action="focus_app")
+
+            def set_value(self, value, element=None):
+                return ActionResult(ok=True, action="set_value")
+
+            def wait(self, seconds=1.0):
+                return ActionResult(ok=True, action="wait")
+
+        backend = NoContextBackend()
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = backend
+
+        cu_tool.handle_computer_use({"action": "click", "element": 5, "capture_after": True})
+
+        # No app context — should pass None so cua-driver picks the frontmost window
+        assert len(captured_app_args) == 1
+        assert captured_app_args[0] is None
+
+# ---------------------------------------------------------------------------
+# Regression tests for bug 1 from issue #24170:
+#   capture(app=...) and focus_app(app=...) must surface when the filter
+#   matches nothing instead of silently picking the frontmost window.
+# ---------------------------------------------------------------------------
+
+def _make_cua_backend_with_windows(windows: List[Dict[str, Any]]):
+    """Construct a CuaDriverBackend with a mocked MCP session that returns
+    the supplied list_windows payload."""
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    backend = CuaDriverBackend()
+    backend._session = MagicMock()
+    backend._session.call_tool.return_value = {
+        "data": "",
+        "images": [],
+        "structuredContent": {"windows": windows},
+        "isError": False,
+    }
+    return backend
+
+
+class TestCaptureAppFilterNoMatch:
+    """capture(app=X) must not silently fall back to the frontmost window
+    when X matches nothing — on a non-English macOS, list_windows returns
+    localized app names (e.g. "計算機"), so an English `app="Calculator"`
+    legitimately matches nothing and the caller needs to retry with the
+    localized name. The old code silently captured the frontmost window
+    (e.g. a menu-bar utility), giving the agent wrong UI elements.
+    """
+
+    def test_app_filter_no_match_returns_empty_capture_with_diagnostic(self):
+        # Simulates a localized macOS where Calculator's app_name is "計算機".
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+            {"app_name": "計算機", "pid": 200, "window_id": 2,
+             "is_on_screen": True, "title": "Calculator", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+
+        cap = backend.capture(mode="som", app="Calculator")
+
+        # No window matched; capture must NOT pick the frontmost (Fuwari).
+        assert cap.app == "", (
+            f"app= filter no-match should not silently target a window; got {cap.app!r}"
+        )
+        assert cap.elements == []
+        assert "Calculator" in cap.window_title
+        assert "list_apps" in cap.window_title
+        # _active_pid must remain unset so a subsequent click doesn't hit Fuwari.
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+
+    def test_app_filter_match_still_works(self):
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+            {"app_name": "計算機", "pid": 200, "window_id": 2,
+             "is_on_screen": True, "title": "Calculator", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        # get_window_state for the matched window
+        backend._session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": '✅ 計算機 — 0 elements\n', "images": [], "isError": False,
+             "structuredContent": None},
+        ]
+
+        cap = backend.capture(mode="ax", app="計算機")
+
+        assert backend._active_pid == 200
+        assert backend._active_window_id == 2
+
+    def test_no_app_filter_still_picks_frontmost(self):
+        """When no app= is given, capture continues to pick the frontmost
+        window — the no-match early-return must not fire on the empty case."""
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        backend._session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": '✅ Fuwari — 0 elements\n', "images": [], "isError": False,
+             "structuredContent": None},
+        ]
+
+        cap = backend.capture(mode="ax", app=None)
+
+        assert backend._active_pid == 100
+
+
+class TestFocusAppFilterNoMatch:
+    """focus_app(app=X) must return ok=False when X matches nothing —
+    not silently target the frontmost window and report ok=True with a
+    misleading 'Targeted Fuwari' message.
+    """
+
+    def test_focus_app_no_match_returns_not_ok(self):
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+            {"app_name": "計算機", "pid": 200, "window_id": 2,
+             "is_on_screen": True, "title": "Calculator", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+
+        res = backend.focus_app("Calculator")
+
+        assert res.ok is False
+        assert res.action == "focus_app"
+        assert "Calculator" in res.message
+        # _active_pid must remain unset so a subsequent click doesn't hit Fuwari.
+        assert backend._active_pid is None
+
+    def test_focus_app_match_still_works(self):
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+            {"app_name": "計算機", "pid": 200, "window_id": 2,
+             "is_on_screen": True, "title": "Calculator", "z_index": 1},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+
+        res = backend.focus_app("計算機")
+
+        assert res.ok is True
+        assert backend._active_pid == 200
+        assert backend._active_window_id == 2
