@@ -2,6 +2,8 @@
 
 import random
 
+from agent.i18n import get_language
+
 
 # ---------------------------------------------------------------------------
 # Tip corpus — one-liners covering slash commands, CLI flags, config,
@@ -473,6 +475,102 @@ TIPS = [
 ]
 
 
+TIPS_HU = [
+    "/background <prompt> külön munkamenetben futtat egy feladatot, miközben az aktuális beszélgetés szabad marad.",
+    "/compress kézzel tömöríti a beszélgetés kontextusát, ha hosszúra nőtt.",
+    "/rollback megmutatja a fájlrendszer-mentési pontokat, és vissza tud állítani korábbi állapotot.",
+    "/title \"projektnév\" nevet ad a munkamenetnek, később /resume vagy hermes -c paranccsal folytatható.",
+    "/queue <prompt> sorba teszi a következő üzenetet anélkül, hogy megszakítaná a mostani futást.",
+    "/undo eltávolítja az utolsó felhasználói és asszisztens választ a beszélgetésből.",
+    "/retry újraküldi az utolsó üzenetedet, ha a válasz nem lett jó.",
+    "/verbose váltja az eszközhaladás kijelzését: ki, új, minden, részletes.",
+    "/model menet közben modellt vált, például /model sonnet vagy /model gpt-5.",
+    "/skin megváltoztatja a CLI témát.",
+    "/tools disable browser ideiglenesen kikapcsolja a böngészőeszközöket ebben a munkamenetben.",
+    "/usage tokenhasználatot, költségbontást és munkamenet-időt mutat.",
+    "@file:útvonal/fájl.py közvetlenül beilleszti a fájl tartalmát az üzenetbe.",
+    "@diff beilleszti a nem commitolt git módosításokat az üzenetbe.",
+    "Tab elfogadja a halvány javaslatot vagy kiegészíti a slash parancsot.",
+    "Ctrl+C megszakítja az agentet. Kétszer gyorsan lenyomva kilépést kényszerít.",
+    "hermes -c folytatja a legutóbbi CLI munkamenetet.",
+    "hermes -w izolált git worktree-t hoz létre, ami jó párhuzamos agent munkához.",
+    "hermes chat -q \"kérdés\" egyszeri, nem interaktív kérést futtat, majd kilép.",
+    "hermes config edit megnyitja a config.yaml fájlt a szerkesztődben.",
+    "hermes sessions browse interaktív munkamenet-választót nyit kereséssel.",
+    "hermes doctor --fix diagnosztizálja és javítja a konfigurációs vagy függőségi gondokat.",
+    "display.streaming: true beállítással a válasz tokenenként jelenik meg.",
+    "approvals.mode: smart beállítással egy LLM automatikusan jóváhagyhat biztonságos parancsokat.",
+    "execute_code Python szkripteket futtat Hermes eszközökkel úgy, hogy a köztes eredmények nem tömik a kontextust.",
+    "delegate_task külön kontextusú alagenteket indít párhuzamos részfeladatokra.",
+    "search_files ripgrep-alapú és gyorsabb, mint a terminálos grep.",
+    "patch célzott fájljavítást végez, és kisebb whitespace eltérések mellett is működik.",
+    "session_search teljes szövegű keresést ad a korábbi beszélgetésekben.",
+    "A háttérfolyamatoknál a notify_on_complete jelzi, ha egy hosszú parancs elkészült.",
+    "Minden profilnak külön configja, kulcsai, memóriája, munkamenetei és skilljei vannak.",
+    "Kilépéskor Hermes kiír egy folytatási parancsot a munkamenet-azonosítóval.",
+    "A memória csak új munkamenet indításakor kerül be újra a rendszerpromptba.",
+    "A skillek újrafelhasználható munkafolyamatokat adnak Hermesnek.",
+    "Cron feladatok friss agent munkamenetben futnak, ezért a prompt legyen önállóan érthető.",
+    "/voice on bekapcsolja a hangmódot a CLI-ben.",
+    "/sethome kijelöli az aktuális chatet a cron kézbesítések alapértelmezett céljának.",
+    "A veszélyes parancsok jóváhagyása lehet egyszeri, munkamenet-szintű, állandó vagy tiltás.",
+    "A kontextus automatikusan tömörül, amikor eléri a beállított küszöböt.",
+    "AGENTS.md, CLAUDE.md és .cursorrules projektkontekstusként automatikusan betöltődhet.",
+    "/new tiszta munkamenetet indít ugyanabban a CLI-ben.",
+    "/clear törli a képernyőt és új munkamenetet indít.",
+    "/history kiírja az aktuális beszélgetést a CLI-ben.",
+    "/reload-skills újraolvassa a ~/.hermes/skills könyvtárat újraindítás nélkül.",
+]
+
+
+TIPS_DE = [
+    "/background <prompt> startet eine Aufgabe in einer separaten Sitzung, während die aktuelle frei bleibt.",
+    "/compress komprimiert den Gesprächskontext manuell, wenn er zu lang wird.",
+    "/rollback zeigt Dateisystem-Checkpoints und kann frühere Zustände wiederherstellen.",
+    "/title \"Projektname\" benennt die Sitzung, damit du sie später mit /resume oder hermes -c fortsetzen kannst.",
+    "/queue <prompt> stellt eine Nachricht für den nächsten Turn in die Warteschlange, ohne die aktuelle Ausführung zu unterbrechen.",
+    "/undo entfernt den letzten Nutzer- und Assistentenaustausch aus dem Gespräch.",
+    "/retry sendet deine letzte Nachricht erneut, wenn die Antwort nicht gepasst hat.",
+    "/verbose schaltet die Anzeige des Werkzeugfortschritts um: aus, neu, alles, ausführlich.",
+    "/model wechselt das Modell während der Sitzung, zum Beispiel /model sonnet oder /model gpt-5.",
+    "/skin ändert das CLI-Theme.",
+    "/tools disable browser deaktiviert Browser-Werkzeuge vorübergehend in dieser Sitzung.",
+    "/usage zeigt Tokenverbrauch, Kostenaufschlüsselung und Sitzungsdauer.",
+    "@file:pfad/datei.py fügt den Dateiinhalt direkt in deine Nachricht ein.",
+    "@diff fügt deine nicht commiteten Git-Änderungen in die Nachricht ein.",
+    "Tab übernimmt den blassen Vorschlag oder vervollständigt Slash-Befehle.",
+    "Ctrl+C unterbricht den Agenten. Zweimal schnell gedrückt erzwingt das Beenden.",
+    "hermes -c setzt die letzte CLI-Sitzung fort.",
+    "hermes -w erstellt ein isoliertes Git-Worktree, ideal für parallele Agentenarbeit.",
+    "hermes chat -q \"Frage\" führt eine einmalige, nicht interaktive Anfrage aus und beendet sich danach.",
+    "hermes config edit öffnet die config.yaml in deinem Editor.",
+    "hermes sessions browse öffnet eine interaktive Sitzungsauswahl mit Suche.",
+    "hermes doctor --fix diagnostiziert und repariert Konfigurations- oder Abhängigkeitsprobleme.",
+    "display.streaming: true zeigt Antworten tokenweise während der Generierung.",
+    "approvals.mode: smart erlaubt einem LLM, sichere Befehle automatisch freizugeben.",
+    "execute_code führt Python-Skripte mit Hermes-Werkzeugen aus, ohne Zwischenergebnisse in den Kontext zu legen.",
+    "delegate_task startet Subagenten mit getrenntem Kontext für parallele Teilaufgaben.",
+    "search_files basiert auf ripgrep und ist schneller als grep im Terminal.",
+    "patch nimmt gezielte Dateiänderungen vor und toleriert kleine Whitespace-Unterschiede.",
+    "session_search durchsucht frühere Gespräche per Volltextsuche.",
+    "Bei Hintergrundprozessen meldet notify_on_complete, wenn ein langer Befehl fertig ist.",
+    "Jedes Profil hat eigene Konfiguration, Schlüssel, Speicher, Sitzungen und Skills.",
+    "Beim Beenden gibt Hermes einen Fortsetzungsbefehl mit Sitzungs-ID aus.",
+    "Speicher wird erst beim Start einer neuen Sitzung wieder in den Systemprompt geladen.",
+    "Skills geben Hermes wiederverwendbare Arbeitsabläufe.",
+    "Cron-Jobs laufen in frischen Agentensitzungen, deshalb sollte der Prompt eigenständig verständlich sein.",
+    "/voice on aktiviert den Sprachmodus in der CLI.",
+    "/sethome setzt den aktuellen Chat als Standardziel für Cron-Zustellungen.",
+    "Gefährliche Befehle können einmalig, für die Sitzung, dauerhaft oder gar nicht genehmigt werden.",
+    "Der Kontext wird automatisch komprimiert, wenn er den eingestellten Schwellenwert erreicht.",
+    "AGENTS.md, CLAUDE.md und .cursorrules können automatisch als Projektkontext geladen werden.",
+    "/new startet eine saubere Sitzung in derselben CLI.",
+    "/clear leert den Bildschirm und startet eine neue Sitzung.",
+    "/history zeigt das aktuelle Gespräch direkt in der CLI an.",
+    "/reload-skills liest ~/.hermes/skills neu ein, ohne Hermes neu zu starten.",
+]
+
+
 def get_random_tip(exclude_recent: int = 0) -> str:
     """Return a random tip string.
 
@@ -480,6 +578,11 @@ def get_random_tip(exclude_recent: int = 0) -> str:
         exclude_recent: not used currently; reserved for future
             deduplication across sessions.
     """
+    lang = get_language()
+    if lang == "hu":
+        return random.choice(TIPS_HU)
+    if lang == "de":
+        return random.choice(TIPS_DE)
     return random.choice(TIPS)
 
 

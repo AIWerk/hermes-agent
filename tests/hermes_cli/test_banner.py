@@ -70,6 +70,78 @@ def test_build_welcome_banner_uses_normalized_toolset_names():
     assert "web_tools:" not in output
 
 
+def test_build_welcome_banner_uses_active_language_for_static_labels(monkeypatch):
+    """Startup banner static prose should honor display language."""
+    from agent.i18n import reset_language_cache
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "hu")
+    reset_language_cache()
+    try:
+        with (
+            patch.object(model_tools, "check_tool_availability", return_value=(["web"], [])),
+            patch.object(banner, "get_available_skills", return_value={}),
+            patch.object(banner, "get_update_result", return_value=None),
+            patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+            patch.object(banner, "get_latest_release_tag", return_value=None),
+        ):
+            console = Console(record=True, force_terminal=False, color_system=None, width=160)
+            banner.build_welcome_banner(
+                console=console,
+                model="anthropic/test-model",
+                cwd="/tmp/project",
+                session_id="abc123",
+                tools=[{"function": {"name": "read_file"}}],
+                get_toolset_for_tool=lambda name: "file",
+                context_length=128000,
+            )
+
+        output = console.export_text()
+        assert "Elérhető eszközök" in output
+        assert "Elérhető készségek" in output
+        assert "Munkamenet: abc123" in output
+        assert "128K kontextus" in output
+        assert "/help a parancsokhoz" in output
+        assert "Available Tools" not in output
+    finally:
+        reset_language_cache()
+
+
+def test_build_welcome_banner_uses_german_static_labels(monkeypatch):
+    """Startup banner static prose should honor German display language."""
+    from agent.i18n import reset_language_cache
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "de")
+    reset_language_cache()
+    try:
+        with (
+            patch.object(model_tools, "check_tool_availability", return_value=(["web"], [])),
+            patch.object(banner, "get_available_skills", return_value={}),
+            patch.object(banner, "get_update_result", return_value=None),
+            patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+            patch.object(banner, "get_latest_release_tag", return_value=None),
+        ):
+            console = Console(record=True, force_terminal=False, color_system=None, width=160)
+            banner.build_welcome_banner(
+                console=console,
+                model="anthropic/test-model",
+                cwd="/tmp/project",
+                session_id="abc123",
+                tools=[{"function": {"name": "read_file"}}],
+                get_toolset_for_tool=lambda name: "file",
+                context_length=128000,
+            )
+
+        output = console.export_text()
+        assert "Verfügbare Werkzeuge" in output
+        assert "Verfügbare Skills" in output
+        assert "Sitzung: abc123" in output
+        assert "128K Kontext" in output
+        assert "/help für Befehle" in output
+        assert "Available Tools" not in output
+    finally:
+        reset_language_cache()
+
+
 def test_build_welcome_banner_title_is_hyperlinked_to_release():
     """Panel title (version label) is wrapped in an OSC-8 hyperlink to the GitHub release."""
     import io

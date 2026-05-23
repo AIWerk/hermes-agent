@@ -1,7 +1,8 @@
 """Tests for hermes_cli/tips.py — random tip display at session start."""
 
 import pytest
-from hermes_cli.tips import TIPS, get_random_tip
+from agent.i18n import reset_language_cache, t
+from hermes_cli.tips import TIPS, TIPS_DE, TIPS_HU, get_random_tip
 
 
 class TestTipsCorpus:
@@ -45,6 +46,24 @@ class TestGetRandomTip:
         tip = get_random_tip()
         assert tip in TIPS
 
+    def test_returns_tip_from_hungarian_corpus(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "hu")
+        reset_language_cache()
+        try:
+            tip = get_random_tip()
+            assert tip in TIPS_HU
+        finally:
+            reset_language_cache()
+
+    def test_returns_tip_from_german_corpus(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "de")
+        reset_language_cache()
+        try:
+            tip = get_random_tip()
+            assert tip in TIPS_DE
+        finally:
+            reset_language_cache()
+
     def test_randomness(self):
         """Multiple calls should eventually return different tips."""
         seen = set()
@@ -70,3 +89,19 @@ class TestTipIntegrationInCLI:
         # Should not contain nested/broken Rich tags
         assert markup.count("[/]") == 1
         assert "[dim #B8860B]" in markup
+
+    def test_hungarian_tip_display_translation(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "hu")
+        reset_language_cache()
+        try:
+            assert t("cli.banner.tip", tip="Próba") == "✦ Tipp: Próba"
+        finally:
+            reset_language_cache()
+
+    def test_german_tip_display_translation(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "de")
+        reset_language_cache()
+        try:
+            assert t("cli.banner.tip", tip="Probe") == "✦ Tipp: Probe"
+        finally:
+            reset_language_cache()

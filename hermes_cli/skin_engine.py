@@ -196,6 +196,32 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
         },
         "tool_prefix": "┊",
     },
+    "default-hu": {
+        "name": "default-hu",
+        "description": "Magyar Hermes alap skin",
+        "branding": {
+            "agent_name": "Hermes Agent",
+            "welcome": "Üdv a Hermes Agentben! Írj üzenetet, vagy használd a /help parancsot.",
+            "goodbye": "Viszlát! ⚕",
+            "response_label": " ⚕ Hermes ",
+            "prompt_symbol": "❯",
+            "help_header": "(^_^)? Elérhető parancsok",
+        },
+        "tool_prefix": "┊",
+    },
+    "default-de": {
+        "name": "default-de",
+        "description": "Deutsche Hermes Standard-Skin",
+        "branding": {
+            "agent_name": "Hermes Agent",
+            "welcome": "Willkommen bei Hermes Agent! Schreib eine Nachricht oder nutze /help für Befehle.",
+            "goodbye": "Auf Wiedersehen! ⚕",
+            "response_label": " ⚕ Hermes ",
+            "prompt_symbol": "❯",
+            "help_header": "(^_^)? Verfügbare Befehle",
+        },
+        "tool_prefix": "┊",
+    },
     "ares": {
         "name": "ares",
         "description": "War-god theme — crimson and bronze",

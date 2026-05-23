@@ -8223,7 +8223,12 @@ class HermesCLI:
                         _tip_color = get_active_skin().get_color("banner_dim", "#B8860B")
                     except Exception:
                         _tip_color = "#B8860B"
-                    cc.print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+                    try:
+                        from agent.i18n import t
+                        _tip_text = t('cli.banner.tip', tip=_tip)
+                    except Exception:
+                        _tip_text = f"✦ Tip: {_tip}"
+                    cc.print(f"[dim {_tip_color}]{_tip_text}[/]")
                 except Exception:
                     pass
             else:
@@ -8238,7 +8243,12 @@ class HermesCLI:
                         _tip_color = get_active_skin().get_color("banner_dim", "#B8860B")
                     except Exception:
                         _tip_color = "#B8860B"
-                    self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+                    try:
+                        from agent.i18n import t
+                        _tip_text = t('cli.banner.tip', tip=_tip)
+                    except Exception:
+                        _tip_text = f"✦ Tip: {_tip}"
+                    self._console_print(f"[dim {_tip_color}]{_tip_text}[/]")
                 except Exception:
                     pass
             self._print_honcho_reset_injection_preview("clear")
@@ -8494,6 +8504,8 @@ class HermesCLI:
             self._handle_subgoal_command(cmd_original)
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
+        elif canonical == "language":
+            self._handle_language_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
@@ -9374,6 +9386,80 @@ class HermesCLI:
         print("  Note: banner colors will update on next session start.")
         if self._apply_tui_skin_style():
             print("  Prompt + TUI colors updated.")
+
+    def _language_default_skin(self, language: str) -> str:
+        """Return the matching default skin name for a language code."""
+        if language == "en":
+            return "default"
+        return f"default-{language}"
+
+    def _handle_language_command(self, cmd: str):
+        """Handle /language [code] — set display.language and matching skin."""
+        try:
+            from agent.i18n import SUPPORTED_LANGUAGES, get_language, reset_language_cache, _normalize_lang
+            from hermes_cli.config import load_config
+            from hermes_cli.skin_engine import list_skins, set_active_skin, get_active_skin_name
+        except ImportError as exc:
+            print(f"Language configuration not available: {exc}")
+            return
+
+        parts = cmd.strip().split(maxsplit=1)
+        cfg = load_config() or {}
+        display_cfg = cfg.get("display") or {}
+        current_lang = get_language()
+        current_skin = display_cfg.get("skin") or get_active_skin_name()
+
+        if len(parts) < 2 or not parts[1].strip():
+            print(f"\n  Current language: {current_lang}")
+            print(f"  Current skin: {current_skin}")
+            print(f"  Supported languages: {', '.join(SUPPORTED_LANGUAGES)}")
+            print("\n  Usage: /language <code>")
+            print("  Aliases: /lang <code>, /locale <code>")
+            print("  If default-<code> exists, it is applied too. English uses default.\n")
+            return
+
+        requested = parts[1].strip().split()[0].lower()
+        language = _normalize_lang(requested)
+        valid_english_aliases = {"en", "english", "en-us", "en-gb"}
+        if language == "en" and requested not in valid_english_aliases:
+            supported = ", ".join(SUPPORTED_LANGUAGES)
+            print(f"  Unknown language: {requested}")
+            print(f"  Supported: {supported}")
+            return
+
+        available_skins = {s["name"] for s in list_skins()}
+        desired_skin = self._language_default_skin(language)
+        skin_changed = False
+        skin_saved = False
+        skin_available = desired_skin in available_skins
+
+        language_saved = save_config_value("display.language", language)
+        if language_saved:
+            # HERMES_LANGUAGE wins over config in the current process. Set it so
+            # the running CLI follows the slash command immediately too.
+            os.environ["HERMES_LANGUAGE"] = language
+            reset_language_cache()
+
+        if skin_available:
+            set_active_skin(desired_skin)
+            _ACCENT.reset()
+            skin_changed = True
+            skin_saved = save_config_value("display.skin", desired_skin)
+            self._apply_tui_skin_style()
+
+        if language_saved:
+            print(f"  Language set to: {language} (saved)")
+        else:
+            print(f"  Language set to: {language} (not saved)")
+
+        if skin_changed:
+            suffix = "saved" if skin_saved else "not saved"
+            print(f"  Skin set to: {desired_skin} ({suffix})")
+        else:
+            print(f"  No matching skin found for {language}: {desired_skin}")
+            print("  Language was changed; skin stayed unchanged.")
+
+        print("  Restart the CLI for the startup banner to use the new language and skin.")
 
     def _handle_footer_command(self, cmd_original: str) -> None:
         """Toggle or inspect ``display.runtime_footer.enabled`` from the CLI.
@@ -12263,13 +12349,14 @@ class HermesCLI:
             pass  # banner is non-critical — never break startup
         # Show a random tip to help users discover features
         try:
+            from agent.i18n import t
             from hermes_cli.tips import get_random_tip
             _tip = get_random_tip()
             try:
                 _tip_color = _welcome_skin.get_color("banner_dim", "#B8860B")
             except Exception:
                 _tip_color = "#B8860B"
-            self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
+            self._console_print(f"[dim {_tip_color}]{t('cli.banner.tip', tip=_tip)}[/]")
         except Exception:
             pass  # Tips are non-critical — never break startup
 
