@@ -9,9 +9,12 @@ from unittest.mock import patch
 
 from cli import HermesCLI
 from hermes_cli.browser_connect import (
+    call_local_browser_launcher,
     get_chrome_debug_candidates,
     is_browser_debug_ready,
+    load_local_browser_launcher_config,
     manual_chrome_debug_command,
+    wait_for_browser_debug_ready,
 )
 
 
@@ -251,3 +254,159 @@ class TestChromeDebugLaunch:
         assert "live Chrome browser" not in note
         assert "real browser" not in note
         assert "Please await their instruction" not in note
+
+    def test_local_launcher_config_defaults_and_tenant_overrides(self):
+        cfg = load_local_browser_launcher_config({"browser": {}})
+        assert cfg.enabled is False
+        assert cfg.launcher_port == 18765
+        assert cfg.cdp_port == 9222
+        assert cfg.launcher_url == "http://127.0.0.1:18765"
+        assert cfg.cdp_url == "http://127.0.0.1:9222"
+
+        cfg = load_local_browser_launcher_config({
+            "browser": {
+                "local_launcher": {
+                    "enabled": True,
+                    "launcher_port": 18766,
+                    "cdp_port": 9333,
+                    "ssh_target": "tenant-user@example.invalid",
+                    "ssh_port": 22222,
+                    "ssh_identity_file": "~/.ssh/tenant_key",
+                    "browser_profile_dir": "~/.hermes/tenant-browser",
+                    "browser_binary": "/usr/bin/chromium",
+                    "start_url": "https://example.invalid/start",
+                }
+            }
+        })
+        assert cfg.enabled is True
+        assert cfg.launcher_url == "http://127.0.0.1:18766"
+        assert cfg.cdp_url == "http://127.0.0.1:9333"
+        assert cfg.ssh_target == "tenant-user@example.invalid"
+        assert cfg.ssh_port == 22222
+        assert cfg.ssh_identity_file == "~/.ssh/tenant_key"
+        assert cfg.browser_profile_dir == "~/.hermes/tenant-browser"
+        assert cfg.browser_binary == "/usr/bin/chromium"
+        assert cfg.start_url == "https://example.invalid/start"
+
+    def test_local_launcher_rejects_non_loopback_urls(self):
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {"enabled": True, "launcher_url": "http://192.0.2.1:18765"}}
+        })
+        assert cfg.enabled is False
+        assert "loopback" in cfg.validation_error
+        ok, detail = call_local_browser_launcher(cfg, "open", timeout=0.1)
+        assert ok is False
+        assert "loopback" in detail
+
+    def test_local_launcher_rejects_non_http_schemes(self):
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {"enabled": True, "launcher_url": "file://127.0.0.1/tmp/socket"}}
+        })
+        assert cfg.enabled is False
+        assert "http/https" in getattr(cfg, "validation_error", "")
+
+    def test_connect_falls_back_when_no_launcher_config(self, monkeypatch):
+        cli = HermesCLI.__new__(HermesCLI)
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        calls = []
+
+        def fake_ready(url, timeout=1.0):
+            calls.append(url)
+            return len(calls) > 1
+
+        with patch("cli.load_local_browser_launcher_config", return_value=load_local_browser_launcher_config({"browser": {}})), \
+             patch("cli.is_browser_debug_ready", side_effect=fake_ready), \
+             patch("cli.wait_for_browser_debug_ready", return_value=True), \
+             patch.object(HermesCLI, "_try_launch_chrome_debug", return_value=True) as launch, \
+             patch("tools.browser_tool.cleanup_all_browsers"), \
+             patch("tools.browser_tool._ensure_cdp_supervisor"), \
+             redirect_stdout(StringIO()):
+            cli._handle_browser_command("/browser connect")
+
+        launch.assert_called_once()
+        assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
+
+    def test_connect_falls_back_to_builtin_launch_when_configured_launcher_unreachable(self, monkeypatch):
+        cli = HermesCLI.__new__(HermesCLI)
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {"enabled": True, "launcher_url": "http://127.0.0.1:18765"}}
+        })
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        with patch("cli.load_local_browser_launcher_config", return_value=cfg), \
+             patch("cli.is_browser_debug_ready", return_value=False), \
+             patch("cli.call_local_browser_launcher", return_value=(False, "connection refused")) as launcher, \
+             patch("cli.wait_for_browser_debug_ready", return_value=True), \
+             patch.object(HermesCLI, "_try_launch_chrome_debug", return_value=True) as launch, \
+             patch("tools.browser_tool.cleanup_all_browsers"), \
+             patch("tools.browser_tool._ensure_cdp_supervisor"), \
+             redirect_stdout(StringIO()) as out:
+            cli._handle_browser_command("/browser connect")
+
+        launcher.assert_called_once()
+        launch.assert_called_once()
+        assert "Falling back to the normal local Chromium launch path" in out.getvalue()
+        assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
+
+    def test_browser_launch_calls_local_launcher_and_connects(self, monkeypatch):
+        cli = HermesCLI.__new__(HermesCLI)
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {"enabled": True, "launcher_url": "http://127.0.0.1:18765"}}
+        })
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+
+        with patch("cli.load_local_browser_launcher_config", return_value=cfg), \
+             patch("cli.call_local_browser_launcher", return_value=(True, "{}")) as launcher, \
+             patch("cli.wait_for_browser_debug_ready", return_value=True), \
+             patch("tools.browser_tool.cleanup_all_browsers"), \
+             patch("tools.browser_tool._ensure_cdp_supervisor"), \
+             redirect_stdout(StringIO()) as out:
+            cli._handle_browser_command("/browser launch")
+
+        launcher.assert_called_once_with(cfg, "open", timeout=15.0)
+        assert "Local browser launcher accepted /open" in out.getvalue()
+        assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
+
+    def test_cdp_readiness_polling_retries_until_ready(self):
+        attempts = []
+
+        def fake_ready(url, timeout=1.0):
+            attempts.append((url, timeout))
+            return len(attempts) == 3
+
+        with patch("hermes_cli.browser_connect.is_browser_debug_ready", side_effect=fake_ready), \
+             patch("hermes_cli.browser_connect.time.sleep", return_value=None):
+            assert wait_for_browser_debug_ready("http://127.0.0.1:9222", timeout_s=2, interval_s=0.1)
+        assert len(attempts) == 3
+
+    def test_call_local_launcher_open_success_is_mockable(self):
+        class FakeResponse:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self, limit):
+                return b'{"ok": true}'
+
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {"enabled": True, "launcher_url": "http://127.0.0.1:18765"}}
+        })
+        with patch("urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+            ok, detail = call_local_browser_launcher(cfg, "open", timeout=1.0)
+        assert ok is True
+        assert detail == '{"ok": true}'
+        urlopen.assert_called_once_with("http://127.0.0.1:18765/open", timeout=1.0)
+
+    def test_generic_browser_code_has_no_attilla_specific_hardcodes(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        paths = [
+            os.path.join(root, "hermes_cli", "browser_connect.py"),
+            os.path.join(root, "cli.py"),
+        ]
+        forbidden = ["agent" + ".aiwerk.ch", "hermes" + "-attila", "id_agent" + "_aiwerk_hermes"]
+        for path in paths:
+            with open(path, encoding="utf-8") as fh:
+                content = fh.read()
+            for marker in forbidden:
+                assert marker not in content

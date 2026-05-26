@@ -689,6 +689,23 @@ DEFAULT_CONFIG = {
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        "local_launcher": {
+            # Optional user-machine browser launcher reachable on localhost,
+            # commonly through a user-initiated reverse SSH tunnel. Inert unless
+            # enabled or tenant config supplies launcher_url / ssh_target.
+            "enabled": False,
+            "launcher_port": 18765,
+            "launcher_url": "http://127.0.0.1:18765",
+            "cdp_port": 9222,
+            "cdp_url": "http://127.0.0.1:9222",
+            "ssh_target": "",
+            "ssh_port": 22,
+            "ssh_identity_file": "",
+            "browser_profile_dir": "",
+            "browser_binary": "",
+            "start_url": "about:blank",
+            "cdp_poll_timeout_s": 20,
+        },
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
         # Active only when a CDP-capable backend is attached (Browserbase or
         # local Chrome via /browser connect). See

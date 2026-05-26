@@ -198,8 +198,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("reload-skills", "Re-scan ~/.hermes/skills/ for newly installed or removed skills",
                "Tools & Skills", aliases=("reload_skills",)),
     CommandDef("browser", "Connect browser tools to your live Chromium-family browser via CDP", "Tools & Skills",
-               cli_only=True, args_hint="[connect|disconnect|status]",
-               subcommands=("connect", "disconnect", "status")),
+               cli_only=True, args_hint="[connect|disconnect|status|launch|close-local]",
+               subcommands=("connect", "disconnect", "status", "launch", "open-local", "close-local")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 

@@ -161,9 +161,12 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 from hermes_constants import get_hermes_home, display_hermes_home
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
+    call_local_browser_launcher,
     is_browser_debug_ready,
+    load_local_browser_launcher_config,
     manual_chrome_debug_command,
     try_launch_chrome_debug,
+    wait_for_browser_debug_ready,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import base_url_host_matches, is_truthy_value
@@ -9096,19 +9099,108 @@ class HermesCLI:
         )
 
     def _handle_browser_command(self, cmd: str):
-        """Handle /browser connect|disconnect|status — manage live Chromium-family CDP connection."""
+        """Handle /browser connect|disconnect|status and local launcher actions."""
         import platform as _plat
 
-        parts = cmd.strip().split(None, 1)
-        sub = parts[1].lower().strip() if len(parts) > 1 else "status"
+        tokens = cmd.strip().split()
+        sub = tokens[1].lower().strip() if len(tokens) > 1 else "status"
+        args = tokens[2:]
 
         _DEFAULT_CDP = DEFAULT_BROWSER_CDP_URL
         current = os.environ.get("BROWSER_CDP_URL", "").strip()
+        launcher_cfg = load_local_browser_launcher_config()
+
+        def _print_launcher_hint() -> None:
+            print("     Local launcher is configured but not reachable.")
+            print("     On the user desktop, start it with:")
+            print("       systemctl --user start rocky-browser-launcher.service")
+
+        def _connect_to_cdp(cdp_url: str, launched_by_local_launcher: bool = False) -> None:
+            os.environ["BROWSER_CDP_URL"] = cdp_url
+            try:
+                from tools.browser_tool import _ensure_cdp_supervisor  # type: ignore[import-not-found]
+                _ensure_cdp_supervisor("default")
+            except Exception:
+                pass
+            print()
+            print("🌐 Browser connected to live Chromium-family browser via CDP")
+            print(f"   Endpoint: {cdp_url}")
+            if launched_by_local_launcher:
+                print("   Source: configured local browser launcher")
+            print()
+
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(
+                    "[System note: The user invoked /browser connect and connected your browser tools to "
+                    "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
+                    "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
+                    "control that CDP browser. The command itself is a signal that using browser tools for "
+                    "their current browser-related request is expected; do not wait for separate permission "
+                    "just because CDP is connected. This is typically a Hermes-managed isolated debug "
+                    "profile, not the user's main everyday browser. It is still user-visible and may contain "
+                    "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
+                    "closing tabs, or navigating away unless the user's task calls for it.]"
+                )
+
+        if sub in {"launch", "open-local", "open", "up"}:
+            print()
+            if launcher_cfg.validation_error:
+                print(f"Browser local launcher config error: {launcher_cfg.validation_error}")
+                print()
+                return
+            if not launcher_cfg.enabled:
+                print("Browser local launcher is not configured.")
+                print("Configure browser.local_launcher.launcher_url, for example http://127.0.0.1:18765")
+                print()
+                return
+            ok, detail = call_local_browser_launcher(launcher_cfg, "open", timeout=15.0)
+            if not ok:
+                print(f"   ⚠ Could not open local browser: {detail}")
+                _print_launcher_hint()
+                print()
+                return
+            print("   ✓ Local browser launcher accepted /open")
+            if wait_for_browser_debug_ready(launcher_cfg.cdp_url, launcher_cfg.cdp_poll_timeout_s):
+                _connect_to_cdp(launcher_cfg.cdp_url, launched_by_local_launcher=True)
+            else:
+                print(f"   ⚠ Launcher responded, but CDP is not ready at {launcher_cfg.cdp_url}")
+                print("     Check the SSH reverse tunnel and rocky-browser logs on the user desktop.")
+                print()
+            return
+
+        if sub in {"close-local", "close", "down"}:
+            print()
+            if launcher_cfg.validation_error:
+                print(f"Browser local launcher config error: {launcher_cfg.validation_error}")
+                print()
+                return
+            if not launcher_cfg.enabled:
+                print("Browser local launcher is not configured.")
+                print()
+                return
+            ok, detail = call_local_browser_launcher(launcher_cfg, "down", timeout=15.0)
+            if not ok:
+                print(f"   ⚠ Could not close local browser: {detail}")
+                _print_launcher_hint()
+                print()
+                return
+            os.environ.pop("BROWSER_CDP_URL", None)
+            try:
+                from tools.browser_tool import cleanup_all_browsers, _stop_cdp_supervisor
+                _stop_cdp_supervisor("default")
+                cleanup_all_browsers()
+            except Exception:
+                pass
+            print("🌐 Local browser launcher accepted /down")
+            print("   Browser tools reverted to default mode")
+            print()
+            return
 
         if sub.startswith("connect"):
-            # Optionally accept a custom CDP URL: /browser connect ws://host:port
-            connect_parts = cmd.strip().split(None, 2)  # ["/browser", "connect", "ws://..."]
-            cdp_url = connect_parts[2].strip() if len(connect_parts) > 2 else _DEFAULT_CDP
+            # Accept: /browser connect, /browser connect --launch, /browser connect http://host:port
+            launch_requested = any(a in {"--launch", "launch", "--local", "local"} for a in args)
+            cdp_arg = next((a for a in args if not a.startswith("--") and a not in {"launch", "local"}), "")
+            cdp_url = cdp_arg.strip() if cdp_arg else (launcher_cfg.cdp_url if launcher_cfg.enabled else _DEFAULT_CDP)
             parsed_cdp = urlparse(cdp_url if "://" in cdp_url else f"http://{cdp_url}")
             if parsed_cdp.scheme not in {"http", "https", "ws", "wss"}:
                 print()
@@ -9130,7 +9222,6 @@ class HermesCLI:
                 print(f"   ⚠ Missing host in browser url: {cdp_url}")
                 print()
                 return
-            _host = parsed_cdp.hostname
             if parsed_cdp.path.startswith("/devtools/browser/"):
                 cdp_url = parsed_cdp.geturl()
             else:
@@ -9141,7 +9232,6 @@ class HermesCLI:
                     fragment="",
                 ).geturl()
 
-            # Clear any existing browser sessions so the next tool call uses the new backend
             try:
                 from tools.browser_tool import cleanup_all_browsers
                 cleanup_all_browsers()
@@ -9149,27 +9239,34 @@ class HermesCLI:
                 pass
 
             print()
-
-            # Check if a Chromium-family browser is already serving CDP on the debug port
             _already_open = is_browser_debug_ready(cdp_url, timeout=1.0)
+            launched_by_local_launcher = False
 
             if _already_open:
                 print(f"   ✓ Chromium-family browser is already listening on port {_port}")
+            elif launcher_cfg.enabled and (launch_requested or not cdp_arg):
+                print("   Chromium-family browser is not reachable — asking configured local launcher to open it...")
+                ok, detail = call_local_browser_launcher(launcher_cfg, "open", timeout=15.0)
+                if ok:
+                    launched_by_local_launcher = True
+                    if wait_for_browser_debug_ready(cdp_url, launcher_cfg.cdp_poll_timeout_s):
+                        _already_open = True
+                        print(f"   ✓ Local browser launcher opened CDP at {cdp_url}")
+                    else:
+                        print(f"   ⚠ Launcher responded, but CDP is not ready at {cdp_url}")
+                        print("     Check the browser process, CDP port, and reverse SSH tunnel.")
+                else:
+                    print(f"   ⚠ Local browser launcher failed: {detail}")
+                    _print_launcher_hint()
             elif cdp_url == _DEFAULT_CDP:
-                # Try to auto-launch a Chromium-family browser with remote debugging
-                print("   Chromium-family browser isn't running with remote debugging — attempting to launch...")
+                print("   Chromium-family browser is not running with remote debugging — attempting to launch...")
                 _launched = self._try_launch_chrome_debug(_port, _plat.system())
                 if _launched:
-                    # Wait for the DevTools discovery endpoint to come up
-                    for _wait in range(10):
-                        if is_browser_debug_ready(cdp_url, timeout=1.0):
-                            _already_open = True
-                            break
-                        time.sleep(0.5)
-                    if _already_open:
+                    if wait_for_browser_debug_ready(cdp_url, timeout_s=5.0):
+                        _already_open = True
                         print(f"   ✓ Chromium-family browser launched and listening on port {_port}")
                     else:
-                        print(f"   ⚠ Browser launched but port {_port} isn't responding yet")
+                        print(f"   ⚠ Browser launched but port {_port} is not responding yet")
                         print("     Try again in a few seconds — the debug instance may still be starting")
                 else:
                     print("   ⚠ Could not auto-launch a Chromium-family browser")
@@ -9183,39 +9280,34 @@ class HermesCLI:
             else:
                 print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
 
+            if not _already_open and launcher_cfg.enabled and (not cdp_arg) and cdp_url == _DEFAULT_CDP:
+                print("   Falling back to the normal local Chromium launch path...")
+                _launched = self._try_launch_chrome_debug(_port, _plat.system())
+                if _launched:
+                    if wait_for_browser_debug_ready(cdp_url, timeout_s=5.0):
+                        _already_open = True
+                        launched_by_local_launcher = False
+                        print(f"   ✓ Chromium-family browser launched and listening on port {_port}")
+                    else:
+                        print(f"   ⚠ Browser launched but port {_port} is not responding yet")
+                        print("     Try again in a few seconds — the debug instance may still be starting")
+                else:
+                    print("   ⚠ Could not auto-launch a Chromium-family browser")
+                    sys_name = _plat.system()
+                    chrome_cmd = manual_chrome_debug_command(_port, sys_name)
+                    if chrome_cmd:
+                        print(f"     Launch a Chromium-family browser manually:")
+                        print(f"     {chrome_cmd}")
+                    else:
+                        print("     No supported Chromium-family browser executable found in this environment")
+
             if not _already_open:
                 print()
                 print("Browser not connected — start a Chromium-family browser with remote debugging and retry /browser connect")
                 print()
                 return
 
-            os.environ["BROWSER_CDP_URL"] = cdp_url
-            # Eagerly start the CDP supervisor so pending_dialogs + frame_tree
-            # show up in the next browser_snapshot.  No-op if already started.
-            try:
-                from tools.browser_tool import _ensure_cdp_supervisor  # type: ignore[import-not-found]
-                _ensure_cdp_supervisor("default")
-            except Exception:
-                pass
-            print()
-            print("🌐 Browser connected to live Chromium-family browser via CDP")
-            print(f"   Endpoint: {cdp_url}")
-            print()
-
-            # Inject context message so the model knows this slash command
-            # intentionally makes the dev/debug CDP browser available for use.
-            if hasattr(self, '_pending_input'):
-                self._pending_input.put(
-                    "[System note: The user invoked /browser connect and connected your browser tools to "
-                    "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
-                    "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
-                    "control that CDP browser. The command itself is a signal that using browser tools for "
-                    "their current browser-related request is expected; do not wait for separate permission "
-                    "just because CDP is connected. This is typically a Hermes-managed isolated debug "
-                    "profile, not the user's main everyday browser. It is still user-visible and may contain "
-                    "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
-                    "closing tabs, or navigating away unless the user's task calls for it.]"
-                )
+            _connect_to_cdp(cdp_url, launched_by_local_launcher=launched_by_local_launcher)
 
         elif sub == "disconnect":
             if current:
@@ -9271,7 +9363,6 @@ class HermesCLI:
                 if provider is not None:
                     print(f"🌐 Browser: {provider.provider_name()} (cloud)")
                 else:
-                    # Show engine info for local mode
                     try:
                         from tools.browser_tool import _get_browser_engine
                         engine = _get_browser_engine()
@@ -9285,18 +9376,26 @@ class HermesCLI:
                         print("🌐 Browser: local headless Chromium (agent-browser --engine chrome)")
                     else:
                         print("🌐 Browser: local headless Chromium (agent-browser)")
+            if launcher_cfg.enabled:
+                print("   Local launcher: configured")
+                print(f"   Launcher URL:   {launcher_cfg.launcher_url}")
+                print(f"   Launcher CDP:   {launcher_cfg.cdp_url}")
             print()
-            print("   /browser connect      — connect to your live Chromium-family browser")
-            print("   /browser disconnect   — revert to default")
+            print("   /browser connect [--launch] — connect to your live Chromium-family browser")
+            print("   /browser launch             — open configured local browser launcher and connect")
+            print("   /browser close-local        — close configured local browser and CDP tunnel")
+            print("   /browser disconnect         — revert to default")
             print()
 
         else:
             print()
-            print("Usage: /browser connect|disconnect|status")
+            print("Usage: /browser connect|disconnect|status|launch|close-local")
             print()
-            print("   connect      Connect browser tools to your live Chromium-family browser session")
-            print("   disconnect   Revert to default browser backend")
-            print("   status       Show current browser mode")
+            print("   connect [--launch]  Connect browser tools to a live Chromium-family browser session")
+            print("   launch              Open configured local browser launcher and connect")
+            print("   close-local         Ask configured local launcher to close browser and tunnel")
+            print("   disconnect          Revert to default browser backend")
+            print("   status              Show current browser mode")
             print()
 
     # ────────────────────────────────────────────────────────────────
