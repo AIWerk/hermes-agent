@@ -25,6 +25,26 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _is_openai_parse_typeerror(exc: BaseException) -> bool:
+    """True when a TypeError originated inside openai-python's Responses
+    stream parsing (accumulate_event -> parse_response), as opposed to one
+    of Hermes' own stream callbacks.
+
+    The ChatGPT Codex backend can emit a snapshot whose ``output`` is null,
+    making the SDK raise ``TypeError: 'NoneType' object is not iterable``
+    while iterating ``response.output``. We only want to recover from *that*
+    failure — a TypeError raised by our delta/reasoning callbacks must keep
+    propagating as a real bug.
+    """
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = tb.tb_frame.f_code.co_filename
+        if "openai/lib/_parsing" in filename or "openai/lib/streaming" in filename:
+            return True
+        tb = tb.tb_next
+    return False
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -191,56 +211,116 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
         collected_output_items: list = []
+
+        def _recover_from_stream(exc):
+            """Build a final_response from already-collected stream content
+            when openai-python crashes parsing a null-output snapshot.
+
+            Returns a SimpleNamespace response, or re-raises ``exc`` when
+            there is nothing safe to recover (no streamed output, or a
+            tool-call turn that only produced text deltas).
+            """
+            if collected_output_items:
+                logger.debug(
+                    "Codex stream: parse crashed (%r); recovering %d output "
+                    "items from stream events. %s",
+                    exc, len(collected_output_items), agent._client_log_context(),
+                )
+                return SimpleNamespace(output=list(collected_output_items), usage=None)
+            if agent._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(agent._codex_streamed_text_parts)
+                logger.debug(
+                    "Codex stream: parse crashed (%r); synthesizing output "
+                    "from %d text deltas (%d chars). %s",
+                    exc, len(agent._codex_streamed_text_parts),
+                    len(assembled), agent._client_log_context(),
+                )
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    usage=None,
+                )
+            # No streamed output, or a tool-call turn with only text deltas —
+            # nothing safe to recover. Preserve the original failure.
+            raise exc
+
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
-                for event in stream:
-                    agent._touch_activity("receiving stream response")
-                    if agent._interrupt_requested:
-                        break
-                    event_type = getattr(event, "type", "")
-                    # Fire callbacks on text content deltas (suppress during tool calls)
-                    if "output_text.delta" in event_type or event_type == "response.output_text.delta":
-                        delta_text = getattr(event, "delta", "")
-                        if delta_text:
-                            agent._codex_streamed_text_parts.append(delta_text)
-                        if delta_text and not has_tool_calls:
-                            if not first_delta_fired:
-                                first_delta_fired = True
-                                if on_first_delta:
-                                    try:
-                                        on_first_delta()
-                                    except Exception:
-                                        pass
-                            agent._fire_stream_delta(delta_text)
-                    # Track tool calls to suppress text streaming
-                    elif "function_call" in event_type:
-                        has_tool_calls = True
-                    # Fire reasoning callbacks
-                    elif "reasoning" in event_type and "delta" in event_type:
-                        reasoning_text = getattr(event, "delta", "")
-                        if reasoning_text:
-                            agent._fire_reasoning_delta(reasoning_text)
-                    # Collect completed output items — some backends
-                    # (chatgpt.com/backend-api/codex) stream valid items
-                    # via response.output_item.done but the SDK's
-                    # get_final_response() returns an empty output list.
-                    elif event_type == "response.output_item.done":
-                        done_item = getattr(event, "item", None)
-                        if done_item is not None:
-                            collected_output_items.append(done_item)
-                    # Log non-completed terminal events for diagnostics
-                    elif event_type in {"response.incomplete", "response.failed"}:
-                        resp_obj = getattr(event, "response", None)
-                        status = getattr(resp_obj, "status", None) if resp_obj else None
-                        incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
-                        logger.warning(
-                            "Codex Responses stream received terminal event %s "
-                            "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
-                            event_type, status, incomplete_details,
-                            sum(len(p) for p in agent._codex_streamed_text_parts),
-                            agent._client_log_context(),
-                        )
-                final_response = stream.get_final_response()
+                try:
+                    for event in stream:
+                        agent._touch_activity("receiving stream response")
+                        if agent._interrupt_requested:
+                            break
+                        event_type = getattr(event, "type", "")
+                        # Fire callbacks on text content deltas (suppress during tool calls)
+                        if "output_text.delta" in event_type or event_type == "response.output_text.delta":
+                            delta_text = getattr(event, "delta", "")
+                            if delta_text:
+                                agent._codex_streamed_text_parts.append(delta_text)
+                            if delta_text and not has_tool_calls:
+                                if not first_delta_fired:
+                                    first_delta_fired = True
+                                    if on_first_delta:
+                                        try:
+                                            on_first_delta()
+                                        except Exception:
+                                            pass
+                                agent._fire_stream_delta(delta_text)
+                        # Track tool calls to suppress text streaming
+                        elif "function_call" in event_type:
+                            has_tool_calls = True
+                        # Fire reasoning callbacks
+                        elif "reasoning" in event_type and "delta" in event_type:
+                            reasoning_text = getattr(event, "delta", "")
+                            if reasoning_text:
+                                agent._fire_reasoning_delta(reasoning_text)
+                        # Collect completed output items — some backends
+                        # (chatgpt.com/backend-api/codex) stream valid items
+                        # via response.output_item.done but the SDK's
+                        # get_final_response() returns an empty output list.
+                        elif event_type == "response.output_item.done":
+                            done_item = getattr(event, "item", None)
+                            if done_item is not None:
+                                collected_output_items.append(done_item)
+                        # Log non-completed terminal events for diagnostics
+                        elif event_type in {"response.incomplete", "response.failed"}:
+                            resp_obj = getattr(event, "response", None)
+                            status = getattr(resp_obj, "status", None) if resp_obj else None
+                            incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
+                            logger.warning(
+                                "Codex Responses stream received terminal event %s "
+                                "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
+                                event_type, status, incomplete_details,
+                                sum(len(p) for p in agent._codex_streamed_text_parts),
+                                agent._client_log_context(),
+                            )
+                except TypeError as _stream_exc:
+                    # The ChatGPT Codex backend (chatgpt.com/backend-api/codex)
+                    # can stream valid output_text deltas and then emit a
+                    # snapshot whose ``output`` is *null*. openai-python's
+                    # streaming state machine (accumulate_event ->
+                    # parse_response) then raises
+                    # ``TypeError: 'NoneType' object is not iterable`` from
+                    # *inside* the ``for event in stream`` iteration — long
+                    # before get_final_response() runs.
+                    #
+                    # Only recover when the TypeError actually originated in
+                    # the openai SDK's response parsing — NOT when one of our
+                    # own stream callbacks (_fire_stream_delta etc.) raised a
+                    # TypeError, which must surface as a real bug.
+                    if not _is_openai_parse_typeerror(_stream_exc):
+                        raise
+                    return _recover_from_stream(_stream_exc)
+                try:
+                    final_response = stream.get_final_response()
+                except TypeError as _final_exc:
+                    # Same null-output backend bug, but surfaced at
+                    # finalization rather than mid-stream. Recover identically.
+                    return _recover_from_stream(_final_exc)
                 # PATCH: ChatGPT Codex backend streams valid output items
                 # but get_final_response() can return an empty output list.
                 # Backfill from collected items or synthesize from deltas.
