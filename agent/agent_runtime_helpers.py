@@ -41,6 +41,7 @@ from agent.message_sanitization import (
 )
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
+from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import classify_api_error, FailoverReason
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -132,7 +133,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                     except json.JSONDecodeError:
                         # This shouldn't happen since we validate and retry during conversation,
                         # but if it does, log warning and use empty dict
-                        logging.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
+                        logger.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
                         arguments = {}
                     
                     tool_call_json = {
@@ -582,12 +583,37 @@ def recover_with_credential_pool(
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
+        # If current credential is already marked exhausted, skip retry and
+        # rotate immediately. This prevents the "cancel-between-429s" trap
+        # where has_retried_429 (a local var) gets reset on each new prompt,
+        # causing the pool to retry the same exhausted credential forever.
+        current_entry = pool.current()
+        current_last_status = getattr(current_entry, "last_status", None) if current_entry else None
+        if current_last_status == STATUS_EXHAUSTED:
+            _ra().logger.info(
+                "Credential already exhausted (last_status=%s) — rotating immediately instead of retrying",
+                current_last_status,
+            )
+            rotate_status = status_code if status_code is not None else 429
+            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            if next_entry is not None:
+                _ra().logger.info(
+                    "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
+                    rotate_status,
+                    getattr(next_entry, "id", "?"),
+                )
+                agent._swap_credential(next_entry)
+                return True, False
+            return False, True
+
         usage_limit_reached = False
         if error_context:
             context_reason = str(error_context.get("reason") or "").lower()
             context_message = str(error_context.get("message") or "").lower()
             usage_limit_reached = (
                 "usage_limit_reached" in context_reason
+                or "gousagelimit" in context_reason
+                or "usage limit reached" in context_message
                 or "usage limit has been reached" in context_message
             )
         if not has_retried_429 and not usage_limit_reached:
@@ -747,7 +773,7 @@ def try_recover_primary_transport(
         time.sleep(wait_time)
         return True
     except Exception as e:
-        logging.warning("Primary transport recovery failed: %s", e)
+        logger.warning("Primary transport recovery failed: %s", e)
         return False
 
 # ── End provider fallback ──────────────────────────────────────────────
@@ -910,19 +936,20 @@ def restore_primary_runtime(agent) -> bool:
             base_url=rt["compressor_base_url"],
             api_key=rt["compressor_api_key"],
             provider=rt["compressor_provider"],
+            api_mode=rt.get("compressor_api_mode", ""),
         )
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
 
-        logging.info(
+        logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
         )
         return True
     except Exception as e:
-        logging.warning("Failed to restore primary runtime: %s", e)
+        logger.warning("Failed to restore primary runtime: %s", e)
         return False
 
 # Which error types indicate a transient transport failure worth
@@ -1093,7 +1120,7 @@ def dump_api_request_debug(
         return dump_file
     except Exception as dump_error:
         if agent.verbose_logging:
-            logging.warning(f"Failed to dump API request debug payload: {dump_error}")
+            logger.warning(f"Failed to dump API request debug payload: {dump_error}")
         return None
 
 
@@ -1478,6 +1505,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
         "compressor_provider": getattr(_cc, "provider", agent.provider) if _cc else agent.provider,
         "compressor_context_length": _cc.context_length if _cc else 0,
+        "compressor_api_mode": getattr(_cc, "api_mode", agent.api_mode) if _cc else agent.api_mode,
         "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
     }
     if api_mode == "anthropic_messages":
@@ -1509,7 +1537,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
 
-    logging.info(
+    logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
     )
@@ -2068,19 +2096,33 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     if "reset_at" not in context:
         message = context.get("message") or ""
         if isinstance(message, str):
-            delay_match = re.search(r"quotaResetDelay[:\s\"]+(\\d+(?:\\.\\d+)?)(ms|s)", message, re.IGNORECASE)
+            delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
             if delay_match:
                 value = float(delay_match.group(1))
                 seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
                 context["reset_at"] = time.time() + seconds
             else:
-                sec_match = re.search(
-                    r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+                resets_in_match = re.search(
+                    r"resets?\s+in\s+"
+                    r"(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b\s*)?"
+                    r"(?:(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b\s*)?"
+                    r"(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b)?",
                     message,
                     re.IGNORECASE,
                 )
-                if sec_match:
-                    context["reset_at"] = time.time() + float(sec_match.group(1))
+                if resets_in_match and any(resets_in_match.groups()):
+                    hours = float(resets_in_match.group(1) or 0)
+                    minutes = float(resets_in_match.group(2) or 0)
+                    seconds = float(resets_in_match.group(3) or 0)
+                    context["reset_at"] = time.time() + (hours * 3600) + (minutes * 60) + seconds
+                else:
+                    sec_match = re.search(
+                        r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+                        message,
+                        re.IGNORECASE,
+                    )
+                    if sec_match:
+                        context["reset_at"] = time.time() + float(sec_match.group(1))
 
     return context
 
