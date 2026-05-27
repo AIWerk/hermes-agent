@@ -1,0 +1,8 @@
+name: self_learning_capture
+version: 0.1.0
+description: Capture correction and tool-failure learning candidates into the local feedback inbox.
+author: AIWerk
+kind: standalone
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
