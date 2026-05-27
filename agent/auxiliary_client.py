@@ -784,34 +784,75 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        # Collect output items and text deltas during streaming.  The
+        # ChatGPT Codex backend can stream usable content and then make the
+        # OpenAI SDK fail while folding a later malformed snapshot.
+        collected_output_items: List[Any] = []
+        collected_text_deltas: List[str] = []
+        has_function_calls = False
+
+        def _looks_like_codex_null_snapshot(exc: BaseException) -> bool:
+            if not isinstance(exc, TypeError):
+                return False
+            return "NoneType" in str(exc) and "iterable" in str(exc)
+
+        def _recover_aux_final(exc: BaseException) -> Any:
+            if collected_output_items:
+                logger.warning(
+                    "Codex auxiliary Responses stream parse failed (%s); "
+                    "recovering %d completed output items",
+                    exc, len(collected_output_items),
+                )
+                return SimpleNamespace(output=list(collected_output_items), usage=None)
+            if collected_text_deltas and not has_function_calls:
+                assembled = "".join(collected_text_deltas)
+                logger.warning(
+                    "Codex auxiliary Responses stream parse failed (%s); "
+                    "synthesizing output from %d text deltas (%d chars)",
+                    exc, len(collected_text_deltas), len(assembled),
+                )
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message", role="assistant", status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    usage=None,
+                )
+            raise exc
+
         try:
-            # Collect output items and text deltas during streaming —
-            # the Codex backend can return empty response.output from
-            # get_final_response() even when items were streamed.
-            collected_output_items: List[Any] = []
-            collected_text_deltas: List[str] = []
-            has_function_calls = False
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
             with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+                try:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
+                except TypeError as stream_exc:
+                    if not _looks_like_codex_null_snapshot(stream_exc):
+                        raise
+                    final = _recover_aux_final(stream_exc)
+                else:
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    try:
+                        final = stream.get_final_response()
+                    except TypeError as final_exc:
+                        if not _looks_like_codex_null_snapshot(final_exc):
+                            raise
+                        final = _recover_aux_final(final_exc)
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
