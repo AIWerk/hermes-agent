@@ -6,7 +6,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 _SECRET_PATTERNS = [
     re.compile(r"(?i)(authorization\s*:\s*bearer)\s+[^\s'\",;]+"),
@@ -33,7 +33,41 @@ def _home() -> Path:
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
-def _feedback_inbox() -> Path:
+def _load_plugin_config() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+        raw = cfg_get(cfg, "self_learning_capture", default={})
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _truthy(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return default
+
+
+def _settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    cfg: Mapping[str, Any] = config if isinstance(config, Mapping) else _load_plugin_config()
+    return {
+        "enabled": _truthy(cfg.get("enabled"), default=True),
+        "feedback_inbox": str(cfg.get("feedback_inbox") or "").strip(),
+    }
+
+
+def _feedback_inbox(config: Mapping[str, Any] | None = None) -> Path:
+    configured = _settings(config).get("feedback_inbox") or ""
+    if configured:
+        return Path(configured).expanduser()
     wiki = os.environ.get("WIKI_PATH")
     if not wiki:
         wiki = str(Path.home() / "wiki")
@@ -84,8 +118,8 @@ def _already_seen(key: str) -> bool:
     return False
 
 
-def _append_inbox(kind: str, session_id: str, body: str, key: str) -> None:
-    inbox = _feedback_inbox()
+def _append_inbox(kind: str, session_id: str, body: str, key: str, *, config: Mapping[str, Any] | None = None) -> None:
+    inbox = _feedback_inbox(config)
     inbox.parent.mkdir(parents=True, exist_ok=True)
     if not inbox.exists():
         inbox.write_text("# Feedback Inbox\n\n", encoding="utf-8")
@@ -128,6 +162,9 @@ def _is_failure_result(result: Any) -> bool:
 
 
 def pre_llm_call(**kwargs: Any) -> None:
+    config = kwargs.get("config") if isinstance(kwargs.get("config"), Mapping) else None
+    if not _settings(config)["enabled"]:
+        return None
     message = str(kwargs.get("user_message") or "")
     if not message.strip() or not _CORRECTION_RE.search(message):
         return None
@@ -142,11 +179,14 @@ def pre_llm_call(**kwargs: Any) -> None:
         f"{_excerpt(message)}\n"
         "```\n"
     )
-    _append_inbox("correction-detector", session_id, body, key)
+    _append_inbox("correction-detector", session_id, body, key, config=config)
     return None
 
 
 def post_tool_call(**kwargs: Any) -> None:
+    config = kwargs.get("config") if isinstance(kwargs.get("config"), Mapping) else None
+    if not _settings(config)["enabled"]:
+        return None
     result = kwargs.get("result")
     if not _is_failure_result(result):
         return None
@@ -172,7 +212,7 @@ def post_tool_call(**kwargs: Any) -> None:
         f"{_excerpt(result, 1400)}\n"
         "```\n"
     )
-    _append_inbox("failure-capture", session_id, body, key)
+    _append_inbox("failure-capture", session_id, body, key, config=config)
     return None
 
 
