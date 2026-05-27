@@ -43,6 +43,29 @@ def test_pre_llm_call_ignores_and_deduplicates_non_corrections(tmp_path, monkeyp
     assert text.count("correction-detector") == 1
 
 
+def test_pre_llm_call_honors_disabled_config(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(user_message="Nem ezt kértem, jegyezd meg így.", session_id="s1", config={"enabled": False})
+
+    assert not inbox.exists()
+
+
+def test_configured_feedback_inbox_path_overrides_wiki_path(tmp_path, monkeypatch):
+    default_inbox = _setup_paths(tmp_path, monkeypatch)
+    custom_inbox = tmp_path / "custom" / "feedback.md"
+
+    pre_llm_call(
+        user_message="Nem ezt kértem, jegyezd meg így.",
+        session_id="s4",
+        config={"feedback_inbox": str(custom_inbox)},
+    )
+
+    assert custom_inbox.exists()
+    assert "correction-detector" in custom_inbox.read_text(encoding="utf-8")
+    assert not default_inbox.exists()
+
+
 def test_post_tool_call_captures_failed_tool_and_sanitizes_secrets(tmp_path, monkeypatch):
     inbox = _setup_paths(tmp_path, monkeypatch)
 
