@@ -2366,6 +2366,129 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["timeout"] == 12.5
         assert response.choices[0].message.content == "summary"
 
+    def test_recovers_completed_output_item_when_codex_stream_parser_raises_typeerror(self):
+        class BrokenAfterItemStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="response.output_item.done",
+                    item=SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="Recovered title")],
+                    ),
+                )
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):  # pragma: no cover — stream raises first
+                return SimpleNamespace(output=[], usage=None)
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return BrokenAfterItemStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.3-codex-spark")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "make a title"}],
+            timeout=12.5,
+        )
+
+        assert response.choices[0].message.content == "Recovered title"
+
+    def test_recovers_when_codex_get_final_response_raises_typeerror(self):
+        class BrokenFinalResponseStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Finalized")
+                yield SimpleNamespace(type="response.output_text.delta", delta=" title")
+
+            def get_final_response(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return BrokenFinalResponseStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.3-codex-spark")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "make a title"}],
+            timeout=12.5,
+        )
+
+        assert response.choices[0].message.content == "Finalized title"
+
+    def test_recovers_text_deltas_when_codex_stream_parser_raises_typeerror(self):
+        class BrokenAfterDeltasStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Session")
+                yield SimpleNamespace(type="response.output_text.delta", delta=" title")
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):  # pragma: no cover — stream raises first
+                return SimpleNamespace(output=[], usage=None)
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return BrokenAfterDeltasStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4-mini")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "summarize"}],
+            timeout=12.5,
+        )
+
+        assert response.choices[0].message.content == "Session title"
+
+    def test_does_not_synthesize_text_deltas_after_function_call_typeerror(self):
+        class BrokenFunctionCallStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="ignore")
+                yield SimpleNamespace(type="response.function_call_arguments.delta", delta="{}")
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):  # pragma: no cover — stream raises first
+                return SimpleNamespace(output=[], usage=None)
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return BrokenFunctionCallStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4-mini")
+
+        with pytest.raises(TypeError, match="NoneType"):
+            adapter.create(
+                messages=[{"role": "user", "content": "use a tool"}],
+                timeout=12.5,
+            )
+
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class SlowAliveStream:
             def __enter__(self):
