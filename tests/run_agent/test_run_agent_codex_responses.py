@@ -174,6 +174,39 @@ class _FakeResponsesStream:
         return self._final_response
 
 
+class _FakeResponsesStreamThenOpenAIParseTypeError:
+    def __init__(self, events):
+        self._events = list(events)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        for event in self._events:
+            yield event
+        _raise_openai_parse_typeerror()
+
+    def get_final_response(self):
+        raise AssertionError("mid-stream parse recovery should not call get_final_response")
+
+
+def _raise_openai_parse_typeerror():
+    namespace = {}
+    exec(
+        compile(
+            "def raise_it():\n"
+            "    raise TypeError(\"'NoneType' object is not iterable\")\n",
+            "/venv/lib/python3.11/site-packages/openai/lib/_parsing/_responses.py",
+            "exec",
+        ),
+        namespace,
+    )
+    namespace["raise_it"]()
+
+
 class _FakeCreateStream:
     def __init__(self, events):
         self._events = list(events)
@@ -392,6 +425,48 @@ def test_build_api_kwargs_copilot_responses_omits_reasoning_for_non_reasoning_mo
     assert "reasoning" not in kwargs
     assert "include" not in kwargs
     assert "prompt_cache_key" not in kwargs
+
+
+def test_run_codex_stream_recovers_text_deltas_after_midstream_openai_null_output(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _FakeResponsesStreamThenOpenAIParseTypeError(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="GPT"),
+                    SimpleNamespace(type="response.output_text.delta", delta="55_OK"),
+                ]
+            ),
+            create=lambda **kwargs: _codex_message_response("fallback should not run"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response is not None
+    assert response.output[0].type == "message"
+    assert response.output[0].content[0].text == "GPT55_OK"
+
+
+def test_run_codex_stream_does_not_mask_callback_typeerror(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    def _broken_delta_callback(text: str):
+        raise TypeError("callback broke")
+
+    agent._fire_stream_delta = _broken_delta_callback
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _FakeResponsesStreamThenOpenAIParseTypeError(
+                [SimpleNamespace(type="response.output_text.delta", delta="hello")]
+            ),
+            create=lambda **kwargs: _codex_message_response("fallback should not run"),
+        )
+    )
+
+    with pytest.raises(TypeError, match="callback broke"):
+        agent._run_codex_stream(_codex_request_kwargs())
 
 
 def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
