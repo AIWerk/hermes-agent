@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hermes Agent Dashboard</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f4f1ec;
+      color: #292720;
+    }
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 340px 1fr;
+    }
+    aside {
+      background: #292720;
+      color: #f8f4ed;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+    .brand {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .logo {
+      width: 48px;
+      height: 48px;
+      border-radius: 15px;
+      display: grid;
+      place-items: center;
+      background: #d7b98e;
+      color: #292720;
+      font-weight: 800;
+      font-size: 20px;
+    }
+    .brand strong { font-size: 20px; }
+    .brand small { color: #bfb7aa; font-size: 14px; }
+    .sidebar-section {
+      display: grid;
+      gap: 10px;
+    }
+    .sidebar-title {
+      color: #bfb7aa;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      font-weight: 750;
+    }
+    .agent-card,
+    .session-card,
+    .history-card {
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.1);
+    }
+    .metric-list { display: grid; gap: 10px; }
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      color: #dcd4c8;
+      font-size: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .metric:last-child { border-bottom: 0; padding-bottom: 0; }
+    .metric strong {
+      color: #f8f4ed;
+      font-size: 14px;
+      text-align: right;
+      font-weight: 700;
+    }
+    .context-bar {
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.12);
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .context-fill {
+      height: 100%;
+      width: 58%;
+      border-radius: inherit;
+      background: #d7b98e;
+    }
+    .session-list { display: grid; gap: 8px; }
+    .session-item {
+      width: 100%;
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 14px;
+      background: rgba(255,255,255,.05);
+      color: #f8f4ed;
+      text-align: left;
+      padding: 10px 11px;
+      cursor: pointer;
+    }
+    .session-item:hover { background: rgba(255,255,255,.1); }
+    .session-item strong {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+    .session-item span {
+      color: #bfb7aa;
+      font-size: 13px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 17px;
+      color: #f8f4ed;
+      margin-top: 4px;
+      font-weight: 750;
+    }
+    .last-activity {
+      margin: 10px 0 0;
+      color: #cfc6b8;
+      font-size: 13px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #7bcf91;
+      box-shadow: 0 0 0 4px rgba(123,207,145,.14);
+    }
+    main {
+      padding: 26px;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 22px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    h1 { margin: 0; font-size: 26px; letter-spacing: -.03em; }
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .icon-btn {
+      border: 1px solid #d9d0c1;
+      background: #fffaf2;
+      color: #5d503f;
+      border-radius: 8px;
+      width: 32px;
+      height: 32px;
+      display: inline-grid;
+      place-items: center;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .icon-btn:hover { background: #f2eadf; }
+    .session-summary {
+      margin-top: 10px;
+      max-width: 760px;
+      color: #625a4c;
+      font-size: 15px;
+      line-height: 1.5;
+    }
+    .session-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .session-badge {
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 750;
+      background: #e9ddcb;
+      color: #695a43;
+      border: 1px solid #dbcfbe;
+    }
+    .muted { color: #777063; }
+    .top-actions { display: flex; gap: 10px; }
+    .btn {
+      border: 1px solid #d9d0c1;
+      background: #fffaf2;
+      color: #3a362d;
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .btn.primary {
+      border-color: #9a7b51;
+      background: #8b724e;
+      color: white;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+      gap: 22px;
+      min-height: 0;
+    }
+    .panel {
+      background: rgba(255,250,242,.86);
+      border: 1px solid #ded4c4;
+      border-radius: 24px;
+      box-shadow: 0 18px 50px rgba(56,42,20,.08);
+      overflow: hidden;
+    }
+    .chat {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 680px;
+    }
+    .chat-head {
+      padding: 18px 20px;
+      border-bottom: 1px solid #e3d9c9;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .pill {
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      background: #efe6d6;
+      color: #695a43;
+      font-weight: 700;
+    }
+    .messages {
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      overflow: auto;
+    }
+    .msg {
+      max-width: 74%;
+      padding: 14px 16px;
+      border-radius: 18px;
+      line-height: 1.45;
+      font-size: 15px;
+    }
+    .msg.agent {
+      background: #eee5d7;
+      border-top-left-radius: 6px;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: #7f6b4d;
+      color: white;
+      border-top-right-radius: 6px;
+    }
+    .compose {
+      padding: 16px;
+      border-top: 1px solid #e3d9c9;
+      display: flex;
+      gap: 10px;
+      background: #fbf5eb;
+    }
+    .attach-btn {
+      width: 46px;
+      border: 1px solid #d9d0c1;
+      background: #fffaf2;
+      color: #4b4235;
+      border-radius: 14px;
+      display: grid;
+      place-items: center;
+      font-size: 19px;
+      cursor: pointer;
+    }
+    .attach-btn:hover { background: #f2eadf; }
+    .compose input[type="text"] {
+      flex: 1;
+      border: 1px solid #d9d0c1;
+      border-radius: 14px;
+      padding: 13px 14px;
+      font-size: 15px;
+      background: white;
+    }
+    .file-note {
+      display: none;
+      padding: 0 18px 14px;
+      color: #6f624f;
+      font-size: 13px;
+      background: #fbf5eb;
+    }
+    .file-note.show { display: block; }
+    .side { display: grid; gap: 16px; align-content: start; }
+    .box { padding: 18px; }
+    .box h3 { margin: 0 0 12px; font-size: 15px; }
+    .info-list { display: grid; gap: 11px; }
+    .info {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #eadfce;
+    }
+    .info:last-child { border-bottom: 0; padding-bottom: 0; }
+    .task {
+      padding: 12px;
+      border-radius: 14px;
+      background: #f1eadf;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+    .task strong { display: block; margin-bottom: 4px; }
+    .control-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .control-grid button,
+    .approval-actions button {
+      border: 1px solid #ddd2c2;
+      background: #fffaf2;
+      border-radius: 10px;
+      padding: 12px;
+      text-align: left;
+      cursor: pointer;
+      font-weight: 650;
+      color: #3b352c;
+    }
+    .control-grid button:hover,
+    .approval-actions button:hover { background: #f2eadf; }
+    .control-grid button.danger { color: #7b3b2f; }
+    .approval-card {
+      padding: 12px;
+      border-radius: 12px;
+      background: #f1eadf;
+      margin-top: 10px;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+    .approval-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .command-hint {
+      display: block;
+      margin-top: 4px;
+      color: #8a7a65;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .toast {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      background: #292720;
+      color: white;
+      border-radius: 14px;
+      padding: 13px 16px;
+      display: none;
+      box-shadow: 0 16px 40px rgba(0,0,0,.18);
+    }
+    .toast.show { display: block; }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      aside { display: none; }
+      .grid { grid-template-columns: 1fr; }
+      header { align-items: flex-start; flex-direction: column; }
+      .msg { max-width: 92%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand">
+        <div class="logo">R</div>
+        <div>
+          <strong>Rocky</strong><br>
+          <small>AIWerk Persönlicher KI-Assistent</small>
+        </div>
+      </div>
+
+      <section class="sidebar-section">
+        <div class="sidebar-title">Status</div>
+        <div class="agent-card">
+          <span class="status"><span class="dot"></span> Aktiv · arbeitet</span>
+          <p class="last-activity">Letzte Aktivität: vor 2 Minuten</p>
+        </div>
+      </section>
+
+      <section class="sidebar-section">
+        <div class="sidebar-title">Aktuelle Sitzung</div>
+        <div class="session-card">
+          <div class="metric-list">
+            <div class="metric"><span>Titel</span><strong>Tagesbriefing</strong></div>
+            <div class="metric"><span>Sitzungs-ID</span><strong>rky-24f8</strong></div>
+            <div class="metric"><span>Dauer</span><strong>38 Min.</strong></div>
+            <div class="metric"><span>Modell</span><strong>GLM 4.6 ▾</strong></div>
+            <div class="metric"><span>Context</span><strong>58%</strong></div>
+          </div>
+          <div class="context-bar" aria-label="Kontextfenster zu 58 Prozent ausgelastet"><div class="context-fill"></div></div>
+        </div>
+      </section>
+
+      <section class="sidebar-section">
+        <div class="sidebar-title">Letzte Sitzungen</div>
+        <div class="history-card session-list">
+          <button class="session-item" onclick="showToast('Sitzung öffnen: Meer Wohnen Lead')"><strong>Meer Wohnen Lead</strong><span>heute · 24 Min.</span></button>
+          <button class="session-item" onclick="showToast('Sitzung öffnen: Webseitentext')"><strong>Webseitentext</strong><span>gestern · 51 Min.</span></button>
+          <button class="session-item" onclick="showToast('Sitzung öffnen: E-Mail-Entwurf prüfen')"><strong>E-Mail-Entwurf prüfen</strong><span>gestern · 12 Min.</span></button>
+          <button class="session-item" onclick="showToast('Sitzung öffnen: Tagesbriefing')"><strong>Tagesbriefing</strong><span>14. Mai · 18 Min.</span></button>
+          <button class="session-item" onclick="showToast('Sitzung öffnen: Dokumentenupload')"><strong>Dokumentenupload</strong><span>13. Mai · 9 Min.</span></button>
+        </div>
+      </section>
+    </aside>
+
+    <main>
+      <header>
+        <div>
+          <div class="title-row">
+            <h1>Tagesbriefing</h1>
+            <button class="icon-btn" onclick="showToast('Sitzungstitel bearbeiten')" title="Titel bearbeiten" aria-label="Titel bearbeiten">✎</button>
+          </div>
+          <div class="session-summary">Aktuelle Kundenanfragen, offene Antwortentwürfe und heutige Prioritäten. Fokus: Meer Wohnen Lead bearbeiten und den nächsten Kundenschritt vorbereiten.</div>
+          <div class="session-badges">
+            <span class="session-badge">Auto-Titel aktiv</span>
+            <span class="session-badge">Live-Notizen aktiv</span>
+            <span class="session-badge">Zusammenfassung wird am Sitzungsende gespeichert</span>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="btn" onclick="showToast('Kontext komprimieren')">Komprimieren</button>
+          <button class="btn primary" onclick="showToast('Neue Unterhaltung gestartet')">Neue Unterhaltung</button>
+        </div>
+      </header>
+
+      <section class="grid">
+        <div class="panel chat">
+          <div class="chat-head">
+            <div>
+              <strong>Unterhaltung mit Hermes</strong><br>
+              <span class="muted">Antwortzeit: ca. 10 Sek.</span>
+            </div>
+            <span class="pill">16:25</span>
+          </div>
+
+          <div class="messages" id="messages">
+            <div class="msg agent">Guten Tag! Ich bin Ihr AIWerk Assistent. Wie kann ich Ihnen heute helfen?</div>
+            <div class="msg user">Ich möchte wissen, wie KI bei eingehenden Anfragen helfen kann.</div>
+            <div class="msg agent">Kurz gesagt: Ich fasse neue Leads zusammen, schlage Antworten vor und markiere dringende Kundenanfragen.</div>
+            <div class="msg agent">Gerne kann ich ein kurzes Beispiel anhand einer eingehenden Anfrage erstellen.</div>
+          </div>
+
+          <div class="compose">
+            <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="Datei oder Bild anhängen" aria-label="Datei oder Bild anhängen">📎</button>
+            <input id="fileInput" type="file" accept="image/*,.pdf,.doc,.docx,.txt" style="display:none" onchange="showFileName(this)" />
+            <input id="messageInput" type="text" placeholder="Nachricht an den Assistenten schreiben…" onkeydown="if(event.key==='Enter') sendMessage()" />
+            <button class="btn primary" onclick="sendMessage()">Senden</button>
+          </div>
+          <div class="file-note" id="fileNote"></div>
+        </div>
+
+        <div class="side">
+          <div class="panel box">
+            <h3>Sitzungssteuerung</h3>
+            <div class="control-grid">
+              <button onclick="showToast('/side starten')">Side-Sitzung<span class="command-hint">/side</span></button>
+              <button onclick="showToast('Zurück zur Hauptsitzung')">Zurück<span class="command-hint">/back</span></button>
+              <button onclick="showToast('Handoff vorbereiten')">Handoff<span class="command-hint">/handoff</span></button>
+              <button onclick="showToast('Sitzungshistorie öffnen')">Historie<span class="command-hint">/history</span></button>
+            </div>
+          </div>
+
+          <div class="panel box">
+            <h3>Agent-Steuerung</h3>
+            <div class="control-grid">
+              <button class="danger" onclick="showToast('Generierung stoppen')">Stop<span class="command-hint">/stop</span></button>
+              <button onclick="showToast('Letzte Antwort erneut versuchen')">Erneut<span class="command-hint">/retry</span></button>
+              <button onclick="showToast('Letzten Schritt zurücknehmen')">Zurücknehmen<span class="command-hint">/undo</span></button>
+              <button onclick="showToast('Denkstufe')">Denken<span class="command-hint">/reasoning</span></button>
+              <button onclick="showToast('Sprachmodus')">Sprache<span class="command-hint">/voice</span></button>
+              <button onclick="showToast('YOLO-Modus wechseln')">YOLO<span class="command-hint">/yolo</span></button>
+            </div>
+          </div>
+
+          <div class="panel box">
+            <h3>Freigaben</h3>
+            <div class="approval-card">
+              <strong>1 Aktion wartet auf Entscheidung</strong><br>
+              Rocky möchte eine E-Mail-Antwort an den Meer Wohnen Lead senden.
+              <div class="approval-actions">
+                <button onclick="showToast('Freigegeben')">Freigeben</button>
+                <button onclick="showToast('Abgelehnt')">Ablehnen</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    function showToast(text) {
+      const toast = document.getElementById('toast');
+      toast.textContent = text;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 1800);
+    }
+
+    function showFileName(input) {
+      const note = document.getElementById('fileNote');
+      if (!input.files || !input.files[0]) return;
+      note.textContent = 'Angehängt: ' + input.files[0].name;
+      note.classList.add('show');
+      showToast('Datei angehängt');
+    }
+
+    function sendMessage() {
+      const input = document.getElementById('messageInput');
+      const text = input.value.trim();
+      if (!text) return;
+      const messages = document.getElementById('messages');
+      const user = document.createElement('div');
+      user.className = 'msg user';
+      user.textContent = text;
+      messages.appendChild(user);
+      input.value = '';
+      setTimeout(() => {
+        const agent = document.createElement('div');
+        agent.className = 'msg agent';
+        agent.textContent = 'Verstanden. Das würde ich an Hermes weiterleiten; die KI-Antwort oder der nächste vorgeschlagene Schritt würde hier erscheinen.';
+        messages.appendChild(agent);
+        messages.scrollTop = messages.scrollHeight;
+      }, 500);
+      messages.scrollTop = messages.scrollHeight;
+    }
+  </script>
+</body>
+</html>

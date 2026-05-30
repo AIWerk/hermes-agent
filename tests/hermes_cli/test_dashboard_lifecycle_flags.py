@@ -22,7 +22,7 @@ def _ns(**kw):
     """Build an argparse.Namespace with dashboard defaults plus overrides."""
     defaults = dict(
         port=9119, host="127.0.0.1", no_open=False, insecure=False,
-        tui=False, stop=False, status=False,
+        tui=False, assistant=False, stop=False, status=False,
     )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
@@ -156,6 +156,25 @@ class TestLifecycleFlagsTakePrecedence:
              pytest.raises(SystemExit):
             cmd_dashboard(_ns(stop=True))
         assert called["start"] is False
+
+
+class TestDashboardAssistantMode:
+    def test_assistant_flag_sets_mode_and_enables_structured_chat(self):
+        called = {}
+
+        def fake_start_server(**kw):
+            called.update(kw)
+
+        fake_ws = MagicMock()
+        fake_ws.start_server = fake_start_server
+
+        with patch("hermes_cli.main._build_web_ui", return_value=True), \
+             patch.dict(sys.modules, {"hermes_cli.web_server": fake_ws, "fastapi": MagicMock(), "uvicorn": MagicMock()}):
+            cmd_dashboard(_ns(assistant=True, port=9120, no_open=True))
+
+        assert called["port"] == 9120
+        assert called["embedded_chat"] is True
+        assert called["mode"] == "assistant"
 
 
 class TestArgparseWiring:

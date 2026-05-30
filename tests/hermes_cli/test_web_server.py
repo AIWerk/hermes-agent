@@ -218,6 +218,53 @@ class TestWebServerEndpoints:
         # Should contain known env var names
         assert any(k.endswith("_API_KEY") or k.endswith("_TOKEN") for k in data.keys())
 
+    def test_assistant_mode_allows_chat_safe_api_and_blocks_admin_api(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_DASHBOARD_MODE", "assistant")
+
+        assert self.client.get("/api/status").status_code == 200
+        assert self.client.get("/api/sessions").status_code == 200
+        assert self.client.get("/api/model/info").status_code == 200
+        assert self.client.post("/api/assistant/attachments", files={"files": ("note.txt", b"hello", "text/plain")}).status_code == 200
+        assert self.client.get("/api/env").status_code == 404
+        assert self.client.get("/api/config").status_code == 404
+        assert self.client.get("/api/logs").status_code == 404
+
+    def test_assistant_attachment_upload_extracts_text_and_sanitizes_path(self):
+        from hermes_constants import get_hermes_home
+
+        resp = self.client.post(
+            "/api/assistant/attachments",
+            data={"session_id": "abc/../unsafe"},
+            files=[
+                ("files", ("../../note.txt", b"hello customer file", "text/plain")),
+                ("files", ("photo.png", b"\x89PNG\r\n\x1a\n", "image/png")),
+            ],
+        )
+
+        assert resp.status_code == 200
+        attachments = resp.json()["attachments"]
+        assert len(attachments) == 2
+        note = attachments[0]
+        assert note["name"] == "note.txt"
+        assert note["extracted_text"] == "hello customer file"
+        assert note["extraction"] == "text"
+        note_path = Path(note["path"]).resolve()
+        assert get_hermes_home().resolve() / "dashboard_uploads" in note_path.parents
+        assert note_path.name.endswith("note.txt")
+        image = attachments[1]
+        assert image["is_image"] is True
+        assert image["extraction"] == "image"
+
+    def test_assistant_attachment_upload_rejects_unsupported_extension(self):
+        resp = self.client.post(
+            "/api/assistant/attachments",
+            files={"files": ("bad.exe", b"nope", "application/octet-stream")},
+        )
+
+        assert resp.status_code == 415
+
     def test_reveal_env_var(self, tmp_path):
         """POST /api/env/reveal should return the real unredacted value."""
         from hermes_cli.config import save_env_value

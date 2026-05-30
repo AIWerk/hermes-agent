@@ -99,6 +99,24 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
   return res.json();
 }
 
+export async function fetchBlob(url: string, init?: RequestInit): Promise<Blob> {
+  const headers = new Headers(init?.headers);
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) {
+    setSessionHeader(headers, token);
+  }
+  const res = await fetch(`${BASE}${url}`, {
+    ...init,
+    headers,
+    credentials: init?.credentials ?? "include",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${text}`);
+  }
+  return res.blob();
+}
+
 /** Encode a plugin registry key for URL paths (preserves `/` segment separators). */
 function pluginPath(name: string): string {
   return name.split("/").map(encodeURIComponent).join("/");
@@ -176,6 +194,30 @@ export const api = {
     }),
   getSessions: (limit = 20, offset = 0) =>
     fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
+  uploadAssistantAttachments: async (files: File[], sessionId?: string) => {
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file));
+    if (sessionId) form.append("session_id", sessionId);
+    return fetchJSON<AssistantAttachmentUploadResponse>("/api/assistant/attachments", {
+      method: "POST",
+      body: form,
+    });
+  },
+  transcribeAssistantAudio: async (file: File, sessionId?: string) => {
+    const form = new FormData();
+    form.append("file", file);
+    if (sessionId) form.append("session_id", sessionId);
+    return fetchJSON<AssistantTranscriptionResponse>("/api/assistant/transcribe", {
+      method: "POST",
+      body: form,
+    });
+  },
+  synthesizeAssistantSpeech: async (text: string, sessionId?: string) =>
+    fetchBlob("/api/assistant/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, session_id: sessionId }),
+    }),
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
   getSessionLatestDescendant: (id: string) =>
@@ -547,6 +589,25 @@ export interface PaginatedSessions {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface AssistantUploadedAttachment {
+  name: string;
+  path: string;
+  type: string;
+  size: number;
+  is_image: boolean;
+  extracted_text: string;
+  extraction: string;
+}
+
+export interface AssistantAttachmentUploadResponse {
+  attachments: AssistantUploadedAttachment[];
+}
+
+export interface AssistantTranscriptionResponse {
+  text: string;
+  provider?: string;
 }
 
 export interface EnvVarInfo {

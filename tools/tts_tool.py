@@ -932,6 +932,11 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     el_config = tts_config.get("elevenlabs", {})
     voice_id = el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
     model_id = el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
+    language_code = el_config.get("language_code") or el_config.get("language")
+    if isinstance(language_code, str):
+        language_code = language_code.strip() or None
+    else:
+        language_code = None
 
     # Determine output format based on file extension
     if output_path.endswith(".ogg"):
@@ -941,12 +946,15 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
     ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key)
-    audio_generator = client.text_to_speech.convert(
-        text=text,
-        voice_id=voice_id,
-        model_id=model_id,
-        output_format=output_format,
-    )
+    convert_kwargs = {
+        "text": text,
+        "voice_id": voice_id,
+        "model_id": model_id,
+        "output_format": output_format,
+    }
+    if language_code:
+        convert_kwargs["language_code"] = language_code
+    audio_generator = client.text_to_speech.convert(**convert_kwargs)
 
     # audio_generator yields chunks -- write them all
     with open(output_path, "wb") as f:

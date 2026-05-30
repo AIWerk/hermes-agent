@@ -14,7 +14,9 @@ import hmac
 import importlib.util
 import json
 import logging
+import mimetypes
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -52,7 +54,7 @@ from gateway.status import get_running_pid, read_runtime_status
 from utils import env_var_enabled
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
@@ -64,7 +66,7 @@ except ImportError:
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
-        from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
@@ -91,6 +93,10 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 # In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
 # or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = False
+
+# Dashboard surface mode. ``admin`` is the full built-in dashboard. ``assistant``
+# serves the simplified AIWerk assistant surface and blocks admin APIs server-side.
+_DASHBOARD_MODE = "admin"
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -121,6 +127,132 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
 })
+
+_ASSISTANT_ALLOWED_API_EXACT: frozenset = frozenset({
+    "/api/status",
+    "/api/sessions",
+    "/api/model/info",
+    "/api/dashboard/themes",
+    "/api/assistant/attachments",
+    "/api/assistant/transcribe",
+    "/api/assistant/tts",
+})
+_ASSISTANT_ALLOWED_API_PREFIXES: tuple[str, ...] = (
+    "/api/sessions/",
+)
+
+# Customer UI attachment upload limits. Files are stored under HERMES_HOME only,
+# scoped by session id, and never under arbitrary user supplied paths.
+_ASSISTANT_UPLOAD_MAX_FILES = 10
+_ASSISTANT_UPLOAD_MAX_FILE_BYTES = 12 * 1024 * 1024
+_ASSISTANT_UPLOAD_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+_ASSISTANT_TEXT_EXTRACT_LIMIT = 60_000
+_ASSISTANT_UPLOAD_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".pdf", ".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".docx",
+})
+_ASSISTANT_AUDIO_EXTENSIONS = frozenset({".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
+_ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _safe_upload_component(value: str, fallback: str = "upload") -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip(".-_")
+    return (safe or fallback)[:80]
+
+
+def _assistant_upload_root() -> Path:
+    root = get_hermes_home() / "dashboard_uploads"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _decode_text_bytes(data: bytes) -> str:
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return data.decode(enc).replace("\x00", "")
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def _extract_uploaded_text(path: Path, content_type: str = "") -> tuple[str, str]:
+    """Best-effort text extraction for customer UI attachments.
+
+    Returns ``(text, note)``. Empty text is valid for binary/image files; the note
+    tells the prompt layer what happened without leaking raw bytes.
+    """
+    ext = path.suffix.lower()
+    if content_type.startswith("image/") or ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        return "", "image"
+    if ext in {".txt", ".md", ".csv", ".json", ".yaml", ".yml"} or content_type.startswith("text/"):
+        data = path.read_bytes()[: _ASSISTANT_TEXT_EXTRACT_LIMIT + 1]
+        text = _decode_text_bytes(data)[:_ASSISTANT_TEXT_EXTRACT_LIMIT]
+        return text, "text" if text else "empty"
+    if ext == ".docx":
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+
+            with zipfile.ZipFile(path) as zf:
+                xml = zf.read("word/document.xml")
+            root = ET.fromstring(xml)
+            parts = [node.text for node in root.iter() if node.text]
+            text = " ".join(parts).strip()[:_ASSISTANT_TEXT_EXTRACT_LIMIT]
+            return text, "docx" if text else "empty-docx"
+        except Exception:
+            return "", "docx-extraction-failed"
+    if ext == ".pdf":
+        try:
+            proc = subprocess.run(
+                ["pdftotext", "-layout", str(path), "-"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                text = _decode_text_bytes(proc.stdout)[:_ASSISTANT_TEXT_EXTRACT_LIMIT]
+                return text, "pdf" if text else "empty-pdf"
+        except Exception:
+            pass
+        return "", "pdf-text-extraction-unavailable"
+    return "", "binary"
+
+
+def _assistant_api_allowed(path: str) -> bool:
+    """Return True for HTTP API paths exposed in assistant mode."""
+    if path in _ASSISTANT_ALLOWED_API_EXACT:
+        return True
+    return any(path.startswith(prefix) for prefix in _ASSISTANT_ALLOWED_API_PREFIXES)
+
+
+def _assistant_mode_enabled() -> bool:
+    return _DASHBOARD_MODE == "assistant"
+
+
+def _assistant_user_display_name() -> Optional[str]:
+    """Return a sanitized display name for the customer UI bootstrap.
+
+    Never expose the full USER.md/profile content to the browser. The CUI only
+    needs a short first-name style label for local personalization.
+    """
+    user_path = get_hermes_home() / "memories" / "USER.md"
+    try:
+        text = user_path.read_text(encoding="utf-8", errors="ignore")[:16_384]
+    except OSError:
+        return None
+
+    patterns = (
+        r"^\s*([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,39})\s+is\b",
+        r"\bname\s+is\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,39})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
+        if not match:
+            continue
+        name = match.group(1).strip(" '’-\t\r\n")
+        if 1 < len(name) <= 40 and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", name):
+            return name
+    return None
 
 
 def _has_valid_session_token(request: Request) -> bool:
@@ -267,15 +399,22 @@ async def _dashboard_auth_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require the session token on /api/ routes and gate assistant-mode APIs."""
+    path = request.url.path
+    if path.startswith("/api/") and _assistant_mode_enabled() and not _assistant_api_allowed(path):
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Not found"},
+        )
+
     # When the OAuth gate is active, cookie-based auth (gated_auth_middleware
     # above) is authoritative.  The legacy _SESSION_TOKEN path is loopback-only
     # and is skipped here so the gate's session attachment isn't overridden.
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
-    path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
-        if not _has_valid_session_token(request):
+
+    if path.startswith("/api/"):
+        if path not in _PUBLIC_API_PATHS and not _has_valid_session_token(request):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Unauthorized"},
@@ -685,6 +824,155 @@ async def get_status():
         "auth_required": auth_required,
         "auth_providers": auth_providers,
     }
+
+
+@app.post("/api/assistant/attachments")
+async def upload_assistant_attachments(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    session_id: str = Form(""),
+):
+    """Store AIWerk Customer UI attachments in a session-scoped temp area."""
+    _require_token(request)
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    if len(files) > _ASSISTANT_UPLOAD_MAX_FILES:
+        raise HTTPException(status_code=413, detail="Too many files")
+
+    session_part = _safe_upload_component(session_id or "session", "session")
+    batch_part = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    target_dir = _assistant_upload_root() / session_part / batch_part
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    uploaded: List[Dict[str, Any]] = []
+    for idx, upload in enumerate(files, start=1):
+        original = Path(upload.filename or f"attachment-{idx}").name
+        safe_name = _safe_upload_component(original, f"attachment-{idx}")
+        ext = Path(safe_name).suffix.lower()
+        if ext not in _ASSISTANT_UPLOAD_EXTENSIONS:
+            raise HTTPException(status_code=415, detail=f"Unsupported file type: {original}")
+
+        data = await upload.read(_ASSISTANT_UPLOAD_MAX_FILE_BYTES + 1)
+        if len(data) > _ASSISTANT_UPLOAD_MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail=f"File too large: {original}")
+        total += len(data)
+        if total > _ASSISTANT_UPLOAD_MAX_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="Attachment batch too large")
+
+        dest = target_dir / f"{idx:02d}-{safe_name}"
+        dest.write_bytes(data)
+        try:
+            dest.chmod(0o600)
+        except Exception:
+            pass
+
+        content_type = upload.content_type or mimetypes.guess_type(dest.name)[0] or "application/octet-stream"
+        extracted_text, extraction = _extract_uploaded_text(dest, content_type)
+        uploaded.append({
+            "name": original,
+            "path": str(dest),
+            "type": content_type,
+            "size": len(data),
+            "is_image": content_type.startswith("image/"),
+            "extracted_text": extracted_text,
+            "extraction": extraction,
+        })
+
+    return {"attachments": uploaded}
+
+
+@app.post("/api/assistant/transcribe")
+async def transcribe_assistant_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: str = Form(""),
+):
+    """Transcribe one browser-recorded audio clip for the AIWerk Customer UI."""
+    _require_token(request)
+    original = Path(file.filename or "sprache.webm").name
+    safe_name = _safe_upload_component(original, "sprache.webm")
+    ext = Path(safe_name).suffix.lower()
+    if ext not in _ASSISTANT_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=415, detail=f"Unsupported audio type: {original}")
+
+    data = await file.read(_ASSISTANT_AUDIO_MAX_BYTES + 1)
+    if len(data) > _ASSISTANT_AUDIO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"Audio file too large: {original}")
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+
+    session_part = _safe_upload_component(session_id or "session", "session")
+    batch_part = f"voice-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    target_dir = _assistant_upload_root() / session_part / batch_part
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / safe_name
+    dest.write_bytes(data)
+    try:
+        dest.chmod(0o600)
+    except Exception:
+        pass
+
+    try:
+        from tools.transcription_tools import transcribe_audio
+        result = await asyncio.to_thread(transcribe_audio, str(dest))
+    except Exception as exc:
+        _log.exception("Assistant audio transcription failed")
+        raise HTTPException(status_code=500, detail="Transcription failed") from exc
+
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error") or "Transcription failed")
+    return {
+        "text": (result.get("transcript") or "").strip(),
+        "provider": result.get("provider"),
+    }
+
+
+class AssistantTTSRequest(BaseModel):
+    text: str
+    session_id: Optional[str] = None
+
+
+@app.post("/api/assistant/tts")
+async def synthesize_assistant_speech(request: Request, body: AssistantTTSRequest):
+    """Generate high-quality TTS audio for one AIWerk Customer UI answer."""
+    _require_token(request)
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    if len(text) > 4_000:
+        text = text[:4_000]
+
+    session_part = _safe_upload_component(body.session_id or "session", "session")
+    batch_part = f"tts-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    target_dir = _assistant_upload_root() / session_part / batch_part
+    target_dir.mkdir(parents=True, exist_ok=True)
+    output_path = target_dir / "answer.mp3"
+
+    try:
+        from tools.tts_tool import text_to_speech_tool
+        raw = await asyncio.to_thread(text_to_speech_tool, text, str(output_path))
+        result = json.loads(raw)
+    except Exception as exc:
+        _log.exception("Assistant speech synthesis failed")
+        raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
+
+    if not result.get("success"):
+        detail = result.get("error") or "Speech synthesis failed"
+        raise HTTPException(status_code=500, detail=detail)
+
+    file_path = Path(str(result.get("file_path") or output_path)).expanduser().resolve()
+    upload_root = _assistant_upload_root().resolve()
+    if not str(file_path).startswith(str(upload_root) + os.sep) or not file_path.exists():
+        raise HTTPException(status_code=500, detail="Speech synthesis produced no playable audio")
+
+    media_type = mimetypes.guess_type(str(file_path))[0] or "audio/mpeg"
+    return FileResponse(
+        str(file_path),
+        media_type=media_type,
+        filename=file_path.name,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3854,23 +4142,23 @@ def mount_spa(application: FastAPI):
         """
         html = _index_path.read_text()
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
+        mode = _DASHBOARD_MODE if _DASHBOARD_MODE in {"admin", "assistant"} else "admin"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        user_display_name_js = json.dumps(_assistant_user_display_name() if mode == "assistant" else None)
+        common_bootstrap = (
+            f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+            f'window.__HERMES_DASHBOARD_MODE__="{mode}";'
+            f'window.__HERMES_BASE_PATH__="{prefix}";'
+            f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+            f"window.__HERMES_USER_DISPLAY_NAME__={user_display_name_js};"
+        )
         if gated:
-            bootstrap_script = (
-                f"<script>"
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
+            bootstrap_script = f"<script>{common_bootstrap}</script>"
         else:
             bootstrap_script = (
                 f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
+                f"{common_bootstrap}</script>"
             )
         if prefix:
             # Rewrite absolute asset URLs baked into the Vite build so the
@@ -4832,12 +5120,16 @@ def start_server(
     allow_public: bool = False,
     *,
     embedded_chat: bool = False,
+    mode: str = "admin",
 ):
     """Start the web UI server."""
     import uvicorn
 
-    global _DASHBOARD_EMBEDDED_CHAT_ENABLED
-    _DASHBOARD_EMBEDDED_CHAT_ENABLED = embedded_chat
+    global _DASHBOARD_EMBEDDED_CHAT_ENABLED, _DASHBOARD_MODE
+    if mode not in {"admin", "assistant"}:
+        raise SystemExit(f"Unsupported dashboard mode: {mode}")
+    _DASHBOARD_MODE = mode
+    _DASHBOARD_EMBEDDED_CHAT_ENABLED = embedded_chat or mode == "assistant"
 
     # Phase 0: stash the auth-gate flag on app.state so middleware / SPA-token
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5
@@ -4941,14 +5233,15 @@ def start_server(
                 "(headless Linux). Pass --no-open to suppress this detection."
             )
 
-    print(f"  Hermes Web UI → http://{host}:{port}")
+    display_name = "AIWerk Customer UI" if _DASHBOARD_MODE == "assistant" else "Hermes dashboard"
+    print(f"  {display_name} ({_DASHBOARD_MODE}) → http://{host}:{port}")
     # proxy_headers defaults to False so _ws_client_is_allowed sees the real
-    # connection peer rather than X-Forwarded-For's rewritten value (which
-    # would defeat the loopback gate when behind a reverse proxy).  When the
-    # OAuth gate is active we are explicitly running behind a TLS terminator
-    # (Fly.io) and need X-Forwarded-Proto to decide cookie Secure flags, so
-    # we flip proxy_headers on for that mode.
+    # connection peer rather than X-Forwarded-For's rewritten value. When the
+    # OAuth gate is active we need X-Forwarded-Proto for secure cookie handling.
     uvicorn.run(
-        app, host=host, port=port, log_level="warning",
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
         proxy_headers=bool(app.state.auth_required),
     )

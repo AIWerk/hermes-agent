@@ -68,6 +68,7 @@ import ProfilesPage from "@/pages/ProfilesPage";
 import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import ChatPage from "@/pages/ChatPage";
+import AiwerkAssistantPage from "@/pages/AiwerkAssistantPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -75,7 +76,10 @@ import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import {
+  isAssistantDashboardMode,
+  isDashboardEmbeddedChatEnabled,
+} from "@/lib/dashboard-flags";
 import { api } from "@/lib/api";
 
 function RootRedirect() {
@@ -307,6 +311,10 @@ function buildRoutes(
 }
 
 export default function App() {
+  return isAssistantDashboardMode() ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
+}
+
+function AdminDashboardApp() {
   const { t } = useI18n();
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();

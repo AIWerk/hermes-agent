@@ -149,6 +149,8 @@ _LONG_HANDLERS = frozenset(
         "browser.manage",
         "cli.exec",
         "session.branch",
+        "session.side.back",
+        "session.side.start",
         "session.compress",
         "session.resume",
         "shell.exec",
@@ -1434,6 +1436,7 @@ def _session_info(agent) -> dict:
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
     info: dict = {
+        "session_id": getattr(agent, "session_id", ""),
         "model": getattr(agent, "model", ""),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
@@ -2001,6 +2004,65 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     return info
 
 
+def _switch_live_session(
+    sid: str,
+    session: dict,
+    target_session_id: str,
+    history: list,
+    *,
+    reason: str,
+) -> dict:
+    """Move the gateway's live agent/session state to another DB session."""
+    old_key = session.get("session_key") or ""
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        if old_key:
+            unregister_gateway_notify(old_key)
+    except Exception:
+        pass
+    session["session_key"] = target_session_id
+    session["pending_title"] = None
+    info = _reset_session_agent(sid, session)
+    with session["history_lock"]:
+        session["history"] = list(history or [])
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        session["running"] = False
+        _clear_inflight_turn(session)
+    agent = session.get("agent")
+    try:
+        if agent is not None and hasattr(agent, "_invalidate_system_prompt"):
+            agent._invalidate_system_prompt()
+    except Exception:
+        pass
+    try:
+        _notify_session_boundary("on_session_reset", target_session_id)
+    except Exception:
+        pass
+    _emit(
+        "session.switched",
+        sid,
+        {"session_id": target_session_id, "reason": reason, "info": info},
+    )
+    return info
+
+
+def _commit_gateway_session_boundary(session: dict, session_id: str) -> None:
+    agent = session.get("agent")
+    with session["history_lock"]:
+        history = list(session.get("history", []))
+    if agent is not None and history and hasattr(agent, "commit_memory_session"):
+        try:
+            agent.commit_memory_session(history)
+        except Exception:
+            pass
+    _notify_session_boundary("on_session_finalize", session_id)
+
+
+def _side_source() -> str:
+    return os.environ.get("HERMES_SESSION_SOURCE", "tui")
+
+
 def _make_agent(sid: str, key: str, session_id: str | None = None):
     from run_agent import AIAgent
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -2171,6 +2233,63 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     return text or "What do you see in this image?"
 
 
+_DASHBOARD_UPLOAD_ROOT = (_hermes_home / "dashboard_uploads").resolve()
+_ATTACHMENT_CONTEXT_LIMIT = 60_000
+_IMAGE_ATTACHMENT_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+
+
+def _attachment_path_allowed(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        return resolved == _DASHBOARD_UPLOAD_ROOT or _DASHBOARD_UPLOAD_ROOT in resolved.parents
+    except Exception:
+        return False
+
+
+def _attachment_text_block(name: str, path: Path, text: str, note: str = "") -> str:
+    header = f"[Attached file: {name}\nPath: {path}"
+    if note:
+        header += f"\nNote: {note}"
+    if text.strip():
+        clipped = text[:_ATTACHMENT_CONTEXT_LIMIT]
+        if len(text) > _ATTACHMENT_CONTEXT_LIMIT:
+            clipped += "\n[Attachment text truncated]"
+        return f"{header}\nContent:\n{clipped}\n]"
+    return f"{header}\nContent was not extracted automatically. The file is available at the path above.]"
+
+
+def _process_prompt_attachments(attachments: Any) -> tuple[list[str], str]:
+    """Validate uploaded Customer UI attachments and build prompt context."""
+    if not isinstance(attachments, list):
+        return [], ""
+    image_paths: list[str] = []
+    file_blocks: list[str] = []
+    for item in attachments[:10]:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        if not _attachment_path_allowed(path) or not path.exists() or not path.is_file():
+            continue
+        name = str(item.get("name") or path.name)
+        mime = str(item.get("type") or "")
+        if mime.startswith("image/") or path.suffix.lower() in _IMAGE_ATTACHMENT_EXTENSIONS:
+            image_paths.append(str(path))
+            continue
+        text = str(item.get("extracted_text") or "")
+        note = str(item.get("extraction") or "")
+        if not text and path.suffix.lower() in {".txt", ".md", ".csv", ".json", ".yaml", ".yml"}:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")[:_ATTACHMENT_CONTEXT_LIMIT]
+                note = note or "text"
+            except Exception:
+                note = note or "text-read-failed"
+        file_blocks.append(_attachment_text_block(name, path, text, note))
+    return image_paths, "\n\n".join(file_blocks)
+
+
 def _content_display_text(content: Any) -> str:
     if content is None:
         return ""
@@ -2301,6 +2420,13 @@ def _(rid, params: dict) -> dict:
     ready = threading.Event()
     now = time.time()
 
+    try:
+        db = _get_db()
+        if db is not None and not db.get_session(key):
+            db.create_session(session_id=key, source=_side_source(), model=_resolve_model())
+    except Exception:
+        logger.exception("failed to pre-create TUI session row")
+
     _sessions[sid] = {
         "agent": None,
         "agent_error": None,
@@ -2342,7 +2468,9 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "session_id": sid,
+            "session_key": key,
             "info": {
+                "session_id": key,
                 "model": _resolve_model(),
                 "tools": {},
                 "skills": {},
@@ -2486,6 +2614,120 @@ def _(rid, params: dict) -> dict:
             "info": _session_info(agent),
         },
     )
+
+
+@method("session.side.start")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = params.get("session_id", "")
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+    wait_err = _wait_agent(session, rid)
+    if wait_err:
+        return wait_err
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    parent_session_id = session.get("session_key") or sid
+    side_session_id = _new_session_key()
+    source = _side_source()
+    raw_title = str(params.get("title") or "").strip()
+    title = None
+    try:
+        if raw_title:
+            from hermes_state import SessionDB
+
+            title = SessionDB.sanitize_title(raw_title)
+        agent = session.get("agent")
+        _commit_gateway_session_boundary(session, parent_session_id)
+        if not db.get_session(parent_session_id):
+            db.create_session(
+                session_id=parent_session_id,
+                source=source,
+                model=getattr(agent, "model", _resolve_model()) if agent else _resolve_model(),
+            )
+        db.end_session(parent_session_id, "side_session")
+        db.create_session(
+            session_id=side_session_id,
+            source=source,
+            model=getattr(agent, "model", _resolve_model()) if agent else _resolve_model(),
+            model_config={
+                "max_iterations": getattr(agent, "max_iterations", None),
+                "reasoning_config": getattr(agent, "reasoning_config", None),
+            } if agent else None,
+            parent_session_id=parent_session_id,
+        )
+        if title:
+            db.set_session_title(side_session_id, title)
+        db.push_side_session(
+            source=source,
+            parent_session_id=parent_session_id,
+            side_session_id=side_session_id,
+            title=title,
+        )
+        info = _switch_live_session(sid, session, side_session_id, [], reason="side")
+        return _ok(
+            rid,
+            {
+                "mode": "side",
+                "parent_session_id": parent_session_id,
+                "side_session_id": side_session_id,
+                "title": title or "",
+                "info": info,
+            },
+        )
+    except ValueError as e:
+        return _err(rid, 4007, str(e))
+    except Exception as e:
+        return _err(rid, 5006, f"side session start failed: {e}")
+
+
+@method("session.side.back")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = params.get("session_id", "")
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+    wait_err = _wait_agent(session, rid)
+    if wait_err:
+        return wait_err
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    source = _side_source()
+    current_session_id = session.get("session_key") or sid
+    try:
+        entry = db.pop_side_session(source=source)
+        if not entry:
+            return _ok(rid, {"mode": "main", "returned": False})
+        parent_session_id = entry["parent_session_id"]
+        side_session_id = entry["side_session_id"]
+        _commit_gateway_session_boundary(session, current_session_id)
+        db.end_session(side_session_id, "side_session_returned")
+        db.reopen_session(parent_session_id)
+        restored = db.get_messages_as_conversation(parent_session_id)
+        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        info = _switch_live_session(sid, session, parent_session_id, restored, reason="back")
+        return _ok(
+            rid,
+            {
+                "mode": "main",
+                "returned": True,
+                "parent_session_id": parent_session_id,
+                "side_session_id": side_session_id,
+                "message_count": len(restored),
+                "messages": _history_to_messages(restored),
+                "info": info,
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5006, f"side session return failed: {e}")
 
 
 def _session_pending_kind(sid: str) -> str:
@@ -2726,20 +2968,83 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5007, str(e))
 
 
+@method("session.notes")
+def _(rid, params: dict) -> dict:
+    """Return the live incremental notes snapshot for the active session."""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    session = session or {}
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5007)
+
+    key = session.get("session_key") or params.get("session_id") or ""
+    try:
+        events = db.get_session_events(key, limit=int(params.get("limit") or 12)) or []
+    except Exception:
+        events = []
+    try:
+        scratchpad = db.get_session_scratchpad(key) or {}
+    except Exception:
+        scratchpad = {}
+    try:
+        summary = db.get_session_summary(key) or None
+    except Exception:
+        summary = None
+    try:
+        title = db.get_session_title(key) or session.get("pending_title") or ""
+    except Exception:
+        title = session.get("pending_title") or ""
+
+    return _ok(
+        rid,
+        {
+            "session_key": key,
+            "title": title,
+            "scratchpad": scratchpad,
+            "events": events,
+            "summary": summary,
+            "event_count": len(events),
+        },
+    )
+
+
 @method("session.usage")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
     agent = session.get("agent")
-    return _ok(
-        rid,
-        (
-            _get_usage(agent)
-            if agent is not None
-            else {"calls": 0, "input": 0, "output": 0, "total": 0}
-        ),
+    usage = (
+        _get_usage(agent)
+        if agent is not None
+        else {"calls": 0, "input": 0, "output": 0, "total": 0}
     )
+    if agent is not None:
+        try:
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            comp = getattr(agent, "context_compressor", None)
+            ctx_max = int(getattr(comp, "context_length", 0) or usage.get("context_max") or 0)
+            lock = session.get("history_lock")
+            if lock is not None:
+                with lock:
+                    history = list(session.get("history", []))
+            else:
+                history = list(session.get("history", []))
+            ctx_used = estimate_request_tokens_rough(
+                history,
+                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+                tools=getattr(agent, "tools", None) or None,
+            )
+            if ctx_max > 0:
+                usage["context_used"] = max(0, int(ctx_used))
+                usage["context_max"] = ctx_max
+                usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
+        except Exception:
+            pass
+    return _ok(rid, usage)
 
 
 @method("session.status")
@@ -3339,12 +3644,17 @@ def _(rid, params: dict) -> dict:
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
+    uploaded_images, attachment_context = _process_prompt_attachments(params.get("attachments"))
+    if attachment_context:
+        text = f"{text}\n\n{attachment_context}" if str(text).strip() else attachment_context
     session, err = _sess_nowait(params, rid)
     if err:
         return err
     with session["history_lock"]:
         if session.get("running"):
             return _err(rid, 4009, "session busy")
+        if uploaded_images:
+            session.setdefault("attached_images", []).extend(uploaded_images)
         session["running"] = True
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
@@ -3754,12 +4064,16 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 try:
                     from agent.title_generator import maybe_auto_title
 
+                    def _notify_title_update(_title: str) -> None:
+                        _emit("session.title", sid, {"title": _title})
+
                     maybe_auto_title(
                         _get_db(),
                         session.get("session_key") or sid,
                         text,
                         raw,
                         session.get("history", []),
+                        title_callback=_notify_title_update,
                     )
                 except Exception:
                     pass
@@ -4243,6 +4557,16 @@ def _(rid, params: dict) -> dict:
 
     if key == "yolo":
         try:
+            raw = str(value or "toggle").strip().lower()
+            if raw in {"1", "on", "true", "yes", "yolo"}:
+                target = True
+            elif raw in {"0", "off", "false", "no", "ask", "approval", "approvals"}:
+                target = False
+            elif raw in {"", "toggle"}:
+                target = None
+            else:
+                return _err(rid, 4002, f"unknown yolo mode: {value}")
+
             if session:
                 from tools.approval import (
                     disable_session_yolo,
@@ -4251,21 +4575,19 @@ def _(rid, params: dict) -> dict:
                 )
 
                 current = is_session_yolo_enabled(session["session_key"])
-                if current:
-                    disable_session_yolo(session["session_key"])
-                    nv = "0"
-                else:
+                enabled = (not current) if target is None else target
+                if enabled:
                     enable_session_yolo(session["session_key"])
-                    nv = "1"
+                else:
+                    disable_session_yolo(session["session_key"])
             else:
                 current = is_truthy_value(os.environ.get("HERMES_YOLO_MODE"))
-                if current:
-                    os.environ.pop("HERMES_YOLO_MODE", None)
-                    nv = "0"
-                else:
+                enabled = (not current) if target is None else target
+                if enabled:
                     os.environ["HERMES_YOLO_MODE"] = "1"
-                    nv = "1"
-            return _ok(rid, {"key": key, "value": nv})
+                else:
+                    os.environ.pop("HERMES_YOLO_MODE", None)
+            return _ok(rid, {"key": key, "value": "on" if enabled else "off"})
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -4564,6 +4886,18 @@ def _(rid, params: dict) -> dict:
         )
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
+    if key == "yolo":
+        session = _sessions.get(params.get("session_id", ""))
+        try:
+            if session:
+                from tools.approval import is_session_yolo_enabled
+
+                enabled = is_session_yolo_enabled(session["session_key"])
+            else:
+                enabled = is_truthy_value(os.environ.get("HERMES_YOLO_MODE"))
+            return _ok(rid, {"value": "on" if enabled else "off"})
+        except Exception as e:
+            return _err(rid, 5001, str(e))
     if key == "details_mode":
         allowed_dm = frozenset({"hidden", "collapsed", "expanded"})
         raw = (
