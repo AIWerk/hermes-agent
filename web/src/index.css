@@ -213,6 +213,31 @@ code { font-size: 0.875rem; }
   font-family: var(--theme-font-mono);
 }
 
+/* AIWerk CUI assistant bubbles render lightweight markdown inside a warm
+   light chat surface. Override the dashboard-global markdown utility colors
+   so **bold**, lists, and links inherit the customer UI bubble palette instead
+   of the dark admin dashboard theme. */
+.aiwerk-message-markdown,
+.aiwerk-message-markdown .text-foreground {
+  color: inherit;
+}
+.aiwerk-message-markdown > div {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+.aiwerk-message-markdown strong {
+  font-weight: 700;
+}
+.aiwerk-message-markdown a {
+  color: #5f4f36;
+  text-decoration-color: rgba(95, 79, 54, 0.35);
+}
+.aiwerk-message-markdown code {
+  background: rgba(255, 250, 242, 0.65);
+  color: #4f4436;
+}
+
 /* Subtle grain overlay for badges. */
 .grain {
   position: relative;

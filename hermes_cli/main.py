@@ -10754,12 +10754,14 @@ def cmd_dashboard(args):
     from hermes_cli.web_server import start_server
 
     embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+    assistant_mode = bool(getattr(args, "assistant", False))
     start_server(
         host=args.host,
         port=args.port,
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
-        embedded_chat=embedded_chat,
+        embedded_chat=embedded_chat or assistant_mode,
+        mode="assistant" if assistant_mode else "admin",
     )
 
 
@@ -13853,6 +13855,14 @@ Examples:
         help=(
             "Expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket). "
             "Alternatively set HERMES_DASHBOARD_TUI=1."
+        ),
+    )
+    dashboard_parser.add_argument(
+        "--assistant",
+        action="store_true",
+        help=(
+            "Serve the simplified AIWerk Customer UI surface and block "
+            "admin-only APIs. Recommended with --port 9120."
         ),
     )
     dashboard_parser.add_argument(
