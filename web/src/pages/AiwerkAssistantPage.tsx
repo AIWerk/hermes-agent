@@ -1,10 +1,10 @@
-import { FileText, Image as ImageIcon, Mic, Paperclip, Pencil, Square, Volume2, VolumeX, X } from "lucide-react";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, Mail, Mic, Paperclip, Pencil, PlugZap, RefreshCw, Square, Volume2, VolumeX, X } from "lucide-react";
+import { Fragment, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
-import { api, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
+import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantResourcesResponse, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -58,6 +58,66 @@ interface RecentSession {
   preview?: string | null;
 }
 
+function recentSessionDisplayTitle(session: RecentSession): string {
+  const title = session.title?.trim();
+  if (title) return title;
+  const preview = session.preview?.trim();
+  if (preview) return `Unbenannte Sitzung · ${preview}`;
+  return "Unbenannte Sitzung";
+}
+
+const RESOURCE_STATUS_COPY: Record<AssistantResourceStatus, { label: string; dot: string }> = {
+  connected: { label: "Verbunden", dot: "#7bcf91" },
+  limited: { label: "Eingeschränkt", dot: "#d7b98e" },
+  auth_required: { label: "Anmeldung nötig", dot: "#d7b98e" },
+  not_configured: { label: "Nicht eingerichtet", dot: "#b7ad9c" },
+  error: { label: "Fehler", dot: "#c98b7a" },
+};
+
+function resourceStatusCopy(status?: AssistantResourceStatus): { label: string; dot: string } {
+  return RESOURCE_STATUS_COPY[status ?? "not_configured"] ?? RESOURCE_STATUS_COPY.not_configured;
+}
+
+function formatResourceTime(value?: string | null): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("de-CH", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function openSharedFolderCloudUrl(url?: string | null): void {
+  if (!url) return;
+  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  if (opened) opened.opener = null;
+}
+
+function openSharedFolderFile(item: AssistantSharedFolderItem): void {
+  if (!item.open_url) return;
+  const opened = window.open("about:blank", "_blank");
+  if (!opened) return;
+  opened.opener = null;
+  opened.document.title = item.name;
+  opened.document.body.textContent = "Datei wird geöffnet…";
+
+  const headers = new Headers();
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) headers.set("X-Hermes-Session-Token", token);
+
+  fetch(`${HERMES_BASE_PATH}${item.open_url}`, { headers, credentials: "include" })
+    .then((response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.blob();
+    })
+    .then((blob) => {
+      const objectUrl = URL.createObjectURL(blob);
+      opened.location.href = objectUrl;
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    })
+    .catch(() => {
+      opened.document.body.textContent = "Datei konnte nicht geöffnet werden.";
+    });
+}
+
 interface SessionNotesSnapshot {
   title?: string | null;
   scratchpad?: {
@@ -95,6 +155,11 @@ type RuntimeBadgeId = "busy" | "reasoning" | "fast" | "approvals";
 type ConversationMode = "main" | "side";
 const ACTIVE_SESSION_STORAGE_KEY = "aiwerk-cui.active-session-id";
 const READ_ALOUD_STORAGE_KEY = "aiwerk-cui.read-aloud-enabled";
+const RIGHT_RAIL_WIDTH_STORAGE_KEY = "aiwerk-cui.right-rail-width";
+const RIGHT_RAIL_DEFAULT_WIDTH = 340;
+const RIGHT_RAIL_MIN_WIDTH = 280;
+const RIGHT_RAIL_MAX_WIDTH = 560;
+const COMPRESS_CONTEXT_PERCENT_THRESHOLD = 45;
 
 interface RuntimeBadge {
   id: RuntimeBadgeId;
@@ -128,12 +193,25 @@ function toolCallsFromGateway(history?: GatewayHistoryMessage[]): ToolCallSummar
     });
 }
 
+interface SessionInflightTurn {
+  assistant?: string;
+  streaming?: boolean;
+  user?: string;
+}
+
 interface SessionOpenResult {
   session_id: string;
   session_key?: string;
   resumed?: string;
   messages?: GatewayHistoryMessage[];
   info?: { session_id?: string };
+  running?: boolean;
+  status?: string;
+  inflight?: SessionInflightTurn | null;
+}
+
+function persistentSessionIdFromOpenResult(result: SessionOpenResult): string {
+  return result.resumed || result.session_key || result.info?.session_id || result.session_id || "";
 }
 
 function readStoredSessionId(): string {
@@ -159,6 +237,29 @@ function readStoredReadAloudEnabled(): boolean {
     return window.localStorage.getItem(READ_ALOUD_STORAGE_KEY) === "true";
   } catch {
     return false;
+  }
+}
+
+function clampRightRailWidth(value: number): number {
+  return Math.max(RIGHT_RAIL_MIN_WIDTH, Math.min(RIGHT_RAIL_MAX_WIDTH, Math.round(value)));
+}
+
+function readStoredRightRailWidth(): number {
+  try {
+    const raw = window.localStorage.getItem(RIGHT_RAIL_WIDTH_STORAGE_KEY);
+    if (!raw) return RIGHT_RAIL_DEFAULT_WIDTH;
+    const stored = Number(raw);
+    return Number.isFinite(stored) ? clampRightRailWidth(stored) : RIGHT_RAIL_DEFAULT_WIDTH;
+  } catch {
+    return RIGHT_RAIL_DEFAULT_WIDTH;
+  }
+}
+
+function storeRightRailWidth(width: number): void {
+  try {
+    window.localStorage.setItem(RIGHT_RAIL_WIDTH_STORAGE_KEY, String(clampRightRailWidth(width)));
+  } catch {
+    // Ignore storage failures; resizing still works for the current page.
   }
 }
 
@@ -210,6 +311,21 @@ function messagesFromGateway(history?: GatewayHistoryMessage[]): ChatMessage[] {
     }
   }
   return mapped.length > 0 ? mapped : [welcomeMessage()];
+}
+
+function messagesWithInflight(history?: GatewayHistoryMessage[], inflight?: SessionInflightTurn | null): ChatMessage[] {
+  const base = messagesFromGateway(history);
+  if (!inflight || !inflight.streaming) return base;
+  const user = inflight.user?.trim() || "";
+  const assistant = inflight.assistant || "";
+  const next = base[0]?.id === "welcome" && user ? [] : [...base];
+  if (user && next[next.length - 1]?.text !== user) {
+    next.push({ id: newId("resume-inflight-user"), role: "user", text: user, status: "complete" });
+  }
+  if (assistant) {
+    next.push({ id: newId("resume-inflight-agent"), role: "agent", text: assistant, status: "streaming" });
+  }
+  return next.length > 0 ? next : base;
 }
 
 function toolDisclosureInsertIndex(messages: ChatMessage[], tools: ToolCallSummary[]): number | null {
@@ -473,6 +589,7 @@ function upsertToolCall(
 export default function AiwerkAssistantPage() {
   const gatewayRef = useRef<GatewayClient | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
+  const contentGridRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceStreamRef = useRef<MediaStream | null>(null);
@@ -503,16 +620,22 @@ export default function AiwerkAssistantPage() {
   const [liveNotes, setLiveNotes] = useState<SessionNotesSnapshot | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({});
   const [modelInfo, setModelInfo] = useState<ModelInfoResponse | null>(null);
+  const [resourceSummary, setResourceSummary] = useState<AssistantResourcesResponse | null>(null);
+  const [resourcesLoading, setResourcesLoading] = useState(false);
+  const [resourcesError, setResourcesError] = useState<string | null>(null);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [activeStatusModal, setActiveStatusModal] = useState<RuntimeBadgeId | null>(null);
   const [conversationMode, setConversationMode] = useState<ConversationMode>("main");
   const [busy, setBusy] = useState(false);
+  const [isCompressing, setIsCompressing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<AttachmentPreview[]>([]);
   const [draggingAttachment, setDraggingAttachment] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceInputState>("idle");
   const [voiceSeconds, setVoiceSeconds] = useState(0);
   const [readAloudEnabled, setReadAloudEnabled] = useState(() => readStoredReadAloudEnabled());
+  const [rightRailWidth, setRightRailWidth] = useState(() => readStoredRightRailWidth());
+  const [isResizingRightRail, setIsResizingRightRail] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [sessionTitleBubble, setSessionTitleBubble] = useState<SessionTitleBubble | null>(null);
@@ -525,6 +648,41 @@ export default function AiwerkAssistantPage() {
   const showToast = useCallback((text: string) => {
     setToast(text);
     window.setTimeout(() => setToast(null), 1800);
+  }, []);
+
+  const startRightRailResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!contentGridRef.current) return;
+    event.preventDefault();
+    const pointerId = event.pointerId;
+    event.currentTarget.setPointerCapture(pointerId);
+    setIsResizingRightRail(true);
+
+    const updateWidth = (clientX: number) => {
+      const rect = contentGridRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const nextWidth = clampRightRailWidth(rect.right - clientX - 12);
+      setRightRailWidth(nextWidth);
+      storeRightRailWidth(nextWidth);
+    };
+
+    updateWidth(event.clientX);
+
+    const handleMove = (moveEvent: PointerEvent) => updateWidth(moveEvent.clientX);
+    const handleUp = () => {
+      setIsResizingRightRail(false);
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp, { once: true });
+    window.addEventListener("pointercancel", handleUp, { once: true });
+  }, []);
+
+  const resetRightRailWidth = useCallback(() => {
+    setRightRailWidth(RIGHT_RAIL_DEFAULT_WIDTH);
+    storeRightRailWidth(RIGHT_RAIL_DEFAULT_WIDTH);
   }, []);
 
   const stopReadAloud = useCallback(() => {
@@ -810,6 +968,17 @@ export default function AiwerkAssistantPage() {
   const foldedTabHelp = conversationMode === "side"
     ? "Nebenfrage schliessen"
     : "Nebenfrage starten";
+  const canCompress = Boolean(
+    sessionId
+    && connection === "open"
+    && conversationMode === "main"
+    && !busy
+    && !isCompressing
+    && (contextUsage?.percent ?? 0) >= COMPRESS_CONTEXT_PERCENT_THRESHOLD,
+  );
+  const compressHelp = canCompress
+    ? "Kontext jetzt komprimieren"
+    : `Komprimieren wird aktiv ab ca. ${COMPRESS_CONTEXT_PERCENT_THRESHOLD}% Kontextbelegung; automatisch komprimiert Hermes erst später.`;
 
   const refreshRuntimeStatus = useCallback(async (gateway: GatewayClient, sid: string) => {
     const [busyResult, reasoningResult, fastResult, yoloResult] = await Promise.allSettled([
@@ -850,6 +1019,61 @@ export default function AiwerkAssistantPage() {
       if (notesResult.value.title?.trim()) setSessionTitle(notesResult.value.title.trim());
     }
   }, []);
+
+  const refreshRecentSessions = useCallback(async (pinnedSession?: RecentSession) => {
+    const pinSession = (sessions: RecentSession[]) => {
+      if (!pinnedSession?.id) return sessions.slice(0, 10);
+      const withoutDuplicate = sessions.filter((session) => session.id !== pinnedSession.id);
+      return [pinnedSession, ...withoutDuplicate].slice(0, 10);
+    };
+    try {
+      const res = await api.getSessions(10, 0, { excludeSources: ["cron"] });
+      setRecentSessions(pinSession(res.sessions ?? []));
+    } catch {
+      if (pinnedSession?.id) setRecentSessions((current) => pinSession(current));
+    }
+  }, []);
+
+  const refreshResources = useCallback(async () => {
+    setResourcesLoading(true);
+    try {
+      const resources = await api.getAssistantResources();
+      setResourceSummary(resources);
+      setResourcesError(null);
+    } catch (e) {
+      setResourcesError(e instanceof Error ? e.message : "Ressourcen konnten nicht geladen werden.");
+    } finally {
+      setResourcesLoading(false);
+    }
+  }, []);
+
+  const reloadMcpServers = useCallback(async () => {
+    const gateway = gatewayRef.current;
+    if (!gateway || !sessionId) {
+      showToast("MCP-Reload nicht verbunden");
+      return;
+    }
+    showToast("MCP-Server werden neu geladen…");
+    try {
+      await gateway.request("slash.exec", { session_id: sessionId, command: "reload-mcp" }, 120_000);
+      window.setTimeout(() => void refreshResources(), 400);
+      window.setTimeout(() => void refreshResources(), 1800);
+      showToast("MCP-Server neu geladen");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      showToast("MCP-Reload fehlgeschlagen");
+      throw e;
+    }
+  }, [refreshResources, sessionId, showToast]);
+
+  useEffect(() => {
+    const initial = window.setTimeout(() => void refreshResources(), 0);
+    const timer = window.setInterval(() => void refreshResources(), 120_000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, [refreshResources]);
 
   const editSessionTitle = useCallback(async () => {
     const gateway = gatewayRef.current;
@@ -1016,7 +1240,7 @@ export default function AiwerkAssistantPage() {
           result = await gateway.request<SessionOpenResult>("session.create", { cols: 100 });
         }
         if (!cancelled) {
-          const persistentSessionId = result.resumed || result.session_key || result.info?.session_id || "";
+          const persistentSessionId = persistentSessionIdFromOpenResult(result);
           setSessionId(result.session_id);
           setActiveSessionKey(persistentSessionId || result.session_id);
           storeActiveSessionId(persistentSessionId);
@@ -1029,7 +1253,9 @@ export default function AiwerkAssistantPage() {
           setSideMessages([]);
           setSideToolCalls([]);
           setToolCalls(result.resumed ? toolCallsFromGateway(result.messages) : []);
-          setMessages(result.resumed ? messagesFromGateway(result.messages) : [welcomeMessage()]);
+          setMessages(result.resumed ? messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()]);
+          setBusy(Boolean(result.running || result.status === "working" || result.status === "waiting" || result.inflight?.streaming));
+          if (result.inflight?.streaming) activeTurnModeRef.current = "main";
           void refreshSessionMeta(gateway, result.session_id);
           void refreshRuntimeStatus(gateway, result.session_id);
           void refreshContextUsage(gateway, result.session_id);
@@ -1044,7 +1270,7 @@ export default function AiwerkAssistantPage() {
 
     void connect();
     api
-      .getSessions(10, 0)
+      .getSessions(10, 0, { excludeSources: ["cron"] })
       .then((res) => {
         if (!cancelled) setRecentSessions((res.sessions ?? []).slice(0, 10));
       })
@@ -1077,13 +1303,16 @@ export default function AiwerkAssistantPage() {
   const loadRecentSession = useCallback(async (session: RecentSession) => {
     const gateway = gatewayRef.current;
     const selectedSessionId = session.id;
-    const title = session.title?.trim() || selectedSessionId;
+    const title = recentSessionDisplayTitle(session);
     setError(null);
     setBusy(false);
+    setIsCompressing(false);
     stopReadAloud();
     try {
       let runtimeSessionId = selectedSessionId;
       let history: GatewayHistoryMessage[] | undefined;
+      let inflight: SessionInflightTurn | null | undefined;
+      let resumedRunning = false;
       if (gateway) {
         const result = await gateway.request<SessionOpenResult>(
           "session.resume",
@@ -1092,6 +1321,8 @@ export default function AiwerkAssistantPage() {
         );
         runtimeSessionId = result.session_id || selectedSessionId;
         history = result.messages;
+        inflight = result.inflight;
+        resumedRunning = Boolean(result.running || result.status === "working" || result.status === "waiting" || result.inflight?.streaming);
       }
       if (!history) {
         const result = await api.getSessionMessages(selectedSessionId);
@@ -1120,7 +1351,9 @@ export default function AiwerkAssistantPage() {
       setSideMessages([]);
       setSideToolCalls([]);
       setToolCalls(toolCallsFromGateway(history));
-      setMessages(messagesFromGateway(history));
+      setMessages(messagesWithInflight(history, inflight));
+      setBusy(resumedRunning);
+      if (inflight?.streaming) activeTurnModeRef.current = "main";
       if (gateway) {
         void refreshSessionMeta(gateway, runtimeSessionId);
         void refreshRuntimeStatus(gateway, runtimeSessionId);
@@ -1132,6 +1365,56 @@ export default function AiwerkAssistantPage() {
       showToast("Session konnte nicht geladen werden");
     }
   }, [refreshContextUsage, refreshRuntimeStatus, refreshSessionMeta, showToast, stopReadAloud]);
+
+  const startNewSession = useCallback(async () => {
+    const gateway = gatewayRef.current;
+    if (!gateway) return;
+    setError(null);
+    setBusy(false);
+    setIsCompressing(false);
+    stopReadAloud();
+    try {
+      const result = await gateway.request<SessionOpenResult>("session.create", { cols: 100 }, 30_000);
+      const persistentSessionId = persistentSessionIdFromOpenResult(result);
+      const nextSessionId = result.session_id;
+      const activeId = persistentSessionId || nextSessionId;
+      setSessionId(nextSessionId);
+      sessionIdRef.current = nextSessionId;
+      setActiveSessionKey(activeId);
+      storeActiveSessionId(activeId);
+      setMessages([welcomeMessage()]);
+      setSessionTitle("Neue Unterhaltung");
+      setLiveNotes(null);
+      setContextUsage(null);
+      setConversationMode("main");
+      conversationModeRef.current = "main";
+      activeTurnModeRef.current = "main";
+      activeToolAnchorRef.current = undefined;
+      activeSideToolAnchorRef.current = undefined;
+      setActiveTurnMode("main");
+      setInput("");
+      setSideInput("");
+      setSideMessages([]);
+      setSideToolCalls([]);
+      setToolCalls([]);
+      setApprovals([]);
+      setActiveStatusModal(null);
+      setAttachedFiles([]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      setRecentSessions((current) => {
+        if (!activeId) return current;
+        const withoutDuplicate = current.filter((session) => session.id !== activeId);
+        return [{ id: activeId, title: "Neue Unterhaltung" }, ...withoutDuplicate].slice(0, 10);
+      });
+      void refreshRuntimeStatus(gateway, nextSessionId);
+      void refreshContextUsage(gateway, nextSessionId);
+      void refreshRecentSessions(activeId ? { id: activeId, title: "Neue Unterhaltung" } : undefined);
+      showToast("Neue Unterhaltung gestartet");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      showToast("Neue Unterhaltung konnte nicht gestartet werden");
+    }
+  }, [refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, showToast, stopReadAloud]);
 
   const submit = async (target: ConversationMode = conversationModeRef.current) => {
     const text = (target === "side" ? sideInput : input).trim();
@@ -1254,31 +1537,45 @@ export default function AiwerkAssistantPage() {
 
   const sendSlash = async (command: string, label: string) => {
     const gateway = gatewayRef.current;
-    showToast(label);
     if (command === "/side") {
+      showToast(label);
       void startSideSession();
       return;
     }
     if (command === "/back") {
+      showToast(label);
       void returnFromSideSession();
       return;
     }
     if (command === "/new") {
-      storeActiveSessionId(null);
-      setActiveSessionKey(null);
-      setMessages([welcomeMessage()]);
-      setSessionTitle("Neue Unterhaltung");
-      setLiveNotes(null);
-      setConversationMode("main");
-      conversationModeRef.current = "main";
-      activeTurnModeRef.current = "main";
-      activeToolAnchorRef.current = undefined;
-      activeSideToolAnchorRef.current = undefined;
-      setActiveTurnMode("main");
-      setSideMessages([]);
-      setSideToolCalls([]);
-      setToolCalls([]);
+      void startNewSession();
+      return;
     }
+    if (command === "/compress") {
+      if (!gateway || !sessionId) return;
+      if (!canCompress) {
+        showToast("Kontext noch zu klein zum Komprimieren");
+        return;
+      }
+      setIsCompressing(true);
+      showToast(label);
+      try {
+        await gateway.request("slash.exec", { session_id: sessionId, command: "compress" }, 60_000);
+        window.setTimeout(() => void refreshContextUsage(gateway, sessionId), 300);
+        window.setTimeout(() => void refreshRuntimeStatus(gateway, sessionId), 600);
+        window.setTimeout(() => void refreshSessionMeta(gateway, sessionId), 600);
+        window.setTimeout(() => void refreshContextUsage(gateway, sessionId), 1600);
+        window.setTimeout(() => void refreshContextUsage(gateway, sessionId), 3200);
+        showToast("Kontext komprimiert");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        showToast("Komprimierung fehlgeschlagen");
+      } finally {
+        setIsCompressing(false);
+      }
+      return;
+    }
+    showToast(label);
     if (!gateway || !sessionId) return;
     try {
       await gateway.request("slash.exec", { session_id: sessionId, command: command.replace(/^\//, "") });
@@ -1484,7 +1781,7 @@ export default function AiwerkAssistantPage() {
                 <p className="text-[13px] text-[#bfb7aa]">Noch keine Historie geladen.</p>
               ) : (
                 recentSessions.map((session) => {
-                  const title = session.title || session.id;
+                  const title = recentSessionDisplayTitle(session);
                   return (
                   <button
                     key={session.id}
@@ -1550,9 +1847,17 @@ export default function AiwerkAssistantPage() {
               <button
                 type="button"
                 onClick={() => void sendSlash("/compress", "Kontext komprimieren")}
-                className="cursor-pointer rounded-[12px] border border-[#d9d0c1] bg-[#fffaf2] px-[14px] py-[10px] font-semibold text-[#3a362d] hover:bg-[#f2eadf]"
+                disabled={!canCompress}
+                title={compressHelp}
+                aria-label={compressHelp}
+                className={
+                  "rounded-[12px] border px-[14px] py-[10px] font-semibold transition " +
+                  (canCompress
+                    ? "cursor-pointer border-[#d9d0c1] bg-[#fffaf2] text-[#3a362d] hover:bg-[#f2eadf]"
+                    : "cursor-not-allowed border-[#e4dacd] bg-[#f4eee5] text-[#9f9383] opacity-60")
+                }
               >
-                Komprimieren
+                {isCompressing ? "Komprimiert…" : "Komprimieren"}
               </button>
               <button
                 type="button"
@@ -1564,7 +1869,14 @@ export default function AiwerkAssistantPage() {
             </div>
           </header>
 
-          <section className="grid min-h-0 grid-cols-1 gap-[22px] xl:grid-cols-[minmax(0,1fr)_340px]">
+          <section
+            ref={contentGridRef}
+            className={
+              "grid min-h-0 grid-cols-1 gap-[12px] xl:grid-cols-[minmax(0,1fr)_10px_var(--right-rail-width)] " +
+              (isResizingRightRail ? "cursor-col-resize select-none" : "")
+            }
+            style={{ "--right-rail-width": `${rightRailWidth}px` } as CSSProperties}
+          >
             {/* Chat panel */}
             <div
               className="aiwerk-chat-panel relative grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] shadow-[0_18px_50px_rgba(56,42,20,.08)]"
@@ -1907,61 +2219,28 @@ export default function AiwerkAssistantPage() {
               </aside>
             </div>
 
+            {/* Right rail resize handle */}
+            <button
+              type="button"
+              aria-label="Ressourcenbereich breiter oder schmaler ziehen"
+              title="Ressourcenbereich ziehen · Doppelklick setzt zurück"
+              onPointerDown={startRightRailResize}
+              onDoubleClick={resetRightRailWidth}
+              className="group hidden h-full cursor-col-resize items-center justify-center rounded-full focus:outline-none focus:ring-2 focus:ring-[#b89d72]/40 xl:flex"
+            >
+              <span className="h-[72px] w-[3px] rounded-full bg-[#d8cdbd] transition group-hover:bg-[#b89d72] group-focus-visible:bg-[#b89d72]" />
+            </button>
+
             {/* Right side panels */}
-            <div className="hidden content-start gap-[16px] xl:grid">
-              <div className="rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
-                <h3 className="m-0 mb-[12px] text-[15px]">Sitzungssteuerung</h3>
-                <div className="grid grid-cols-2 gap-[10px]">
-                  <SlashButton label="Nebenfrage" hint="/side" onClick={() => void sendSlash("/side", "Nebenfrage starten")} />
-                  <SlashButton label="Schliessen" hint="/back" onClick={() => void sendSlash("/back", "Nebenfrage schliessen")} />
-                  <SlashButton label="Handoff" hint="/handoff" onClick={() => void sendSlash("/handoff", "Handoff vorbereiten")} />
-                  <SlashButton label="Historie" hint="/history" onClick={() => showToast("Sitzungshistorie öffnen")} />
-                </div>
-              </div>
-
-              <div className="rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
-                <h3 className="m-0 mb-[12px] text-[15px]">Agent-Steuerung</h3>
-                <div className="grid grid-cols-2 gap-[10px]">
-                  <SlashButton label="Stop" hint="/stop" danger onClick={() => void sendSlash("/stop", "Stoppen")} />
-                  <SlashButton label="Erneut" hint="/retry" onClick={() => void sendSlash("/retry", "Erneut versuchen")} />
-                  <SlashButton label="Zurücknehmen" hint="/undo" onClick={() => void sendSlash("/undo", "Rückgängig")} />
-                  <SlashButton label="Denken" hint="/reasoning" onClick={() => void sendSlash("/reasoning", "Denkstufe")} />
-                  <SlashButton label="Sprache" hint="/voice" onClick={() => void sendSlash("/voice", "Sprachmodus")} />
-                  <SlashButton label="YOLO" hint="/yolo" onClick={() => void sendSlash("/yolo", "YOLO-Modus")} />
-                </div>
-              </div>
-
-              <div className="rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
-                <h3 className="m-0 mb-[12px] text-[15px]">Freigaben</h3>
-                {approvals.length === 0 ? (
-                  <p className="m-0 text-[14px] text-[#777063]">Keine Aktion wartet auf Freigabe.</p>
-                ) : (
-                  approvals.map((card) => (
-                    <div key={card.id} className="mt-[10px] rounded-[12px] bg-[#f1eadf] p-[12px] text-[14px] leading-[1.4]">
-                      <strong>1 Aktion wartet auf Entscheidung</strong>
-                      <br />
-                      {card.detail}
-                      <div className="mt-[10px] grid grid-cols-2 gap-[8px]">
-                        <button
-                          type="button"
-                          onClick={() => void resolveApproval(card.id, true)}
-                          className="cursor-pointer rounded-[10px] border border-[#ddd2c2] bg-[#fffaf2] p-[12px] text-left font-semibold text-[#3b352c] hover:bg-[#f2eadf]"
-                        >
-                          Freigeben
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void resolveApproval(card.id, false)}
-                          className="cursor-pointer rounded-[10px] border border-[#ddd2c2] bg-[#fffaf2] p-[12px] text-left font-semibold text-[#7b3b2f] hover:bg-[#f2eadf]"
-                        >
-                          Ablehnen
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
+            <ResourcesRail
+              resources={resourceSummary}
+              loading={resourcesLoading}
+              error={resourcesError}
+              attachments={attachedFiles}
+              approvals={approvals}
+              onRefresh={() => void refreshResources()}
+              onReloadMcp={reloadMcpServers}
+            />
           </section>
         </main>
       </div>
@@ -2082,6 +2361,427 @@ function ToolCallsDisclosure({ tools, compact = false }: { tools: ToolCallSummar
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+
+function ResourcesRail({
+  resources,
+  loading,
+  error,
+  attachments,
+  approvals,
+  onRefresh,
+  onReloadMcp,
+}: {
+  resources: AssistantResourcesResponse | null;
+  loading: boolean;
+  error: string | null;
+  attachments: AttachmentPreview[];
+  approvals: ApprovalCard[];
+  onRefresh: () => void;
+  onReloadMcp: () => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({
+    email: true,
+    calendar: false,
+    shared: false,
+    connectors: false,
+  });
+  const [expandedSharedItems, setExpandedSharedItems] = useState<Record<string, boolean>>({});
+  const [expandedConnectorItems, setExpandedConnectorItems] = useState<Record<string, boolean>>({});
+  const [openingSharedFolder, setOpeningSharedFolder] = useState(false);
+  const [reloadingMcp, setReloadingMcp] = useState(false);
+  const toggle = (id: string) => setExpanded((current) => ({ ...current, [id]: !current[id] }));
+  const toggleSharedItem = (id: string) => setExpandedSharedItems((current) => ({ ...current, [id]: !current[id] }));
+  const toggleConnectorItem = (id: string) => setExpandedConnectorItems((current) => ({ ...current, [id]: !current[id] }));
+  const reloadMcpConnectors = async () => {
+    if (reloadingMcp) return;
+    setReloadingMcp(true);
+    try {
+      await onReloadMcp();
+    } finally {
+      setReloadingMcp(false);
+    }
+  };
+  const openSharedFolder = async () => {
+    if (openingSharedFolder) return;
+    if (!resources?.shared_folder.can_open_folder) {
+      openSharedFolderCloudUrl(resources?.shared_folder.cloud_url);
+      return;
+    }
+    setOpeningSharedFolder(true);
+    try {
+      await api.openAssistantSharedFolder();
+    } catch {
+      openSharedFolderCloudUrl(resources?.shared_folder.cloud_url);
+    } finally {
+      setOpeningSharedFolder(false);
+    }
+  };
+  const emailStatus = resourceStatusCopy(resources?.email.status);
+  const calendarStatus = resourceStatusCopy(resources?.calendar.status);
+  const sharedStatus = resourceStatusCopy(resources?.shared_folder.status);
+  const connectorCount = resources?.connectors.length ?? 0;
+  const connectorSummary = resources
+    ? connectorCount
+      ? `${connectorCount} MCP-Server verfügbar`
+      : "Keine MCP-Server verfügbar"
+    : "Wird geprüft…";
+  return (
+    <aside className="hidden max-h-[calc(100vh-56px)] w-full content-start gap-[14px] overflow-y-auto pr-[2px] xl:grid aiwerk-scrollbar" aria-label="Ressourcen">
+      <div className="rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.9)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
+        <div className="mb-[14px] flex items-start justify-between gap-[12px]">
+          <div>
+            <p className="m-0 text-[11px] font-bold uppercase tracking-[.18em] text-[#948873]">Ressourcen</p>
+            <h3 className="m-0 mt-[4px] text-[17px] text-[#302b24]">Was Rocky nutzen kann</h3>
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="grid h-[34px] w-[34px] shrink-0 cursor-pointer place-items-center rounded-full border border-[#d9cdbc] bg-[#fffaf2] text-[#6f614e] hover:bg-[#f3eadc] disabled:cursor-wait disabled:opacity-60"
+            disabled={loading}
+            title="Ressourcen aktualisieren"
+            aria-label="Ressourcen aktualisieren"
+          >
+            <RefreshCw size={15} className={loading ? "animate-spin" : undefined} />
+          </button>
+        </div>
+        {error && <p className="mb-[12px] rounded-[12px] bg-[#f4e1da] px-[10px] py-[8px] text-[12px] text-[#7b3b2f]">Ressourcen konnten nicht geladen werden.</p>}
+        <div className="grid gap-[10px]">
+          <ResourceCard
+            id="email"
+            icon={<Mail size={16} />}
+            title="E-Mail"
+            summary={resources?.email.summary ?? "Wird geprüft…"}
+            status={emailStatus}
+            expanded={expanded.email}
+            onToggle={toggle}
+            badge={resources?.email.unread_count ? String(resources.email.unread_count) : undefined}
+          >
+            {resources?.email.items.length ? (
+              <div className="grid gap-[8px]">
+                {!resources.email.unread_count && <p className="m-0 text-[12px] text-[#8a7f70]">Zuletzt im Posteingang</p>}
+                {resources.email.items.slice(0, 5).map((item, index) => (
+                  <div key={item.id ?? `${item.subject}-${index}`} className="rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px]">
+                    <div className="flex items-center gap-[6px]">
+                      {item.unread && <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-[#8b724e]" aria-label="Neu" />}
+                      <p className="m-0 min-w-0 flex-1 truncate text-[13px] font-semibold text-[#342f27]">{item.subject || "Ohne Betreff"}</p>
+                      {item.has_attachment && <Paperclip size={12} className="shrink-0 text-[#8a7a64]" aria-label="Mit Anhang" />}
+                    </div>
+                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{item.sender || "Unbekannt"}{item.received_at ? ` · ${formatResourceTime(item.received_at)}` : ""}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="m-0 text-[13px] text-[#776d5f]">Keine neuen Nachrichten oder noch keine Mailbox angebunden.</p>
+            )}
+          </ResourceCard>
+
+          <ResourceCard
+            id="calendar"
+            icon={<CalendarDays size={16} />}
+            title="Kalender"
+            summary={resources?.calendar.summary ?? "Wird geprüft…"}
+            status={calendarStatus}
+            expanded={expanded.calendar}
+            onToggle={toggle}
+          >
+            {resources?.calendar.items.length ? (
+              <div className="grid gap-[8px]">
+                {resources.calendar.items.slice(0, 5).map((item, index) => (
+                  <div key={item.id ?? `${item.title}-${index}`} className="rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px]">
+                    <p className="m-0 truncate text-[13px] font-semibold text-[#342f27]">{item.title || "Termin"}</p>
+                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{formatResourceTime(item.starts_at)}{item.location_hint ? ` · ${item.location_hint}` : ""}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="m-0 text-[13px] text-[#776d5f]">Keine kommenden Termine oder Kalender noch nicht angebunden.</p>
+            )}
+          </ResourceCard>
+
+          <ResourceCard
+            id="shared"
+            icon={<FolderOpen size={16} />}
+            title="Shared Ordner"
+            summary={resources?.shared_folder.summary ?? "Wird geprüft…"}
+            status={sharedStatus}
+            expanded={expanded.shared}
+            onToggle={toggle}
+            action={{
+              icon: resources?.shared_folder.can_open_folder ? <FolderOpen size={14} /> : <ExternalLink size={14} />,
+              label: resources?.shared_folder.can_open_folder
+                ? "Ordner im Dateimanager öffnen"
+                : resources?.shared_folder.cloud_url
+                  ? "Ordner in cloud.aiwerk.ch öffnen"
+                  : "Cloud-Ordner nicht verfügbar",
+              onClick: openSharedFolder,
+              disabled: (!resources?.shared_folder.can_open_folder && !resources?.shared_folder.cloud_url) || openingSharedFolder,
+            }}
+          >
+            {resources?.shared_folder.items.length ? (
+              <SharedFolderTree
+                items={resources.shared_folder.items}
+                expandedItems={expandedSharedItems}
+                onToggle={toggleSharedItem}
+                showCloudFolderLinks={!resources.shared_folder.can_open_folder}
+              />
+            ) : (
+              <p className="m-0 text-[13px] text-[#776d5f]">Shared Ordner ist leer oder noch nicht eingerichtet.</p>
+            )}
+          </ResourceCard>
+
+          <ResourceCard
+            id="connectors"
+            icon={<PlugZap size={16} />}
+            title="Konnektoren"
+            summary={connectorSummary}
+            status={resourceStatusCopy(connectorCount ? "connected" : "not_configured")}
+            expanded={expanded.connectors}
+            onToggle={toggle}
+            action={{
+              icon: <RefreshCw size={13} className={reloadingMcp ? "animate-spin" : undefined} />,
+              label: "Alle MCP-Server neu laden",
+              onClick: () => void reloadMcpConnectors(),
+              disabled: reloadingMcp,
+            }}
+          >
+            <div className="grid gap-[7px]">
+              {resources?.connectors.length ? (
+                <McpConnectorTree
+                  items={resources.connectors}
+                  expandedItems={expandedConnectorItems}
+                  onToggle={toggleConnectorItem}
+                />
+              ) : (
+                <p className="m-0 text-[13px] text-[#776d5f]">Keine MCP-Server verfügbar.</p>
+              )}
+            </div>
+          </ResourceCard>
+
+          <ResourceCard
+            id="material"
+            icon={<FileText size={16} />}
+            title="Aktuelles Material"
+            summary={attachments.length ? `${attachments.length} Dateien bereit` : "Keine Dateien in dieser Unterhaltung"}
+            status={resourceStatusCopy(attachments.length ? "connected" : "not_configured")}
+            expanded={false}
+            onToggle={() => undefined}
+            disabled
+          />
+
+          <ResourceCard
+            id="actions"
+            icon={<Square size={15} />}
+            title="Nächste Aktionen"
+            summary={approvals.length ? `${approvals.length} Freigabe offen` : "Keine Aktion wartet"}
+            status={resourceStatusCopy(approvals.length ? "limited" : "connected")}
+            expanded={false}
+            onToggle={() => undefined}
+            disabled
+          />
+        </div>
+        {resources?.checked_at && <p className="m-0 mt-[12px] text-[11px] text-[#9a8f7e]">Aktualisiert {formatResourceTime(resources.checked_at)}</p>}
+      </div>
+    </aside>
+  );
+}
+
+function McpConnectorTree({
+  items,
+  expandedItems,
+  onToggle,
+  depth = 0,
+}: {
+  items: AssistantConnectorSummary[];
+  expandedItems: Record<string, boolean>;
+  onToggle: (id: string) => void;
+  depth?: number;
+}) {
+  return (
+    <div className="grid gap-[7px]">
+      {items.map((connector) => {
+        const status = resourceStatusCopy(connector.status);
+        const children = connector.children ?? [];
+        const hasChildren = children.length > 0;
+        const isExpanded = !!expandedItems[connector.id];
+        return (
+          <div key={connector.id} className={depth ? "grid gap-[7px]" : undefined}>
+            <button
+              type="button"
+              onClick={hasChildren ? () => onToggle(connector.id) : undefined}
+              disabled={!hasChildren}
+              className="flex min-w-0 items-center gap-[8px] rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
+              aria-expanded={hasChildren ? isExpanded : undefined}
+              style={{ paddingLeft: 10 + depth * 14 }}
+            >
+              <span className="grid h-[18px] w-[18px] shrink-0 place-items-center text-[#7b6b55]">
+                {hasChildren ? <ChevronRight size={14} className={isExpanded ? "rotate-90 transition-transform" : "transition-transform"} /> : null}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[13px] font-semibold text-[#342f27]">{connector.label}</span>
+                <span className="block truncate text-[12px] text-[#7c705f]">{connector.capabilities?.join(" · ") || "MCP"}</span>
+              </span>
+              <span className="shrink-0 text-[11px] font-semibold text-[#766b5b]">{status.label}</span>
+            </button>
+            {hasChildren && isExpanded && (
+              <McpConnectorTree
+                items={children}
+                expandedItems={expandedItems}
+                onToggle={onToggle}
+                depth={depth + 1}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
+function SharedFolderTree({
+  items,
+  expandedItems,
+  onToggle,
+  showCloudFolderLinks,
+  depth = 0,
+}: {
+  items: AssistantSharedFolderItem[];
+  expandedItems: Record<string, boolean>;
+  onToggle: (id: string) => void;
+  showCloudFolderLinks: boolean;
+  depth?: number;
+}) {
+  return (
+    <div className="grid gap-[7px]">
+      {items.map((item) => {
+        const isFolder = item.kind === "folder";
+        const children = item.children ?? [];
+        const hasChildren = isFolder && children.length > 0;
+        const isExpanded = !!expandedItems[item.id];
+        const canOpenFile = !isFolder && !!item.open_url;
+        const canOpenCloudFolder = showCloudFolderLinks && isFolder && !!item.cloud_url;
+        const meta = isFolder
+          ? `${children.length || item.child_count || 0} Elemente${item.modified_at ? ` · ${formatResourceTime(item.modified_at)}` : ""}`
+          : `${formatFileSize(item.size_bytes ?? 0)}${item.modified_at ? ` · ${formatResourceTime(item.modified_at)}` : ""}`;
+        const handleClick = hasChildren
+          ? () => onToggle(item.id)
+          : canOpenFile
+            ? () => openSharedFolderFile(item)
+            : undefined;
+        return (
+          <div key={item.id} className={depth ? "grid gap-[7px]" : undefined}>
+            <div className="flex items-center gap-[6px]">
+              <button
+                type="button"
+                onClick={handleClick}
+                disabled={!hasChildren && !canOpenFile}
+                className="flex min-w-0 flex-1 items-center gap-[8px] rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
+                aria-expanded={hasChildren ? isExpanded : undefined}
+                title={canOpenFile ? "Datei öffnen" : undefined}
+                style={{ paddingLeft: 10 + depth * 14 }}
+              >
+                <span className="grid h-[18px] w-[18px] shrink-0 place-items-center text-[#7b6b55]">
+                  {hasChildren ? <ChevronRight size={14} className={isExpanded ? "rotate-90 transition-transform" : "transition-transform"} /> : null}
+                </span>
+                <span className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[8px] bg-[#ebe1d0] text-[#78684f]">
+                  {isFolder ? <FolderOpen size={14} /> : <FileText size={14} />}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[13px] font-semibold text-[#342f27]">{item.name}</span>
+                  <span className="block truncate text-[12px] text-[#7c705f]">{isFolder ? "Ordner" : "Datei"} · {meta}</span>
+                </span>
+              </button>
+              {canOpenCloudFolder && (
+                <button
+                  type="button"
+                  onClick={() => openSharedFolderCloudUrl(item.cloud_url)}
+                  title="Ordner in cloud.aiwerk.ch öffnen"
+                  aria-label={`${item.name} in cloud.aiwerk.ch öffnen`}
+                  className="grid h-[34px] w-[34px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                >
+                  <ExternalLink size={13} />
+                </button>
+              )}
+            </div>
+            {hasChildren && isExpanded && (
+              <SharedFolderTree
+                items={children}
+                expandedItems={expandedItems}
+                onToggle={onToggle}
+                showCloudFolderLinks={showCloudFolderLinks}
+                depth={depth + 1}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ResourceCard({
+  id,
+  icon,
+  title,
+  summary,
+  status,
+  expanded,
+  onToggle,
+  badge,
+  action,
+  disabled,
+  children,
+}: {
+  id: string;
+  icon: ReactNode;
+  title: string;
+  summary: string;
+  status: { label: string; dot: string };
+  expanded: boolean;
+  onToggle: (id: string) => void;
+  badge?: string;
+  action?: { icon: ReactNode; label: string; onClick: () => void; disabled?: boolean };
+  disabled?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="rounded-[18px] border border-[#dfd4c4] bg-[#fffaf2] shadow-[0_8px_24px_rgba(56,42,20,.05)]">
+      <div className="flex items-stretch gap-[6px] p-[12px]">
+        <button
+          type="button"
+          onClick={() => !disabled && onToggle(id)}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-[10px] border-0 bg-transparent p-0 text-left disabled:cursor-default"
+          disabled={disabled}
+          aria-expanded={expanded}
+        >
+          <span className="grid h-[32px] w-[32px] shrink-0 place-items-center rounded-[12px] bg-[#eee4d6] text-[#6d5f4d]">{icon}</span>
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-[7px] text-[13px] font-bold text-[#302b24]">
+              <span className="h-[7px] w-[7px] rounded-full" style={{ backgroundColor: status.dot }} />
+              {title}
+            </span>
+            <span className="mt-[2px] block truncate text-[12px] text-[#7a705f]">{summary}</span>
+          </span>
+          {badge && <span className="rounded-full bg-[#8b724e] px-[8px] py-[3px] text-[11px] font-bold text-white">{badge}</span>}
+        </button>
+        {action && (
+          <button
+            type="button"
+            onClick={action.onClick}
+            disabled={action.disabled}
+            title={action.label}
+            aria-label={action.label}
+            className="grid h-[32px] w-[32px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-[#f8f0e3]"
+          >
+            {action.icon}
+          </button>
+        )}
+      </div>
+      {expanded && children && <div className="border-t border-[#eadfce] px-[12px] pb-[12px] pt-[10px]">{children}</div>}
     </div>
   );
 }
@@ -2324,31 +3024,5 @@ function ThinkingIndicator() {
         </span>
       </div>
     </div>
-  );
-}
-
-function SlashButton({
-  label,
-  hint,
-  onClick,
-  danger,
-}: {
-  label: string;
-  hint: string;
-  onClick: () => void;
-  danger?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={
-        "cursor-pointer rounded-[10px] border border-[#ddd2c2] bg-[#fffaf2] p-[12px] text-left font-semibold hover:bg-[#f2eadf] " +
-        (danger ? "text-[#7b3b2f]" : "text-[#3b352c]")
-      }
-    >
-      {label}
-      <span className="mt-[4px] block text-[12px] font-semibold text-[#8a7a65]">{hint}</span>
-    </button>
   );
 }

@@ -4033,6 +4033,51 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         server._sessions.pop("sid-live", None)
 
 
+def test_session_resume_reattaches_live_session_by_persistent_key(monkeypatch):
+    class _Transport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, obj):
+            self.frames.append(obj)
+            return True
+
+        def close(self):
+            return None
+
+    old_transport = _Transport()
+    new_transport = _Transport()
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model, "session_id": "key-live"})
+    server._sessions["sid-live"] = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        history=[{"role": "user", "content": "old prompt"}],
+        inflight_turn={"assistant": "partial", "streaming": True, "user": "current prompt"},
+        running=True,
+        session_key="key-live",
+        transport=old_transport,
+    )
+    token = server.bind_transport(new_transport)
+    try:
+        resp = server.handle_request(
+            {"id": "resume", "method": "session.resume", "params": {"session_id": "key-live"}}
+        )
+
+        assert resp["result"]["session_id"] == "sid-live"
+        assert resp["result"]["session_key"] == "key-live"
+        assert resp["result"]["resumed"] == "key-live"
+        assert resp["result"]["running"] is True
+        assert resp["result"]["status"] == "working"
+        assert resp["result"]["inflight"] == {
+            "assistant": "partial",
+            "streaming": True,
+            "user": "current prompt",
+        }
+        assert server._sessions["sid-live"]["transport"] is new_transport
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("sid-live", None)
+
+
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
     server._sessions["sid-a"] = _session(

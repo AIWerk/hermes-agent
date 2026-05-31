@@ -226,10 +226,313 @@ class TestWebServerEndpoints:
         assert self.client.get("/api/status").status_code == 200
         assert self.client.get("/api/sessions").status_code == 200
         assert self.client.get("/api/model/info").status_code == 200
+        assert self.client.get("/api/assistant/resources").status_code == 200
         assert self.client.post("/api/assistant/attachments", files={"files": ("note.txt", b"hello", "text/plain")}).status_code == 200
         assert self.client.get("/api/env").status_code == 404
         assert self.client.get("/api/config").status_code == 404
         assert self.client.get("/api/logs").status_code == 404
+
+    def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        docs = shared / "docs"
+        docs.mkdir()
+        (shared / "offer.pdf").write_bytes(b"pdf")
+        (docs / "contract.pdf").write_bytes(b"contract")
+        (shared / ".env").write_text("SECRET=1")
+        email_json = tmp_path / "email.json"
+        email_json.write_text(json.dumps({
+            "unread_count": 2,
+            "items": [{"id": "m1", "sender": "Max", "subject": "Offerte", "received_at": "2026-05-30T12:00:00Z"}],
+        }))
+        calendar_json = tmp_path / "calendar.json"
+        calendar_json.write_text(json.dumps({
+            "items": [{"id": "e1", "title": "Kundentermin", "starts_at": "2026-05-30T14:30:00Z"}],
+        }))
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+        monkeypatch.setenv("AIWERK_CUI_EMAIL_SUMMARY_JSON", str(email_json))
+        monkeypatch.setenv("AIWERK_CUI_CALENDAR_SUMMARY_JSON", str(calendar_json))
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {
+                "shared_cloud": {
+                    "base_url": "https://cloud.aiwerk.ch",
+                    "share_id": "share-123",
+                    "path": "/",
+                }
+            },
+            "mcp_servers": {
+                "aiwerk_bridge": {"url": "http://127.0.0.1:8000/mcp", "enabled": True},
+                "disabled_demo": {"command": "demo", "enabled": False},
+                "hermes_neo4j": {"command": "python", "enabled": True},
+            },
+        })
+        monkeypatch.setattr(web_server, "_can_open_system_folder", lambda: True)
+        opened = []
+        monkeypatch.setattr(web_server, "_open_system_folder", lambda path, **kwargs: opened.append(path) or True)
+
+        local_headers = {"host": "127.0.0.1:9120", "x-forwarded-for": "127.0.0.1"}
+        resp = self.client.get("/api/assistant/resources", headers=local_headers)
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["email"]["unread_count"] == 2
+        assert data["calendar"]["items"][0]["title"] == "Kundentermin"
+        assert data["shared_folder"]["status"] == "connected"
+        assert data["shared_folder"]["can_open_folder"] is True
+        assert data["shared_folder"]["cloud_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share-123/browse?path=%2F"
+        shared_items = data["shared_folder"]["items"]
+        assert [item["name"] for item in shared_items] == ["docs", "offer.pdf"]
+        assert shared_items[0]["kind"] == "folder"
+        assert shared_items[0]["cloud_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share-123/browse?path=%2Fdocs"
+        assert shared_items[0]["children"][0]["name"] == "contract.pdf"
+        assert shared_items[0]["children"][0]["open_url"].startswith("/api/assistant/shared-folder/open?path=")
+        assert shared_items[1]["kind"] == "file"
+        assert shared_items[1]["open_url"].startswith("/api/assistant/shared-folder/open?path=")
+        open_resp = self.client.get(shared_items[0]["children"][0]["open_url"])
+        assert open_resp.status_code == 200
+        assert open_resp.content == b"contract"
+        assert open_resp.headers["content-type"].startswith("application/pdf")
+        assert self.client.get("/api/assistant/shared-folder/open?path=../.env").status_code == 404
+        open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers=local_headers)
+        assert open_folder_resp.status_code == 200
+        assert opened == [shared]
+        labels = {connector["label"] for connector in data["connectors"]}
+        assert labels == {"AIWerk Bridge", "Wissensbasis"}
+        assert all(connector["status"] == "connected" for connector in data["connectors"])
+        assert all("MCP" in connector["capabilities"] for connector in data["connectors"])
+        bridge = next(connector for connector in data["connectors"] if connector["label"] == "AIWerk Bridge")
+        assert [child["label"] for child in bridge["children"]][:3] == ["Firecrawl", "Google Maps", "Google Workspace AIWerk"]
+        assert all(child["capabilities"] == ["Bridge-Subserver"] for child in bridge["children"])
+
+    def test_assistant_resources_can_read_himalaya_mailbox(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            assert kwargs["timeout"] == 12
+            if cmd[-3:] == ["not", "flag", "Seen"]:
+                return _Proc(json.dumps([
+                    {
+                        "id": "42",
+                        "flags": [],
+                        "subject": "Neue Offerte",
+                        "from": {"name": "Max Muster", "addr": "max@example.com"},
+                        "date": "2026-05-30 16:57+00:00",
+                        "has_attachment": True,
+                    }
+                ]))
+            return _Proc("[]")
+
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_SUMMARY_JSON", raising=False)
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_DISABLE_HIMALAYA", raising=False)
+        monkeypatch.setattr("hermes_cli.web_server.shutil.which", lambda name: "/usr/bin/himalaya" if name == "himalaya" else None)
+        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {"email": {"backend": "himalaya", "account": "bergsmann", "folder": "INBOX"}},
+        })
+
+        resp = self.client.get("/api/assistant/resources")
+
+        assert resp.status_code == 200
+        email = resp.json()["email"]
+        assert email["status"] == "connected"
+        assert email["unread_count"] == 1
+        assert email["summary"] == "1 neue Nachrichten"
+        assert email["items"][0]["subject"] == "Neue Offerte"
+        assert email["items"][0]["sender"] == "Max Muster <max@example.com>"
+        assert email["items"][0]["received_at"] == "2026-05-30T16:57:00Z"
+        assert email["items"][0]["unread"] is True
+        assert email["items"][0]["has_attachment"] is True
+        assert calls[0][:9] == ["himalaya", "envelope", "list", "--account", "bergsmann", "--folder", "INBOX", "--page-size", "50"]
+
+    def test_assistant_resources_himalaya_preview_falls_back_to_latest_when_no_unread(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[-3:] == ["not", "flag", "Seen"]:
+                return _Proc("[]")
+            return _Proc(json.dumps([
+                {
+                    "id": "99",
+                    "flags": ["Seen"],
+                    "subject": "Letzte Nachricht",
+                    "from": {"addr": "info@example.com"},
+                    "date": "2026-05-30 08:00+02:00",
+                }
+            ]))
+
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_SUMMARY_JSON", raising=False)
+        monkeypatch.setattr("hermes_cli.web_server.shutil.which", lambda name: "/usr/bin/himalaya" if name == "himalaya" else None)
+        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+        monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"email": {"enabled": True}}})
+
+        resp = self.client.get("/api/assistant/resources")
+
+        assert resp.status_code == 200
+        email = resp.json()["email"]
+        assert email["unread_count"] == 0
+        assert email["summary"] == "Keine neuen Nachrichten"
+        assert email["items"][0]["subject"] == "Letzte Nachricht"
+        assert email["items"][0]["unread"] is False
+        assert len(calls) == 2
+
+    def test_assistant_resources_can_read_google_workspace_mail_via_aiwerk_bridge(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _Response:
+            def __init__(self, body, headers=None):
+                self._body = body
+                self.headers = headers or {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body.encode("utf-8")
+
+        def mcp_tool_payload(text):
+            return json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps({
+                        "result": {
+                            "structuredContent": {"result": text},
+                            "content": [{"type": "text", "text": text}],
+                            "isError": False,
+                        }
+                    })}],
+                },
+            })
+
+        def fake_urlopen(req, timeout):
+            payload = json.loads(req.data.decode("utf-8"))
+            calls.append(payload)
+            assert timeout == 30
+            if payload["method"] == "initialize":
+                return _Response(
+                    json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18"}}),
+                    {"MCP-Session-Id": "session-1"},
+                )
+            arguments = payload["params"]["arguments"]
+            assert arguments["server"] == "google-workspace-aiwerk"
+            if arguments["tool"] == "search_gmail_messages":
+                return _Response(mcp_tool_payload("""
+Found 1 messages matching 'is:unread':
+
+📧 MESSAGES:
+  1. Message ID: 19e70ea1de7486ee
+     Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
+     Thread ID: 19e70ea1de7486ee
+"""))
+            return _Response(mcp_tool_payload("""
+Retrieved 1 messages:
+
+Message ID: 19e70ea1de7486ee
+Subject: Kontaktformular Anfrage
+From: AIWerk Website <kontakt@aiwerk.ch>
+Date: Sat, 30 May 2026 19:10:00 +0000
+To: <kontakt@aiwerk.ch>
+Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
+"""))
+
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_SUMMARY_JSON", raising=False)
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {"email": {"backend": "aiwerk_bridge", "mcp_server": "google-workspace-aiwerk", "user_google_email": "me"}},
+            "mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp", "enabled": True, "headers": {"Authorization": "Bearer test"}}},
+        })
+
+        resp = self.client.get("/api/assistant/resources")
+
+        assert resp.status_code == 200
+        email = resp.json()["email"]
+        assert email["status"] == "connected"
+        assert email["unread_count"] == 1
+        assert email["summary"] == "1 neue Nachrichten"
+        assert email["items"][0]["subject"] == "Kontaktformular Anfrage"
+        assert email["items"][0]["sender"] == "AIWerk Website <kontakt@aiwerk.ch>"
+        assert email["items"][0]["received_at"] == "2026-05-30T19:10:00Z"
+        assert email["items"][0]["unread"] is True
+        assert email["items"][0]["open_url"].startswith("https://mail.google.com/")
+        assert calls[1]["params"]["arguments"]["tool"] == "search_gmail_messages"
+        assert calls[3]["params"]["arguments"]["tool"] == "get_gmail_messages_content_batch"
+
+    def test_shared_folder_file_manager_open_is_disabled_for_remote_dashboard_requests(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "offer.pdf").write_bytes(b"pdf")
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+        monkeypatch.delenv("HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN", raising=False)
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {
+                "shared_cloud": {
+                    "base_url": "https://cloud.aiwerk.ch",
+                    "share_id": "share-123",
+                    "path": "/",
+                }
+            }
+        })
+        monkeypatch.setattr(web_server, "_can_open_system_folder", lambda: True)
+        monkeypatch.setattr(web_server.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("xdg-open must not run for remote CUI requests")))
+        remote_headers = {"host": "rocky.aiwerk.ch", "x-forwarded-for": "203.0.113.42"}
+
+        resp = self.client.get("/api/assistant/resources", headers=remote_headers)
+
+        assert resp.status_code == 200
+        shared_folder = resp.json()["shared_folder"]
+        assert shared_folder["can_open_folder"] is False
+        assert shared_folder["cloud_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share-123/browse?path=%2F"
+        open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers=remote_headers)
+        assert open_folder_resp.status_code == 409
+
+    def test_shared_folder_file_manager_open_can_be_explicitly_enabled_for_remote_requests(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+        monkeypatch.setenv("HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN", "true")
+        monkeypatch.setattr(web_server, "_can_open_system_folder", lambda: True)
+        opened = []
+        monkeypatch.setattr(web_server.subprocess, "Popen", lambda args, **kwargs: opened.append(args))
+        remote_headers = {"host": "rocky.aiwerk.ch", "x-forwarded-for": "203.0.113.42"}
+
+        resp = self.client.get("/api/assistant/resources", headers=remote_headers)
+
+        assert resp.status_code == 200
+        assert resp.json()["shared_folder"]["can_open_folder"] is True
+        open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers=remote_headers)
+        assert open_folder_resp.status_code == 200
+        assert opened and opened[0][0] == "xdg-open"
 
     def test_assistant_attachment_upload_extracts_text_and_sanitizes_path(self):
         from hermes_constants import get_hermes_home
@@ -637,6 +940,27 @@ class TestNewEndpoints:
     def test_cron_job_not_found(self):
         resp = self.client.get("/api/cron/jobs/nonexistent-id")
         assert resp.status_code == 404
+
+    def test_sessions_can_exclude_cron_sources(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("cui-visible-session", "cli")
+            db.append_message("cui-visible-session", "user", "visible")
+            db.create_session("cron-hidden-session", "cron")
+            db.append_message("cron-hidden-session", "user", "hidden")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=10&offset=0&exclude_sources=cron")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        ids = [session["id"] for session in data["sessions"]]
+        assert "cui-visible-session" in ids
+        assert "cron-hidden-session" not in ids
+        assert data["total"] == 1
 
     # --- Profiles ---
 

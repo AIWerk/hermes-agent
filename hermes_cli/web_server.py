@@ -10,14 +10,19 @@ Usage:
 """
 
 import asyncio
+import email.utils
+import html
 import hmac
+import http.cookiejar
 import importlib.util
 import json
 import logging
 import mimetypes
+import ipaddress
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,6 +30,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -133,6 +139,9 @@ _ASSISTANT_ALLOWED_API_EXACT: frozenset = frozenset({
     "/api/sessions",
     "/api/model/info",
     "/api/dashboard/themes",
+    "/api/assistant/resources",
+    "/api/assistant/shared-folder/open",
+    "/api/assistant/shared-folder/open-folder",
     "/api/assistant/attachments",
     "/api/assistant/transcribe",
     "/api/assistant/tts",
@@ -154,6 +163,1088 @@ _ASSISTANT_UPLOAD_EXTENSIONS = frozenset({
 _ASSISTANT_AUDIO_EXTENSIONS = frozenset({".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
 _ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 
+
+
+_ASSISTANT_RESOURCE_MAX_SHARED_ITEMS = 40
+_ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS = 12
+_ASSISTANT_RESOURCE_HIDDEN_NAMES = frozenset({
+    ".env", ".env.local", ".envrc", "config.yaml", "auth.json", "credentials.json",
+    "id_rsa", "id_ed25519", "known_hosts",
+})
+_ASSISTANT_EMAIL_PREVIEW_ITEMS = 5
+_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT = 50
+_ASSISTANT_EMAIL_TIMEOUT_SECONDS = 12
+_ASSISTANT_MCP_BRIDGE_TIMEOUT_SECONDS = 30
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resource_status_label(status: str) -> str:
+    return {
+        "connected": "Verbunden",
+        "limited": "Eingeschränkt",
+        "auth_required": "Anmeldung nötig",
+        "not_configured": "Nicht eingerichtet",
+        "error": "Fehler",
+    }.get(status, "Unbekannt")
+
+
+def _safe_resource_id(value: str, fallback: str = "item") -> str:
+    safe = re.sub(r"[^A-Za-z0-9._:-]+", "-", value or "").strip(".-_:")
+    return (safe or fallback)[:120]
+
+
+def _read_optional_json(path_value: str | None) -> dict[str, Any] | None:
+    if not path_value:
+        return None
+    try:
+        path = Path(path_value).expanduser().resolve()
+        if not path.is_file() or path.stat().st_size > 256_000:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_shared_folder_root(config: dict[str, Any]) -> Path | None:
+    candidates: list[Any] = [
+        os.environ.get("AIWERK_CUI_SHARED_FOLDER"),
+        os.environ.get("AIWERK_SHARED_FOLDER"),
+        os.environ.get("HERMES_SHARED_FOLDER"),
+        os.environ.get("HERMES_SHARED_DIR"),
+    ]
+    for section_name in ("assistant", "dashboard", "shared_folder", "shared"):
+        section = config.get(section_name)
+        if isinstance(section, dict):
+            for key in ("shared_folder", "shared_dir", "shared_path", "path", "root", "mount_path", "dav_path", "webdav_path"):
+                candidates.append(section.get(key))
+            cloud = section.get("shared_cloud") or section.get("cloud_share")
+            if isinstance(cloud, dict):
+                for key in ("mount_path", "dav_path", "webdav_path", "local_path", "local_mount"):
+                    candidates.append(cloud.get(key))
+    discovered = _discover_dav_shared_folder_root(config)
+    if discovered:
+        candidates.append(str(discovered))
+    for value in candidates:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            root = Path(value).expanduser().resolve()
+            if root.is_dir():
+                return root
+        except Exception:
+            continue
+    return None
+
+
+def _discover_dav_shared_folder_root(config: dict[str, Any]) -> Path | None:
+    """Best-effort discovery for a desktop WebDAV mount used by the CUI shared folder."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    gvfs_root = Path(runtime_dir) / "gvfs"
+    if not gvfs_root.is_dir():
+        return None
+
+    wanted_hosts: set[str] = {"dav.aiwerk.ch"}
+    cloud = _shared_cloud_config(config)
+    if isinstance(cloud, dict):
+        for raw in (cloud.get("dav_url"), cloud.get("webdav_url"), cloud.get("mount_url")):
+            if isinstance(raw, str) and raw.strip():
+                parsed = urllib.parse.urlparse(raw)
+                if parsed.hostname:
+                    wanted_hosts.add(parsed.hostname.lower())
+    preferred_folder = "Hermes-Shared"
+
+    try:
+        for mount in sorted(gvfs_root.iterdir(), key=lambda p: p.name):
+            mount_name = mount.name.lower()
+            if not mount.is_dir() or not any(f"host={host}" in mount_name for host in wanted_hosts):
+                continue
+            direct = mount / preferred_folder
+            if direct.is_dir():
+                return direct
+            for owner_dir in sorted([p for p in mount.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
+                candidate = owner_dir / preferred_folder
+                if candidate.is_dir():
+                    return candidate
+    except Exception:
+        return None
+    return None
+
+
+def _is_hidden_shared_item(path: Path) -> bool:
+    name = path.name
+    lower = name.lower()
+    if name.startswith("."):
+        return True
+    if lower in _ASSISTANT_RESOURCE_HIDDEN_NAMES:
+        return True
+    if any(part in lower for part in ("secret", "credential", "password", "token", "private-key")):
+        return True
+    return False
+
+
+def _shared_cloud_browse_url(cloud: dict[str, Any] | None, rel_path: str | None = None) -> str | None:
+    if not isinstance(cloud, dict):
+        return None
+    base_url = str(cloud.get("base_url") or "").rstrip("/")
+    share_id = str(cloud.get("share_id") or "").strip().strip("/")
+    if not base_url or not share_id:
+        return None
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    root_path = str(cloud.get("path") or "/").strip() or "/"
+    clean_root = _clean_shared_cloud_path(root_path) or "/"
+    if rel_path:
+        clean_rel = _clean_shared_relative_path(rel_path)
+        if not clean_rel:
+            return None
+        path = _clean_shared_cloud_path(clean_root.rstrip("/") + "/" + clean_rel)
+    else:
+        path = clean_root
+    if not path:
+        return None
+    return f"{base_url}/web/client/pubshares/{urllib.parse.quote(share_id, safe='')}/browse?path={urllib.parse.quote(path, safe='')}"
+
+
+def _shared_folder_items(root: Path, *, base: Path | None = None, depth: int = 1, cloud: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    try:
+        root_real = root.resolve()
+        base_real = (base or root).resolve()
+        for child in sorted(root_real.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+            if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
+                break
+            try:
+                resolved = child.resolve()
+                if base_real not in resolved.parents and resolved != base_real:
+                    continue
+                if _is_hidden_shared_item(resolved):
+                    continue
+                stat_result = resolved.stat()
+                mime = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+                rel = resolved.relative_to(base_real).as_posix()
+                item = {
+                    "id": _safe_resource_id(rel),
+                    "name": resolved.name,
+                    "kind": "folder" if resolved.is_dir() else "file",
+                    "mime": mime if resolved.is_file() else None,
+                    "size_bytes": None if resolved.is_dir() else stat_result.st_size,
+                    "modified_at": datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+                if resolved.is_file():
+                    item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel, safe='')}"
+                if resolved.is_dir():
+                    cloud_url = _shared_cloud_browse_url(cloud, rel)
+                    if cloud_url:
+                        item["cloud_url"] = cloud_url
+                if resolved.is_dir() and depth > 0:
+                    item["children"] = _shared_folder_items(resolved, base=base_real, depth=depth - 1, cloud=cloud)
+                    item["child_count"] = len(item["children"])
+                items.append(item)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return items
+
+
+def _shared_cloud_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    for section_name in ("assistant", "dashboard", "shared", "shared_folder"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        cloud = section.get("shared_cloud") or section.get("cloud_share")
+        if isinstance(cloud, dict):
+            return cloud
+    return None
+
+
+def _clean_shared_relative_path(value: str) -> str | None:
+    parts = [part for part in str(value or "").replace("\\", "/").split("/") if part]
+    clean_parts: list[str] = []
+    for part in parts:
+        if part in {".", ".."} or "/" in part or _is_hidden_shared_item(Path(part)):
+            return None
+        clean_parts.append(part)
+    return "/".join(clean_parts) if clean_parts else None
+
+
+def _clean_shared_cloud_path(value: str) -> str | None:
+    parts = [part for part in str(value or "").replace("\\", "/").split("/") if part]
+    clean_parts: list[str] = []
+    for part in parts:
+        if part in {".", ".."} or "/" in part or _is_hidden_shared_item(Path(part)):
+            return None
+        clean_parts.append(part)
+    return "/" + "/".join(clean_parts) if clean_parts else "/"
+
+
+def _resolve_shared_folder_file(root: Path, rel_path: str) -> Path | None:
+    clean = _clean_shared_relative_path(rel_path)
+    if not clean:
+        return None
+    try:
+        base = root.resolve()
+        target = (base / clean).resolve()
+        if base not in target.parents or not target.is_file() or _is_hidden_shared_item(target):
+            return None
+        return target
+    except Exception:
+        return None
+
+
+def _bool_config_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _shared_folder_remote_open_allowed(config: dict[str, Any]) -> bool:
+    if _bool_config_value(os.environ.get("HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN")):
+        return True
+    for section_name in ("assistant", "dashboard", "shared_folder", "shared"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for key in ("allow_remote_file_manager_open", "allow_remote_open_folder", "remote_file_manager_open"):
+            if _bool_config_value(section.get(key)):
+                return True
+    return False
+
+
+def _request_looks_local(request: Request | None) -> bool:
+    if request is None:
+        return False
+    forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    client_host = forwarded_for or real_ip or (request.client.host if request.client else "")
+    try:
+        if not ipaddress.ip_address(client_host).is_loopback:
+            return False
+    except ValueError:
+        if client_host not in {"localhost", ""}:
+            return False
+
+    raw_host = request.headers.get("host", "").strip().lower()
+    if raw_host.startswith("[") and "]" in raw_host:
+        host = raw_host[1:raw_host.index("]")]
+    else:
+        host = raw_host.split(":", 1)[0]
+    if host in {"", "localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _can_open_system_folder() -> bool:
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    if sys.platform.startswith("linux"):
+        return shutil.which("xdg-open") is not None
+    if sys.platform == "darwin":
+        return shutil.which("open") is not None
+    if os.name == "nt":
+        return True
+    return False
+
+
+def _can_open_shared_folder_for_request(request: Request | None, config: dict[str, Any]) -> bool:
+    if not _can_open_system_folder():
+        return False
+    if _shared_folder_remote_open_allowed(config):
+        return True
+    return _request_looks_local(request)
+
+
+def _open_system_folder(path: Path, *, request: Request | None = None, config: dict[str, Any] | None = None) -> bool:
+    try:
+        effective_config = config or load_config()
+        if not path.is_dir() or not _can_open_shared_folder_for_request(request, effective_config):
+            return False
+        if sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+        if os.name == "nt":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _pass_first_line(entry: str) -> str | None:
+    if not entry or not re.match(r"^[A-Za-z0-9._/@+-]+$", entry):
+        return None
+    try:
+        result = subprocess.run(
+            ["pass", "show", entry],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        return (result.stdout.splitlines() or [""])[0].strip() or None
+    except Exception:
+        return None
+
+
+def _urlopen_text(opener: urllib.request.OpenerDirector, request: urllib.request.Request, timeout: int = 20) -> tuple[int, str]:
+    with opener.open(request, timeout=timeout) as response:
+        data = response.read(512_000)
+        return response.status, data.decode("utf-8", errors="replace")
+
+
+def _urlopen_json(opener: urllib.request.OpenerDirector, request: urllib.request.Request, timeout: int = 20) -> Any:
+    with opener.open(request, timeout=timeout) as response:
+        data = response.read(512_000)
+        return json.loads(data.decode("utf-8", errors="replace"))
+
+
+def _sftpgo_item_kind(raw: dict[str, Any]) -> str:
+    raw_type = raw.get("type")
+    if raw_type in (1, "1", "dir", "directory", "folder"):
+        return "folder"
+    return "file"
+
+
+def _sftpgo_modified_at(raw: dict[str, Any]) -> str | None:
+    for key in ("modified_time", "mtime", "last_modified"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, (int, float)) and value > 0:
+            seconds = value / 1000 if value > 10_000_000_000 else value
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+    return None
+
+
+def _sftpgo_pubshare_items(cloud: dict[str, Any]) -> list[dict[str, Any]]:
+    base_url = str(cloud.get("base_url") or "").rstrip("/")
+    share_id = str(cloud.get("share_id") or "").strip().strip("/")
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    root_path = str(cloud.get("path") or "/").strip() or "/"
+    max_depth = int(cloud.get("max_depth") or 2)
+    if not base_url or not share_id or not pass_entry:
+        return []
+    password = _pass_first_line(pass_entry)
+    if not password:
+        return []
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    quoted_share_id = urllib.parse.quote(share_id, safe="")
+    login_next = urllib.parse.quote(f"/web/client/pubshares/{share_id}/browse", safe="")
+    login_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/login?next={login_next}"
+    status, login_html = _urlopen_text(opener, urllib.request.Request(login_url, headers={"User-Agent": "Hermes-CUI/1.0"}))
+    if status >= 400:
+        return []
+    match = re.search(r'name="_form_token"\s+value="([^"]+)"', login_html)
+    if not match:
+        return []
+    form_token = html.unescape(match.group(1))
+    body = urllib.parse.urlencode({"share_password": password, "_form_token": form_token}).encode()
+    status, browse_html = _urlopen_text(
+        opener,
+        urllib.request.Request(
+            login_url,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Hermes-CUI/1.0"},
+            method="POST",
+        ),
+    )
+    if status >= 400 or 'name="share_password"' in browse_html:
+        return []
+    csrf_match = re.search(r"'X-CSRF-TOKEN':\s*'([^']+)'", browse_html)
+    if not csrf_match:
+        return []
+    headers = {"X-CSRF-TOKEN": csrf_match.group(1), "User-Agent": "Hermes-CUI/1.0"}
+
+    def clean_path(value: str) -> str:
+        parts = [part for part in value.split("/") if part and part not in {".", ".."}]
+        return "/" + "/".join(parts) if parts else "/"
+
+    def child_path(parent: str, name: str) -> str:
+        return clean_path((parent.rstrip("/") + "/" + name) if parent != "/" else "/" + name)
+
+    def list_path(path: str, depth: int) -> list[dict[str, Any]]:
+        dirs_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/dirs?path={urllib.parse.quote(clean_path(path), safe='')}"
+        raw_items = _urlopen_json(opener, urllib.request.Request(dirs_url, headers=headers))
+        if not isinstance(raw_items, list):
+            return []
+        items: list[dict[str, Any]] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name or "/" in name or name in {".", ".."} or _is_hidden_shared_item(Path(name)):
+                continue
+            kind = _sftpgo_item_kind(raw)
+            size = raw.get("size")
+            size_bytes = int(size) if kind == "file" and isinstance(size, (int, float, str)) and str(size).isdigit() else None
+            item_path = child_path(path, name)
+            item = {
+                "id": _safe_resource_id(item_path),
+                "name": name,
+                "kind": kind,
+                "mime": (mimetypes.guess_type(name)[0] or "application/octet-stream") if kind == "file" else None,
+                "size_bytes": size_bytes,
+                "modified_at": _sftpgo_modified_at(raw),
+            }
+            if kind == "file":
+                item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(item_path, safe='')}"
+            if kind == "folder":
+                clean_item_path = _clean_shared_cloud_path(item_path)
+                if clean_item_path:
+                    item["cloud_url"] = f"{base_url}/web/client/pubshares/{quoted_share_id}/browse?path={urllib.parse.quote(clean_item_path, safe='')}"
+            if kind == "folder" and depth > 0:
+                children = list_path(item_path, depth - 1)
+                item["children"] = children
+                item["child_count"] = len(children)
+            items.append(item)
+            if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
+                break
+        return items
+
+    return list_path(root_path, max(0, min(max_depth, 3)))
+
+
+def _download_sftpgo_pubshare_file(cloud: dict[str, Any], rel_path: str) -> tuple[bytes, str, str] | None:
+    clean = _clean_shared_relative_path(rel_path)
+    if not clean:
+        return None
+    base_url = str(cloud.get("base_url") or "").rstrip("/")
+    share_id = str(cloud.get("share_id") or "").strip().strip("/")
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    if not base_url or not share_id or not pass_entry:
+        return None
+    password = _pass_first_line(pass_entry)
+    if not password:
+        return None
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    quoted_share_id = urllib.parse.quote(share_id, safe="")
+    login_next = urllib.parse.quote(f"/web/client/pubshares/{share_id}/browse", safe="")
+    login_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/login?next={login_next}"
+    status, login_html = _urlopen_text(opener, urllib.request.Request(login_url, headers={"User-Agent": "Hermes-CUI/1.0"}))
+    if status >= 400:
+        return None
+    match = re.search(r'name="_form_token"\s+value="([^"]+)"', login_html)
+    if not match:
+        return None
+    body = urllib.parse.urlencode({"share_password": password, "_form_token": html.unescape(match.group(1))}).encode()
+    status, browse_html = _urlopen_text(
+        opener,
+        urllib.request.Request(
+            login_url,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Hermes-CUI/1.0"},
+            method="POST",
+        ),
+    )
+    if status >= 400 or 'name="share_password"' in browse_html:
+        return None
+
+    csrf_match = re.search(r"'X-CSRF-TOKEN':\s*'([^']+)'", browse_html)
+    headers = {"User-Agent": "Hermes-CUI/1.0"}
+    if csrf_match:
+        headers["X-CSRF-TOKEN"] = csrf_match.group(1)
+
+    filename = Path(clean).name
+    file_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/browse?path={urllib.parse.quote('/' + clean, safe='')}"
+    try:
+        with opener.open(urllib.request.Request(file_url, headers=headers), timeout=30) as response:
+            content_type = response.headers.get("content-type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+            data = response.read(64 * 1024 * 1024 + 1)
+            if len(data) > 64 * 1024 * 1024:
+                return None
+            if response.status < 400 and data and "text/html" not in content_type.lower():
+                return data, content_type, filename
+    except Exception:
+        return None
+    return None
+
+
+def _shared_folder_summary(config: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
+    cloud = _shared_cloud_config(config)
+    cloud_url = _shared_cloud_browse_url(cloud)
+    shared_root = _resolve_shared_folder_root(config)
+    if shared_root:
+        items = _shared_folder_items(shared_root, cloud=cloud)
+        payload = {
+            "status": "connected",
+            "root_label": shared_root.name,
+            "summary": f"{len(items)} Dateien" if len(items) != 1 else "1 Datei",
+            "items": items[:_ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS],
+            "total_count": len(items),
+            "source": "local",
+            "can_open_folder": _can_open_shared_folder_for_request(request, config),
+        }
+        if cloud_url:
+            payload["cloud_url"] = cloud_url
+        return payload
+
+    if isinstance(cloud, dict):
+        items = _sftpgo_pubshare_items(cloud)
+        root_label = str(cloud.get("root_label") or cloud.get("label") or "cloud.aiwerk.ch")
+        if items:
+            payload = {
+                "status": "connected",
+                "root_label": root_label,
+                "summary": f"{len(items)} Dateien" if len(items) != 1 else "1 Datei",
+                "items": items[:_ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS],
+                "total_count": len(items),
+                "source": "cloud",
+                "can_open_folder": False,
+            }
+            if cloud_url:
+                payload["cloud_url"] = cloud_url
+            return payload
+        payload = {
+            "status": "error",
+            "root_label": root_label,
+            "summary": "Cloud-Ordner konnte nicht geprüft werden",
+            "items": [],
+            "total_count": 0,
+            "source": "cloud",
+            "can_open_folder": False,
+        }
+        if cloud_url:
+            payload["cloud_url"] = cloud_url
+        return payload
+
+    return {
+        "status": "not_configured",
+        "root_label": "Shared",
+        "summary": "Nicht eingerichtet",
+        "items": [],
+        "total_count": 0,
+        "source": "none",
+        "can_open_folder": False,
+    }
+
+
+def _parse_himalaya_email_date(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        # Himalaya JSON currently returns e.g. ``2026-05-30 16:57+00:00``.
+        normalized = raw.replace(" ", "T", 1) if "T" not in raw else raw
+        return datetime.fromisoformat(normalized).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return raw
+
+
+def _format_himalaya_address(value: Any) -> str:
+    if isinstance(value, dict):
+        name = str(value.get("name") or "").strip()
+        addr = str(value.get("addr") or value.get("email") or "").strip()
+        if name and addr:
+            return f"{name} <{addr}>"
+        return name or addr
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _himalaya_envelope_to_resource_item(envelope: Any) -> dict[str, Any] | None:
+    if not isinstance(envelope, dict):
+        return None
+    envelope_id = str(envelope.get("id") or "").strip()
+    subject = str(envelope.get("subject") or "").strip()
+    sender = _format_himalaya_address(envelope.get("from"))
+    received_at = _parse_himalaya_email_date(envelope.get("date"))
+    item = {
+        "id": _safe_resource_id(envelope_id or f"mail-{subject}-{sender}", "mail"),
+        "sender": sender,
+        "subject": subject,
+        "received_at": received_at,
+    }
+    flags = envelope.get("flags")
+    if isinstance(flags, list):
+        item["unread"] = not any(str(flag).lower() == "seen" for flag in flags)
+    if bool(envelope.get("has_attachment")):
+        item["has_attachment"] = True
+    return item
+
+
+def _email_resource_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    for section_name in ("assistant", "dashboard", "email", "mailbox"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        if section_name in {"email", "mailbox"}:
+            return section
+        nested = section.get("email") or section.get("mailbox")
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _run_himalaya_envelope_list(*, query: list[str] | None = None, page_size: int = _ASSISTANT_EMAIL_PREVIEW_ITEMS, account: str | None = None, folder: str | None = None) -> list[dict[str, Any]]:
+    if not shutil.which("himalaya"):
+        raise FileNotFoundError("himalaya not installed")
+    cmd = ["himalaya", "envelope", "list"]
+    account = account or os.environ.get("AIWERK_CUI_EMAIL_ACCOUNT") or os.environ.get("HIMALAYA_ACCOUNT")
+    folder = folder or os.environ.get("AIWERK_CUI_EMAIL_FOLDER") or os.environ.get("HIMALAYA_FOLDER") or "INBOX"
+    if account:
+        cmd.extend(["--account", account])
+    if folder:
+        cmd.extend(["--folder", folder])
+    cmd.extend(["--page-size", str(page_size), "--output", "json"])
+    if query:
+        cmd.extend(query)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "himalaya failed").strip())
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        return []
+    data = json.loads(stdout)
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _mcp_bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return {}
+    bridge = servers.get("aiwerk_bridge")
+    if not isinstance(bridge, dict) or bridge.get("enabled") is False:
+        return {}
+    url = str(bridge.get("url") or "").strip()
+    if not url:
+        return {}
+    raw_headers = bridge.get("headers")
+    headers = raw_headers if isinstance(raw_headers, dict) else {}
+    return {"url": url, "headers": {str(k): str(v) for k, v in headers.items()}}
+
+
+def _mcp_bridge_rpc(config: dict[str, Any] | None, method: str, params: dict[str, Any], *, session_id: str | None = None, request_id: int = 1) -> tuple[dict[str, Any], str | None]:
+    bridge = _mcp_bridge_config(config)
+    if not bridge:
+        raise RuntimeError("AIWerk Bridge MCP server not configured")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **bridge.get("headers", {}),
+    }
+    if session_id:
+        headers["MCP-Session-Id"] = session_id
+    payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(bridge["url"], data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=_ASSISTANT_MCP_BRIDGE_TIMEOUT_SECONDS) as resp:
+        raw = resp.read().decode("utf-8")
+        response = json.loads(raw) if raw else {}
+        next_session_id = resp.headers.get("MCP-Session-Id") or resp.headers.get("mcp-session-id") or session_id
+    if isinstance(response, dict) and response.get("error"):
+        raise RuntimeError(str(response["error"]))
+    return response, next_session_id
+
+
+def _mcp_bridge_initialize(config: dict[str, Any] | None) -> str | None:
+    _, session_id = _mcp_bridge_rpc(
+        config,
+        "initialize",
+        {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "aiwerk-cui", "version": str(__version__)},
+        },
+        request_id=1,
+    )
+    return session_id
+
+
+def _call_aiwerk_bridge_tool(config: dict[str, Any] | None, *, server: str, tool: str, params: dict[str, Any]) -> dict[str, Any]:
+    session_id = _mcp_bridge_initialize(config)
+    response, _ = _mcp_bridge_rpc(
+        config,
+        "tools/call",
+        {
+            "name": "mcp",
+            "arguments": {
+                "action": "call",
+                "server": server,
+                "tool": tool,
+                "params": params,
+            },
+        },
+        session_id=session_id,
+        request_id=2,
+    )
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict):
+        return {}
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                text = item["text"].strip()
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
+    return result
+
+
+def _bridge_result_text(result: dict[str, Any]) -> str:
+    nested = result.get("result") if isinstance(result, dict) else None
+    if isinstance(nested, dict):
+        structured = nested.get("structuredContent")
+        if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+            return structured["result"]
+        content = nested.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            if parts:
+                return "\n".join(parts)
+    structured = result.get("structuredContent") if isinstance(result, dict) else None
+    if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+        return structured["result"]
+    return ""
+
+
+def _gmail_search_message_ids(text: str) -> list[str]:
+    return re.findall(r"Message ID:\s*([A-Za-z0-9_-]+)", text or "")
+
+
+def _parse_gmail_bridge_date(value: str) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(raw).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return raw
+
+
+def _gmail_bridge_metadata_to_items(text: str, *, unread: bool) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for block in re.split(r"\n(?=Message ID:\s*)", text or ""):
+        if "Message ID:" not in block:
+            continue
+        message_id = ""
+        subject = ""
+        sender = ""
+        date = ""
+        web_link = ""
+        for line in block.splitlines():
+            key, _, value = line.partition(":")
+            normalized = key.strip().lower()
+            value = value.strip()
+            if normalized == "message id":
+                message_id = value
+            elif normalized == "subject":
+                subject = value
+            elif normalized == "from":
+                sender = value
+            elif normalized == "date":
+                date = value
+            elif normalized == "web link":
+                web_link = value
+        if not message_id and not subject:
+            continue
+        item: dict[str, Any] = {
+            "id": _safe_resource_id(message_id or f"gmail-{subject}-{sender}", "mail"),
+            "sender": sender,
+            "subject": subject,
+            "received_at": _parse_gmail_bridge_date(date),
+            "unread": unread,
+        }
+        if web_link:
+            item["open_url"] = web_link
+        items.append(item)
+    return items
+
+
+def _gmail_bridge_message_items(config: dict[str, Any] | None, *, server: str, user_google_email: str, query: str, page_size: int, unread: bool) -> list[dict[str, Any]]:
+    search = _call_aiwerk_bridge_tool(
+        config,
+        server=server,
+        tool="search_gmail_messages",
+        params={"query": query, "user_google_email": user_google_email, "page_size": page_size},
+    )
+    message_ids = _gmail_search_message_ids(_bridge_result_text(search))[:page_size]
+    if not message_ids:
+        return []
+    batch = _call_aiwerk_bridge_tool(
+        config,
+        server=server,
+        tool="get_gmail_messages_content_batch",
+        params={"message_ids": message_ids, "user_google_email": user_google_email, "format": "metadata"},
+    )
+    return _gmail_bridge_metadata_to_items(_bridge_result_text(batch), unread=unread)[:page_size]
+
+
+def _google_workspace_email_summary(config: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if os.environ.get("AIWERK_CUI_EMAIL_DISABLE_AIWERK_BRIDGE", "").lower() in {"1", "true", "yes", "on"}:
+        return None
+    email_cfg = _email_resource_config(config)
+    backend = str(os.environ.get("AIWERK_CUI_EMAIL_BACKEND") or email_cfg.get("backend") or email_cfg.get("type") or "").lower()
+    if backend not in {"aiwerk_bridge", "aiwerk-bridge", "google_workspace", "google-workspace", "gmail", "mcp"}:
+        return None
+    server = str(os.environ.get("AIWERK_CUI_GOOGLE_WORKSPACE_SERVER") or email_cfg.get("server") or email_cfg.get("mcp_server") or "google-workspace-aiwerk").strip()
+    user_google_email = str(os.environ.get("AIWERK_CUI_GOOGLE_EMAIL") or email_cfg.get("user_google_email") or email_cfg.get("google_email") or "me").strip() or "me"
+    unread_query = str(email_cfg.get("unread_query") or os.environ.get("AIWERK_CUI_GMAIL_UNREAD_QUERY") or "is:unread").strip()
+    latest_query = str(email_cfg.get("latest_query") or os.environ.get("AIWERK_CUI_GMAIL_LATEST_QUERY") or "in:inbox").strip()
+    try:
+        unread_items = _gmail_bridge_message_items(
+            config,
+            server=server,
+            user_google_email=user_google_email,
+            query=unread_query,
+            page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
+            unread=True,
+        )
+        unread = len(unread_items)
+        preview_items = unread_items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS]
+        if not preview_items:
+            preview_items = _gmail_bridge_message_items(
+                config,
+                server=server,
+                user_google_email=user_google_email,
+                query=latest_query,
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
+                unread=False,
+            )
+        if unread:
+            summary = f"{unread} neue Nachrichten" if unread != _ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT else f"{unread}+ neue Nachrichten"
+        else:
+            summary = "Keine neuen Nachrichten"
+        return {
+            "status": "connected",
+            "unread_count": unread,
+            "summary": summary,
+            "items": preview_items,
+        }
+    except Exception as exc:
+        _log.debug("CUI AIWerk Bridge Gmail summary failed: %s", exc)
+        return None
+
+
+def _himalaya_email_summary(config: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if os.environ.get("AIWERK_CUI_EMAIL_DISABLE_HIMALAYA", "").lower() in {"1", "true", "yes", "on"}:
+        return None
+    email_cfg = _email_resource_config(config)
+    backend = str(os.environ.get("AIWERK_CUI_EMAIL_BACKEND") or email_cfg.get("backend") or email_cfg.get("type") or "").lower()
+    enabled = email_cfg.get("enabled")
+    if backend not in {"himalaya", "imap"} and enabled is not True:
+        return None
+    account = str(email_cfg.get("account") or "").strip() or None
+    folder = str(email_cfg.get("folder") or email_cfg.get("mailbox") or "").strip() or None
+    try:
+        unread_raw = _run_himalaya_envelope_list(
+            query=["not", "flag", "Seen"],
+            page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
+            account=account,
+            folder=folder,
+        )
+        unread_items = [_himalaya_envelope_to_resource_item(item) for item in unread_raw]
+        unread_items = [item for item in unread_items if item]
+        unread = len(unread_items)
+        preview_items = unread_items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS]
+        if not preview_items:
+            latest_raw = _run_himalaya_envelope_list(page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS, account=account, folder=folder)
+            preview_items = [item for item in (_himalaya_envelope_to_resource_item(item) for item in latest_raw) if item]
+        if unread:
+            summary = f"{unread} neue Nachrichten" if unread != _ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT else f"{unread}+ neue Nachrichten"
+        else:
+            summary = "Keine neuen Nachrichten"
+        return {
+            "status": "connected",
+            "unread_count": unread,
+            "summary": summary,
+            "items": preview_items,
+        }
+    except Exception as exc:
+        _log.debug("CUI himalaya email summary failed: %s", exc)
+        return None
+
+
+def _email_summary(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = _read_optional_json(os.environ.get("AIWERK_CUI_EMAIL_SUMMARY_JSON"))
+    if data:
+        unread = int(data.get("unread_count") or data.get("new_count") or 0)
+        raw_items = data.get("items")
+        items = raw_items if isinstance(raw_items, list) else []
+        return {
+            "status": data.get("status") or "connected",
+            "unread_count": unread,
+            "summary": data.get("summary") or (f"{unread} neue Nachrichten" if unread else "Keine neuen Nachrichten"),
+            "items": items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
+        }
+    bridge_mail = _google_workspace_email_summary(config)
+    if bridge_mail:
+        return bridge_mail
+    himalaya = _himalaya_email_summary(config)
+    if himalaya:
+        return himalaya
+    maildir = os.environ.get("AIWERK_CUI_MAILDIR") or os.environ.get("MAILDIR")
+    if maildir:
+        try:
+            new_dir = Path(maildir).expanduser() / "new"
+            unread = len([p for p in new_dir.iterdir() if p.is_file()]) if new_dir.is_dir() else 0
+            return {
+                "status": "connected",
+                "unread_count": unread,
+                "summary": f"{unread} neue Nachrichten" if unread else "Keine neuen Nachrichten",
+                "items": [],
+            }
+        except Exception:
+            return {"status": "error", "unread_count": 0, "summary": "E-Mail konnte nicht geprüft werden", "items": []}
+    return {"status": "not_configured", "unread_count": 0, "summary": "Nicht eingerichtet", "items": []}
+
+
+def _calendar_summary() -> dict[str, Any]:
+    data = _read_optional_json(os.environ.get("AIWERK_CUI_CALENDAR_SUMMARY_JSON"))
+    if data:
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        return {
+            "status": data.get("status") or "connected",
+            "summary": data.get("summary") or (f"{len(items)} kommende Termine" if items else "Keine Termine heute"),
+            "items": items[:5],
+        }
+    return {"status": "not_configured", "summary": "Nicht eingerichtet", "items": []}
+
+
+def _default_aiwerk_bridge_subservers() -> list[dict[str, Any]]:
+    server_labels = {
+        "firecrawl": "Firecrawl",
+        "google-maps": "Google Maps",
+        "google-workspace-aiwerk": "Google Workspace AIWerk",
+        "google-workspace-bergsmann": "Google Workspace Bergsmann",
+        "grok": "Grok",
+        "serpapi": "SerpAPI",
+        "smallinvoice": "Smallinvoice",
+        "vault": "Vault",
+    }
+    return [
+        {
+            "id": f"aiwerk-bridge-{_safe_resource_id(name)}",
+            "label": label,
+            "status": "connected",
+            "status_label": _resource_status_label("connected"),
+            "capabilities": ["Bridge-Subserver"],
+        }
+        for name, label in server_labels.items()
+    ]
+
+
+def _aiwerk_bridge_subservers(config: dict[str, Any], bridge_details: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_servers = bridge_details.get("subservers") or bridge_details.get("servers")
+    if raw_servers is None:
+        dashboard = config.get("dashboard")
+        if isinstance(dashboard, dict):
+            bridge_cfg = dashboard.get("aiwerk_bridge") or dashboard.get("bridge")
+            if isinstance(bridge_cfg, dict):
+                raw_servers = bridge_cfg.get("subservers") or bridge_cfg.get("servers")
+
+    children: list[dict[str, Any]] = []
+    if isinstance(raw_servers, dict):
+        iterable = raw_servers.items()
+    elif isinstance(raw_servers, list):
+        iterable = [(str(item.get("name") if isinstance(item, dict) else item), item) for item in raw_servers]
+    else:
+        return _default_aiwerk_bridge_subservers()
+
+    for name, raw in iterable:
+        details = raw if isinstance(raw, dict) else {}
+        if details.get("enabled", True) is False:
+            continue
+        label = str(details.get("label") or str(name).replace("_", " ").replace("-", " ").title())
+        children.append({
+            "id": f"aiwerk-bridge-{_safe_resource_id(str(name))}",
+            "label": label,
+            "status": "connected",
+            "status_label": _resource_status_label("connected"),
+            "capabilities": ["Bridge-Subserver"],
+        })
+    return children
+
+
+def _connector_summary(config: dict[str, Any], shared_folder: dict[str, Any], email: dict[str, Any], calendar: dict[str, Any]) -> list[dict[str, Any]]:
+    del shared_folder, email, calendar
+    connectors: list[dict[str, Any]] = []
+
+    def add_connector(connector_id: str, label: str, capabilities: list[str] | None = None, children: list[dict[str, Any]] | None = None) -> None:
+        item = {
+            "id": connector_id,
+            "label": label,
+            "status": "connected",
+            "status_label": _resource_status_label("connected"),
+            "capabilities": capabilities or ["MCP"],
+        }
+        if children:
+            item["children"] = children
+        connectors.append(item)
+
+    mcp_servers = config.get("mcp_servers")
+    label_map = {
+        "aiwerk_bridge": "AIWerk Bridge",
+        "elevenlabs": "ElevenLabs",
+        "hermes_neo4j": "Wissensbasis",
+    }
+    if isinstance(mcp_servers, dict):
+        for name, raw in sorted(mcp_servers.items()):
+            details = raw if isinstance(raw, dict) else {}
+            if details.get("enabled", True) is False:
+                continue
+            label = label_map.get(str(name), str(name).replace("_", " ").title())
+            capabilities = ["MCP"]
+            if details.get("url"):
+                capabilities.append("Remote")
+            if details.get("command"):
+                capabilities.append("Lokal")
+            children = _aiwerk_bridge_subservers(config, details) if str(name) == "aiwerk_bridge" else None
+            add_connector(f"mcp-{_safe_resource_id(str(name))}", label, capabilities, children)
+
+    return connectors
+
+
+def _assistant_resources_payload(request: Request | None = None) -> dict[str, Any]:
+    config = load_config()
+    shared_folder = _shared_folder_summary(config, request)
+    email = _email_summary(config)
+    calendar = _calendar_summary()
+    connectors = _connector_summary(config, shared_folder, email, calendar)
+    warnings = []
+    if shared_folder.get("status") == "error":
+        warnings.append("Shared Ordner konnte nicht geprüft werden")
+    return {
+        "checked_at": _utc_now_iso(),
+        "email": email,
+        "calendar": calendar,
+        "shared_folder": shared_folder,
+        "connectors": connectors,
+        "warnings": warnings,
+    }
 
 def _safe_upload_component(value: str, fallback: str = "upload") -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip(".-_")
@@ -826,6 +1917,66 @@ async def get_status():
     }
 
 
+
+@app.get("/api/assistant/resources")
+async def get_assistant_resources(request: Request):
+    """Return sanitized AIWerk CUI resource summaries for the right rail."""
+    _require_token(request)
+    try:
+        return _assistant_resources_payload(request)
+    except Exception:
+        _log.exception("GET /api/assistant/resources failed")
+        raise HTTPException(status_code=500, detail="Resource summary failed")
+
+
+@app.post("/api/assistant/shared-folder/open-folder")
+async def open_assistant_shared_folder_root(request: Request):
+    """Open the local shared-folder root in the server machine's file manager."""
+    _require_token(request)
+    config = load_config()
+    shared_root = _resolve_shared_folder_root(config)
+    if not shared_root:
+        raise HTTPException(status_code=409, detail="Shared folder is not locally mounted")
+    if not _open_system_folder(shared_root, request=request, config=config):
+        raise HTTPException(status_code=409, detail="File manager is not available")
+    return {"ok": True}
+
+
+@app.get("/api/assistant/shared-folder/open")
+async def open_assistant_shared_folder_file(request: Request):
+    """Open a sanitized shared-folder file through the CUI backend."""
+    _require_token(request)
+    rel_path = request.query_params.get("path") or ""
+    config = load_config()
+
+    shared_root = _resolve_shared_folder_root(config)
+    if shared_root:
+        target = _resolve_shared_folder_file(shared_root, rel_path)
+        if not target:
+            raise HTTPException(status_code=404, detail="File not found")
+        media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        return FileResponse(
+            target,
+            media_type=media_type,
+            filename=target.name,
+            headers={"Content-Disposition": f"inline; filename*=UTF-8''{urllib.parse.quote(target.name)}"},
+        )
+
+    cloud = _shared_cloud_config(config)
+    if isinstance(cloud, dict):
+        downloaded = _download_sftpgo_pubshare_file(cloud, rel_path)
+        if not downloaded:
+            raise HTTPException(status_code=404, detail="File not found")
+        data, media_type, filename = downloaded
+        return Response(
+            data,
+            media_type=media_type,
+            headers={"Content-Disposition": f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}"},
+        )
+
+    raise HTTPException(status_code=404, detail="Shared folder not configured")
+
+
 @app.post("/api/assistant/attachments")
 async def upload_assistant_attachments(
     request: Request,
@@ -1108,13 +2259,14 @@ async def get_action_status(name: str, lines: int = 200):
 
 
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 20, offset: int = 0):
+async def get_sessions(limit: int = 20, offset: int = 0, exclude_sources: str = ""):
+    excluded = [source.strip() for source in exclude_sources.split(",") if source.strip()]
     try:
         from hermes_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            sessions = db.list_sessions_rich(limit=limit, offset=offset, exclude_sources=excluded or None)
+            total = db.session_count(exclude_sources=excluded or None)
             now = time.time()
             for s in sessions:
                 s["is_active"] = (

@@ -192,8 +192,13 @@ export const api = {
       window.location.assign("/login");
       return r;
     }),
-  getSessions: (limit = 20, offset = 0) =>
-    fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
+  getSessions: (limit = 20, offset = 0, options?: { excludeSources?: string[] }) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (options?.excludeSources?.length) {
+      params.set("exclude_sources", options.excludeSources.join(","));
+    }
+    return fetchJSON<PaginatedSessions>(`/api/sessions?${params.toString()}`);
+  },
   uploadAssistantAttachments: async (files: File[], sessionId?: string) => {
     const form = new FormData();
     files.forEach((file) => form.append("files", file));
@@ -218,6 +223,8 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, session_id: sessionId }),
     }),
+  getAssistantResources: () => fetchJSON<AssistantResourcesResponse>("/api/assistant/resources"),
+  openAssistantSharedFolder: () => fetchJSON<{ ok: boolean }>("/api/assistant/shared-folder/open-folder", { method: "POST" }),
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
   getSessionLatestDescendant: (id: string) =>
@@ -608,6 +615,75 @@ export interface AssistantAttachmentUploadResponse {
 export interface AssistantTranscriptionResponse {
   text: string;
   provider?: string;
+}
+
+export type AssistantResourceStatus = "connected" | "limited" | "auth_required" | "not_configured" | "error";
+
+export interface AssistantResourceMailItem {
+  id?: string;
+  sender?: string;
+  subject?: string;
+  received_at?: string;
+  unread?: boolean;
+  has_attachment?: boolean;
+  open_url?: string | null;
+}
+
+export interface AssistantResourceEventItem {
+  id?: string;
+  title?: string;
+  starts_at?: string;
+  ends_at?: string;
+  location_hint?: string;
+}
+
+export interface AssistantSharedFolderItem {
+  id: string;
+  name: string;
+  kind: "file" | "folder";
+  mime?: string | null;
+  size_bytes?: number | null;
+  modified_at?: string | null;
+  open_url?: string | null;
+  cloud_url?: string | null;
+  child_count?: number;
+  children?: AssistantSharedFolderItem[];
+}
+
+export interface AssistantConnectorSummary {
+  id: string;
+  label: string;
+  status: AssistantResourceStatus;
+  status_label?: string;
+  capabilities?: string[];
+  children?: AssistantConnectorSummary[];
+}
+
+export interface AssistantResourcesResponse {
+  checked_at: string;
+  email: {
+    status: AssistantResourceStatus;
+    unread_count: number;
+    summary: string;
+    items: AssistantResourceMailItem[];
+  };
+  calendar: {
+    status: AssistantResourceStatus;
+    summary: string;
+    items: AssistantResourceEventItem[];
+  };
+  shared_folder: {
+    status: AssistantResourceStatus;
+    root_label: string;
+    summary: string;
+    items: AssistantSharedFolderItem[];
+    total_count: number;
+    source?: "local" | "cloud" | "none";
+    can_open_folder?: boolean;
+    cloud_url?: string | null;
+  };
+  connectors: AssistantConnectorSummary[];
+  warnings: string[];
 }
 
 export interface EnvVarInfo {

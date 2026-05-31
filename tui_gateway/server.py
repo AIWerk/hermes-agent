@@ -2577,6 +2577,12 @@ def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
+    live = _find_live_session(str(target))
+    if live is not None:
+        sid, session = live
+        payload = _live_session_payload(sid, session)
+        payload["resumed"] = session.get("session_key") or sid
+        return _ok(rid, payload)
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5000)
@@ -2807,6 +2813,47 @@ def _fallback_session_info(session: dict) -> dict:
     }
 
 
+def _find_live_session(target: str) -> tuple[str, dict] | None:
+    needle = str(target or "").strip()
+    if not needle:
+        return None
+    try:
+        snapshot = list(_sessions.items())
+    except Exception:
+        return None
+    for sid, session in snapshot:
+        key = str(session.get("session_key") or sid)
+        if needle in {sid, key}:
+            return sid, session
+    return None
+
+
+def _live_session_payload(sid: str, session: dict) -> dict:
+    with session["history_lock"]:
+        session["last_active"] = time.time()
+        # Rebind async events to the transport that just resumed/activated this
+        # live session. This is what makes browser reload reattach to the
+        # still-running turn instead of streaming into the old closed WebSocket.
+        session["transport"] = current_transport() or _stdio_transport
+        history = list(session.get("display_history") or session.get("history") or [])
+        inflight = _inflight_snapshot(session)
+        running = bool(session.get("running"))
+    status = _session_live_status(sid, session)
+    payload = {
+        "info": _fallback_session_info(session),
+        "message_count": len(history),
+        "messages": _history_to_messages(history),
+        "running": running,
+        "session_id": sid,
+        "session_key": session.get("session_key") or sid,
+        "started_at": float(session.get("created_at") or time.time()),
+        "status": status,
+    }
+    if inflight:
+        payload["inflight"] = inflight
+    return payload
+
+
 @method("session.active_list")
 def _(rid, params: dict) -> dict:
     """Return live TUI sessions in this gateway process.
@@ -2840,24 +2887,7 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
 
-    with session["history_lock"]:
-        session["last_active"] = time.time()
-        history = list(session.get("display_history") or session.get("history") or [])
-        inflight = _inflight_snapshot(session)
-        running = bool(session.get("running"))
-    status = _session_live_status(sid, session)
-    payload = {
-        "info": _fallback_session_info(session),
-        "message_count": len(history),
-        "messages": _history_to_messages(history),
-        "running": running,
-        "session_id": sid,
-        "session_key": session.get("session_key") or sid,
-        "started_at": float(session.get("created_at") or time.time()),
-        "status": status,
-    }
-    if inflight:
-        payload["inflight"] = inflight
+    payload = _live_session_payload(sid, session)
     return _ok(
         rid,
         payload,
