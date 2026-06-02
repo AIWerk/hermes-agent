@@ -2136,7 +2136,7 @@ export default function AiwerkAssistantPage() {
               <div
                 role="tablist"
                 aria-label="Geöffnete Ansichten"
-                className="flex min-w-0 items-end gap-[2px] overflow-x-auto border-b border-[#d8cbb9] bg-[#f1e8da] px-[14px] pt-[8px] aiwerk-scrollbar"
+                className="flex min-w-0 items-end gap-[2px] overflow-hidden border-b border-[#d8cbb9] bg-[#f1e8da] px-[14px] pt-[8px]"
               >
                 <button
                   type="button"
