@@ -108,8 +108,11 @@ class TestWebServerEndpoints:
 
         import hermes_state
         from hermes_constants import get_hermes_home
+        import hermes_cli.web_server as web_server
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
+        web_server._MCP_BRIDGE_SESSIONS.clear()
+        web_server._MCP_BRIDGE_REQUEST_IDS.clear()
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
 
         self.client = TestClient(app)
@@ -429,7 +432,7 @@ class TestWebServerEndpoints:
     def test_aiwerk_bridge_live_subservers_use_router_status(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
-        monkeypatch.setattr(web_server, "_mcp_bridge_initialize", lambda config: "session-1")
+        monkeypatch.setattr(web_server, "_mcp_bridge_initialize", lambda config, **kwargs: "session-1")
 
         def fake_rpc(config, method, params, *, session_id=None, request_id=1):
             assert method == "tools/call"
@@ -747,6 +750,31 @@ www.example.org/landing
         assert "angebot.pdf (application/pdf, 128 KB)" in text
         assert "<script>alert(1)</script>" not in text
 
+    def test_email_reader_strips_invisible_preheader_and_wraps_long_single_line_body(self):
+        import hermes_cli.web_server as web_server
+
+        body = (
+            "N26 Please log in to your N26 app. "
+            + " \u200c" * 175
+            + " Don't forget to confirm your details Hey CUSTOMER, "
+            "This is a friendly reminder to please log in to your N26 app before August 17, 2026 to confirm your information and answer a few questions about yourself. "
+            "This is required to continue using your N26 account, and it should only take a few minutes. "
+            "Need to update some details? You can update most of your information via the questionnaire without Customer Support assistance. "
+            "Please note, this is required even if your personal information hasn’t changed. "
+            "Confirm my details What happens if I don’t confirm your details? "
+            "As a fully licensed bank, we’re legally required to regularly ensure information from all our customers is up to date. "
+            "Need help? Chat with us N26 Bank SE Voltairestraße 8 | 10179 Berlin | Germany "
+            "This email was intended for CUSTOMER."
+        )
+
+        cleaned = web_server._strip_email_reader_transport_metadata(body)
+
+        assert "\u200c" not in cleaned
+        assert "  " not in cleaned
+        assert "Confirm my details\n\nWhat happens" in cleaned
+        assert "Need help?\n\nChat with us" in cleaned
+        assert cleaned.count("\n\n") >= 4
+
     def test_assistant_resources_himalaya_preview_falls_back_to_latest_when_no_unread(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
@@ -878,6 +906,101 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
         assert "id=19e70ea1de7486ee" in email["items"][0]["open_url"]
         assert calls[1]["params"]["arguments"]["tool"] == "search_gmail_messages"
         assert calls[3]["params"]["arguments"]["tool"] == "get_gmail_messages_content_batch"
+
+    def test_aiwerk_bridge_reuses_session_across_cui_tool_calls(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def fake_rpc(_config, method, params, *, session_id=None, request_id=1):
+            calls.append({"method": method, "session_id": session_id, "request_id": request_id, "params": params})
+            if method == "initialize":
+                return {"result": {}}, "session-123"
+            return {"result": {"content": [{"text": json.dumps({"ok": True})}]}}, session_id
+
+        config = {"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp"}}}
+        monkeypatch.setattr(web_server, "_mcp_bridge_rpc", fake_rpc)
+
+        first = web_server._call_aiwerk_bridge_tool(config, server="google-workspace-aiwerk", tool="one", params={})
+        second = web_server._call_aiwerk_bridge_tool(config, server="google-workspace-aiwerk", tool="two", params={})
+
+        assert first == {"ok": True}
+        assert second == {"ok": True}
+        assert [call["method"] for call in calls] == ["initialize", "tools/call", "tools/call"]
+        assert calls[1]["session_id"] == "session-123"
+        assert calls[2]["session_id"] == "session-123"
+        assert [call["request_id"] for call in calls] == [1, 2, 3]
+
+    def test_google_workspace_email_summary_counts_unread_without_metadata_fetch(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def fake_bridge_call(_config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            if tool == "search_gmail_messages" and params["query"] == "in:inbox is:unread":
+                return {"result": {"content": [{"text": "Message ID: unread-1\nMessage ID: unread-2\n"}]}}
+            if tool == "search_gmail_messages" and params["query"] == "in:inbox":
+                return {"result": {"content": [{"text": "Message ID: latest-1\n"}]}}
+            if tool == "get_gmail_messages_content_batch":
+                assert params["message_ids"] == ["latest-1"]
+                return {"result": {"content": [{"text": "Message ID: latest-1\nSubject: Hello\nFrom: Sender <s@example.com>\nDate: Tue, 02 Jun 2026 10:00:00 +0000\n"}]}}
+            raise AssertionError(f"unexpected bridge call: {tool} {params}")
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+        summary = web_server._google_workspace_email_summary(
+            {"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp"}}},
+            {
+                "backend": "google_workspace",
+                "mcp_server": "google-workspace-aiwerk",
+                "user_google_email": "me@example.com",
+                "unread_query": "in:inbox is:unread",
+                "latest_query": "in:inbox",
+            },
+        )
+
+        assert summary is not None
+        assert summary["unread_count"] == 2
+        assert summary["items"][0]["message_id"] == "latest-1"
+        assert [call["tool"] for call in calls] == [
+            "search_gmail_messages",
+            "search_gmail_messages",
+            "get_gmail_messages_content_batch",
+        ]
+
+    def test_google_workspace_email_summary_reuses_search_when_queries_match(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def fake_bridge_call(_config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            if tool == "search_gmail_messages":
+                return {"result": {"content": [{"text": "Message ID: unread-1\n"}]}}
+            if tool == "get_gmail_messages_content_batch":
+                assert params["message_ids"] == ["unread-1"]
+                return {"result": {"content": [{"text": "Message ID: unread-1\nSubject: Hi\nFrom: Sender <s@example.com>\nDate: Tue, 02 Jun 2026 10:00:00 +0000\n"}]}}
+            raise AssertionError(f"unexpected bridge call: {tool}")
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+        summary = web_server._google_workspace_email_summary(
+            {"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp"}}},
+            {
+                "backend": "google_workspace",
+                "mcp_server": "google-workspace-aiwerk",
+                "user_google_email": "me@example.com",
+                "unread_query": "in:inbox is:unread",
+                "latest_query": "in:inbox is:unread",
+            },
+        )
+
+        assert summary is not None
+        assert summary["unread_count"] == 1
+        assert summary["items"][0]["unread"] is True
+        assert [call["tool"] for call in calls] == [
+            "search_gmail_messages",
+            "get_gmail_messages_content_batch",
+        ]
 
     def test_assistant_resources_aggregates_google_workspace_and_imap_accounts(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -1083,6 +1206,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
                         "starts_at": "2026-06-01T10:00:00Z",
                         "ends_at": "2026-06-01T10:30:00Z",
                         "location_hint": "Bern<script>alert(1)</script>",
+                        "description": "SEO Webseite Strub Lucarnum<br>Review &amp; Planung<div>Bitte vorbereiten.</div><script>alert(1)</script>",
                         "html_link": "https://calendar.google.com/event?eid=secret",
                     }],
                 }]
@@ -1099,6 +1223,11 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert "Nur-Leseansicht" in text
         assert "&lt;Kundentermin&gt;" in text
         assert "Bern&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "SEO Webseite Strub Lucarnum" in text
+        assert "Review &amp; Planung" in text
+        assert "Bitte vorbereiten." in text
+        assert "&lt;br&gt;" not in text
+        assert "<br>" not in text
         assert "Titel: &lt;Kundentermin&gt;" not in text
         assert "Ort: Bern" not in text
         assert "calendar.google.com" not in text
@@ -1190,17 +1319,14 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
 
         calls = []
 
+        def fake_search_ids(config, *, server, user_google_email, query, page_size):
+            calls.append({"query": query, "page_size": page_size, "kind": "search"})
+            if query == "in:inbox is:unread":
+                return ["old-unread"]
+            return ["fresh-read"]
+
         def fake_items(config, *, server, user_google_email, query, page_size, unread):
-            calls.append({"query": query, "page_size": page_size, "unread": unread})
-            if unread:
-                return [{
-                    "id": "old-unread",
-                    "message_id": "old-unread",
-                    "sender": "Status <status@example.com>",
-                    "subject": "Old unread",
-                    "received_at": "2026-04-01T08:00:00Z",
-                    "unread": True,
-                }]
+            calls.append({"query": query, "page_size": page_size, "unread": unread, "kind": "items"})
             return [{
                 "id": "fresh-read",
                 "message_id": "fresh-read",
@@ -1210,6 +1336,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
                 "unread": False,
             }]
 
+        monkeypatch.setattr(web_server, "_gmail_bridge_search_message_ids", fake_search_ids)
         monkeypatch.setattr(web_server, "_gmail_bridge_message_items", fake_items)
         summary = web_server._google_workspace_email_summary({"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.example/mcp"}}}, {
             "backend": "google_workspace",
@@ -1300,7 +1427,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert resp.json()["shared_folder"]["can_open_folder"] is True
         open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers=remote_headers)
         assert open_folder_resp.status_code == 200
-        assert opened and opened[0][0] == "xdg-open"
+        assert any(args and args[0] == "xdg-open" for args in opened)
 
     def test_assistant_attachment_upload_extracts_text_and_sanitizes_path(self):
         from hermes_constants import get_hermes_home

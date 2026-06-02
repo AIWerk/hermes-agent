@@ -259,6 +259,7 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+_DEFAULT_KEEPALIVE_INTERVAL = 30 * 60  # seconds between idle keepalives
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
@@ -1287,13 +1288,22 @@ class MCPServerTask:
 
         Shutdown takes precedence if both events are set simultaneously.
 
-        Periodically sends a lightweight keepalive (``list_tools``) to
-        prevent TCP connections from going stale during long idle
-        periods (#17003).  If the keepalive fails, triggers a reconnect.
+        Periodically sends a lightweight keepalive to prevent TCP connections
+        from going stale during long idle periods (#17003). Prefer MCP ping
+        when the SDK exposes it; fall back to ``list_tools`` only for older
+        SDKs. If the keepalive fails, triggers a reconnect.
         """
-        # Keepalive interval in seconds.  Must be shorter than typical
-        # LB / NAT idle-timeout (commonly 300-600s).
-        _KEEPALIVE_INTERVAL = 180  # 3 minutes
+        # Keepalive interval in seconds.  Defaults to 30 minutes to avoid
+        # hammering remote MCP servers with tools/list. Override per server
+        # with mcp_servers.<name>.keepalive_interval_seconds. Set 0/false to
+        # disable idle keepalives and rely on reconnect-on-use.
+        raw_keepalive = self._config.get("keepalive_interval_seconds", _DEFAULT_KEEPALIVE_INTERVAL)
+        try:
+            keepalive_interval = float(raw_keepalive)
+        except (TypeError, ValueError):
+            keepalive_interval = float(_DEFAULT_KEEPALIVE_INTERVAL)
+        if raw_keepalive is False or keepalive_interval <= 0:
+            keepalive_interval = None
 
         shutdown_task = asyncio.create_task(self._shutdown_event.wait())
         reconnect_task = asyncio.create_task(self._reconnect_event.wait())
@@ -1301,20 +1311,27 @@ class MCPServerTask:
             while True:
                 done, _pending = await asyncio.wait(
                     {shutdown_task, reconnect_task},
-                    timeout=_KEEPALIVE_INTERVAL,
+                    timeout=keepalive_interval,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if done:
                     break
 
+                if keepalive_interval is None:
+                    continue
+
                 # Timeout — no lifecycle event fired.  Send a keepalive
                 # to exercise the connection and detect stale sockets.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
-                            self.session.list_tools(),
-                            timeout=30.0,
-                        )
+                        ping = getattr(self.session, "send_ping", None) or getattr(self.session, "ping", None)
+                        if callable(ping):
+                            ping_result = ping()
+                            if inspect.isawaitable(ping_result):
+                                await asyncio.wait_for(ping_result, timeout=30.0)
+                        else:
+                            async with self._rpc_lock:
+                                await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
                     except Exception as exc:
                         logger.warning(
                             "MCP server '%s' keepalive failed, "

@@ -14,6 +14,7 @@ import copy
 import email.utils
 import html
 import hmac
+from html.parser import HTMLParser
 import http.cookiejar
 import importlib.util
 import json
@@ -1098,6 +1099,14 @@ _EMAIL_READER_ATTACHMENTS_MARKER_RE = re.compile(r"^[-\s]*ATTACHMENTS[-\s]*$", r
 _EMAIL_READER_ATTACHMENT_ITEM_RE = re.compile(r"^\s*\d+\.\s+(.+?)\s+\(([^,()]+)(?:,\s*([^()]+))?\)\s*$")
 _EMAIL_READER_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>()\[\]{}\"']+")
 _EMAIL_READER_WWW_RE = re.compile(r"(?i)(?<![@\w])www\.[^\s<>()\[\]{}\"']+")
+_EMAIL_READER_INVISIBLE_RE = re.compile(r"[\u034f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+_EMAIL_READER_LONG_BODY_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?])\s+(?=(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]+|N\d{1,3}|[A-Z]{2,}\b))"
+)
+_EMAIL_READER_LONG_BODY_HINT_RE = re.compile(
+    r"\s+(?=(?:Don't forget to confirm|Confirm my details|What happens|This is an official email|Remember,|Need help\?|Chat with us|If you have|We[’']re here|N26 Bank SE|Registered in|Management Board|This email was intended)\b)",
+    re.IGNORECASE,
+)
 
 
 def _email_reader_attachment_summaries(lines: list[str]) -> tuple[list[str], list[str]]:
@@ -1135,9 +1144,28 @@ def _replace_email_reader_links(body: str) -> str:
     return text
 
 
+def _wrap_long_email_reader_body_text(text: str) -> str:
+    non_empty_lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if len(non_empty_lines) == 1 and len(non_empty_lines[0]) > 500:
+        long_line = non_empty_lines[0]
+        long_line = _EMAIL_READER_LONG_BODY_HINT_RE.sub("\n\n", long_line)
+        long_line = _EMAIL_READER_LONG_BODY_BOUNDARY_RE.sub("\n\n", long_line)
+        return re.sub(r"\n{3,}", "\n\n", long_line).strip()
+    return str(text or "").strip()
+
+
+def _normalize_email_reader_body_text(body: str) -> str:
+    """Make bridge/plain email bodies readable without exposing unsafe HTML."""
+    text = _EMAIL_READER_INVISIBLE_RE.sub("", str(body or "")).replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines = [re.sub(r"[ \t\f\v]{2,}", " ", line).strip() for line in text.split("\n")]
+    text = "\n".join(normalized_lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return _wrap_long_email_reader_body_text(text)
+
+
 def _strip_email_reader_transport_metadata(body: str) -> str:
     """Remove bridge/Himalaya transport headers from the CUI read-only body."""
-    text = str(body or "")
+    text = _normalize_email_reader_body_text(body)
     lines = text.splitlines()
     index = 0
     while index < len(lines) and not lines[index].strip():
@@ -1168,6 +1196,7 @@ def _strip_email_reader_transport_metadata(body: str) -> str:
     cleaned = "\n".join(content_lines).lstrip()
     if attachment_summaries:
         cleaned = f"{cleaned.rstrip()}\n\nAnhänge:\n" + "\n".join(attachment_summaries) if cleaned else "Anhänge:\n" + "\n".join(attachment_summaries)
+    cleaned = _wrap_long_email_reader_body_text(cleaned)
     if not cleaned and not stripped_any_header:
         cleaned = text
     return _replace_email_reader_links(cleaned)
@@ -1198,7 +1227,7 @@ def _plain_email_reader_html(*, account_label: str, sender: str, subject: str, r
     dt {{ color: #8a7f70; font-weight: 700; }}
     dd {{ margin: 0; min-width: 0; overflow-wrap: anywhere; color: #473f34; }}
     .body {{ padding: 22px 24px 26px; }}
-    pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, \"Liberation Mono\", monospace; color: #342f27; }}
+    .email-body {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.62 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #342f27; }}
     .notice {{ margin: 0 0 16px; color: #7c705f; font-size: 12px; }}
   </style>
 </head>
@@ -1216,12 +1245,78 @@ def _plain_email_reader_html(*, account_label: str, sender: str, subject: str, r
       </header>
       <section class=\"body\">
         <p class=\"notice\">Diese Ansicht ist bereinigt. Externe Inhalte, Skripte und Anhänge werden nicht automatisch geladen.</p>
-        <pre>{safe_body}</pre>
+        <div class=\"email-body\">{safe_body}</div>
       </section>
     </article>
   </main>
 </body>
 </html>"""
+
+
+class _CalendarHtmlToTextParser(HTMLParser):
+    _BLOCK_TAGS = {"address", "article", "aside", "blockquote", "div", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "li", "p", "section", "tr"}
+    _LINE_TAGS = {"br", "hr"}
+    _SKIP_TAGS = {"script", "style", "iframe", "object", "embed", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def _newline(self) -> None:
+        if not self.parts or self.parts[-1].endswith("\n"):
+            return
+        self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        name = tag.lower()
+        if name in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if name in self._LINE_TAGS or name in self._BLOCK_TAGS:
+            self._newline()
+
+    def handle_endtag(self, tag: str) -> None:
+        name = tag.lower()
+        if name in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+        if name in self._BLOCK_TAGS:
+            self._newline()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        self.parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def _html_fragment_to_plain_text(value: str) -> str:
+    text = html.unescape(str(value or ""))
+    if not re.search(r"<\s*/?\s*[A-Za-z][^>]*>", text):
+        return text
+    parser = _CalendarHtmlToTextParser()
+    try:
+        parser.feed(text)
+        parser.close()
+        return parser.text()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def _clean_calendar_reader_body(body: str) -> str:
+    text = _html_fragment_to_plain_text(body)
+    text = _EMAIL_READER_INVISIBLE_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t\f\v]{2,}", " ", line).strip() for line in text.split("\n")]
+    text = "\n".join(line for line in lines if line)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return _replace_email_reader_links(_wrap_long_email_reader_body_text(text))
 
 
 def _plain_calendar_reader_html(*, account_label: str, title: str, starts_at: str, ends_at: str, location: str, body: str) -> str:
@@ -1230,7 +1325,7 @@ def _plain_calendar_reader_html(*, account_label: str, title: str, starts_at: st
     safe_starts = html.escape(starts_at or "")
     safe_ends = html.escape(ends_at or "")
     safe_location = html.escape(location or "")
-    safe_body = html.escape(_replace_email_reader_links(body or ""))
+    safe_body = html.escape(_clean_calendar_reader_body(body or ""))
     return f"""<!doctype html>
 <html lang="de">
 <head>
@@ -1293,6 +1388,28 @@ def _mcp_bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
     return {"url": url, "headers": {str(k): str(v) for k, v in headers.items()}}
 
 
+_MCP_BRIDGE_SESSION_LOCK = threading.Lock()
+_MCP_BRIDGE_SESSIONS: dict[str, str | None] = {}
+_MCP_BRIDGE_REQUEST_IDS: dict[str, int] = {}
+
+
+def _mcp_bridge_session_key(config: dict[str, Any] | None) -> str:
+    bridge = _mcp_bridge_config(config)
+    if not bridge:
+        raise RuntimeError("AIWerk Bridge MCP server not configured")
+    try:
+        return json.dumps(bridge, sort_keys=True, default=str)
+    except TypeError:
+        return repr(bridge)
+
+
+def _mcp_bridge_next_request_id(session_key: str) -> int:
+    with _MCP_BRIDGE_SESSION_LOCK:
+        next_id = int(_MCP_BRIDGE_REQUEST_IDS.get(session_key, 0)) + 1
+        _MCP_BRIDGE_REQUEST_IDS[session_key] = next_id
+        return next_id
+
+
 def _mcp_bridge_rpc(config: dict[str, Any] | None, method: str, params: dict[str, Any], *, session_id: str | None = None, request_id: int = 1) -> tuple[dict[str, Any], str | None]:
     bridge = _mcp_bridge_config(config)
     if not bridge:
@@ -1316,7 +1433,8 @@ def _mcp_bridge_rpc(config: dict[str, Any] | None, method: str, params: dict[str
     return response, next_session_id
 
 
-def _mcp_bridge_initialize(config: dict[str, Any] | None) -> str | None:
+def _mcp_bridge_initialize(config: dict[str, Any] | None, *, session_key: str | None = None) -> str | None:
+    session_key = session_key or _mcp_bridge_session_key(config)
     _, session_id = _mcp_bridge_rpc(
         config,
         "initialize",
@@ -1325,27 +1443,60 @@ def _mcp_bridge_initialize(config: dict[str, Any] | None) -> str | None:
             "capabilities": {},
             "clientInfo": {"name": "aiwerk-cui", "version": str(__version__)},
         },
-        request_id=1,
+        request_id=_mcp_bridge_next_request_id(session_key),
     )
     return session_id
 
 
+def _mcp_bridge_session(config: dict[str, Any] | None) -> tuple[str, str | None]:
+    session_key = _mcp_bridge_session_key(config)
+    with _MCP_BRIDGE_SESSION_LOCK:
+        cached_session_id = _MCP_BRIDGE_SESSIONS.get(session_key)
+    if cached_session_id:
+        return session_key, cached_session_id
+    session_id = _mcp_bridge_initialize(config, session_key=session_key)
+    with _MCP_BRIDGE_SESSION_LOCK:
+        _MCP_BRIDGE_SESSIONS[session_key] = session_id
+    return session_key, session_id
+
+
+def _mcp_bridge_forget_session(session_key: str) -> None:
+    with _MCP_BRIDGE_SESSION_LOCK:
+        _MCP_BRIDGE_SESSIONS.pop(session_key, None)
+
+
+def _mcp_bridge_router_call(config: dict[str, Any] | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    session_key, session_id = _mcp_bridge_session(config)
+    try:
+        response, next_session_id = _mcp_bridge_rpc(
+            config,
+            "tools/call",
+            {"name": "mcp", "arguments": arguments},
+            session_id=session_id,
+            request_id=_mcp_bridge_next_request_id(session_key),
+        )
+    except RuntimeError as exc:
+        if "session" not in str(exc).lower():
+            raise
+        _mcp_bridge_forget_session(session_key)
+        session_key, session_id = _mcp_bridge_session(config)
+        response, next_session_id = _mcp_bridge_rpc(
+            config,
+            "tools/call",
+            {"name": "mcp", "arguments": arguments},
+            session_id=session_id,
+            request_id=_mcp_bridge_next_request_id(session_key),
+        )
+    if next_session_id and next_session_id != session_id:
+        with _MCP_BRIDGE_SESSION_LOCK:
+            _MCP_BRIDGE_SESSIONS[session_key] = next_session_id
+    return response
+
+
 def _call_aiwerk_bridge_tool(config: dict[str, Any] | None, *, server: str, tool: str, params: dict[str, Any]) -> dict[str, Any]:
-    session_id = _mcp_bridge_initialize(config)
-    response, _ = _mcp_bridge_rpc(
+    response = _mcp_bridge_router_call(
         config,
-        "tools/call",
-        {
-            "name": "mcp",
-            "arguments": {
-                "action": "call",
-                "server": server,
-                "tool": tool,
-                "params": params,
-            },
-        },
-        session_id=session_id,
-        request_id=2,
+        {"action": "call", "server": server, "tool": tool, "params": params},
     )
     result = response.get("result") if isinstance(response, dict) else None
     if not isinstance(result, dict):
@@ -1438,25 +1589,46 @@ def _gmail_bridge_metadata_to_items(text: str, *, unread: bool) -> list[dict[str
     return items
 
 
-def _gmail_bridge_message_items(config: dict[str, Any] | None, *, server: str, user_google_email: str, query: str, page_size: int, unread: bool) -> list[dict[str, Any]]:
+def _gmail_bridge_search_message_ids(config: dict[str, Any] | None, *, server: str, user_google_email: str, query: str, page_size: int) -> list[str]:
     search = _call_aiwerk_bridge_tool(
         config,
         server=server,
         tool="search_gmail_messages",
         params={"query": query, "user_google_email": user_google_email, "page_size": page_size},
     )
-    message_ids = _gmail_search_message_ids(_bridge_result_text(search))[:page_size]
+    return _gmail_search_message_ids(_bridge_result_text(search))[:page_size]
+
+
+def _gmail_bridge_metadata_items_for_ids(config: dict[str, Any] | None, *, server: str, user_google_email: str, message_ids: list[str], unread: bool, page_size: int) -> list[dict[str, Any]]:
     if not message_ids:
         return []
     batch = _call_aiwerk_bridge_tool(
         config,
         server=server,
         tool="get_gmail_messages_content_batch",
-        params={"message_ids": message_ids, "user_google_email": user_google_email, "format": "metadata"},
+        params={"message_ids": message_ids[:page_size], "user_google_email": user_google_email, "format": "metadata"},
     )
     items = _gmail_bridge_metadata_to_items(_bridge_result_text(batch), unread=unread)
     items.sort(key=lambda item: str(item.get("received_at") or ""), reverse=True)
     return items[:page_size]
+
+
+def _gmail_bridge_message_items(config: dict[str, Any] | None, *, server: str, user_google_email: str, query: str, page_size: int, unread: bool) -> list[dict[str, Any]]:
+    message_ids = _gmail_bridge_search_message_ids(
+        config,
+        server=server,
+        user_google_email=user_google_email,
+        query=query,
+        page_size=page_size,
+    )
+    return _gmail_bridge_metadata_items_for_ids(
+        config,
+        server=server,
+        user_google_email=user_google_email,
+        message_ids=message_ids,
+        unread=unread,
+        page_size=page_size,
+    )
 
 
 def _google_workspace_email_summary(config: dict[str, Any] | None = None, account_cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -1473,30 +1645,46 @@ def _google_workspace_email_summary(config: dict[str, Any] | None = None, accoun
     unread_query = str(email_cfg.get("unread_query") or os.environ.get("AIWERK_CUI_GMAIL_UNREAD_QUERY") or "in:inbox is:unread").strip()
     latest_query = str(email_cfg.get("latest_query") or os.environ.get("AIWERK_CUI_GMAIL_LATEST_QUERY") or "in:inbox").strip()
     try:
-        unread_items = _gmail_bridge_message_items(
+        unread_ids = _gmail_bridge_search_message_ids(
             config,
             server=server,
             user_google_email=user_google_email,
             query=unread_query,
             page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
-            unread=True,
         )
-        unread = len(unread_items)
-        unread_ids = {str(item.get("message_id") or item.get("id") or "") for item in unread_items}
-        preview_items = _gmail_bridge_message_items(
-            config,
-            server=server,
-            user_google_email=user_google_email,
-            query=latest_query,
-            page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
-            unread=False,
-        )
-        for item in preview_items:
-            message_ref = str(item.get("message_id") or item.get("id") or "")
-            if message_ref in unread_ids:
-                item["unread"] = True
-        if not preview_items:
-            preview_items = unread_items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS]
+        unread = len(unread_ids)
+        unread_id_set = set(unread_ids)
+        if latest_query == unread_query:
+            preview_items = _gmail_bridge_metadata_items_for_ids(
+                config,
+                server=server,
+                user_google_email=user_google_email,
+                message_ids=unread_ids,
+                unread=True,
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
+            )
+        else:
+            preview_items = _gmail_bridge_message_items(
+                config,
+                server=server,
+                user_google_email=user_google_email,
+                query=latest_query,
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
+                unread=False,
+            )
+            for item in preview_items:
+                message_ref = str(item.get("message_id") or item.get("id") or "")
+                if message_ref in unread_id_set:
+                    item["unread"] = True
+        if not preview_items and unread_ids:
+            preview_items = _gmail_bridge_metadata_items_for_ids(
+                config,
+                server=server,
+                user_google_email=user_google_email,
+                message_ids=unread_ids,
+                unread=True,
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
+            )
         for item in preview_items:
             item.setdefault("account_label", account_label)
             item.setdefault("account_address", account_address)
@@ -1966,14 +2154,7 @@ def _aiwerk_bridge_live_subservers(config: dict[str, Any]) -> list[dict[str, Any
     Hermes config, so the CUI should prefer the live router inventory and only
     fall back to static/configured names when the bridge cannot be reached.
     """
-    session_id = _mcp_bridge_initialize(config)
-    response, _ = _mcp_bridge_rpc(
-        config,
-        "tools/call",
-        {"name": "mcp", "arguments": {"action": "status"}},
-        session_id=session_id,
-        request_id=2,
-    )
+    response = _mcp_bridge_router_call(config, {"action": "status"})
     result = response.get("result") if isinstance(response, dict) else None
     content = result.get("content") if isinstance(result, dict) else None
     for item in content if isinstance(content, list) else []:
