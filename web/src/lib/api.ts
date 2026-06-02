@@ -260,6 +260,12 @@ export const api = {
       body: form,
     });
   },
+  attachAssistantResource: (body: AssistantResourceAttachmentRequest) =>
+    fetchJSON<AssistantAttachmentUploadResponse>("/api/assistant/attachments/resource", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   transcribeAssistantAudio: async (file: File, sessionId?: string) => {
     const form = new FormData();
     form.append("file", file);
@@ -275,7 +281,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, session_id: sessionId }),
     }),
-  getAssistantResources: () => fetchJSON<AssistantResourcesResponse>("/api/assistant/resources"),
+  getAssistantResources: (options?: { refresh?: boolean; resource?: "email" | "calendar" | "shared_folder" | "vault" | "todos" | "connectors" }) => {
+    const params = new URLSearchParams();
+    if (options?.refresh) params.set("refresh", "1");
+    if (options?.resource) params.set("resource", options.resource);
+    const query = params.toString();
+    return fetchJSON<AssistantResourcesResponse>(`/api/assistant/resources${query ? `?${query}` : ""}`);
+  },
   openAssistantSharedFolder: () => fetchJSON<{ ok: boolean }>("/api/assistant/shared-folder/open-folder", { method: "POST" }),
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
@@ -673,6 +685,12 @@ export interface AssistantAttachmentUploadResponse {
   attachments: AssistantUploadedAttachment[];
 }
 
+export interface AssistantResourceAttachmentRequest {
+  kind: "email" | "calendar_event" | "shared_file";
+  item: Record<string, unknown>;
+  session_id?: string;
+}
+
 export interface AssistantTranscriptionResponse {
   text: string;
   provider?: string;
@@ -687,15 +705,46 @@ export interface AssistantResourceMailItem {
   received_at?: string;
   unread?: boolean;
   has_attachment?: boolean;
+  message_id?: string;
   open_url?: string | null;
+  gmail_web_url?: string | null;
+  account_label?: string;
+  account_address?: string;
+  source?: "gmail" | "imap" | string;
+}
+
+export interface AssistantResourceMailAccount {
+  label: string;
+  address?: string;
+  source?: "gmail" | "imap" | string;
+  status: AssistantResourceStatus;
+  unread_count: number;
+  summary: string;
+  items?: AssistantResourceMailItem[];
 }
 
 export interface AssistantResourceEventItem {
   id?: string;
+  event_id?: string;
   title?: string;
   starts_at?: string;
   ends_at?: string;
   location_hint?: string;
+  account_label?: string;
+  account_address?: string;
+  source?: "google_calendar" | string;
+  html_link?: string;
+  open_url?: string | null;
+}
+
+export interface AssistantResourceCalendarAccount {
+  label: string;
+  address?: string;
+  calendar_id?: string;
+  source?: "google_calendar" | string;
+  status: AssistantResourceStatus;
+  summary: string;
+  items?: AssistantResourceEventItem[];
 }
 
 export interface AssistantSharedFolderItem {
@@ -717,7 +766,43 @@ export interface AssistantConnectorSummary {
   status: AssistantResourceStatus;
   status_label?: string;
   capabilities?: string[];
+  description?: string | null;
   children?: AssistantConnectorSummary[];
+  open_url?: string | null;
+}
+
+export interface AssistantVaultSummary {
+  status: AssistantResourceStatus;
+  vault_url: string;
+  summary: string;
+  item_count: number | null;
+  exposed_count?: number | null;
+  agent_created_count?: number | null;
+  weak_count: number | null;
+  reused_count: number | null;
+  compromised_count: number | null;
+  compromised_supported?: boolean;
+  two_factor_status?: "active" | "recommended" | "unknown" | string;
+  source?: "aiwerk_bridge" | "bw" | "link" | "none" | string;
+  checked_at?: string;
+}
+
+export interface AssistantTodoItem {
+  id: string;
+  text: string;
+  line?: number;
+  done?: boolean;
+}
+
+export interface AssistantTodoSummary {
+  status: AssistantResourceStatus;
+  summary: string;
+  path?: string;
+  items: AssistantTodoItem[];
+  open_count: number;
+  done_count: number;
+  total_count: number;
+  checked_at?: string;
 }
 
 export interface AssistantResourcesResponse {
@@ -727,11 +812,13 @@ export interface AssistantResourcesResponse {
     unread_count: number;
     summary: string;
     items: AssistantResourceMailItem[];
+    accounts?: AssistantResourceMailAccount[];
   };
   calendar: {
     status: AssistantResourceStatus;
     summary: string;
     items: AssistantResourceEventItem[];
+    accounts?: AssistantResourceCalendarAccount[];
   };
   shared_folder: {
     status: AssistantResourceStatus;
@@ -743,8 +830,21 @@ export interface AssistantResourcesResponse {
     can_open_folder?: boolean;
     cloud_url?: string | null;
   };
+  vault: AssistantVaultSummary;
+  todos: AssistantTodoSummary;
   connectors: AssistantConnectorSummary[];
   warnings: string[];
+  cache?: {
+    cached: boolean;
+    resources: Record<string, {
+      cached: boolean;
+      stale?: boolean;
+      updated_at: string;
+      expires_at: string;
+      ttl_seconds: number;
+      last_error?: string;
+    }>;
+  };
 }
 
 export interface EnvVarInfo {

@@ -1,10 +1,10 @@
-import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, Mail, Mic, Paperclip, Pencil, PlugZap, RefreshCw, Square, Volume2, VolumeX, X } from "lucide-react";
-import { Fragment, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, ListChecks, Mail, Mic, Paperclip, Pencil, PlugZap, RefreshCw, Square, Volume2, VolumeX, X } from "lucide-react";
+import { Fragment, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
-import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantResourcesResponse, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
+import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -66,6 +66,10 @@ function recentSessionDisplayTitle(session: RecentSession): string {
   return "Unbenannte Sitzung";
 }
 
+type ResourcePanelKey = "email" | "calendar" | "shared_folder" | "vault" | "todos" | "connectors";
+
+type ResourceCardAction = { icon: ReactNode; label: string; onClick: () => void; disabled?: boolean };
+
 const RESOURCE_STATUS_COPY: Record<AssistantResourceStatus, { label: string; dot: string }> = {
   connected: { label: "Verbunden", dot: "#7bcf91" },
   limited: { label: "Eingeschränkt", dot: "#d7b98e" },
@@ -78,17 +82,47 @@ function resourceStatusCopy(status?: AssistantResourceStatus): { label: string; 
   return RESOURCE_STATUS_COPY[status ?? "not_configured"] ?? RESOURCE_STATUS_COPY.not_configured;
 }
 
-function formatResourceTime(value?: string | null): string {
+function formatResourceTime(value?: string | null, options?: { year?: boolean }): string {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleString("de-CH", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleString("de-CH", {
+    day: "2-digit",
+    month: "2-digit",
+    ...(options?.year ? { year: "numeric" as const } : {}),
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function openSharedFolderCloudUrl(url?: string | null): void {
   if (!url) return;
   const opened = window.open(url, "_blank", "noopener,noreferrer");
   if (opened) opened.opener = null;
+}
+
+type DocumentTabKind = "email" | "calendar";
+
+type PanelTabId = "chat" | string;
+
+interface DocumentTab {
+  id: string;
+  kind: DocumentTabKind;
+  title: string;
+  subtitle?: string;
+  openUrl: string;
+  status: "loading" | "ready" | "error";
+  html?: string;
+  error?: string;
+}
+
+async function fetchTokenProtectedHtml(openUrl: string): Promise<string> {
+  const headers = new Headers();
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) headers.set("X-Hermes-Session-Token", token);
+  const response = await fetch(`${HERMES_BASE_PATH}${openUrl}`, { headers, credentials: "include" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.text();
 }
 
 function openSharedFolderFile(item: AssistantSharedFolderItem): void {
@@ -591,6 +625,8 @@ export default function AiwerkAssistantPage() {
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const contentGridRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const mainInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const sideInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const voiceStreamRef = useRef<MediaStream | null>(null);
   const voiceChunksRef = useRef<Blob[]>([]);
@@ -622,6 +658,7 @@ export default function AiwerkAssistantPage() {
   const [modelInfo, setModelInfo] = useState<ModelInfoResponse | null>(null);
   const [resourceSummary, setResourceSummary] = useState<AssistantResourcesResponse | null>(null);
   const [resourcesLoading, setResourcesLoading] = useState(false);
+  const [resourceRefreshing, setResourceRefreshing] = useState<Partial<Record<ResourcePanelKey, boolean>>>({});
   const [resourcesError, setResourcesError] = useState<string | null>(null);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [activeStatusModal, setActiveStatusModal] = useState<RuntimeBadgeId | null>(null);
@@ -640,6 +677,8 @@ export default function AiwerkAssistantPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [sessionTitleBubble, setSessionTitleBubble] = useState<SessionTitleBubble | null>(null);
   const [activeTurnMode, setActiveTurnMode] = useState<ConversationMode>("main");
+  const [documentTabs, setDocumentTabs] = useState<DocumentTab[]>([]);
+  const [activePanelTab, setActivePanelTab] = useState<PanelTabId>("chat");
   const activeTurnModeRef = useRef<ConversationMode>("main");
   const activeToolAnchorRef = useRef<string | undefined>(undefined);
   const activeSideToolAnchorRef = useRef<string | undefined>(undefined);
@@ -649,6 +688,61 @@ export default function AiwerkAssistantPage() {
     setToast(text);
     window.setTimeout(() => setToast(null), 1800);
   }, []);
+
+  const activeDocumentTab = useMemo(
+    () => documentTabs.find((tab) => tab.id === activePanelTab) ?? null,
+    [activePanelTab, documentTabs],
+  );
+  const isChatPanelActive = activePanelTab === "chat";
+
+  const closeDocumentTab = useCallback((tabId: string) => {
+    setDocumentTabs((current) => {
+      const index = current.findIndex((tab) => tab.id === tabId);
+      const next = current.filter((tab) => tab.id !== tabId);
+      setActivePanelTab((active) => {
+        if (active !== tabId) return active;
+        return next[index - 1]?.id ?? next[index]?.id ?? "chat";
+      });
+      return next;
+    });
+  }, []);
+
+  const openDocumentTab = useCallback(async (kind: DocumentTabKind, openUrl: string | null | undefined, title: string, subtitle?: string) => {
+    if (!openUrl) return;
+    if (/^https?:\/\//i.test(openUrl)) {
+      const opened = window.open(openUrl, "_blank", "noopener,noreferrer");
+      if (opened) opened.opener = null;
+      return;
+    }
+    const id = `${kind}:${openUrl}`;
+    setDocumentTabs((current) => {
+      const existing = current.find((tab) => tab.id === id);
+      if (existing) return current.map((tab) => tab.id === id ? { ...tab, title, subtitle, status: "loading", error: undefined } : tab);
+      return [...current, { id, kind, title, subtitle, openUrl, status: "loading" }];
+    });
+    setActivePanelTab(id);
+    try {
+      const html = await fetchTokenProtectedHtml(openUrl);
+      setDocumentTabs((current) => current.map((tab) => tab.id === id ? { ...tab, html, status: "ready", error: undefined } : tab));
+    } catch (error) {
+      setDocumentTabs((current) => current.map((tab) => tab.id === id ? {
+        ...tab,
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      } : tab));
+      showToast(kind === "email" ? "E-Mail konnte nicht geöffnet werden." : "Termin konnte nicht geöffnet werden.");
+    }
+  }, [showToast]);
+
+  const openEmailInPanel = useCallback((item: AssistantResourceMailItem) => {
+    const subtitle = [item.sender, item.received_at ? formatResourceTime(item.received_at) : undefined].filter(Boolean).join(" · ");
+    void openDocumentTab("email", item.open_url, item.subject || "E-Mail", subtitle || item.account_address || item.account_label);
+  }, [openDocumentTab]);
+
+  const openCalendarInPanel = useCallback((item: AssistantResourceEventItem) => {
+    const subtitle = [formatResourceTime(item.starts_at), item.location_hint].filter(Boolean).join(" · ");
+    void openDocumentTab("calendar", item.open_url, item.title || "Termin", subtitle || item.account_address || item.account_label);
+  }, [openDocumentTab]);
 
   const startRightRailResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     if (!contentGridRef.current) return;
@@ -684,6 +778,23 @@ export default function AiwerkAssistantPage() {
     setRightRailWidth(RIGHT_RAIL_DEFAULT_WIDTH);
     storeRightRailWidth(RIGHT_RAIL_DEFAULT_WIDTH);
   }, []);
+
+  const resizeComposerTextarea = useCallback((element: HTMLTextAreaElement | null) => {
+    if (!element) return;
+    const maxHeight = 160;
+    element.style.height = "auto";
+    const nextHeight = Math.min(element.scrollHeight, maxHeight);
+    element.style.height = `${nextHeight}px`;
+    element.style.overflowY = element.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeComposerTextarea(mainInputRef.current);
+  }, [input, resizeComposerTextarea]);
+
+  useLayoutEffect(() => {
+    resizeComposerTextarea(sideInputRef.current);
+  }, [sideInput, resizeComposerTextarea]);
 
   const stopReadAloud = useCallback(() => {
     readAloudRequestRef.current += 1;
@@ -814,6 +925,31 @@ export default function AiwerkAssistantPage() {
       : (files.length === 1 ? "Datei angehängt" : `${files.length} Dateien angehängt`);
     showToast(source === "paste" ? "Bild aus der Zwischenablage angehängt" : label);
   }, [showToast]);
+
+  const attachResourceToSession = useCallback(async (
+    kind: "email" | "calendar_event" | "shared_file",
+    item: Record<string, unknown>,
+    label: string,
+  ) => {
+    if (!sessionId) {
+      showToast("Sitzung noch nicht bereit.");
+      return;
+    }
+    try {
+      const result = await api.attachAssistantResource({ kind, item, session_id: sessionId });
+      const previews = result.attachments.map((uploaded) => ({
+        id: newId("attachment"),
+        name: uploaded.name || label,
+        type: uploaded.type || "application/octet-stream",
+        size: uploaded.size || 0,
+        uploaded,
+      }));
+      setAttachedFiles((current) => [...current, ...previews]);
+      showToast(`${label} angehängt`);
+    } catch {
+      showToast(`${label} konnte nicht angehängt werden.`);
+    }
+  }, [sessionId, showToast]);
 
   const stopVoiceTracks = useCallback(() => {
     if (voiceTimerRef.current !== null) {
@@ -1034,16 +1170,24 @@ export default function AiwerkAssistantPage() {
     }
   }, []);
 
-  const refreshResources = useCallback(async () => {
-    setResourcesLoading(true);
+  const refreshResources = useCallback(async (options?: { force?: boolean; resource?: ResourcePanelKey }) => {
+    if (options?.resource) {
+      setResourceRefreshing((current) => ({ ...current, [options.resource as ResourcePanelKey]: true }));
+    } else {
+      setResourcesLoading(true);
+    }
     try {
-      const resources = await api.getAssistantResources();
+      const resources = await api.getAssistantResources({ refresh: options?.force, resource: options?.resource });
       setResourceSummary(resources);
       setResourcesError(null);
     } catch (e) {
       setResourcesError(e instanceof Error ? e.message : "Ressourcen konnten nicht geladen werden.");
     } finally {
-      setResourcesLoading(false);
+      if (options?.resource) {
+        setResourceRefreshing((current) => ({ ...current, [options.resource as ResourcePanelKey]: false }));
+      } else {
+        setResourcesLoading(false);
+      }
     }
   }, []);
 
@@ -1056,8 +1200,8 @@ export default function AiwerkAssistantPage() {
     showToast("MCP-Server werden neu geladen…");
     try {
       await gateway.request("slash.exec", { session_id: sessionId, command: "reload-mcp" }, 120_000);
-      window.setTimeout(() => void refreshResources(), 400);
-      window.setTimeout(() => void refreshResources(), 1800);
+      window.setTimeout(() => void refreshResources({ force: true }), 400);
+      window.setTimeout(() => void refreshResources({ force: true }), 1800);
       showToast("MCP-Server neu geladen");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1068,7 +1212,7 @@ export default function AiwerkAssistantPage() {
 
   useEffect(() => {
     const initial = window.setTimeout(() => void refreshResources(), 0);
-    const timer = window.setInterval(() => void refreshResources(), 120_000);
+    const timer = window.setInterval(() => void refreshResources(), 30 * 60 * 1000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
@@ -1392,6 +1536,8 @@ export default function AiwerkAssistantPage() {
       activeToolAnchorRef.current = undefined;
       activeSideToolAnchorRef.current = undefined;
       setActiveTurnMode("main");
+      setActivePanelTab("chat");
+      setDocumentTabs([]);
       setInput("");
       setSideInput("");
       setSideMessages([]);
@@ -1872,14 +2018,14 @@ export default function AiwerkAssistantPage() {
           <section
             ref={contentGridRef}
             className={
-              "grid min-h-0 grid-cols-1 gap-[12px] xl:grid-cols-[minmax(0,1fr)_10px_var(--right-rail-width)] " +
+              "grid h-full min-h-0 overflow-hidden grid-cols-1 gap-[12px] xl:grid-cols-[minmax(0,1fr)_10px_var(--right-rail-width)] " +
               (isResizingRightRail ? "cursor-col-resize select-none" : "")
             }
             style={{ "--right-rail-width": `${rightRailWidth}px` } as CSSProperties}
           >
             {/* Chat panel */}
             <div
-              className="aiwerk-chat-panel relative grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] shadow-[0_18px_50px_rgba(56,42,20,.08)]"
+              className="aiwerk-chat-panel relative grid h-full min-h-0 grid-rows-[auto_auto_minmax(0,1fr)_auto] overflow-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] shadow-[0_18px_50px_rgba(56,42,20,.08)]"
               onDragEnter={(e) => {
                 if (Array.from(e.dataTransfer.types).includes("Files")) {
                   e.preventDefault();
@@ -1987,44 +2133,109 @@ export default function AiwerkAssistantPage() {
                 </div>
               </div>
 
-              <div ref={messagesScrollRef} className="aiwerk-scrollbar min-h-0 overflow-y-auto overscroll-contain p-[24px]">
-                <div className="flex min-h-full flex-col gap-[16px]">
-                {messages.map((msg, index) => (
-                  <Fragment key={msg.id}>
-                    {mainToolDisclosureIndex === index && <ToolCallsDisclosure tools={mainUnanchoredToolCalls} />}
-                    {msg.role === "system" ? (
-                      <div className="mx-auto max-w-[74%] rounded-[18px] bg-[#f1eadf] px-4 py-3.5 text-center text-[14px] text-[#695a43]">
-                        {msg.text}
-                      </div>
-                    ) : (
-                      <div
-                        className={
-                          msg.role === "user"
-                            ? "max-w-[74%] self-end rounded-[18px] rounded-tr-[6px] bg-[#7f6b4d] px-4 py-3.5 text-[15px] leading-[1.45] text-white"
-                            : "max-w-[74%] rounded-[18px] rounded-tl-[6px] bg-[#eee5d7] px-4 py-3.5 text-[15px] leading-[1.45]"
-                        }
+              <div
+                role="tablist"
+                aria-label="Geöffnete Ansichten"
+                className="flex min-w-0 items-end gap-[2px] overflow-x-auto border-b border-[#d8cbb9] bg-[#f1e8da] px-[14px] pt-[8px] aiwerk-scrollbar"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  onClick={() => setActivePanelTab("chat")}
+                  aria-selected={activePanelTab === "chat"}
+                  className={
+                    "-mb-px flex h-[36px] shrink-0 items-center rounded-t-[9px] border px-[14px] text-[12px] font-bold transition " +
+                    (activePanelTab === "chat"
+                      ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
+                      : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
+                  }
+                >
+                  Chat
+                </button>
+                {documentTabs.map((tab) => {
+                  const isActive = activePanelTab === tab.id;
+                  const Icon = tab.kind === "email" ? Mail : CalendarDays;
+                  return (
+                    <div
+                      key={tab.id}
+                      role="tab"
+                      aria-selected={isActive}
+                      className={
+                        "-mb-px flex h-[36px] min-w-0 max-w-[260px] shrink-0 items-center rounded-t-[9px] border pl-[11px] pr-[5px] text-[12px] transition " +
+                        (isActive
+                          ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
+                          : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
+                      }
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setActivePanelTab(tab.id)}
+                        className="flex min-w-0 flex-1 items-center gap-[7px] truncate text-left font-bold"
+                        title={tab.title}
                       >
-                        {msg.attachments && msg.attachments.length > 0 && (
-                          <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} />
-                        )}
-                        <MessageText message={msg} className={msg.attachments?.length ? "mt-[10px]" : undefined} />
-                      </div>
-                    )}
-                    {msg.role === "user" && <ToolCallsDisclosure tools={anchoredToolsForMessage(toolCalls, msg.id)} />}
-                  </Fragment>
-                ))}
-                {mainToolDisclosureIndex === messages.length && <ToolCallsDisclosure tools={mainUnanchoredToolCalls} />}
-                {showMainThinking && <ThinkingIndicator />}
-                {error && (
-                  <div className="max-w-[74%] rounded-[18px] border border-[#c98b7a] bg-[#f6e3dd] px-4 py-3 text-[14px] text-[#7b3b2f]">
-                    {error}
-                  </div>
-                )}
-                </div>
+                        <Icon className="h-[13px] w-[13px] shrink-0 opacity-75" />
+                        <span className="min-w-0 truncate">{tab.kind === "email" ? "Mail" : "Termin"}: {tab.title}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => closeDocumentTab(tab.id)}
+                        className={
+                          "ml-[4px] grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[6px] opacity-70 transition hover:opacity-100 " +
+                          (isActive ? "hover:bg-[#eee5d7]" : "hover:bg-[#e6dac8]")
+                        }
+                        aria-label={`${tab.title} schließen`}
+                        title="Tab schließen"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
 
-              <div>
-                <div className="flex gap-[10px] border-t border-[#e3d9c9] bg-[#fbf5eb] p-[16px]">
+              {isChatPanelActive ? (
+                <div ref={messagesScrollRef} className="aiwerk-scrollbar min-h-0 overflow-y-auto overscroll-contain p-[24px]">
+                  <div className="flex min-h-full flex-col gap-[16px]">
+                    {messages.map((msg, index) => (
+                      <Fragment key={msg.id}>
+                        {mainToolDisclosureIndex === index && <ToolCallsDisclosure tools={mainUnanchoredToolCalls} />}
+                        {msg.role === "system" ? (
+                          <div className="mx-auto max-w-[74%] rounded-[18px] bg-[#f1eadf] px-4 py-3.5 text-center text-[14px] text-[#695a43]">
+                            {msg.text}
+                          </div>
+                        ) : (
+                          <div
+                            className={
+                              msg.role === "user"
+                                ? "max-w-[74%] self-end rounded-[18px] rounded-tr-[6px] bg-[#7f6b4d] px-4 py-3.5 text-[15px] leading-[1.45] text-white"
+                                : "max-w-[74%] rounded-[18px] rounded-tl-[6px] bg-[#eee5d7] px-4 py-3.5 text-[15px] leading-[1.45]"
+                            }
+                          >
+                            {msg.attachments && msg.attachments.length > 0 && (
+                              <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} />
+                            )}
+                            <MessageText message={msg} className={msg.attachments?.length ? "mt-[10px]" : undefined} />
+                          </div>
+                        )}
+                        {msg.role === "user" && <ToolCallsDisclosure tools={anchoredToolsForMessage(toolCalls, msg.id)} />}
+                      </Fragment>
+                    ))}
+                    {mainToolDisclosureIndex === messages.length && <ToolCallsDisclosure tools={mainUnanchoredToolCalls} />}
+                    {showMainThinking && <ThinkingIndicator />}
+                    {error && (
+                      <div className="max-w-[74%] rounded-[18px] border border-[#c98b7a] bg-[#f6e3dd] px-4 py-3 text-[14px] text-[#7b3b2f]">
+                        {error}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <DocumentTabPanel tab={activeDocumentTab} />
+              )}
+
+              {isChatPanelActive && (
+                <div>
+                <div className="flex items-end gap-[10px] border-t border-[#e3d9c9] bg-[#fbf5eb] p-[16px]">
                   <button
                     type="button"
                     onClick={() => void startVoiceInput()}
@@ -2032,7 +2243,7 @@ export default function AiwerkAssistantPage() {
                     title={voiceState === "recording" ? "Aufnahme stoppen" : "Spracheingabe"}
                     aria-label={voiceState === "recording" ? "Aufnahme stoppen" : "Spracheingabe"}
                     className={
-                      "grid w-[46px] cursor-pointer place-items-center rounded-[14px] border transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-50 " +
+                      "grid h-[46px] w-[46px] shrink-0 cursor-pointer place-items-center rounded-[14px] border transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-50 " +
                       (voiceState === "recording"
                         ? "border-[#9a6a51] bg-[#8b5d4e] text-white shadow-[0_10px_22px_rgba(91,55,39,.18)]"
                         : "border-[#d9d0c1] bg-[#fffaf2] text-[#4b4235] hover:bg-[#f2eadf]")
@@ -2044,7 +2255,7 @@ export default function AiwerkAssistantPage() {
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                     title="Datei oder Bild anhängen"
-                    className="grid w-[46px] cursor-pointer place-items-center rounded-[14px] border border-[#d9d0c1] bg-[#fffaf2] text-[#4b4235] hover:bg-[#f2eadf]"
+                    className="grid h-[46px] w-[46px] shrink-0 cursor-pointer place-items-center rounded-[14px] border border-[#d9d0c1] bg-[#fffaf2] text-[#4b4235] hover:bg-[#f2eadf]"
                   >
                     <Paperclip className="h-[20px] w-[20px]" />
                   </button>
@@ -2060,12 +2271,16 @@ export default function AiwerkAssistantPage() {
                       e.currentTarget.value = "";
                     }}
                   />
-                  <input
-                    type="text"
+                  <textarea
+                    ref={mainInputRef}
+                    rows={1}
                     value={input}
-                    onChange={(e) => setInput(e.target.value)}
+                    onChange={(e) => {
+                      setInput(e.target.value);
+                      resizeComposerTextarea(e.currentTarget);
+                    }}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") {
+                      if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
                         void submit("main");
                       }
@@ -2080,13 +2295,13 @@ export default function AiwerkAssistantPage() {
                       addAttachedFiles(imageFiles, "paste");
                     }}
                     placeholder="Nachricht an den Assistenten schreiben…"
-                    className="flex-1 rounded-[14px] border border-[#d9d0c1] bg-white px-[14px] py-[13px] text-[15px] outline-none"
+                    className="aiwerk-scrollbar min-h-[46px] max-h-[160px] min-w-0 flex-1 resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[14px] py-[12px] text-[15px] leading-[1.45] outline-none"
                   />
                   <button
                     type="button"
                     onClick={() => void submit("main")}
                     disabled={(!input.trim() && attachedFiles.length === 0) || !sessionId || busy || connection !== "open"}
-                    className="cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[10px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
+                    className="h-[46px] shrink-0 cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[10px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     Senden
                   </button>
@@ -2124,7 +2339,8 @@ export default function AiwerkAssistantPage() {
                     <AttachmentPreviewGrid attachments={attachedFiles} onRemove={removeAttachedFile} />
                   </div>
                 )}
-              </div>
+                </div>
+              )}
 
               <button
                 type="button"
@@ -2192,25 +2408,29 @@ export default function AiwerkAssistantPage() {
                   </div>
                 </div>
                 <div className="border-t border-[#e3d9c9] bg-[#fbf5eb] p-[14px]">
-                  <div className="flex gap-[10px]">
-                    <input
-                      type="text"
+                  <div className="flex items-end gap-[10px]">
+                    <textarea
+                      ref={sideInputRef}
+                      rows={1}
                       value={sideInput}
-                      onChange={(e) => setSideInput(e.target.value)}
+                      onChange={(e) => {
+                        setSideInput(e.target.value);
+                        resizeComposerTextarea(e.currentTarget);
+                      }}
                       onKeyDown={(e) => {
-                        if (e.key === "Enter") {
+                        if (e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
                           void submit("side");
                         }
                       }}
                       placeholder="Nachricht in der Nebenunterhaltung…"
-                      className="min-w-0 flex-1 rounded-[14px] border border-[#d9d0c1] bg-white px-[13px] py-[12px] text-[14px] outline-none"
+                      className="aiwerk-scrollbar min-h-[44px] max-h-[160px] min-w-0 flex-1 resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[13px] py-[11px] text-[14px] leading-[1.45] outline-none"
                     />
                     <button
                       type="button"
                       onClick={() => void submit("side")}
                       disabled={!sideInput.trim() || !sessionId || busy || connection !== "open"}
-                      className="cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[13px] py-[9px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
+                      className="h-[44px] shrink-0 cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[13px] py-[9px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Senden
                     </button>
@@ -2235,11 +2455,14 @@ export default function AiwerkAssistantPage() {
             <ResourcesRail
               resources={resourceSummary}
               loading={resourcesLoading}
+              refreshing={resourceRefreshing}
               error={resourcesError}
-              attachments={attachedFiles}
-              approvals={approvals}
-              onRefresh={() => void refreshResources()}
+              activeDocumentTab={activeDocumentTab}
+              onRefresh={(resource) => void refreshResources({ force: true, resource })}
               onReloadMcp={reloadMcpServers}
+              onAttachResource={attachResourceToSession}
+              onOpenEmail={openEmailInPanel}
+              onOpenCalendar={openCalendarInPanel}
             />
           </section>
         </main>
@@ -2364,38 +2587,89 @@ function ToolCallsDisclosure({ tools, compact = false }: { tools: ToolCallSummar
     </div>
   );
 }
+function DocumentTabPanel({ tab }: { tab: DocumentTab | null }) {
+  if (!tab) {
+    return (
+      <div className="grid min-h-0 place-items-center bg-[#fffaf2] p-[24px] text-center text-[13px] text-[#776d5f]">
+        Kein Tab ausgewählt.
+      </div>
+    );
+  }
+  if (tab.status === "loading") {
+    return (
+      <div className="grid min-h-0 place-items-center bg-[#fffaf2] p-[24px] text-center text-[#6f614e]">
+        <div className="rounded-[18px] border border-[#e1d5c4] bg-[#f8f0e5] px-[18px] py-[14px] shadow-[0_12px_30px_rgba(56,42,20,.08)]">
+          <strong className="block text-[14px]">{tab.kind === "email" ? "E-Mail wird geöffnet…" : "Termin wird geöffnet…"}</strong>
+          {tab.subtitle && <span className="mt-[4px] block text-[12px] text-[#827765]">{tab.subtitle}</span>}
+        </div>
+      </div>
+    );
+  }
+  if (tab.status === "error") {
+    return (
+      <div className="grid min-h-0 place-items-center bg-[#fffaf2] p-[24px] text-center text-[#7b3b2f]">
+        <div className="rounded-[18px] border border-[#d9aaa0] bg-[#f6e3dd] px-[18px] py-[14px]">
+          <strong className="block text-[14px]">{tab.kind === "email" ? "E-Mail konnte nicht geöffnet werden." : "Termin konnte nicht geöffnet werden."}</strong>
+          {tab.error && <span className="mt-[4px] block text-[12px]">{tab.error}</span>}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="min-h-0 bg-[#fffaf2] p-[12px]">
+      <iframe
+        title={tab.title}
+        srcDoc={tab.html || ""}
+        sandbox=""
+        className="h-full min-h-0 w-full rounded-[18px] border border-[#dfd4c4] bg-white shadow-[0_12px_30px_rgba(56,42,20,.08)]"
+      />
+    </div>
+  );
+}
 
 
 function ResourcesRail({
   resources,
   loading,
+  refreshing,
   error,
-  attachments,
-  approvals,
+  activeDocumentTab,
   onRefresh,
   onReloadMcp,
+  onAttachResource,
+  onOpenEmail,
+  onOpenCalendar,
 }: {
   resources: AssistantResourcesResponse | null;
   loading: boolean;
+  refreshing: Partial<Record<ResourcePanelKey, boolean>>;
   error: string | null;
-  attachments: AttachmentPreview[];
-  approvals: ApprovalCard[];
-  onRefresh: () => void;
+  activeDocumentTab: DocumentTab | null;
+  onRefresh: (resource?: ResourcePanelKey) => void;
   onReloadMcp: () => Promise<void>;
+  onAttachResource: (kind: "email" | "calendar_event" | "shared_file", item: Record<string, unknown>, label: string) => Promise<void>;
+  onOpenEmail: (item: AssistantResourceMailItem) => void;
+  onOpenCalendar: (item: AssistantResourceEventItem) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({
-    email: true,
+    email: false,
     calendar: false,
     shared: false,
+    vault: false,
+    todos: false,
     connectors: false,
   });
   const [expandedSharedItems, setExpandedSharedItems] = useState<Record<string, boolean>>({});
   const [expandedConnectorItems, setExpandedConnectorItems] = useState<Record<string, boolean>>({});
+  const [expandedEmailAccounts, setExpandedEmailAccounts] = useState<Record<string, boolean>>({});
+  const [expandedCalendarAccounts, setExpandedCalendarAccounts] = useState<Record<string, boolean>>({});
   const [openingSharedFolder, setOpeningSharedFolder] = useState(false);
   const [reloadingMcp, setReloadingMcp] = useState(false);
   const toggle = (id: string) => setExpanded((current) => ({ ...current, [id]: !current[id] }));
   const toggleSharedItem = (id: string) => setExpandedSharedItems((current) => ({ ...current, [id]: !current[id] }));
   const toggleConnectorItem = (id: string) => setExpandedConnectorItems((current) => ({ ...current, [id]: !current[id] }));
+  const toggleEmailAccount = (id: string) => setExpandedEmailAccounts((current) => ({ ...current, [id]: !current[id] }));
+  const toggleCalendarAccount = (id: string) => setExpandedCalendarAccounts((current) => ({ ...current, [id]: !current[id] }));
   const reloadMcpConnectors = async () => {
     if (reloadingMcp) return;
     setReloadingMcp(true);
@@ -2423,23 +2697,70 @@ function ResourcesRail({
   const emailStatus = resourceStatusCopy(resources?.email.status);
   const calendarStatus = resourceStatusCopy(resources?.calendar.status);
   const sharedStatus = resourceStatusCopy(resources?.shared_folder.status);
+  const vaultStatus = resourceStatusCopy(resources?.vault.status);
+  const todoStatus = resourceStatusCopy(resources?.todos.status);
+  const vaultHintCount = (resources?.vault.weak_count ?? 0) + (resources?.vault.reused_count ?? 0) + (resources?.vault.compromised_count ?? 0);
   const connectorCount = resources?.connectors.length ?? 0;
   const connectorSummary = resources
     ? connectorCount
       ? `${connectorCount} MCP-Server verfügbar`
       : "Keine MCP-Server verfügbar"
     : "Wird geprüft…";
+  const emailAccountSections = useMemo(() => {
+    if (!resources) return [];
+    const allItems = resources.email.items ?? [];
+    const accounts = resources.email.accounts?.length
+      ? resources.email.accounts
+      : [{ label: "Mailbox", address: "Mailbox", source: "", status: resources.email.status, unread_count: resources.email.unread_count, summary: resources.email.summary }];
+    return accounts.map((account) => {
+      const accountId = account.address ?? account.label;
+      const accountItems = account.items?.length
+        ? account.items
+        : allItems.filter((item) => (item.account_address ?? item.account_label ?? "Mailbox") === accountId);
+      return { ...account, id: accountId, items: accountItems as AssistantResourceMailItem[] };
+    });
+  }, [resources]);
+  const calendarAccountSections = useMemo(() => {
+    if (!resources) return [];
+    const allItems = resources.calendar.items ?? [];
+    const accounts = resources.calendar.accounts?.length
+      ? resources.calendar.accounts
+      : [{ label: "Kalender", address: "Kalender", source: "", status: resources.calendar.status, summary: resources.calendar.summary }];
+    return accounts.map((account) => {
+      const accountId = account.address ?? account.label;
+      const accountItems = account.items?.length
+        ? account.items
+        : allItems.filter((item) => (item.account_address ?? item.account_label ?? "Kalender") === accountId);
+      return { ...account, id: accountId, items: accountItems as AssistantResourceEventItem[] };
+    });
+  }, [resources]);
+  const resourceCacheUpdatedAt = resources?.cache?.resources?.email?.updated_at ?? resources?.checked_at;
+  const resourceCacheCopy = resourceCacheUpdatedAt
+    ? `Zuletzt aktualisiert: ${formatResourceTime(resourceCacheUpdatedAt, { year: true })}`
+    : "Aktualisierung nach Bedarf";
+  const refreshAction = (resource: ResourcePanelKey, label: string): ResourceCardAction => ({
+    icon: <RefreshCw size={13} className={refreshing[resource] ? "animate-spin" : undefined} />,
+    label: `${label} aktualisieren`,
+    onClick: () => onRefresh(resource),
+    disabled: !!refreshing[resource] || loading,
+  });
+  const openVault = () => {
+    const url = resources?.vault.vault_url || "https://pass.aiwerk.ch";
+    const opened = window.open(url, "_blank", "noopener,noreferrer");
+    if (opened) opened.opener = null;
+  };
   return (
-    <aside className="hidden max-h-[calc(100vh-56px)] w-full content-start gap-[14px] overflow-y-auto pr-[2px] xl:grid aiwerk-scrollbar" aria-label="Ressourcen">
-      <div className="rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.9)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
-        <div className="mb-[14px] flex items-start justify-between gap-[12px]">
-          <div>
-            <p className="m-0 text-[11px] font-bold uppercase tracking-[.18em] text-[#948873]">Ressourcen</p>
-            <h3 className="m-0 mt-[4px] text-[17px] text-[#302b24]">Was Rocky nutzen kann</h3>
+    <aside className="hidden h-full min-h-0 w-full flex-col gap-[14px] overflow-x-hidden overflow-y-auto overscroll-contain pr-[4px] xl:flex aiwerk-scrollbar" aria-label="Ressourcen">
+      <div className="min-w-0 shrink-0 overflow-x-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.9)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
+        <div className="mb-[14px] flex min-w-0 items-start justify-between gap-[12px]">
+          <div className="min-w-0 flex-1">
+            <p className="m-0 truncate text-[11px] font-bold uppercase tracking-[.18em] text-[#948873]">Ressourcen</p>
+            <h3 className="m-0 mt-[4px] truncate text-[17px] text-[#302b24]">Was Rocky nutzen kann</h3>
+            <p className="m-0 mt-[5px] truncate text-[11px] text-[#8a7f70]">{resourceCacheCopy}</p>
           </div>
           <button
             type="button"
-            onClick={onRefresh}
+            onClick={() => onRefresh()}
             className="grid h-[34px] w-[34px] shrink-0 cursor-pointer place-items-center rounded-full border border-[#d9cdbc] bg-[#fffaf2] text-[#6f614e] hover:bg-[#f3eadc] disabled:cursor-wait disabled:opacity-60"
             disabled={loading}
             title="Ressourcen aktualisieren"
@@ -2459,20 +2780,93 @@ function ResourcesRail({
             expanded={expanded.email}
             onToggle={toggle}
             badge={resources?.email.unread_count ? String(resources.email.unread_count) : undefined}
+            action={refreshAction("email", "E-Mail")}
           >
-            {resources?.email.items.length ? (
-              <div className="grid gap-[8px]">
-                {!resources.email.unread_count && <p className="m-0 text-[12px] text-[#8a7f70]">Zuletzt im Posteingang</p>}
-                {resources.email.items.slice(0, 5).map((item, index) => (
-                  <div key={item.id ?? `${item.subject}-${index}`} className="rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px]">
-                    <div className="flex items-center gap-[6px]">
-                      {item.unread && <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-[#8b724e]" aria-label="Neu" />}
-                      <p className="m-0 min-w-0 flex-1 truncate text-[13px] font-semibold text-[#342f27]">{item.subject || "Ohne Betreff"}</p>
-                      {item.has_attachment && <Paperclip size={12} className="shrink-0 text-[#8a7a64]" aria-label="Mit Anhang" />}
+            {resources && emailAccountSections.length ? (
+              <div className="grid gap-[6px]">
+                {emailAccountSections.map((account) => {
+                  const accountOpen = expandedEmailAccounts[account.id] ?? false;
+                  const accountListScrollable = account.items.length > 5;
+                  return (
+                    <div key={account.id} className="min-w-0 overflow-hidden rounded-[12px] border border-[#e4d8c6] bg-[#fffaf2]">
+                      <button
+                        type="button"
+                        onClick={() => toggleEmailAccount(account.id)}
+                        className="flex w-full min-w-0 max-w-full cursor-pointer items-center justify-between gap-[8px] overflow-hidden px-[9px] py-[7px] text-left text-[12px] text-[#7c705f] hover:bg-[#f8efe3]"
+                        aria-expanded={accountOpen}
+                      >
+                        <span className="flex min-w-0 flex-1 items-center gap-[6px] overflow-hidden">
+                          <ChevronRight size={13} className={`shrink-0 transition-transform ${accountOpen ? "rotate-90" : ""}`} />
+                          <span className="block min-w-0 max-w-full truncate">{account.address ?? account.label}</span>
+                        </span>
+                        <span className="shrink-0 font-semibold text-[#6b5a45]">{account.unread_count ? `${account.unread_count} neu` : "0 neu"}</span>
+                      </button>
+                      {accountOpen && (
+                        <div className="border-t border-[#eadfce] bg-[#f8f0e5] px-[8px] py-[7px]">
+                          {account.items.length ? (
+                            <div className={`grid gap-[6px] ${accountListScrollable ? "max-h-[320px] overflow-y-auto pr-[2px] aiwerk-scrollbar" : ""}`}>
+                              {account.items.map((item, index) => {
+                                const canOpenMail = !!item.open_url;
+                                const canAttachMail = !!(item.message_id || item.id) && !!(item.account_address || item.account_label || account.id);
+                                const key = item.id ?? `${account.id}-${item.subject}-${index}`;
+                                const isOpenMail = activeDocumentTab?.kind === "email" && !!item.open_url && activeDocumentTab.openUrl === item.open_url;
+                                const rowClass = `relative w-full min-w-0 max-w-full overflow-hidden rounded-[10px] border px-[9px] py-[7px] text-left ${
+                                  isOpenMail
+                                    ? "border-[#c8b48f] bg-[#fff8ec] shadow-[inset_3px_0_0_#b8955f] after:absolute after:right-[7px] after:top-[7px] after:h-[8px] after:w-[8px] after:rounded-bl-[8px] after:border-r after:border-t after:border-[#b8955f]"
+                                    : "border-transparent bg-[#f1e8dc]"
+                                } ${canOpenMail ? "cursor-pointer transition hover:bg-[#eaddcc]" : ""}`;
+                                const content = (
+                                  <>
+                                    <div className="flex min-w-0 max-w-full items-center gap-[6px] overflow-hidden">
+                                      {item.unread && <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-[#8b724e]" aria-label="Neu" />}
+                                      <span className="block min-w-0 flex-1 truncate text-[13px] font-semibold text-[#342f27]">{item.subject || "Ohne Betreff"}</span>
+                                      {item.has_attachment && <Paperclip size={12} className="shrink-0 text-[#8a7a64]" aria-label="Mit Anhang" />}
+                                      {canOpenMail && <ExternalLink size={12} className="shrink-0 text-[#8a7a64]" aria-hidden="true" />}
+                                    </div>
+                                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{item.sender || "Unbekannt"}{item.received_at ? ` · ${formatResourceTime(item.received_at)}` : ""}</p>
+                                  </>
+                                );
+                                const attachItem = {
+                                  ...item,
+                                  account_address: item.account_address ?? account.address ?? account.id,
+                                  account_label: item.account_label ?? account.label,
+                                };
+                                return (
+                                  <div key={key} className="flex min-w-0 max-w-full items-stretch gap-[6px] overflow-hidden">
+                                    {canOpenMail ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => onOpenEmail(item)}
+                                        className={rowClass}
+                                        title={item.open_url?.startsWith("http") ? "Im Webmail öffnen" : "E-Mail anzeigen"}
+                                      >
+                                        {content}
+                                      </button>
+                                    ) : (
+                                      <div className={rowClass}>{content}</div>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => void onAttachResource("email", attachItem as Record<string, unknown>, "E-Mail")}
+                                      disabled={!canAttachMail}
+                                      title="E-Mail an Agent anhängen"
+                                      aria-label="E-Mail an Agent anhängen"
+                                      className="grid h-auto w-[34px] shrink-0 cursor-pointer place-items-center rounded-[10px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[#f8f0e3]"
+                                    >
+                                      <Paperclip size={13} />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <p className="m-0 px-[2px] py-[3px] text-[12px] text-[#8a7f70]">Keine neuen Nachrichten.</p>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{item.sender || "Unbekannt"}{item.received_at ? ` · ${formatResourceTime(item.received_at)}` : ""}</p>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <p className="m-0 text-[13px] text-[#776d5f]">Keine neuen Nachrichten oder noch keine Mailbox angebunden.</p>
@@ -2487,15 +2881,74 @@ function ResourcesRail({
             status={calendarStatus}
             expanded={expanded.calendar}
             onToggle={toggle}
+            action={refreshAction("calendar", "Kalender")}
           >
-            {resources?.calendar.items.length ? (
-              <div className="grid gap-[8px]">
-                {resources.calendar.items.slice(0, 5).map((item, index) => (
-                  <div key={item.id ?? `${item.title}-${index}`} className="rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px]">
-                    <p className="m-0 truncate text-[13px] font-semibold text-[#342f27]">{item.title || "Termin"}</p>
-                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{formatResourceTime(item.starts_at)}{item.location_hint ? ` · ${item.location_hint}` : ""}</p>
-                  </div>
-                ))}
+            {resources && calendarAccountSections.length ? (
+              <div className="grid gap-[6px]">
+                {calendarAccountSections.map((account) => {
+                  const accountOpen = expandedCalendarAccounts[account.id] ?? false;
+                  const accountListScrollable = account.items.length > 5;
+                  return (
+                    <div key={account.id} className="min-w-0 overflow-hidden rounded-[12px] border border-[#e4d8c6] bg-[#fffaf2]">
+                      <button
+                        type="button"
+                        onClick={() => toggleCalendarAccount(account.id)}
+                        className="flex w-full min-w-0 max-w-full cursor-pointer items-center justify-between gap-[8px] overflow-hidden px-[9px] py-[7px] text-left text-[12px] text-[#7c705f] hover:bg-[#f8efe3]"
+                        aria-expanded={accountOpen}
+                      >
+                        <span className="min-w-0 flex-1 truncate font-semibold text-[#4d4336]">{account.label || account.address || "Kalender"}</span>
+                        <span className="shrink-0 text-[11px] text-[#8a7f70]">{account.items.length} Termine</span>
+                      </button>
+                      {accountOpen && (
+                        <div className="grid gap-[6px] px-[8px] pb-[8px]">
+                          {account.items.length ? (
+                            <div className={`grid gap-[6px] ${accountListScrollable ? "max-h-[260px] overflow-y-auto pr-[2px] aiwerk-scrollbar" : ""}`}>
+                              {account.items.map((item, index) => {
+                                const key = item.id ?? `${account.id}-${item.title}-${index}`;
+                                const attachItem = {
+                                  ...item,
+                                  account_address: item.account_address ?? account.address ?? account.id,
+                                  account_label: item.account_label ?? account.label,
+                                };
+                                const canOpenCalendar = !!item.open_url;
+                                const isOpenCalendar = activeDocumentTab?.kind === "calendar" && !!item.open_url && activeDocumentTab.openUrl === item.open_url;
+                                return (
+                                  <div key={key} className="flex min-w-0 max-w-full items-stretch gap-[6px] overflow-hidden">
+                                    <button
+                                      type="button"
+                                      onClick={() => onOpenCalendar(item)}
+                                      disabled={!canOpenCalendar}
+                                      title={canOpenCalendar ? "Termin anzeigen" : undefined}
+                                      className={`relative min-w-0 flex-1 overflow-hidden rounded-[10px] border px-[9px] py-[7px] text-left ${
+                                        isOpenCalendar
+                                          ? "border-[#c8b48f] bg-[#fff8ec] shadow-[inset_3px_0_0_#b8955f] after:absolute after:right-[7px] after:top-[7px] after:h-[8px] after:w-[8px] after:rounded-bl-[8px] after:border-r after:border-t after:border-[#b8955f]"
+                                          : "border-transparent bg-[#f5eee3]"
+                                      } ${canOpenCalendar ? "cursor-pointer transition hover:bg-[#eee4d6] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]" : "cursor-default"}`}
+                                    >
+                                      <p className="m-0 truncate text-[13px] font-semibold text-[#342f27]">{item.title || "Termin"}</p>
+                                      <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{formatResourceTime(item.starts_at)}{item.location_hint ? ` · ${item.location_hint}` : ""}</p>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => void onAttachResource("calendar_event", attachItem as Record<string, unknown>, "Termin")}
+                                      title="Termin an Agent anhängen"
+                                      aria-label="Termin an Agent anhängen"
+                                      className="grid h-auto w-[34px] shrink-0 cursor-pointer place-items-center rounded-[10px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                                    >
+                                      <Paperclip size={13} />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <p className="m-0 px-[2px] py-[3px] text-[12px] text-[#8a7f70]">Keine kommenden Termine.</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <p className="m-0 text-[13px] text-[#776d5f]">Keine kommenden Termine oder Kalender noch nicht angebunden.</p>
@@ -2510,26 +2963,105 @@ function ResourcesRail({
             status={sharedStatus}
             expanded={expanded.shared}
             onToggle={toggle}
-            action={{
-              icon: resources?.shared_folder.can_open_folder ? <FolderOpen size={14} /> : <ExternalLink size={14} />,
-              label: resources?.shared_folder.can_open_folder
-                ? "Ordner im Dateimanager öffnen"
-                : resources?.shared_folder.cloud_url
-                  ? "Ordner in cloud.aiwerk.ch öffnen"
-                  : "Cloud-Ordner nicht verfügbar",
-              onClick: openSharedFolder,
-              disabled: (!resources?.shared_folder.can_open_folder && !resources?.shared_folder.cloud_url) || openingSharedFolder,
-            }}
+            action={[
+              {
+                icon: resources?.shared_folder.can_open_folder ? <FolderOpen size={14} /> : <ExternalLink size={14} />,
+                label: resources?.shared_folder.can_open_folder
+                  ? "Ordner im Dateimanager öffnen"
+                  : resources?.shared_folder.cloud_url
+                    ? "Ordner in cloud.aiwerk.ch öffnen"
+                    : "Cloud-Ordner nicht verfügbar",
+                onClick: openSharedFolder,
+                disabled: (!resources?.shared_folder.can_open_folder && !resources?.shared_folder.cloud_url) || openingSharedFolder,
+              },
+              refreshAction("shared_folder", "Shared Ordner"),
+            ]}
           >
             {resources?.shared_folder.items.length ? (
               <SharedFolderTree
                 items={resources.shared_folder.items}
                 expandedItems={expandedSharedItems}
                 onToggle={toggleSharedItem}
+                onAttachResource={onAttachResource}
                 showCloudFolderLinks={!resources.shared_folder.can_open_folder}
               />
             ) : (
               <p className="m-0 text-[13px] text-[#776d5f]">Shared Ordner ist leer oder noch nicht eingerichtet.</p>
+            )}
+          </ResourceCard>
+
+
+          <ResourceCard
+            id="vault"
+            icon={<KeyRound size={16} />}
+            title="Passwort-Tresor"
+            summary={resources?.vault.summary ?? "Wird geprüft…"}
+            status={vaultStatus}
+            expanded={expanded.vault}
+            onToggle={toggle}
+            badge={vaultHintCount ? String(vaultHintCount) : undefined}
+            action={[
+              {
+                icon: <ExternalLink size={14} />,
+                label: "Tresor öffnen",
+                onClick: openVault,
+                disabled: !resources?.vault.vault_url,
+              },
+              refreshAction("vault", "Tresor"),
+            ]}
+          >
+            {resources?.vault ? (
+              <div className="grid gap-[7px] text-[12px] text-[#746957]">
+                <div className="grid gap-[6px] rounded-[12px] border border-[#e4d8c6] bg-[#fffaf2] px-[9px] py-[8px]">
+                  <div className="flex items-center justify-between gap-[8px]">
+                    <span>Zugangsdaten</span>
+                    <strong className="text-[#4c4235]">{resources.vault.item_count ?? "–"}</strong>
+                  </div>
+                  <div className="flex items-center justify-between gap-[8px]">
+                    <span>Schwache Passwörter</span>
+                    <strong className={resources.vault.weak_count ? "text-[#8a5b2e]" : "text-[#4c4235]"}>{resources.vault.weak_count ?? "–"}</strong>
+                  </div>
+                  <div className="flex items-center justify-between gap-[8px]">
+                    <span>Mehrfach verwendet</span>
+                    <strong className={resources.vault.reused_count ? "text-[#8a5b2e]" : "text-[#4c4235]"}>{resources.vault.reused_count ?? "–"}</strong>
+                  </div>
+                  <div className="flex items-center justify-between gap-[8px]">
+                    <span>Kompromittiert</span>
+                    <strong className={resources.vault.compromised_count ? "text-[#8a3d2e]" : "text-[#4c4235]"}>
+                      {resources.vault.compromised_count ?? "im Tresor prüfen"}
+                    </strong>
+                  </div>
+                </div>
+                {resources.vault.status === "auth_required" && (
+                  <p className="m-0 rounded-[10px] bg-[#f6ead8] px-[9px] py-[7px] text-[#7a6141]">Tresor öffnen und entsperren, um Statistiken zu aktualisieren.</p>
+                )}
+              </div>
+            ) : (
+              <p className="m-0 text-[13px] text-[#776d5f]">Tresor wird geprüft.</p>
+            )}
+          </ResourceCard>
+
+          <ResourceCard
+            id="todos"
+            icon={<ListChecks size={16} />}
+            title="Aufgaben"
+            summary={resources?.todos.summary ?? "Wird geprüft…"}
+            status={todoStatus}
+            expanded={expanded.todos}
+            onToggle={toggle}
+            badge={resources?.todos.open_count ? String(resources.todos.open_count) : undefined}
+            action={refreshAction("todos", "Aufgaben")}
+          >
+            {resources?.todos.items.length ? (
+              <div className="grid gap-[6px]">
+                {resources.todos.items.map((item) => (
+                  <div key={item.id} className="min-w-0 rounded-[10px] border border-[#e4d8c6] bg-[#fffaf2] px-[9px] py-[7px] text-[13px] text-[#4c4235]">
+                    <span className="block truncate">{item.text}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="m-0 text-[13px] text-[#776d5f]">Keine offenen Aufgaben in TODO.md.</p>
             )}
           </ResourceCard>
 
@@ -2561,27 +3093,6 @@ function ResourcesRail({
             </div>
           </ResourceCard>
 
-          <ResourceCard
-            id="material"
-            icon={<FileText size={16} />}
-            title="Aktuelles Material"
-            summary={attachments.length ? `${attachments.length} Dateien bereit` : "Keine Dateien in dieser Unterhaltung"}
-            status={resourceStatusCopy(attachments.length ? "connected" : "not_configured")}
-            expanded={false}
-            onToggle={() => undefined}
-            disabled
-          />
-
-          <ResourceCard
-            id="actions"
-            icon={<Square size={15} />}
-            title="Nächste Aktionen"
-            summary={approvals.length ? `${approvals.length} Freigabe offen` : "Keine Aktion wartet"}
-            status={resourceStatusCopy(approvals.length ? "limited" : "connected")}
-            expanded={false}
-            onToggle={() => undefined}
-            disabled
-          />
         </div>
         {resources?.checked_at && <p className="m-0 mt-[12px] text-[11px] text-[#9a8f7e]">Aktualisiert {formatResourceTime(resources.checked_at)}</p>}
       </div>
@@ -2607,22 +3118,29 @@ function McpConnectorTree({
         const children = connector.children ?? [];
         const hasChildren = children.length > 0;
         const isExpanded = !!expandedItems[connector.id];
+        const canOpen = !!connector.open_url;
+        const openConnector = () => {
+          if (!connector.open_url) return;
+          const opened = window.open(connector.open_url, "_blank", "noopener,noreferrer");
+          if (opened) opened.opener = null;
+        };
         return (
-          <div key={connector.id} className={depth ? "grid gap-[7px]" : undefined}>
+          <div key={connector.id} className={depth ? "grid min-w-0 gap-[7px] overflow-hidden" : "min-w-0 overflow-hidden"}>
             <button
               type="button"
-              onClick={hasChildren ? () => onToggle(connector.id) : undefined}
-              disabled={!hasChildren}
-              className="flex min-w-0 items-center gap-[8px] rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
+              onClick={hasChildren ? () => onToggle(connector.id) : canOpen ? openConnector : undefined}
+              disabled={!hasChildren && !canOpen}
+              className="flex w-full min-w-0 max-w-full cursor-pointer items-center gap-[8px] overflow-hidden rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
               aria-expanded={hasChildren ? isExpanded : undefined}
+              title={canOpen ? `${connector.label} auf aiwerkmcp.com öffnen` : undefined}
               style={{ paddingLeft: 10 + depth * 14 }}
             >
               <span className="grid h-[18px] w-[18px] shrink-0 place-items-center text-[#7b6b55]">
-                {hasChildren ? <ChevronRight size={14} className={isExpanded ? "rotate-90 transition-transform" : "transition-transform"} /> : null}
+                {hasChildren ? <ChevronRight size={14} className={isExpanded ? "rotate-90 transition-transform" : "transition-transform"} /> : canOpen ? <ExternalLink size={13} /> : null}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[13px] font-semibold text-[#342f27]">{connector.label}</span>
-                <span className="block truncate text-[12px] text-[#7c705f]">{connector.capabilities?.join(" · ") || "MCP"}</span>
+                <span className="block truncate text-[12px] text-[#7c705f]">{connector.description || connector.capabilities?.join(" · ") || "MCP"}</span>
               </span>
               <span className="shrink-0 text-[11px] font-semibold text-[#766b5b]">{status.label}</span>
             </button>
@@ -2646,12 +3164,14 @@ function SharedFolderTree({
   items,
   expandedItems,
   onToggle,
+  onAttachResource,
   showCloudFolderLinks,
   depth = 0,
 }: {
   items: AssistantSharedFolderItem[];
   expandedItems: Record<string, boolean>;
   onToggle: (id: string) => void;
+  onAttachResource: (kind: "email" | "calendar_event" | "shared_file", item: Record<string, unknown>, label: string) => Promise<void>;
   showCloudFolderLinks: boolean;
   depth?: number;
 }) {
@@ -2673,13 +3193,13 @@ function SharedFolderTree({
             ? () => openSharedFolderFile(item)
             : undefined;
         return (
-          <div key={item.id} className={depth ? "grid gap-[7px]" : undefined}>
-            <div className="flex items-center gap-[6px]">
+          <div key={item.id} className={depth ? "grid min-w-0 gap-[7px] overflow-hidden" : "min-w-0 overflow-hidden"}>
+            <div className="flex min-w-0 max-w-full items-center gap-[6px] overflow-hidden">
               <button
                 type="button"
                 onClick={handleClick}
                 disabled={!hasChildren && !canOpenFile}
-                className="flex min-w-0 flex-1 items-center gap-[8px] rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
+                className="flex min-w-0 max-w-full flex-1 items-center gap-[8px] overflow-hidden rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
                 aria-expanded={hasChildren ? isExpanded : undefined}
                 title={canOpenFile ? "Datei öffnen" : undefined}
                 style={{ paddingLeft: 10 + depth * 14 }}
@@ -2691,8 +3211,8 @@ function SharedFolderTree({
                   {isFolder ? <FolderOpen size={14} /> : <FileText size={14} />}
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-semibold text-[#342f27]">{item.name}</span>
-                  <span className="block truncate text-[12px] text-[#7c705f]">{isFolder ? "Ordner" : "Datei"} · {meta}</span>
+                  <span className="block min-w-0 max-w-full truncate text-[13px] font-semibold text-[#342f27]">{item.name}</span>
+                  <span className="block min-w-0 max-w-full truncate text-[12px] text-[#7c705f]">{isFolder ? "Ordner" : "Datei"} · {meta}</span>
                 </span>
               </button>
               {canOpenCloudFolder && (
@@ -2706,12 +3226,24 @@ function SharedFolderTree({
                   <ExternalLink size={13} />
                 </button>
               )}
+              {canOpenFile && (
+                <button
+                  type="button"
+                  onClick={() => void onAttachResource("shared_file", item as unknown as Record<string, unknown>, "Datei")}
+                  title="Datei an Agent anhängen"
+                  aria-label={`${item.name} an Agent anhängen`}
+                  className="grid h-[34px] w-[34px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                >
+                  <Paperclip size={13} />
+                </button>
+              )}
             </div>
             {hasChildren && isExpanded && (
               <SharedFolderTree
                 items={children}
                 expandedItems={expandedItems}
                 onToggle={onToggle}
+                onAttachResource={onAttachResource}
                 showCloudFolderLinks={showCloudFolderLinks}
                 depth={depth + 1}
               />
@@ -2744,42 +3276,44 @@ function ResourceCard({
   expanded: boolean;
   onToggle: (id: string) => void;
   badge?: string;
-  action?: { icon: ReactNode; label: string; onClick: () => void; disabled?: boolean };
+  action?: ResourceCardAction | ResourceCardAction[];
   disabled?: boolean;
   children?: ReactNode;
 }) {
+  const actions: ResourceCardAction[] = Array.isArray(action) ? action : action ? [action] : [];
   return (
-    <div className="rounded-[18px] border border-[#dfd4c4] bg-[#fffaf2] shadow-[0_8px_24px_rgba(56,42,20,.05)]">
-      <div className="flex items-stretch gap-[6px] p-[12px]">
+    <div className="min-w-0 overflow-hidden rounded-[18px] border border-[#dfd4c4] bg-[#fffaf2] shadow-[0_8px_24px_rgba(56,42,20,.05)]">
+      <div className="flex min-w-0 items-stretch gap-[6px] p-[12px]">
         <button
           type="button"
           onClick={() => !disabled && onToggle(id)}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-[10px] border-0 bg-transparent p-0 text-left disabled:cursor-default"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-[10px] overflow-hidden border-0 bg-transparent p-0 text-left disabled:cursor-default"
           disabled={disabled}
           aria-expanded={expanded}
         >
           <span className="grid h-[32px] w-[32px] shrink-0 place-items-center rounded-[12px] bg-[#eee4d6] text-[#6d5f4d]">{icon}</span>
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-[7px] text-[13px] font-bold text-[#302b24]">
-              <span className="h-[7px] w-[7px] rounded-full" style={{ backgroundColor: status.dot }} />
-              {title}
+          <span className="min-w-0 flex-1 overflow-hidden">
+            <span className="flex min-w-0 items-center gap-[7px] text-[13px] font-bold text-[#302b24]">
+              <span className="h-[7px] w-[7px] shrink-0 rounded-full" style={{ backgroundColor: status.dot }} />
+              <span className="min-w-0 truncate">{title}</span>
             </span>
-            <span className="mt-[2px] block truncate text-[12px] text-[#7a705f]">{summary}</span>
+            <span className="mt-[2px] block min-w-0 max-w-full truncate text-[12px] text-[#7a705f]">{summary}</span>
           </span>
-          {badge && <span className="rounded-full bg-[#8b724e] px-[8px] py-[3px] text-[11px] font-bold text-white">{badge}</span>}
+          {badge && <span className="shrink-0 rounded-full bg-[#8b724e] px-[8px] py-[3px] text-[11px] font-bold text-white">{badge}</span>}
         </button>
-        {action && (
+        {actions.map((item) => (
           <button
+            key={item.label}
             type="button"
-            onClick={action.onClick}
-            disabled={action.disabled}
-            title={action.label}
-            aria-label={action.label}
+            onClick={item.onClick}
+            disabled={item.disabled}
+            title={item.label}
+            aria-label={item.label}
             className="grid h-[32px] w-[32px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-[#f8f0e3]"
           >
-            {action.icon}
+            {item.icon}
           </button>
-        )}
+        ))}
       </div>
       {expanded && children && <div className="border-t border-[#eadfce] px-[12px] pb-[12px] pt-[10px]">{children}</div>}
     </div>

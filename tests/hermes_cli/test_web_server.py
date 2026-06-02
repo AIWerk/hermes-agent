@@ -2,6 +2,8 @@
 
 import os
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -224,9 +226,73 @@ class TestWebServerEndpoints:
         assert self.client.get("/api/model/info").status_code == 200
         assert self.client.get("/api/assistant/resources").status_code == 200
         assert self.client.post("/api/assistant/attachments", files={"files": ("note.txt", b"hello", "text/plain")}).status_code == 200
+        assert self.client.post("/api/assistant/attachments/resource", json={"kind": "unknown", "item": {}}).status_code == 400
         assert self.client.get("/api/env").status_code == 404
         assert self.client.get("/api/config").status_code == 404
         assert self.client.get("/api/logs").status_code == 404
+
+    def test_assistant_resources_cache_ttl_and_manual_refresh(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        cache_lock = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE_LOCK")
+        cache = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE")
+        with cache_lock:
+            cache.clear()
+        calls = {"email": 0, "calendar": 0, "shared": 0, "vault": 0, "todos": 0, "connectors": 0}
+        monkeypatch.setattr(web_server, "load_config", lambda: {"mcp_servers": {"hermes_neo4j": {"enabled": True}}})
+
+        def email_summary(config):
+            calls["email"] += 1
+            return {"status": "connected", "unread_count": calls["email"], "summary": "Mail", "items": []}
+
+        def calendar_summary(config=None):
+            calls["calendar"] += 1
+            return {"status": "connected", "summary": "Kalender", "items": []}
+
+        def shared_summary(config, request=None):
+            calls["shared"] += 1
+            return {"status": "connected", "root_label": "Shared", "summary": "1 Datei", "items": [], "total_count": 1}
+
+        def vault_summary(config):
+            calls["vault"] += 1
+            return {"status": "connected", "vault_url": "https://pass.aiwerk.ch", "summary": "Tresor", "item_count": calls["vault"], "weak_count": 0, "reused_count": 0, "compromised_count": None}
+
+        def todo_summary(config):
+            calls["todos"] += 1
+            return {"status": "connected", "summary": "Aufgaben", "items": [], "open_count": calls["todos"], "done_count": 0, "total_count": calls["todos"]}
+
+        def connector_summary(config, shared_folder, email, calendar):
+            calls["connectors"] += 1
+            return [{"id": "mcp-hermes_neo4j", "label": "Wissensbasis", "status": "connected"}]
+
+        monkeypatch.setattr(web_server, "_email_summary", email_summary)
+        monkeypatch.setattr(web_server, "_calendar_summary", calendar_summary)
+        monkeypatch.setattr(web_server, "_shared_folder_summary", shared_summary)
+        monkeypatch.setattr(web_server, "_vaultwarden_summary", vault_summary)
+        monkeypatch.setattr(web_server, "_todo_summary", todo_summary)
+        monkeypatch.setattr(web_server, "_connector_summary", connector_summary)
+
+        first = self.client.get("/api/assistant/resources")
+        second = self.client.get("/api/assistant/resources")
+        forced = self.client.get("/api/assistant/resources?refresh=1")
+        email_forced = self.client.get("/api/assistant/resources?refresh=1&resource=email")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert forced.status_code == 200
+        assert email_forced.status_code == 200
+        assert calls == {"email": 3, "calendar": 2, "shared": 2, "vault": 2, "todos": 2, "connectors": 2}
+        assert first.json()["cache"]["resources"]["email"]["ttl_seconds"] == 3600
+        assert first.json()["cache"]["resources"]["calendar"]["ttl_seconds"] == 1800
+        assert first.json()["cache"]["resources"]["vault"]["ttl_seconds"] == 900
+        assert first.json()["cache"]["resources"]["todos"]["ttl_seconds"] == 60
+        assert second.json()["cache"]["cached"] is True
+        assert second.json()["email"]["unread_count"] == 1
+        assert forced.json()["cache"]["cached"] is False
+        assert forced.json()["email"]["unread_count"] == 2
+        assert email_forced.json()["email"]["unread_count"] == 3
+        assert email_forced.json()["cache"]["resources"]["email"]["cached"] is False
+        assert email_forced.json()["cache"]["resources"]["calendar"]["cached"] is True
 
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -247,9 +313,22 @@ class TestWebServerEndpoints:
         calendar_json.write_text(json.dumps({
             "items": [{"id": "e1", "title": "Kundentermin", "starts_at": "2026-05-30T14:30:00Z"}],
         }))
+        todo_file = tmp_path / "TODO.md"
+        todo_file.write_text("# TODO\n- [ ] Angebot prüfen\n- [x] Alt erledigt\n", encoding="utf-8")
         monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
         monkeypatch.setenv("AIWERK_CUI_EMAIL_SUMMARY_JSON", str(email_json))
         monkeypatch.setenv("AIWERK_CUI_CALENDAR_SUMMARY_JSON", str(calendar_json))
+        monkeypatch.setenv("AIWERK_CUI_VAULT_SUMMARY_JSON", json.dumps({
+            "status": "limited",
+            "vault_url": "https://pass.aiwerk.ch",
+            "summary": "4 Zugangsdaten · 2 Hinweise",
+            "item_count": 4,
+            "weak_count": 1,
+            "reused_count": 1,
+            "compromised_count": None,
+            "compromised_supported": False,
+        }))
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
         monkeypatch.setattr(web_server, "load_config", lambda: {
             "dashboard": {
                 "shared_cloud": {
@@ -265,6 +344,11 @@ class TestWebServerEndpoints:
             },
         })
         monkeypatch.setattr(web_server, "_can_open_system_folder", lambda: True)
+        monkeypatch.setattr(web_server, "_aiwerk_bridge_live_subservers", lambda config: [
+            {"id": "aiwerk-bridge-coinmarketcap", "label": "CoinMarketCap", "status": "connected", "status_label": "Verbunden", "capabilities": ["Bridge-Subserver"]},
+            {"id": "aiwerk-bridge-firecrawl", "label": "Firecrawl", "status": "connected", "status_label": "Verbunden", "capabilities": ["Bridge-Subserver"]},
+            {"id": "aiwerk-bridge-google-maps", "label": "Google Maps", "status": "connected", "status_label": "Verbunden", "capabilities": ["Bridge-Subserver"]},
+        ])
         opened = []
         monkeypatch.setattr(web_server, "_open_system_folder", lambda path, **kwargs: opened.append(path) or True)
 
@@ -276,6 +360,11 @@ class TestWebServerEndpoints:
         assert data["email"]["unread_count"] == 2
         assert data["calendar"]["items"][0]["title"] == "Kundentermin"
         assert data["shared_folder"]["status"] == "connected"
+        assert data["vault"]["vault_url"] == "https://pass.aiwerk.ch"
+        assert data["vault"]["item_count"] == 4
+        assert data["vault"]["weak_count"] == 1
+        assert data["todos"]["open_count"] == 1
+        assert data["todos"]["items"][0]["text"] == "Angebot prüfen"
         assert data["shared_folder"]["can_open_folder"] is True
         assert data["shared_folder"]["cloud_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share-123/browse?path=%2F"
         shared_items = data["shared_folder"]["items"]
@@ -299,8 +388,146 @@ class TestWebServerEndpoints:
         assert all(connector["status"] == "connected" for connector in data["connectors"])
         assert all("MCP" in connector["capabilities"] for connector in data["connectors"])
         bridge = next(connector for connector in data["connectors"] if connector["label"] == "AIWerk Bridge")
-        assert [child["label"] for child in bridge["children"]][:3] == ["Firecrawl", "Google Maps", "Google Workspace AIWerk"]
+        assert [child["label"] for child in bridge["children"]][:3] == ["CoinMarketCap", "Firecrawl", "Google Maps"]
         assert all(child["capabilities"] == ["Bridge-Subserver"] for child in bridge["children"])
+
+    def test_vault_summary_prefers_aiwerk_bridge_health_check(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def fake_bridge_call(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            return {
+                "status": "ok",
+                "vault_url": "https://pass.aiwerk.ch/api",
+                "authenticated": True,
+                "exposed_collection_visible": True,
+                "agent_created_collection_visible": True,
+                "items_in_exposed": 7,
+                "items_in_agent_created": 2,
+            }
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+        monkeypatch.setattr(web_server.shutil, "which", lambda name: None)
+
+        data = getattr(web_server, "_vaultwarden_summary")({
+            "mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp", "enabled": True}},
+        })
+
+        assert calls == [{"server": "vault", "tool": "health_check", "params": {}}]
+        assert data["status"] == "connected"
+        assert data["source"] == "aiwerk_bridge"
+        assert data["vault_url"] == "https://pass.aiwerk.ch"
+        assert data["item_count"] == 9
+        assert data["exposed_count"] == 7
+        assert data["agent_created_count"] == 2
+        assert data["weak_count"] is None
+        assert data["reused_count"] is None
+        assert "freigegebene Zugangsdaten" in data["summary"]
+
+    def test_aiwerk_bridge_live_subservers_use_router_status(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_mcp_bridge_initialize", lambda config: "session-1")
+
+        def fake_rpc(config, method, params, *, session_id=None, request_id=1):
+            assert method == "tools/call"
+            assert params == {"name": "mcp", "arguments": {"action": "status"}}
+            assert session_id == "session-1"
+            return {
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
+                            "action": "status",
+                            "mode": "router",
+                            "servers": [
+                                {"name": "coinmarketcap", "transport": "streamable-http", "status": "disconnected", "tools": 0},
+                                {"name": "google-workspace-aiwerk", "transport": "stdio", "status": "disconnected", "tools": 0},
+                                {"name": "firecrawl", "transport": "stdio", "status": "disconnected", "tools": 0},
+                            ],
+                        }),
+                    }]
+                }
+            }, "session-1"
+
+        monkeypatch.setattr(web_server, "_mcp_bridge_rpc", fake_rpc)
+
+        children = getattr(web_server, "_aiwerk_bridge_live_subservers")({"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.example/mcp"}}})
+
+        assert [child["label"] for child in children] == ["CoinMarketCap", "Google Workspace AIWerk", "Firecrawl"]
+        assert children[0]["open_url"] == "https://aiwerkmcp.com/#/catalog/coinmarketcap"
+        assert children[1]["open_url"] == "https://aiwerkmcp.com/#/catalog/google-workspace"
+        assert children[1]["description"] == "Gmail, Kalender und Drive"
+        assert all(child["capabilities"] == ["Bridge-Subserver"] for child in children)
+
+    def test_assistant_resource_attachment_copies_shared_file(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        image = shared / "photo.png"
+        image.write_bytes(b"fake-png")
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+        monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {}})
+
+        resp = self.client.post("/api/assistant/attachments/resource", json={
+            "kind": "shared_file",
+            "session_id": "session-123",
+            "item": {
+                "name": "photo.png",
+                "kind": "file",
+                "mime": "image/png",
+                "open_url": "/api/assistant/shared-folder/open?path=photo.png",
+            },
+        })
+
+        assert resp.status_code == 200
+        attachment = resp.json()["attachments"][0]
+        assert attachment["name"] == "photo.png"
+        assert attachment["type"] == "image/png"
+        assert attachment["is_image"] is True
+        copied = Path(attachment["path"])
+        assert copied.read_bytes() == b"fake-png"
+        assert web_server.get_hermes_home() / "dashboard_uploads" in copied.parents
+
+    def test_assistant_resource_attachment_writes_calendar_context_without_raw_link(self):
+        resp = self.client.post("/api/assistant/attachments/resource", json={
+            "kind": "calendar_event",
+            "session_id": "session-123",
+            "item": {
+                "title": "Kundentermin",
+                "starts_at": "2026-06-01T10:00:00Z",
+                "ends_at": "2026-06-01T10:30:00Z",
+                "location_hint": "Bern",
+                "account_address": "team@example.ch",
+                "html_link": "https://calendar.google.com/event?eid=secret",
+            },
+        })
+
+        assert resp.status_code == 200
+        attachment = resp.json()["attachments"][0]
+        text = Path(attachment["path"]).read_text(encoding="utf-8")
+        assert "Kundentermin" in text
+        assert "team@example.ch" in text
+        assert "[LINK]" in text
+        assert "calendar.google.com" not in text
+
+    def test_assistant_resource_attachment_rejects_shared_traversal(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+        monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {}})
+
+        resp = self.client.post("/api/assistant/attachments/resource", json={
+            "kind": "shared_file",
+            "item": {"open_url": "/api/assistant/shared-folder/open?path=../secret.png"},
+        })
+
+        assert resp.status_code == 400
 
     def test_assistant_resources_can_read_himalaya_mailbox(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -335,7 +562,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr("hermes_cli.web_server.shutil.which", lambda name: "/usr/bin/himalaya" if name == "himalaya" else None)
         monkeypatch.setattr(web_server.subprocess, "run", fake_run)
         monkeypatch.setattr(web_server, "load_config", lambda: {
-            "dashboard": {"email": {"backend": "himalaya", "account": "bergsmann", "folder": "INBOX"}},
+            "dashboard": {"email": {"backend": "himalaya", "account": "demo", "folder": "INBOX"}},
         })
 
         resp = self.client.get("/api/assistant/resources")
@@ -350,7 +577,175 @@ class TestWebServerEndpoints:
         assert email["items"][0]["received_at"] == "2026-05-30T16:57:00Z"
         assert email["items"][0]["unread"] is True
         assert email["items"][0]["has_attachment"] is True
-        assert calls[0][:9] == ["himalaya", "envelope", "list", "--account", "bergsmann", "--folder", "INBOX", "--page-size", "50"]
+        assert email["items"][0]["message_id"] == "42"
+        assert email["items"][0]["open_url"].startswith("/api/assistant/email/view?")
+        assert "account=demo" in email["items"][0]["open_url"]
+        assert "id=42" in email["items"][0]["open_url"]
+        assert calls[0][:9] == ["himalaya", "envelope", "list", "--account", "demo", "--folder", "INBOX", "--page-size", "50"]
+
+    def test_assistant_email_summary_hides_obvious_dashboard_spam(self):
+        import hermes_cli.web_server as web_server
+
+        merged = web_server._merge_email_summaries([
+            {
+                "status": "connected",
+                "account_label": "user@example.com",
+                "account_address": "user@example.com",
+                "source": "imap",
+                "unread_count": 2,
+                "items": [
+                    {
+                        "id": "9687",
+                        "sender": "Migros <info@attractivewedding.info>",
+                        "subject": "Es gibt ein Update zu Ihrem kürzlich getätigten Kauf!!",
+                        "received_at": "2026-06-01T14:52:00Z",
+                        "unread": True,
+                    },
+                    {
+                        "id": "9688",
+                        "sender": "Max Muster <max@example.com>",
+                        "subject": "Neue Offerte",
+                        "received_at": "2026-06-01T14:53:00Z",
+                        "unread": True,
+                    },
+                ],
+            }
+        ])
+
+        assert merged is not None
+        assert merged["unread_count"] == 1
+        assert merged["filtered_count"] == 1
+        assert [item["id"] for item in merged["items"]] == ["9688"]
+        assert merged["accounts"][0]["unread_count"] == 1
+        assert merged["accounts"][0]["filtered_count"] == 1
+
+    def test_assistant_email_viewer_reads_himalaya_message_as_sanitized_html(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {"email": {"backend": "himalaya", "account": "demo", "address": "user@example.com", "folder": "INBOX"}},
+        })
+        monkeypatch.setattr(web_server, "_assistant_resources_payload", lambda request, force_refresh=False, **kwargs: {
+            "email": {
+                "accounts": [{
+                    "address": "user@example.com",
+                    "label": "user@example.com",
+                    "items": [{"id": "42", "message_id": "42", "sender": "Max <max@example.com>", "subject": "<Hello>", "received_at": "2026-05-31T18:00:00Z"}],
+                }]
+            }
+        })
+        seen = {}
+
+        def fake_read(**kwargs):
+            seen.update(kwargs)
+            return "--- BODY ---\nHallo<script>alert(1)</script>\nhttps://example.com/really/long/tracking/url?token=abc123\n<img src=x>"
+
+        monkeypatch.setattr(web_server, "_run_himalaya_message_read", fake_read)
+
+        resp = self.client.get("/api/assistant/email/view?account=attila%40example.com&id=42")
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert "no-store" in resp.headers["cache-control"]
+        assert "default-src 'none'" in resp.headers["content-security-policy"]
+        assert seen == {"message_id": "42", "account": "demo", "folder": "INBOX"}
+        text = resp.text
+        assert "Nur-Leseansicht" in text
+        assert "&lt;Hello&gt;" in text
+        assert "Hallo&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "--- BODY ---" not in text
+        assert "https://example.com" not in text
+        assert "[LINK]" in text
+        assert "<script>alert(1)</script>" not in text
+
+    def test_assistant_email_viewer_reads_google_workspace_message_as_sanitized_html(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        seen = {}
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {
+                "email": {
+                    "accounts": [
+                        {
+                            "backend": "aiwerk_bridge",
+                            "address": "kontakt@aiwerk.ch",
+                            "mcp_server": "google-workspace-aiwerk",
+                            "user_google_email": "kontakt@aiwerk.ch",
+                        }
+                    ]
+                }
+            },
+            "mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp", "enabled": True}},
+        })
+        monkeypatch.setattr(web_server, "_assistant_resources_payload", lambda request, force_refresh=False, **kwargs: {
+            "email": {
+                "accounts": [{
+                    "address": "kontakt@aiwerk.ch",
+                    "items": [{
+                        "message_id": "gmail-1",
+                        "sender": "Website <web@example.com>",
+                        "subject": "Google Anfrage",
+                        "received_at": "2026-05-30T19:10:00Z",
+                    }],
+                }]
+            }
+        })
+
+        def fake_google_read(config, account_cfg, *, message_id):
+            seen["message_id"] = message_id
+            seen["account"] = account_cfg["address"]
+            return """Retrieved 1 messages:
+
+Message ID: gmail-1
+Subject: Google Anfrage
+From: Website <web@example.com>
+Date: Sat, 30 May 2026 19:10:00 +0000
+Message-ID: <gmail-1@example.com>
+To: kontakt@aiwerk.ch
+List-Unsubscribe: <https://example.com/unsubscribe>
+Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
+
+--- BODY ---
+Google body<script>alert(1)</script>
+Link: https://example.com/a/very/long/link?with=query&and=tracking
+www.example.org/landing
+
+--- ATTACHMENTS ---
+1. conv_0201kszsyfvpe8f8vhag6cfyd196.json (application/json, 4.8 KB)
+   Attachment ID: ANGjdJ9X4YSaYhNIGonrXR7S34YjmYZR8acEwKVANQ80UZurma5q7pbvsvirvd5CXIWizCZzvszLCAwFkFYrnXYfHiQeKHOlnDH9IoQgntGt7BgwXP_7mxY
+   Use get_gmail_attachment_content(message_id='gmail-1', attachment_id='ANGjdJ9X4YSaYhNIGonrXR7S34YjmYZR8acEwKVANQ80UZurma5q7pbvsvirvd5CXIWizCZzvszLCAwFkFYrnXYfHiQeKHOlnDH9IoQgntGt7BgwXP_7mxY') to download
+2. angebot.pdf (application/pdf, 128 KB)
+   Attachment ID: secret-attachment-id
+<img src=x>"""
+
+        monkeypatch.setattr(web_server, "_run_google_workspace_message_read", fake_google_read)
+
+        resp = self.client.get("/api/assistant/email/view?account=kontakt%40aiwerk.ch&id=gmail-1")
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.headers["cache-control"] == "no-store"
+        assert "default-src 'none'" in resp.headers["content-security-policy"]
+        assert seen == {"message_id": "gmail-1", "account": "kontakt@aiwerk.ch"}
+        text = resp.text
+        assert "Google Anfrage" in text
+        assert "Google body&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "Retrieved 1 messages" not in text
+        assert "Message ID: gmail-1" not in text
+        assert "List-Unsubscribe" not in text
+        assert "mail.google.com" not in text
+        assert "--- BODY ---" not in text
+        assert "https://example.com/a/very/long" not in text
+        assert "www.example.org" not in text
+        assert text.count("[LINK]") >= 2
+        assert "--- ATTACHMENTS ---" not in text
+        assert "Attachment ID" not in text
+        assert "get_gmail_attachment_content" not in text
+        assert "ANGjdJ9X4YSa" not in text
+        assert "Anhänge:" in text
+        assert "conv_0201kszsyfvpe8f8vhag6cfyd196.json (application/json, 4.8 KB)" in text
+        assert "angebot.pdf (application/pdf, 128 KB)" in text
+        assert "<script>alert(1)</script>" not in text
 
     def test_assistant_resources_himalaya_preview_falls_back_to_latest_when_no_unread(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -440,7 +835,7 @@ class TestWebServerEndpoints:
             assert arguments["server"] == "google-workspace-aiwerk"
             if arguments["tool"] == "search_gmail_messages":
                 return _Response(mcp_tool_payload("""
-Found 1 messages matching 'is:unread':
+Found 1 messages matching 'in:inbox is:unread':
 
 📧 MESSAGES:
   1. Message ID: 19e70ea1de7486ee
@@ -476,9 +871,386 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
         assert email["items"][0]["sender"] == "AIWerk Website <kontakt@aiwerk.ch>"
         assert email["items"][0]["received_at"] == "2026-05-30T19:10:00Z"
         assert email["items"][0]["unread"] is True
-        assert email["items"][0]["open_url"].startswith("https://mail.google.com/")
+        assert email["items"][0]["message_id"] == "19e70ea1de7486ee"
+        assert email["items"][0]["gmail_web_url"].startswith("https://mail.google.com/")
+        assert email["items"][0]["open_url"].startswith("/api/assistant/email/view?")
+        assert "account=Google+Workspace" in email["items"][0]["open_url"]
+        assert "id=19e70ea1de7486ee" in email["items"][0]["open_url"]
         assert calls[1]["params"]["arguments"]["tool"] == "search_gmail_messages"
         assert calls[3]["params"]["arguments"]["tool"] == "get_gmail_messages_content_batch"
+
+    def test_assistant_resources_aggregates_google_workspace_and_imap_accounts(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        bridge_calls = []
+        himalaya_calls = []
+
+        class _Response:
+            def __init__(self, body, headers=None):
+                self._body = body
+                self.headers = headers or {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body.encode("utf-8")
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def mcp_tool_payload(text):
+            return json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps({
+                        "result": {
+                            "structuredContent": {"result": text},
+                            "content": [{"type": "text", "text": text}],
+                            "isError": False,
+                        }
+                    })}],
+                },
+            })
+
+        def fake_urlopen(req, timeout):
+            payload = json.loads(req.data.decode("utf-8"))
+            bridge_calls.append(payload)
+            if payload["method"] == "initialize":
+                return _Response(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), {"MCP-Session-Id": "session-1"})
+            arguments = payload["params"]["arguments"]
+            assert arguments["server"] == "google-workspace-aiwerk"
+            assert arguments["params"]["user_google_email"] == "kontakt@aiwerk.ch"
+            if arguments["tool"] == "search_gmail_messages":
+                return _Response(mcp_tool_payload("Message ID: gmail-1"))
+            return _Response(mcp_tool_payload("""
+Message ID: gmail-1
+Subject: Gmail Anfrage
+From: Website <web@example.com>
+Date: Sat, 30 May 2026 19:10:00 +0000
+Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
+"""))
+
+        def fake_run(cmd, **kwargs):
+            himalaya_calls.append(cmd)
+            assert "--account" in cmd
+            assert cmd[cmd.index("--account") + 1] == "info-imap"
+            if cmd[-3:] == ["not", "flag", "Seen"]:
+                return _Proc(json.dumps([{
+                    "id": "imap-1",
+                    "flags": [],
+                    "subject": "IMAP Anfrage",
+                    "from": {"addr": "kunde@example.com"},
+                    "date": "2026-05-30 18:00+00:00",
+                }]))
+            return _Proc("[]")
+
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_SUMMARY_JSON", raising=False)
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_BACKEND", raising=False)
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr("hermes_cli.web_server.shutil.which", lambda name: "/usr/bin/himalaya" if name == "himalaya" else None)
+        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {
+                "email": {
+                    "accounts": [
+                        {"backend": "google_workspace", "address": "kontakt@aiwerk.ch", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
+                        {"backend": "imap", "address": "info@example.ch", "account": "info-imap", "folder": "INBOX"},
+                    ]
+                }
+            },
+            "mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp", "enabled": True}},
+        })
+
+        resp = self.client.get("/api/assistant/resources")
+
+        assert resp.status_code == 200
+        email = resp.json()["email"]
+        assert email["status"] == "connected"
+        assert email["unread_count"] == 2
+        assert email["summary"] == "2 neue Nachrichten in 2 Konten"
+        assert {account["label"] for account in email["accounts"]} == {"kontakt@aiwerk.ch", "info@example.ch"}
+        assert {account["address"] for account in email["accounts"]} == {"kontakt@aiwerk.ch", "info@example.ch"}
+        assert {item["account_label"] for item in email["items"]} == {"kontakt@aiwerk.ch", "info@example.ch"}
+        assert {item["account_address"] for item in email["items"]} == {"kontakt@aiwerk.ch", "info@example.ch"}
+        account_items = {account["address"]: account["items"] for account in email["accounts"]}
+        assert account_items["kontakt@aiwerk.ch"][0]["subject"] == "Gmail Anfrage"
+        assert account_items["info@example.ch"][0]["subject"] == "IMAP Anfrage"
+        assert any(item["subject"] == "Gmail Anfrage" for item in email["items"])
+        assert any(item["subject"] == "IMAP Anfrage" for item in email["items"])
+        assert bridge_calls
+        assert himalaya_calls
+
+    def test_assistant_calendar_mirrors_google_workspace_mail_accounts(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        seen = []
+
+        def fake_calendar_summary(config, account_cfg, *, now=None):
+            address = account_cfg["address"]
+            seen.append(address)
+            items = [] if address == "kontakt@aiwerk.ch" else [{
+                "id": "event-1",
+                "title": "Kieferorthopäde — Anika",
+                "starts_at": "2026-06-03T13:40:00+02:00",
+                "ends_at": "2026-06-03T14:40:00+02:00",
+                "account_label": address,
+                "account_address": address,
+            }]
+            return {
+                "label": address,
+                "address": address,
+                "calendar_id": address,
+                "source": "google_calendar",
+                "status": "connected",
+                "summary": f"{len(items)} kommende Termine" if items else "Keine kommenden Termine",
+                "items": items,
+            }
+
+        monkeypatch.setattr(web_server, "_google_workspace_calendar_summary", fake_calendar_summary)
+        summary = getattr(web_server, "_calendar_summary")({
+            "dashboard": {
+                "email": {
+                    "accounts": [
+                        {"backend": "google_workspace", "address": "kontakt@aiwerk.ch", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
+                        {"backend": "google_workspace", "address": "user@example.com", "mcp_server": "google-workspace-demo", "user_google_email": "user@example.com"},
+                        {"backend": "himalaya", "address": "office@example.ch", "account": "office"},
+                    ]
+                }
+            }
+        })
+
+        assert seen == ["kontakt@aiwerk.ch", "user@example.com"]
+        assert summary["status"] == "connected"
+        assert summary["summary"] == "1 kommende Termine in 2 Kalendern"
+        assert [account["address"] for account in summary["accounts"]] == ["kontakt@aiwerk.ch", "user@example.com"]
+        assert summary["items"][0]["title"] == "Kieferorthopäde — Anika"
+        assert summary["items"][0]["account_address"] == "user@example.com"
+        assert summary["items"][0]["open_url"].startswith("/api/assistant/calendar/view?")
+        assert "account=user%40example.com" in summary["items"][0]["open_url"]
+        assert "id=event-1" in summary["items"][0]["open_url"]
+        assert summary["accounts"][1]["items"][0]["open_url"].startswith("/api/assistant/calendar/view?")
+
+    def test_google_workspace_calendar_summary_requests_default_event_type_filter(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def fake_bridge_call(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            return {
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": 'Successfully retrieved 1 events from calendar \'primary\':\n- "Kundentermin" (Starts: 2026-06-02T10:00:00+02:00, Ends: 2026-06-02T10:30:00+02:00) ID: event-1 | Link: https://calendar.google.com/event?eid=secret',
+                    }],
+                }
+            }
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+
+        summary = getattr(web_server, "_google_workspace_calendar_summary")(
+            {},
+            {"backend": "google_workspace", "address": "team@example.ch", "user_google_email": "team@example.ch"},
+            now=datetime(2026, 6, 1, 8, 0, tzinfo=timezone.utc),
+        )
+
+        assert calls[0]["tool"] == "get_events"
+        assert calls[0]["params"]["event_types"] == ["default"]
+        assert summary is not None
+        assert summary["items"][0]["title"] == "Kundentermin"
+
+    def test_assistant_calendar_viewer_reads_cached_event_as_sanitized_html(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_assistant_resources_payload", lambda request, force_refresh=False, **kwargs: {
+            "calendar": {
+                "accounts": [{
+                    "address": "team@example.ch",
+                    "label": "team@example.ch",
+                    "items": [{
+                        "id": "event-1",
+                        "event_id": "event-1",
+                        "title": "<Kundentermin>",
+                        "starts_at": "2026-06-01T10:00:00Z",
+                        "ends_at": "2026-06-01T10:30:00Z",
+                        "location_hint": "Bern<script>alert(1)</script>",
+                        "html_link": "https://calendar.google.com/event?eid=secret",
+                    }],
+                }]
+            }
+        })
+
+        resp = self.client.get("/api/assistant/calendar/view?account=team%40example.ch&id=event-1")
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert "no-store" in resp.headers["cache-control"]
+        assert "default-src 'none'" in resp.headers["content-security-policy"]
+        text = resp.text
+        assert "Nur-Leseansicht" in text
+        assert "&lt;Kundentermin&gt;" in text
+        assert "Bern&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "Titel: &lt;Kundentermin&gt;" not in text
+        assert "Ort: Bern" not in text
+        assert "calendar.google.com" not in text
+        assert "[LINK]" in text
+        assert "<script>alert(1)</script>" not in text
+
+    def test_assistant_calendar_viewer_fetches_detailed_location_when_cache_lacks_it(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_assistant_resources_payload", lambda request, force_refresh=False, **kwargs: {
+            "calendar": {
+                "accounts": [{
+                    "address": "user@example.com",
+                    "label": "user@example.com",
+                    "items": [{
+                        "id": "event-1",
+                        "event_id": "event-1",
+                        "title": "Kieferorthopäde — Anika",
+                        "starts_at": "2026-06-03T13:40:00+02:00",
+                        "ends_at": "2026-06-03T14:40:00+02:00",
+                    }],
+                }]
+            }
+        })
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "dashboard": {
+                "email": {
+                    "accounts": [{
+                        "backend": "google_workspace",
+                        "address": "user@example.com",
+                        "mcp_server": "google-workspace-demo",
+                        "user_google_email": "user@example.com",
+                    }]
+                }
+            }
+        })
+        calls = []
+
+        def fake_bridge_tool(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            return {
+                "result": {
+                    "structuredContent": {
+                        "result": "Event Details:\n"
+                        "- Title: Kieferorthopäde — Anika\n"
+                        "- Starts: 2026-06-03T13:40:00+02:00\n"
+                        "- Ends: 2026-06-03T14:40:00+02:00\n"
+                        "- Description: No Description\n"
+                        "- Location: Bahnhofplatz 1, Bern<script>alert(1)</script>\n"
+                        "- Event ID: event-1\n"
+                        "- Link: https://calendar.google.com/event?eid=secret"
+                    }
+                }
+            }
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_tool)
+
+        resp = self.client.get("/api/assistant/calendar/view?account=user%40example.com&id=event-1")
+
+        assert resp.status_code == 200
+        text = resp.text
+        assert "Bahnhofplatz 1, Bern&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "Titel: Kieferorthopäde" not in text
+        assert "Ort: Bahnhofplatz" not in text
+        assert "calendar.google.com" not in text
+        assert "[LINK]" in text
+        assert calls == [{
+            "server": "google-workspace-demo",
+            "tool": "get_events",
+            "params": {
+                "calendar_id": "user@example.com",
+                "user_google_email": "user@example.com",
+                "event_id": "event-1",
+                "max_results": 1,
+                "detailed": True,
+            },
+        }]
+
+    def test_assistant_calendar_viewer_is_token_gated(self):
+        import hermes_cli.web_server as web_server
+
+        from starlette.testclient import TestClient
+        assert "/api/assistant/calendar/view" in web_server._ASSISTANT_ALLOWED_API_EXACT
+        resp = TestClient(web_server.app).get("/api/assistant/calendar/view?account=team%40example.ch&id=event-1")
+        assert resp.status_code == 401
+
+    def test_google_workspace_preview_uses_latest_items_even_when_unread_exists(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def fake_items(config, *, server, user_google_email, query, page_size, unread):
+            calls.append({"query": query, "page_size": page_size, "unread": unread})
+            if unread:
+                return [{
+                    "id": "old-unread",
+                    "message_id": "old-unread",
+                    "sender": "Status <status@example.com>",
+                    "subject": "Old unread",
+                    "received_at": "2026-04-01T08:00:00Z",
+                    "unread": True,
+                }]
+            return [{
+                "id": "fresh-read",
+                "message_id": "fresh-read",
+                "sender": "Fresh <fresh@example.com>",
+                "subject": "Fresh latest",
+                "received_at": "2026-05-31T20:00:00Z",
+                "unread": False,
+            }]
+
+        monkeypatch.setattr(web_server, "_gmail_bridge_message_items", fake_items)
+        summary = web_server._google_workspace_email_summary({"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.example/mcp"}}}, {
+            "backend": "google_workspace",
+            "address": "user@example.com",
+            "mcp_server": "google-workspace-demo",
+            "user_google_email": "user@example.com",
+        })
+
+        assert summary is not None
+        assert summary["unread_count"] == 1
+        assert summary["items"][0]["subject"] == "Fresh latest"
+        assert summary["items"][0]["unread"] is False
+        assert [call["query"] for call in calls] == ["in:inbox is:unread", "in:inbox"]
+
+    def test_assistant_resources_account_items_keep_all_scanned_unread_messages(self):
+        import hermes_cli.web_server as web_server
+
+        unread_items = [
+            {
+                "id": f"mail-{index}",
+                "subject": f"Neue Nachricht {index}",
+                "received_at": f"2026-05-30T12:{index:02d}:00Z",
+                "unread": True,
+            }
+            for index in range(7)
+        ]
+
+        merged = web_server._merge_email_summaries([{
+            "status": "connected",
+            "account_label": "info@example.ch",
+            "account_address": "info@example.ch",
+            "source": "imap",
+            "unread_count": len(unread_items),
+            "summary": "7 neue Nachrichten",
+            "items": unread_items,
+        }])
+
+        assert merged is not None
+        assert merged["unread_count"] == 7
+        assert len(merged["accounts"][0]["items"]) == 7
+        assert len(merged["items"]) == 5
 
     def test_shared_folder_file_manager_open_is_disabled_for_remote_dashboard_requests(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
