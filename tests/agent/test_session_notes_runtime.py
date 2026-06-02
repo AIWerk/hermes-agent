@@ -25,4 +25,5 @@ def test_record_incremental_session_notes_captures_tool_results(tmp_path):
     assert [event["event_type"] for event in events] == ["tool_result", "turn_note"]
     assert events[0]["content"]["summary"] == "Wrote /tmp/a.txt with token [REDACTED]"
     scratchpad = db.get_session_scratchpad("sess-1")
-    assert scratchpad["current_goal"] == "Continue the current user task"
+    assert scratchpad is not None
+    assert scratchpad["current_goal"] == "Aktuelle Nutzeraufgabe fortsetzen"

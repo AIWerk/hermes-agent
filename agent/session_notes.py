@@ -96,11 +96,11 @@ def update_session_scratchpad(
         scratchpad["current_goal"] = str(content.get("current_goal"))[:_MAX_TEXT]
     elif event_type == "user_correction" and summary:
         scratchpad["decisions"] = _append_limited(
-            scratchpad.get("decisions", []), f"User correction: {summary}"
+            scratchpad.get("decisions", []), f"Korrektur des Nutzers: {summary}"
         )
     elif event_type == "checkpoint" and summary:
         scratchpad["open_items"] = _append_limited(
-            scratchpad.get("open_items", []), f"Checkpoint: {summary}"
+            scratchpad.get("open_items", []), f"Zwischenstand: {summary}"
         )
 
     session_db.set_session_scratchpad(session_id, scratchpad)

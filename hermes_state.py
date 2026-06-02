@@ -3173,15 +3173,21 @@ class SessionDB:
     # Utility
     # =========================================================================
 
-    def session_count(self, source: str = None) -> int:
-        """Count sessions, optionally filtered by source."""
+    def session_count(self, source: Optional[str] = None, exclude_sources: Optional[List[str]] = None) -> int:
+        """Count sessions, optionally filtered by source/excluded sources."""
         with self._lock:
+            where_clauses = []
+            params = []
             if source:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
-                )
-            else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+                where_clauses.append("source = ?")
+                params.append(source)
+            if exclude_sources:
+                placeholders = ",".join("?" for _ in exclude_sources)
+                where_clauses.append(f"source NOT IN ({placeholders})")
+                params.extend(exclude_sources)
+            where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            assert self._conn is not None
+            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions{where_sql}", params)
             return cursor.fetchone()[0]
 
     def message_count(self, session_id: str = None) -> int:

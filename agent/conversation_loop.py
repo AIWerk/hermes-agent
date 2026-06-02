@@ -109,7 +109,7 @@ def _record_incremental_session_notes(
                 "turn_note",
                 {
                     "summary": str(final_response)[:500],
-                    "current_goal": "Continue the current user task",
+                    "current_goal": "Aktuelle Nutzeraufgabe fortsetzen",
                     "tool_turns": tool_turns,
                 },
                 turn_index=turn_index,

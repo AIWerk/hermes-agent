@@ -28,12 +28,13 @@ _MAX_INPUT_CHARS = 12_000
 _MAX_OUTLINE_ITEMS = 8
 _MAX_TOPICS = 8
 
-_SYSTEM_PROMPT = """Create a compact session note for later search.
+_SYSTEM_PROMPT = """Erstelle eine kompakte Sitzungsnotiz für die spätere Suche.
+Write all human-readable values in German, even when the transcript contains another language.
 Return ONLY valid JSON with exactly these keys:
 {
-  "short_summary": "1-2 concise sentences about what happened",
-  "outline": ["3-8 short bullets of the session flow"],
-  "topics": ["3-8 lowercase search tags"]
+  "short_summary": "1-2 concise German sentences about what happened",
+  "outline": ["3-8 short German bullets of the session flow"],
+  "topics": ["3-8 lowercase German or stable technical search tags"]
 }
 Do not include secrets, credentials, private addresses, or raw transcript dumps.
 This is a session index note, not durable memory or wiki content.
