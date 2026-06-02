@@ -1037,9 +1037,10 @@ def init_agent(
         "max_tokens": max_tokens,
     }
     
-    # In-memory todo list for task planning (one per agent/session)
-    from tools.todo_tool import TodoStore
-    agent._todo_store = TodoStore()
+    # Shared todo list for task planning; persisted to TODO.md when available so
+    # the CUI Aufgaben panel can show the same active agent tasks.
+    from tools.todo_tool import TodoStore, default_todo_markdown_path
+    agent._todo_store = TodoStore(markdown_path=default_todo_markdown_path())
     
     # Load config once for memory, skills, and compression sections
     try:

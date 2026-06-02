@@ -2,7 +2,7 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool
+from tools.todo_tool import TodoStore, default_todo_markdown_path, todo_tool
 
 
 class TestWriteAndRead:
@@ -96,6 +96,38 @@ class TestMergeMode:
         )
         items = store.read()
         assert len(items) == 2
+
+
+class TestMarkdownSync:
+    def test_hydrates_from_markdown_checkboxes(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        path.write_text("# Agent TODO\n\n- [ ] Open item\n- [x] Done item\n", encoding="utf-8")
+
+        store = TodoStore(markdown_path=path)
+
+        assert store.read() == [
+            {"id": "todo-3", "content": "Open item", "status": "pending"},
+            {"id": "todo-4", "content": "Done item", "status": "completed"},
+        ]
+
+    def test_writes_markdown_for_cui_panel(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        store = TodoStore(markdown_path=path)
+
+        store.write([
+            {"id": "1", "content": "Open item", "status": "in_progress"},
+            {"id": "2", "content": "Done item", "status": "completed"},
+        ])
+
+        text = path.read_text(encoding="utf-8")
+        assert "- [ ] Open item" in text
+        assert "- [x] Done item" in text
+
+    def test_default_path_honors_cui_env(self, monkeypatch, tmp_path):
+        path = tmp_path / "panel.md"
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(path))
+
+        assert default_todo_markdown_path() == path
 
 
 class TestTodoToolFunction:

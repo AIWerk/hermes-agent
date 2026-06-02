@@ -2,9 +2,10 @@
 """
 Todo Tool Module - Planning & Task Management
 
-Provides an in-memory task list the agent uses to decompose complex tasks,
-track progress, and maintain focus across long conversations. The state
-lives on the AIAgent instance (one per session) and is re-injected into
+Provides a task list the agent uses to decompose complex tasks,
+track progress, and maintain focus across long conversations. The live state
+lives on the AIAgent instance (one per session) and can sync to TODO.md so
+CUI Aufgaben shows the same active agent work. It is also re-injected into
 the conversation after context compression events.
 
 Design:
@@ -15,11 +16,27 @@ Design:
 """
 
 import json
+import os
+import re
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 
 # Valid status values for todo items
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+
+
+def default_todo_markdown_path() -> Path:
+    """Return the shared TODO.md path used by the agent and CUI Aufgaben panel."""
+    raw = os.environ.get("AIWERK_CUI_TODO_PATH") or os.environ.get("HERMES_TODO_PATH")
+    if raw:
+        return Path(raw).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "TODO.md"
+    except Exception:
+        return Path.home() / ".hermes" / "TODO.md"
 
 
 class TodoStore:
@@ -32,8 +49,10 @@ class TodoStore:
       - status: pending | in_progress | completed | cancelled
     """
 
-    def __init__(self):
+    def __init__(self, markdown_path: Optional[str | Path] = None):
         self._items: List[Dict[str, str]] = []
+        self._markdown_path = Path(markdown_path).expanduser() if markdown_path else None
+        self._load_markdown_if_available()
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -77,11 +96,16 @@ class TodoStore:
                     rebuilt.append(current)
                     seen.add(current["id"])
             self._items = rebuilt
+        self._sync_markdown()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
+
+    def markdown_path(self) -> Optional[Path]:
+        """Return the backing TODO.md path, if markdown sync is enabled."""
+        return self._markdown_path
 
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
@@ -152,6 +176,47 @@ class TodoStore:
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 
+    def _load_markdown_if_available(self) -> None:
+        """Hydrate the in-memory list from TODO.md without failing agent startup."""
+        if not self._markdown_path or not self._markdown_path.exists():
+            return
+        try:
+            lines = self._markdown_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return
+        items: List[Dict[str, str]] = []
+        for line_no, line in enumerate(lines, start=1):
+            match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$", line)
+            if not match:
+                continue
+            content = re.sub(r"<!--.*?-->", "", match.group(2)).strip()
+            if not content:
+                continue
+            status = "completed" if match.group(1).lower() == "x" else "pending"
+            items.append({"id": f"todo-{line_no}", "content": content, "status": status})
+        self._items = items
+
+    def _sync_markdown(self) -> None:
+        """Persist the current tool list to TODO.md for the CUI Aufgaben panel."""
+        if not self._markdown_path:
+            return
+        try:
+            self._markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                "# Agent TODO",
+                "",
+                "<!-- Managed by Hermes todo tool. The CUI Aufgaben panel reads open Markdown checkboxes from this file. -->",
+                "",
+            ]
+            for item in self._items:
+                marker = "x" if item["status"] in {"completed", "cancelled"} else " "
+                content = item["content"].replace("\n", " ").strip()
+                lines.append(f"- [{marker}] {content}")
+            self._markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        except Exception:
+            # Todo is a planning aid; disk sync must never break tool execution.
+            return
+
 
 def todo_tool(
     todos: Optional[List[Dict[str, Any]]] = None,
@@ -209,8 +274,10 @@ def check_todo_requirements() -> bool:
 TODO_SCHEMA = {
     "name": "todo",
     "description": (
-        "Manage your task list for the current session. Use for complex tasks "
-        "with 3+ steps or when the user provides multiple tasks. "
+        "Manage your shared task list for the current session. When the agent is "
+        "initialized with a TODO.md path, writes are also synced to that Markdown "
+        "file so the CUI Aufgaben panel can show the same active tasks. Use for "
+        "complex tasks with 3+ steps or when the user provides multiple tasks. "
         "Call with no parameters to read the current list.\n\n"
         "Writing:\n"
         "- Provide 'todos' array to create/update items\n"
