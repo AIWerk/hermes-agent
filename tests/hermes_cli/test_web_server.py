@@ -642,7 +642,7 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(web_server, "_run_himalaya_message_read", fake_read)
 
-        resp = self.client.get("/api/assistant/email/view?account=attila%40example.com&id=42")
+        resp = self.client.get("/api/assistant/email/view?account=user%40example.com&id=42")
 
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
