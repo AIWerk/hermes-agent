@@ -192,6 +192,105 @@ class TestWebServerEndpoints:
         assert resp.json()["gateway_state"] == "startup_failed"
         assert resp.json()["gateway_platforms"] == {}
 
+
+    def test_assistant_support_saves_log_and_delivers_telegram(self, monkeypatch):
+        import json
+        import hermes_cli.web_server as web_server
+        from hermes_constants import get_hermes_home
+
+        sent = []
+
+        def fake_deliver(targets, text):
+            sent.append((targets, text))
+            return True, []
+
+        monkeypatch.setenv("AIWERK_SUPPORT_TELEGRAM_CHAT_ID", "-1001234567890")
+        monkeypatch.setattr(web_server, "_deliver_support_message", fake_deliver)
+
+        resp = self.client.post(
+            "/api/assistant/support",
+            json={
+                "category": "E-Mail / Kalender / Dateien",
+                "message": "Rocky sieht meine neuen Mails nicht.",
+                "include_diagnostics": True,
+                "session_id": "session-123",
+                "session_title": "Mailproblem",
+                "connection": "open",
+                "diagnostics": {
+                    "email": {"status": "auth_required", "summary": "Anmeldung nötig"},
+                    "secret": "token=should-not-be-raw-but-is-truncated-only",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["delivered"] is True
+        assert data["support_id"].startswith("sup_")
+        assert sent
+        assert sent[0][0] == ["telegram:-1001234567890"]
+        assert "AIWerk Supportmeldung" in sent[0][1]
+        assert "Rocky sieht meine neuen Mails nicht." in sent[0][1]
+        log_path = get_hermes_home() / "aiwerk-support" / "inbox.jsonl"
+        line = log_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+        record = json.loads(line)
+        assert record["support_id"] == data["support_id"]
+        assert record["session_id"] == "session-123"
+        assert record["diagnostics"]["email"]["status"] == "auth_required"
+
+    def test_assistant_support_keeps_saved_message_when_delivery_fails(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_constants import get_hermes_home
+
+        monkeypatch.setenv("AIWERK_SUPPORT_TELEGRAM_CHAT_ID", "-1001234567890")
+        monkeypatch.setattr(web_server, "_deliver_support_message", lambda targets, text: (False, ["telegram:-1001234567890: offline"]))
+
+        resp = self.client.post(
+            "/api/assistant/support",
+            json={"category": "Sonstiges", "message": "Bitte prüfen.", "include_diagnostics": False},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["delivered"] is False
+        assert data["queued"] is True
+        assert (get_hermes_home() / "aiwerk-support" / "inbox.jsonl").exists()
+
+    def test_assistant_support_does_not_fallback_to_gateway_home_channel(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        sent = []
+        monkeypatch.setenv("AIWERK_CUI_SUPPORT_TARGET", "telegram")
+        monkeypatch.delenv("AIWERK_SUPPORT_TELEGRAM_CHAT_ID", raising=False)
+        monkeypatch.delenv("AIWERK_CUI_SUPPORT_TELEGRAM_CHAT_ID", raising=False)
+        monkeypatch.setattr(web_server, "_deliver_support_message", lambda targets, text: sent.append(targets) or (False, []))
+
+        resp = self.client.post(
+            "/api/assistant/support",
+            json={"category": "Sonstiges", "message": "Bitte prüfen.", "include_diagnostics": False},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["delivered"] is False
+        assert data["queued"] is True
+        assert sent == [[]]
+
+    def test_aiwerk_system_targets_use_explicit_telegram_chat_id(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("AIWERK_SYSTEM_TELEGRAM_CHAT_ID", "-1009876543210")
+        assert getattr(web_server, "_system_delivery_targets")({}) == ["telegram:-1009876543210"]
+
+    def test_aiwerk_system_targets_ignore_bare_telegram_home_channel(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.delenv("AIWERK_SYSTEM_TELEGRAM_CHAT_ID", raising=False)
+        assert getattr(web_server, "_system_delivery_targets")({"dashboard": {"notifications": {"delivery_target": "telegram"}}}) == []
+
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")
         assert resp.status_code == 200
@@ -393,6 +492,62 @@ class TestWebServerEndpoints:
         bridge = next(connector for connector in data["connectors"] if connector["label"] == "AIWerk Bridge")
         assert [child["label"] for child in bridge["children"]][:3] == ["CoinMarketCap", "Firecrawl", "Google Maps"]
         assert all(child["capabilities"] == ["Bridge-Subserver"] for child in bridge["children"])
+
+    def test_assistant_todo_update_marks_item_done_and_invalidates_cache(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        cache_lock = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE_LOCK")
+        cache = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE")
+        with cache_lock:
+            cache.clear()
+        todo_file = tmp_path / "TODO.md"
+        todo_file.write_text("# TODO\n- [ ] Angebot prüfen\n- [ ] Ölwechsel planen\n", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+
+        first = self.client.get("/api/assistant/resources?refresh=1&resource=todos")
+        assert first.status_code == 200
+        assert first.json()["todos"]["open_count"] == 2
+        item_id = first.json()["todos"]["items"][0]["id"]
+
+        updated = self.client.post("/api/assistant/todos/update", json={"id": item_id, "done": True})
+        assert updated.status_code == 200
+        assert updated.json()["todos"]["open_count"] == 1
+        assert updated.json()["todos"]["done_count"] == 1
+        assert "- [x] Angebot prüfen" in todo_file.read_text(encoding="utf-8")
+
+        cached_after_update = self.client.get("/api/assistant/resources?resource=todos")
+        assert cached_after_update.status_code == 200
+        assert cached_after_update.json()["todos"]["open_count"] == 1
+        assert cached_after_update.json()["todos"]["items"][0]["text"] == "Ölwechsel planen"
+        assert self.client.post("/api/assistant/todos/update", json={"id": "bad", "done": True}).status_code == 400
+
+    def test_assistant_todo_add_appends_item_and_invalidates_cache(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        cache_lock = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE_LOCK")
+        cache = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE")
+        with cache_lock:
+            cache.clear()
+        todo_file = tmp_path / "TODO.md"
+        todo_file.write_text("# TODO\n- [ ] Angebot prüfen\n", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+
+        first = self.client.get("/api/assistant/resources?refresh=1&resource=todos")
+        assert first.status_code == 200
+        assert first.json()["todos"]["open_count"] == 1
+
+        added = self.client.post("/api/assistant/todos/add", json={"text": "  Neue Aufgabe   erfassen  "})
+        assert added.status_code == 200
+        assert added.json()["todos"]["open_count"] == 2
+        assert added.json()["todos"]["items"][-1]["text"] == "Neue Aufgabe erfassen"
+        assert "- [ ] Neue Aufgabe erfassen" in todo_file.read_text(encoding="utf-8")
+
+        cached_after_add = self.client.get("/api/assistant/resources?resource=todos")
+        assert cached_after_add.status_code == 200
+        assert cached_after_add.json()["todos"]["open_count"] == 2
+        assert self.client.post("/api/assistant/todos/add", json={"text": "   "}).status_code == 400
 
     def test_vault_summary_prefers_aiwerk_bridge_health_check(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -621,6 +776,40 @@ class TestWebServerEndpoints:
         assert [item["id"] for item in merged["items"]] == ["9688"]
         assert merged["accounts"][0]["unread_count"] == 1
         assert merged["accounts"][0]["filtered_count"] == 1
+
+    def test_assistant_email_items_show_all_unread_then_fill_to_five(self):
+        import hermes_cli.web_server as web_server
+
+        unread = [
+            {"id": "u1", "message_id": "u1", "subject": "Unread 1", "received_at": "2026-06-02T10:00:00Z"},
+            {"id": "u2", "message_id": "u2", "subject": "Unread 2", "received_at": "2026-06-02T11:00:00Z"},
+        ]
+        latest = [
+            {"id": "u2", "message_id": "u2", "subject": "Unread duplicate", "received_at": "2026-06-02T11:00:00Z"},
+            {"id": "r1", "message_id": "r1", "subject": "Read 1", "received_at": "2026-06-02T09:00:00Z"},
+            {"id": "spam", "message_id": "spam", "sender": "Migros <info@attractivewedding.info>", "subject": "Migros fake", "received_at": "2026-06-02T08:30:00Z"},
+            {"id": "r2", "message_id": "r2", "subject": "Read 2", "received_at": "2026-06-02T08:00:00Z"},
+            {"id": "r3", "message_id": "r3", "subject": "Read 3", "received_at": "2026-06-02T07:00:00Z"},
+        ]
+
+        items = web_server._unread_first_email_items(unread, latest)
+
+        assert [item["message_id"] for item in items] == ["u2", "u1", "r1", "r2", "r3"]
+        assert [item["unread"] for item in items] == [True, True, False, False, False]
+
+    def test_assistant_email_items_keep_more_than_five_unread_without_latest_fill(self):
+        import hermes_cli.web_server as web_server
+
+        unread = [
+            {"id": f"u{index}", "message_id": f"u{index}", "subject": f"Unread {index}", "received_at": f"2026-06-02T10:{index:02d}:00Z"}
+            for index in range(7)
+        ]
+
+        items = web_server._unread_first_email_items(unread, [{"id": "read", "message_id": "read"}])
+
+        assert len(items) == 7
+        assert all(item["unread"] is True for item in items)
+        assert "read" not in {item["message_id"] for item in items}
 
     def test_assistant_email_viewer_reads_himalaya_message_as_sanitized_html(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -904,8 +1093,13 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
         assert email["items"][0]["open_url"].startswith("/api/assistant/email/view?")
         assert "account=Google+Workspace" in email["items"][0]["open_url"]
         assert "id=19e70ea1de7486ee" in email["items"][0]["open_url"]
-        assert calls[1]["params"]["arguments"]["tool"] == "search_gmail_messages"
-        assert calls[3]["params"]["arguments"]["tool"] == "get_gmail_messages_content_batch"
+        tools = [
+            call.get("params", {}).get("arguments", {}).get("tool")
+            for call in calls[1:]
+            if call.get("params", {}).get("arguments", {}).get("tool")
+        ]
+        assert tools.count("search_gmail_messages") >= 1
+        assert "get_gmail_messages_content_batch" in tools
 
     def test_aiwerk_bridge_reuses_session_across_cui_tool_calls(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -931,7 +1125,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
         assert calls[2]["session_id"] == "session-123"
         assert [call["request_id"] for call in calls] == [1, 2, 3]
 
-    def test_google_workspace_email_summary_counts_unread_without_metadata_fetch(self, monkeypatch):
+    def test_google_workspace_email_summary_fetches_unread_and_fills_with_latest(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
         calls = []
@@ -942,9 +1136,10 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
                 return {"result": {"content": [{"text": "Message ID: unread-1\nMessage ID: unread-2\n"}]}}
             if tool == "search_gmail_messages" and params["query"] == "in:inbox":
                 return {"result": {"content": [{"text": "Message ID: latest-1\n"}]}}
-            if tool == "get_gmail_messages_content_batch":
-                assert params["message_ids"] == ["latest-1"]
-                return {"result": {"content": [{"text": "Message ID: latest-1\nSubject: Hello\nFrom: Sender <s@example.com>\nDate: Tue, 02 Jun 2026 10:00:00 +0000\n"}]}}
+            if tool == "get_gmail_messages_content_batch" and params["message_ids"] == ["unread-1", "unread-2"]:
+                return {"result": {"content": [{"text": "Message ID: unread-1\nSubject: U1\nFrom: Sender <s@example.com>\nDate: Tue, 02 Jun 2026 11:00:00 +0000\n\nMessage ID: unread-2\nSubject: U2\nFrom: Sender <s@example.com>\nDate: Tue, 02 Jun 2026 10:00:00 +0000\n"}]}}
+            if tool == "get_gmail_messages_content_batch" and params["message_ids"] == ["latest-1"]:
+                return {"result": {"content": [{"text": "Message ID: latest-1\nSubject: Hello\nFrom: Sender <s@example.com>\nDate: Tue, 02 Jun 2026 09:00:00 +0000\n"}]}}
             raise AssertionError(f"unexpected bridge call: {tool} {params}")
 
         monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
@@ -961,9 +1156,11 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
 
         assert summary is not None
         assert summary["unread_count"] == 2
-        assert summary["items"][0]["message_id"] == "latest-1"
+        assert [item["message_id"] for item in summary["items"]] == ["unread-1", "unread-2", "latest-1"]
+        assert [item["unread"] for item in summary["items"]] == [True, True, False]
         assert [call["tool"] for call in calls] == [
             "search_gmail_messages",
+            "get_gmail_messages_content_batch",
             "search_gmail_messages",
             "get_gmail_messages_content_batch",
         ]
@@ -1314,7 +1511,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         resp = TestClient(web_server.app).get("/api/assistant/calendar/view?account=team%40example.ch&id=event-1")
         assert resp.status_code == 401
 
-    def test_google_workspace_preview_uses_latest_items_even_when_unread_exists(self, monkeypatch):
+    def test_google_workspace_preview_shows_unread_before_latest_fill(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
         calls = []
@@ -1336,8 +1533,20 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
                 "unread": False,
             }]
 
+        def fake_metadata_items(config, *, server, user_google_email, message_ids, unread, page_size):
+            calls.append({"message_ids": message_ids, "page_size": page_size, "unread": unread, "kind": "metadata"})
+            return [{
+                "id": "old-unread",
+                "message_id": "old-unread",
+                "sender": "Old <old@example.com>",
+                "subject": "Old unread",
+                "received_at": "2026-05-31T19:00:00Z",
+                "unread": True,
+            }]
+
         monkeypatch.setattr(web_server, "_gmail_bridge_search_message_ids", fake_search_ids)
         monkeypatch.setattr(web_server, "_gmail_bridge_message_items", fake_items)
+        monkeypatch.setattr(web_server, "_gmail_bridge_metadata_items_for_ids", fake_metadata_items)
         summary = web_server._google_workspace_email_summary({"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.example/mcp"}}}, {
             "backend": "google_workspace",
             "address": "user@example.com",
@@ -1347,9 +1556,12 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
 
         assert summary is not None
         assert summary["unread_count"] == 1
-        assert summary["items"][0]["subject"] == "Fresh latest"
-        assert summary["items"][0]["unread"] is False
-        assert [call["query"] for call in calls] == ["in:inbox is:unread", "in:inbox"]
+        assert summary["items"][0]["subject"] == "Old unread"
+        assert summary["items"][0]["unread"] is True
+        assert summary["items"][1]["subject"] == "Fresh latest"
+        assert summary["items"][1]["unread"] is False
+        assert [call["kind"] for call in calls] == ["search", "metadata", "items"]
+        assert [call.get("query") for call in calls if call["kind"] == "search"] == ["in:inbox is:unread"]
 
     def test_assistant_resources_account_items_keep_all_scanned_unread_messages(self):
         import hermes_cli.web_server as web_server

@@ -1,6 +1,7 @@
 """Tests for the todo tool module."""
 
 import json
+import os
 
 from tools.todo_tool import TodoStore, default_todo_markdown_path, todo_tool
 
@@ -128,6 +129,42 @@ class TestMarkdownSync:
         monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(path))
 
         assert default_todo_markdown_path() == path
+
+    def test_read_reloads_when_markdown_changes_externally(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        path.write_text("# Agent TODO\n\n- [ ] Original\n", encoding="utf-8")
+        store = TodoStore(markdown_path=path)
+
+        path.write_text("# Agent TODO\n\n- [ ] Original\n- [ ] Added from CUI\n", encoding="utf-8")
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000_000))
+
+        assert store.read() == [
+            {"id": "todo-3", "content": "Original", "status": "pending"},
+            {"id": "todo-4", "content": "Added from CUI", "status": "pending"},
+        ]
+
+    def test_replace_write_preserves_externally_added_markdown_items(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        store = TodoStore(markdown_path=path)
+        store.write([{"id": "plan", "content": "Agent plan", "status": "pending"}])
+
+        path.write_text(
+            "# Agent TODO\n\n- [ ] Agent plan\n- [ ] Added from CUI\n",
+            encoding="utf-8",
+        )
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000_000))
+
+        result = store.write([
+            {"id": "next", "content": "Next agent plan", "status": "in_progress"},
+        ])
+
+        assert result == [
+            {"id": "next", "content": "Next agent plan", "status": "in_progress"},
+            {"id": "todo-3", "content": "Agent plan", "status": "pending"},
+            {"id": "todo-4", "content": "Added from CUI", "status": "pending"},
+        ]
+        text = path.read_text(encoding="utf-8")
+        assert "- [ ] Added from CUI" in text
 
 
 class TestTodoToolFunction:

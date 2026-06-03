@@ -52,6 +52,7 @@ class TodoStore:
     def __init__(self, markdown_path: Optional[str | Path] = None):
         self._items: List[Dict[str, str]] = []
         self._markdown_path = Path(markdown_path).expanduser() if markdown_path else None
+        self._markdown_mtime_ns: Optional[int] = None
         self._load_markdown_if_available()
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
@@ -63,9 +64,23 @@ class TodoStore:
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        external_changed = self._refresh_from_markdown_if_changed()
+        external_items = [item.copy() for item in self._items] if external_changed else []
+
         if not merge:
-            # Replace mode: new list entirely
+            # Replace mode: new list entirely. If TODO.md was edited by the
+            # CUI since this store last synced, keep external-only tasks so a
+            # stale agent plan cannot clobber freshly added right-rail tasks.
             self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
+            if external_items:
+                seen_ids = {item["id"] for item in self._items}
+                seen_content = {self._content_key(item["content"]) for item in self._items}
+                for item in external_items:
+                    content_key = self._content_key(item["content"])
+                    if item["id"] not in seen_ids and content_key not in seen_content:
+                        self._items.append(item.copy())
+                        seen_ids.add(item["id"])
+                        seen_content.add(content_key)
         else:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
@@ -101,6 +116,7 @@ class TodoStore:
 
     def read(self) -> List[Dict[str, str]]:
         """Return a copy of the current list."""
+        self._refresh_from_markdown_if_changed()
         return [item.copy() for item in self._items]
 
     def markdown_path(self) -> Optional[Path]:
@@ -109,6 +125,7 @@ class TodoStore:
 
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
+        self._refresh_from_markdown_if_changed()
         return bool(self._items)
 
     def format_for_injection(self) -> Optional[str]:
@@ -118,6 +135,7 @@ class TodoStore:
         Returns a human-readable string to append to the compressed
         message history, or None if the list is empty.
         """
+        self._refresh_from_markdown_if_changed()
         if not self._items:
             return None
 
@@ -176,6 +194,19 @@ class TodoStore:
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 
+    @staticmethod
+    def _content_key(content: str) -> str:
+        """Normalize task text for duplicate detection across file/tool ids."""
+        return re.sub(r"\s+", " ", str(content or "")).strip().casefold()
+
+    def _markdown_mtime(self) -> Optional[int]:
+        if not self._markdown_path or not self._markdown_path.exists():
+            return None
+        try:
+            return self._markdown_path.stat().st_mtime_ns
+        except Exception:
+            return None
+
     def _load_markdown_if_available(self) -> None:
         """Hydrate the in-memory list from TODO.md without failing agent startup."""
         if not self._markdown_path or not self._markdown_path.exists():
@@ -195,6 +226,15 @@ class TodoStore:
             status = "completed" if match.group(1).lower() == "x" else "pending"
             items.append({"id": f"todo-{line_no}", "content": content, "status": status})
         self._items = items
+        self._markdown_mtime_ns = self._markdown_mtime()
+
+    def _refresh_from_markdown_if_changed(self) -> bool:
+        """Reload TODO.md when CUI or another process changed it externally."""
+        current_mtime = self._markdown_mtime()
+        if current_mtime is None or current_mtime == self._markdown_mtime_ns:
+            return False
+        self._load_markdown_if_available()
+        return True
 
     def _sync_markdown(self) -> None:
         """Persist the current tool list to TODO.md for the CUI Aufgaben panel."""
@@ -213,6 +253,7 @@ class TodoStore:
                 content = item["content"].replace("\n", " ").strip()
                 lines.append(f"- [{marker}] {content}")
             self._markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            self._markdown_mtime_ns = self._markdown_mtime()
         except Exception:
             # Todo is a planning aid; disk sync must never break tool execution.
             return

@@ -1,10 +1,10 @@
-import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, ListChecks, Mail, Mic, Paperclip, Pencil, PlugZap, RefreshCw, Square, Volume2, VolumeX, X } from "lucide-react";
+import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, Mail, Mic, Paperclip, Pencil, PlugZap, Plus, RefreshCw, Send, Square, Volume2, VolumeX, X } from "lucide-react";
 import { Fragment, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
-import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
+import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -69,6 +69,9 @@ function recentSessionDisplayTitle(session: RecentSession): string {
 type ResourcePanelKey = "email" | "calendar" | "shared_folder" | "vault" | "todos" | "connectors";
 
 type ResourceCardAction = { icon: ReactNode; label: string; onClick: () => void; disabled?: boolean };
+
+const RIGHT_RAIL_ROW_ACTION_CLASS = "grid h-auto w-[34px] shrink-0 cursor-pointer place-items-center rounded-[10px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]";
+const RIGHT_RAIL_ROW_ACTION_DISABLED_CLASS = "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[#f8f0e3]";
 
 const RESOURCE_STATUS_COPY: Record<AssistantResourceStatus, { label: string; dot: string }> = {
   connected: { label: "Verbunden", dot: "#7bcf91" },
@@ -530,11 +533,26 @@ function statusBadges(status: RuntimeStatus, approvalCount: number): RuntimeBadg
   ];
 }
 
+
+function cleanAssistantName(value?: string | null): string {
+  const clean = (value ?? "").replace(/\s+/g, " ").trim();
+  return clean || "Agent";
+}
+
+function assistantSubjectName(name: string): string {
+  return name === "Agent" ? "der Agent" : name;
+}
+
+function assistantDativeName(name: string): string {
+  return name === "Agent" ? "dem Agent" : name;
+}
+
 function chatHeaderCopy(
   busy: boolean,
   approvalCount: number,
   connection: ConnectionState,
   statusLabel: string,
+  assistantName: string,
 ): { title: string; subtitle: string } {
   if (approvalCount > 0) {
     return {
@@ -558,7 +576,7 @@ function chatHeaderCopy(
   }
   return {
     title: "Aktuelle Unterhaltung",
-    subtitle: "Schreiben Sie, was Rocky erledigen soll.",
+    subtitle: `Schreiben Sie, was ${assistantSubjectName(assistantName)} erledigen soll.`,
   };
 }
 
@@ -1094,12 +1112,14 @@ export default function AiwerkAssistantPage() {
     if (!modelInfo?.model) return "Wird geladen…";
     return modelInfo.provider ? `${modelInfo.provider}/${modelInfo.model}` : modelInfo.model;
   }, [modelInfo]);
+  const assistantName = useMemo(() => cleanAssistantName(modelInfo?.agent_name), [modelInfo?.agent_name]);
+  const assistantInitial = assistantName.charAt(0).toUpperCase();
 
   const liveNotesText = useMemo(() => formatLiveNotes(liveNotes), [liveNotes]);
   const headerBadges = useMemo(() => statusBadges(runtimeStatus, approvals.length), [runtimeStatus, approvals.length]);
   const chatHeader = useMemo(
-    () => chatHeaderCopy(busy, approvals.length, connection, statusLabel),
-    [busy, approvals.length, connection, statusLabel],
+    () => chatHeaderCopy(busy, approvals.length, connection, statusLabel, assistantName),
+    [busy, approvals.length, connection, statusLabel, assistantName],
   );
   const foldedTabHelp = conversationMode === "side"
     ? "Nebenfrage schliessen"
@@ -1190,6 +1210,38 @@ export default function AiwerkAssistantPage() {
       }
     }
   }, []);
+
+  const addTodo = useCallback(async (text: string) => {
+    try {
+      const result = await api.addAssistantTodo(text);
+      setResourceSummary((current) => current ? { ...current, todos: result.todos } : current);
+      setResourcesError(null);
+    } catch (e) {
+      setResourcesError(e instanceof Error ? e.message : "Aufgabe konnte nicht hinzugefügt werden.");
+      throw e;
+    }
+  }, []);
+
+  const updateTodoDone = useCallback(async (id: string, done: boolean) => {
+    try {
+      const result = await api.updateAssistantTodo(id, done);
+      setResourceSummary((current) => current ? { ...current, todos: result.todos } : current);
+      setResourcesError(null);
+    } catch (e) {
+      setResourcesError(e instanceof Error ? e.message : "Aufgabe konnte nicht aktualisiert werden.");
+      throw e;
+    }
+  }, []);
+
+  const submitSupportMessage = useCallback(async (payload: AssistantSupportRequest) => {
+    const result = await api.sendAssistantSupport(payload);
+    if (result.delivered) {
+      showToast(`Nachricht an AIWerk gesendet · ${result.support_id}`);
+    } else {
+      showToast(`Nachricht gespeichert · ${result.support_id}`);
+    }
+    return result;
+  }, [showToast]);
 
   const reloadMcpServers = useCallback(async () => {
     const gateway = gatewayRef.current;
@@ -1849,10 +1901,10 @@ export default function AiwerkAssistantPage() {
         <aside className="hidden h-dvh min-h-0 flex-col gap-[20px] overflow-hidden bg-[#292720] p-[24px] text-[#f8f4ed] lg:flex">
           <div className="flex items-center gap-[12px]">
             <div className="grid h-[48px] w-[48px] place-items-center rounded-[15px] bg-[#d7b98e] text-[20px] font-extrabold text-[#292720]">
-              R
+              {assistantInitial}
             </div>
             <div>
-              <strong className="text-[20px]">Rocky</strong>
+              <strong className="text-[20px]">{assistantName}</strong>
               <br />
               <small className="text-[14px] text-[#bfb7aa]">AIWerk Persönlicher KI-Assistent</small>
             </div>
@@ -2160,8 +2212,16 @@ export default function AiwerkAssistantPage() {
                       key={tab.id}
                       role="tab"
                       aria-selected={isActive}
+                      tabIndex={0}
+                      onClick={() => setActivePanelTab(tab.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setActivePanelTab(tab.id);
+                        }
+                      }}
                       className={
-                        "-mb-px flex h-[36px] min-w-0 max-w-[260px] shrink-0 items-center rounded-t-[9px] border pl-[11px] pr-[5px] text-[12px] transition " +
+                        "-mb-px flex h-[36px] min-w-[24px] max-w-[260px] flex-[1_1_170px] cursor-pointer items-center rounded-t-[9px] border pl-[5px] pr-[1px] text-[12px] transition focus:outline-none focus:ring-2 focus:ring-[#b9a98f] " +
                         (isActive
                           ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
                           : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
@@ -2170,7 +2230,7 @@ export default function AiwerkAssistantPage() {
                       <button
                         type="button"
                         onClick={() => setActivePanelTab(tab.id)}
-                        className="flex min-w-0 flex-1 items-center gap-[7px] truncate text-left font-bold"
+                        className="flex min-w-0 flex-1 items-center gap-[7px] overflow-hidden truncate text-left font-bold"
                         title={tab.title}
                       >
                         <Icon className="h-[13px] w-[13px] shrink-0 opacity-75" />
@@ -2178,15 +2238,18 @@ export default function AiwerkAssistantPage() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => closeDocumentTab(tab.id)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          closeDocumentTab(tab.id);
+                        }}
                         className={
-                          "ml-[4px] grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[6px] opacity-70 transition hover:opacity-100 " +
+                          "ml-[1px] grid h-[16px] w-[16px] shrink-0 place-items-center rounded-[5px] opacity-70 transition hover:opacity-100 " +
                           (isActive ? "hover:bg-[#eee5d7]" : "hover:bg-[#e6dac8]")
                         }
                         aria-label={`${tab.title} schließen`}
                         title="Tab schließen"
                       >
-                        <X size={12} />
+                        <X size={10} />
                       </button>
                     </div>
                   );
@@ -2458,8 +2521,15 @@ export default function AiwerkAssistantPage() {
               refreshing={resourceRefreshing}
               error={resourcesError}
               activeDocumentTab={activeDocumentTab}
+              assistantName={assistantName}
+              sessionId={activeSessionKey ?? sessionId ?? undefined}
+              sessionTitle={sessionTitle}
+              connection={connection}
+              onSendSupport={submitSupportMessage}
               onRefresh={(resource) => void refreshResources({ force: true, resource })}
               onReloadMcp={reloadMcpServers}
+              onAddTodo={addTodo}
+              onUpdateTodoDone={updateTodoDone}
               onAttachResource={attachResourceToSession}
               onOpenEmail={openEmailInPanel}
               onOpenCalendar={openCalendarInPanel}
@@ -2634,8 +2704,15 @@ function ResourcesRail({
   refreshing,
   error,
   activeDocumentTab,
+  assistantName,
+  sessionId,
+  sessionTitle,
+  connection,
+  onSendSupport,
   onRefresh,
   onReloadMcp,
+  onAddTodo,
+  onUpdateTodoDone,
   onAttachResource,
   onOpenEmail,
   onOpenCalendar,
@@ -2645,8 +2722,15 @@ function ResourcesRail({
   refreshing: Partial<Record<ResourcePanelKey, boolean>>;
   error: string | null;
   activeDocumentTab: DocumentTab | null;
+  assistantName: string;
+  sessionId?: string;
+  sessionTitle: string;
+  connection: ConnectionState;
+  onSendSupport: (payload: AssistantSupportRequest) => Promise<{ ok: boolean; support_id: string; delivered: boolean; queued?: boolean }>;
   onRefresh: (resource?: ResourcePanelKey) => void;
   onReloadMcp: () => Promise<void>;
+  onAddTodo: (text: string) => Promise<void>;
+  onUpdateTodoDone: (id: string, done: boolean) => Promise<void>;
   onAttachResource: (kind: "email" | "calendar_event" | "shared_file", item: Record<string, unknown>, label: string) => Promise<void>;
   onOpenEmail: (item: AssistantResourceMailItem) => void;
   onOpenCalendar: (item: AssistantResourceEventItem) => void;
@@ -2665,6 +2749,16 @@ function ResourcesRail({
   const [expandedCalendarAccounts, setExpandedCalendarAccounts] = useState<Record<string, boolean>>({});
   const [openingSharedFolder, setOpeningSharedFolder] = useState(false);
   const [reloadingMcp, setReloadingMcp] = useState(false);
+  const [updatingTodoId, setUpdatingTodoId] = useState<string | null>(null);
+  const [todoModalOpen, setTodoModalOpen] = useState(false);
+  const [newTodoText, setNewTodoText] = useState("");
+  const [addingTodo, setAddingTodo] = useState(false);
+  const [supportModalOpen, setSupportModalOpen] = useState(false);
+  const [supportCategory, setSupportCategory] = useState("Agent antwortet falsch");
+  const [supportMessage, setSupportMessage] = useState("");
+  const [supportDiagnostics, setSupportDiagnostics] = useState(true);
+  const [sendingSupport, setSendingSupport] = useState(false);
+  const [supportError, setSupportError] = useState<string | null>(null);
   const toggle = (id: string) => setExpanded((current) => ({ ...current, [id]: !current[id] }));
   const toggleSharedItem = (id: string) => setExpandedSharedItems((current) => ({ ...current, [id]: !current[id] }));
   const toggleConnectorItem = (id: string) => setExpandedConnectorItems((current) => ({ ...current, [id]: !current[id] }));
@@ -2679,6 +2773,69 @@ function ResourcesRail({
       setReloadingMcp(false);
     }
   };
+  const updateTodoDone = async (id: string, done: boolean) => {
+    if (updatingTodoId) return;
+    setUpdatingTodoId(id);
+    try {
+      await onUpdateTodoDone(id, done);
+    } catch {
+      // Parent stores the customer-facing error message.
+    } finally {
+      setUpdatingTodoId(null);
+    }
+  };
+  const submitNewTodo = async () => {
+    const text = newTodoText.trim();
+    if (!text || addingTodo) return;
+    setAddingTodo(true);
+    try {
+      await onAddTodo(text);
+      setNewTodoText("");
+      setTodoModalOpen(false);
+      setExpanded((current) => ({ ...current, todos: true }));
+    } catch {
+      // Parent stores the customer-facing error message.
+    } finally {
+      setAddingTodo(false);
+    }
+  };
+
+  const submitSupport = async () => {
+    const message = supportMessage.trim();
+    if (!message || sendingSupport) return;
+    setSendingSupport(true);
+    setSupportError(null);
+    const diagnostics = {
+      connection,
+      email: resources?.email ? { status: resources.email.status, summary: resources.email.summary, unread_count: resources.email.unread_count } : undefined,
+      calendar: resources?.calendar ? { status: resources.calendar.status, summary: resources.calendar.summary } : undefined,
+      shared_folder: resources?.shared_folder ? { status: resources.shared_folder.status, summary: resources.shared_folder.summary, source: resources.shared_folder.source } : undefined,
+      vault: resources?.vault ? { status: resources.vault.status, summary: resources.vault.summary, source: resources.vault.source } : undefined,
+      todos: resources?.todos ? { status: resources.todos.status, summary: resources.todos.summary, open_count: resources.todos.open_count } : undefined,
+      connectors: { count: resources?.connectors.length ?? 0 },
+    };
+    try {
+      await onSendSupport({
+        category: supportCategory,
+        message,
+        agent_name: assistantName,
+        include_diagnostics: supportDiagnostics,
+        session_id: sessionId,
+        session_title: sessionTitle,
+        connection,
+        page_url: window.location.pathname + window.location.search,
+        user_agent: navigator.userAgent,
+        diagnostics,
+      });
+      setSupportMessage("");
+      setSupportModalOpen(false);
+    } catch {
+      setSupportError("Nachricht konnte nicht gesendet werden. Bitte später erneut versuchen.");
+    } finally {
+      setSendingSupport(false);
+    }
+  };
+
   const openSharedFolder = async () => {
     if (openingSharedFolder) return;
     if (!resources?.shared_folder.can_open_folder) {
@@ -2750,12 +2907,33 @@ function ResourcesRail({
     if (opened) opened.opener = null;
   };
   return (
-    <aside className="hidden h-full min-h-0 w-full flex-col gap-[14px] overflow-x-hidden overflow-y-auto overscroll-contain pr-[4px] xl:flex aiwerk-scrollbar" aria-label="Ressourcen">
+    <>
+      <aside className="hidden h-full min-h-0 w-full flex-col gap-[14px] overflow-x-hidden overflow-y-auto overscroll-contain pr-[4px] xl:flex aiwerk-scrollbar" aria-label="Ressourcen">
+      <div className="min-w-0 shrink-0 overflow-hidden rounded-[22px] border border-[#dacdbb] bg-[rgba(255,250,242,.94)] p-[15px] shadow-[0_14px_38px_rgba(56,42,20,.07)]">
+        <div className="flex min-w-0 items-start gap-[10px]">
+          <span className="grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[12px] bg-[#efe4d4] text-[#6f5d45]">
+            <LifeBuoy size={17} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="m-0 truncate text-[11px] font-bold uppercase tracking-[.16em] text-[#948873]">Hilfe & Support</p>
+            <h3 className="m-0 mt-[3px] truncate text-[15px] text-[#302b24]">{`Problem mit ${assistantDativeName(assistantName)} melden`}</h3>
+            <p className="m-0 mt-[4px] text-[12px] leading-[1.35] text-[#776d5f]">Schreiben Sie kurz, was nicht funktioniert. AIWerk erhält eine sichere Diagnose.</p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setSupportModalOpen(true)}
+          className="mt-[12px] flex w-full cursor-pointer items-center justify-center gap-[7px] rounded-[12px] border border-[#d5c6b0] bg-[#8b724e] px-[12px] py-[9px] text-[12px] font-bold text-white transition hover:bg-[#7a6342]"
+        >
+          <Send size={13} />
+          Nachricht an AIWerk senden
+        </button>
+      </div>
       <div className="min-w-0 shrink-0 overflow-x-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.9)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
         <div className="mb-[14px] flex min-w-0 items-start justify-between gap-[12px]">
           <div className="min-w-0 flex-1">
             <p className="m-0 truncate text-[11px] font-bold uppercase tracking-[.18em] text-[#948873]">Ressourcen</p>
-            <h3 className="m-0 mt-[4px] truncate text-[17px] text-[#302b24]">Was Rocky nutzen kann</h3>
+            <h3 className="m-0 mt-[4px] truncate text-[17px] text-[#302b24]">{`Was ${assistantSubjectName(assistantName)} nutzen kann`}</h3>
             <p className="m-0 mt-[5px] truncate text-[11px] text-[#8a7f70]">{resourceCacheCopy}</p>
           </div>
           <button
@@ -2787,6 +2965,67 @@ function ResourcesRail({
                 {emailAccountSections.map((account) => {
                   const accountOpen = expandedEmailAccounts[account.id] ?? false;
                   const accountListScrollable = account.items.length > 5;
+                  const unreadMailItems = account.items.filter((item) => item.unread);
+                  const latestMailItems = account.items.filter((item) => !item.unread);
+                  const mailSections = unreadMailItems.length
+                    ? [
+                        { id: "new", label: "Neue Nachrichten", items: unreadMailItems },
+                        ...(latestMailItems.length ? [{ id: "latest", label: "Letzte Nachrichten", items: latestMailItems }] : []),
+                      ]
+                    : [{ id: "latest", label: account.items.length ? "Letzte Nachrichten" : "", items: latestMailItems }];
+                  const renderMailRow = (item: AssistantResourceMailItem, index: number, sectionId: string) => {
+                    const canOpenMail = !!item.open_url;
+                    const canAttachMail = !!(item.message_id || item.id) && !!(item.account_address || item.account_label || account.id);
+                    const key = item.id ?? `${account.id}-${sectionId}-${item.subject}-${index}`;
+                    const isOpenMail = activeDocumentTab?.kind === "email" && !!item.open_url && activeDocumentTab.openUrl === item.open_url;
+                    const rowClass = `relative w-full min-w-0 max-w-full overflow-hidden rounded-[10px] border px-[9px] py-[7px] text-left ${
+                      isOpenMail
+                        ? "border-[#c8b48f] bg-[#fff8ec] shadow-[inset_3px_0_0_#b8955f] after:absolute after:right-[7px] after:top-[7px] after:h-[8px] after:w-[8px] after:rounded-bl-[8px] after:border-r after:border-t after:border-[#b8955f]"
+                        : "border-transparent bg-[#f1e8dc]"
+                    } ${canOpenMail ? "cursor-pointer transition hover:bg-[#eaddcc]" : ""}`;
+                    const content = (
+                      <>
+                        <div className="flex min-w-0 max-w-full items-center gap-[6px] overflow-hidden">
+                          {item.unread && <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-[#8b724e]" aria-label="Neu" />}
+                          <span className="block min-w-0 flex-1 truncate text-[13px] font-semibold text-[#342f27]">{item.subject || "Ohne Betreff"}</span>
+                          {item.has_attachment && <Paperclip size={12} className="shrink-0 text-[#8a7a64]" aria-label="Mit Anhang" />}
+                          {canOpenMail && <ExternalLink size={12} className="shrink-0 text-[#8a7a64]" aria-hidden="true" />}
+                        </div>
+                        <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{item.sender || "Unbekannt"}{item.received_at ? ` · ${formatResourceTime(item.received_at)}` : ""}</p>
+                      </>
+                    );
+                    const attachItem = {
+                      ...item,
+                      account_address: item.account_address ?? account.address ?? account.id,
+                      account_label: item.account_label ?? account.label,
+                    };
+                    return (
+                      <div key={key} className="flex min-w-0 max-w-full items-stretch gap-[6px] overflow-hidden">
+                        {canOpenMail ? (
+                          <button
+                            type="button"
+                            onClick={() => onOpenEmail(item)}
+                            className={rowClass}
+                            title={item.open_url?.startsWith("http") ? "Im Webmail öffnen" : "E-Mail anzeigen"}
+                          >
+                            {content}
+                          </button>
+                        ) : (
+                          <div className={rowClass}>{content}</div>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void onAttachResource("email", attachItem as Record<string, unknown>, "E-Mail")}
+                          disabled={!canAttachMail}
+                          title="E-Mail an Agent anhängen"
+                          aria-label="E-Mail an Agent anhängen"
+                          className={`${RIGHT_RAIL_ROW_ACTION_CLASS} ${RIGHT_RAIL_ROW_ACTION_DISABLED_CLASS}`}
+                        >
+                          <Paperclip size={13} />
+                        </button>
+                      </div>
+                    );
+                  };
                   return (
                     <div key={account.id} className="min-w-0 overflow-hidden rounded-[12px] border border-[#e4d8c6] bg-[#fffaf2]">
                       <button
@@ -2804,63 +3043,16 @@ function ResourcesRail({
                       {accountOpen && (
                         <div className="border-t border-[#eadfce] bg-[#f8f0e5] px-[8px] py-[7px]">
                           {account.items.length ? (
-                            <div className={`grid gap-[6px] ${accountListScrollable ? "max-h-[320px] overflow-y-auto pr-[2px] aiwerk-scrollbar" : ""}`}>
-                              {account.items.map((item, index) => {
-                                const canOpenMail = !!item.open_url;
-                                const canAttachMail = !!(item.message_id || item.id) && !!(item.account_address || item.account_label || account.id);
-                                const key = item.id ?? `${account.id}-${item.subject}-${index}`;
-                                const isOpenMail = activeDocumentTab?.kind === "email" && !!item.open_url && activeDocumentTab.openUrl === item.open_url;
-                                const rowClass = `relative w-full min-w-0 max-w-full overflow-hidden rounded-[10px] border px-[9px] py-[7px] text-left ${
-                                  isOpenMail
-                                    ? "border-[#c8b48f] bg-[#fff8ec] shadow-[inset_3px_0_0_#b8955f] after:absolute after:right-[7px] after:top-[7px] after:h-[8px] after:w-[8px] after:rounded-bl-[8px] after:border-r after:border-t after:border-[#b8955f]"
-                                    : "border-transparent bg-[#f1e8dc]"
-                                } ${canOpenMail ? "cursor-pointer transition hover:bg-[#eaddcc]" : ""}`;
-                                const content = (
-                                  <>
-                                    <div className="flex min-w-0 max-w-full items-center gap-[6px] overflow-hidden">
-                                      {item.unread && <span className="h-[7px] w-[7px] shrink-0 rounded-full bg-[#8b724e]" aria-label="Neu" />}
-                                      <span className="block min-w-0 flex-1 truncate text-[13px] font-semibold text-[#342f27]">{item.subject || "Ohne Betreff"}</span>
-                                      {item.has_attachment && <Paperclip size={12} className="shrink-0 text-[#8a7a64]" aria-label="Mit Anhang" />}
-                                      {canOpenMail && <ExternalLink size={12} className="shrink-0 text-[#8a7a64]" aria-hidden="true" />}
-                                    </div>
-                                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{item.sender || "Unbekannt"}{item.received_at ? ` · ${formatResourceTime(item.received_at)}` : ""}</p>
-                                  </>
-                                );
-                                const attachItem = {
-                                  ...item,
-                                  account_address: item.account_address ?? account.address ?? account.id,
-                                  account_label: item.account_label ?? account.label,
-                                };
-                                return (
-                                  <div key={key} className="flex min-w-0 max-w-full items-stretch gap-[6px] overflow-hidden">
-                                    {canOpenMail ? (
-                                      <button
-                                        type="button"
-                                        onClick={() => onOpenEmail(item)}
-                                        className={rowClass}
-                                        title={item.open_url?.startsWith("http") ? "Im Webmail öffnen" : "E-Mail anzeigen"}
-                                      >
-                                        {content}
-                                      </button>
-                                    ) : (
-                                      <div className={rowClass}>{content}</div>
-                                    )}
-                                    <button
-                                      type="button"
-                                      onClick={() => void onAttachResource("email", attachItem as Record<string, unknown>, "E-Mail")}
-                                      disabled={!canAttachMail}
-                                      title="E-Mail an Agent anhängen"
-                                      aria-label="E-Mail an Agent anhängen"
-                                      className="grid h-auto w-[34px] shrink-0 cursor-pointer place-items-center rounded-[10px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[#f8f0e3]"
-                                    >
-                                      <Paperclip size={13} />
-                                    </button>
-                                  </div>
-                                );
-                              })}
+                            <div className={`grid gap-[7px] ${accountListScrollable ? "max-h-[320px] overflow-y-auto pr-[2px] aiwerk-scrollbar" : ""}`}>
+                              {mailSections.map((section) => section.items.length ? (
+                                <div key={section.id} className="grid gap-[6px]">
+                                  {section.label && <p className="m-0 px-[2px] text-[10px] font-bold uppercase tracking-[.16em] text-[#9a8b73]">{section.label}</p>}
+                                  {section.items.map((item, index) => renderMailRow(item, index, section.id))}
+                                </div>
+                              ) : null)}
                             </div>
                           ) : (
-                            <p className="m-0 px-[2px] py-[3px] text-[12px] text-[#8a7f70]">Keine neuen Nachrichten.</p>
+                            <p className="m-0 px-[2px] py-[3px] text-[12px] text-[#8a7f70]">Keine Nachrichten gefunden.</p>
                           )}
                         </div>
                       )}
@@ -2896,13 +3088,16 @@ function ResourcesRail({
                         className="flex w-full min-w-0 max-w-full cursor-pointer items-center justify-between gap-[8px] overflow-hidden px-[9px] py-[7px] text-left text-[12px] text-[#7c705f] hover:bg-[#f8efe3]"
                         aria-expanded={accountOpen}
                       >
-                        <span className="min-w-0 flex-1 truncate font-semibold text-[#4d4336]">{account.label || account.address || "Kalender"}</span>
-                        <span className="shrink-0 text-[11px] text-[#8a7f70]">{account.items.length} Termine</span>
+                        <span className="flex min-w-0 flex-1 items-center gap-[6px] overflow-hidden">
+                          <ChevronRight size={13} className={`shrink-0 transition-transform ${accountOpen ? "rotate-90" : ""}`} />
+                          <span className="block min-w-0 max-w-full truncate">{account.label || account.address || "Kalender"}</span>
+                        </span>
+                        <span className="shrink-0 font-semibold text-[#6b5a45]">{account.items.length} Termine</span>
                       </button>
                       {accountOpen && (
-                        <div className="grid gap-[6px] px-[8px] pb-[8px]">
+                        <div className="border-t border-[#eadfce] bg-[#f8f0e5] px-[8px] py-[7px]">
                           {account.items.length ? (
-                            <div className={`grid gap-[6px] ${accountListScrollable ? "max-h-[260px] overflow-y-auto pr-[2px] aiwerk-scrollbar" : ""}`}>
+                            <div className={`grid gap-[6px] ${accountListScrollable ? "max-h-[320px] overflow-y-auto pr-[2px] aiwerk-scrollbar" : ""}`}>
                               {account.items.map((item, index) => {
                                 const key = item.id ?? `${account.id}-${item.title}-${index}`;
                                 const attachItem = {
@@ -2912,28 +3107,40 @@ function ResourcesRail({
                                 };
                                 const canOpenCalendar = !!item.open_url;
                                 const isOpenCalendar = activeDocumentTab?.kind === "calendar" && !!item.open_url && activeDocumentTab.openUrl === item.open_url;
+                                const rowClass = `relative w-full min-w-0 max-w-full overflow-hidden rounded-[10px] border px-[9px] py-[7px] text-left ${
+                                  isOpenCalendar
+                                    ? "border-[#c8b48f] bg-[#fff8ec] shadow-[inset_3px_0_0_#b8955f] after:absolute after:right-[7px] after:top-[7px] after:h-[8px] after:w-[8px] after:rounded-bl-[8px] after:border-r after:border-t after:border-[#b8955f]"
+                                    : "border-transparent bg-[#f1e8dc]"
+                                } ${canOpenCalendar ? "cursor-pointer transition hover:bg-[#eaddcc] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]" : ""}`;
+                                const content = (
+                                  <>
+                                    <div className="flex min-w-0 max-w-full items-center gap-[6px] overflow-hidden">
+                                      <span className="block min-w-0 flex-1 truncate text-[13px] font-semibold text-[#342f27]">{item.title || "Termin"}</span>
+                                      {canOpenCalendar && <ExternalLink size={12} className="shrink-0 text-[#8a7a64]" aria-hidden="true" />}
+                                    </div>
+                                    <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{formatResourceTime(item.starts_at)}{item.location_hint ? ` · ${item.location_hint}` : ""}</p>
+                                  </>
+                                );
                                 return (
                                   <div key={key} className="flex min-w-0 max-w-full items-stretch gap-[6px] overflow-hidden">
-                                    <button
-                                      type="button"
-                                      onClick={() => onOpenCalendar(item)}
-                                      disabled={!canOpenCalendar}
-                                      title={canOpenCalendar ? "Termin anzeigen" : undefined}
-                                      className={`relative min-w-0 flex-1 overflow-hidden rounded-[10px] border px-[9px] py-[7px] text-left ${
-                                        isOpenCalendar
-                                          ? "border-[#c8b48f] bg-[#fff8ec] shadow-[inset_3px_0_0_#b8955f] after:absolute after:right-[7px] after:top-[7px] after:h-[8px] after:w-[8px] after:rounded-bl-[8px] after:border-r after:border-t after:border-[#b8955f]"
-                                          : "border-transparent bg-[#f5eee3]"
-                                      } ${canOpenCalendar ? "cursor-pointer transition hover:bg-[#eee4d6] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]" : "cursor-default"}`}
-                                    >
-                                      <p className="m-0 truncate text-[13px] font-semibold text-[#342f27]">{item.title || "Termin"}</p>
-                                      <p className="m-0 mt-[2px] truncate text-[12px] text-[#7c705f]">{formatResourceTime(item.starts_at)}{item.location_hint ? ` · ${item.location_hint}` : ""}</p>
-                                    </button>
+                                    {canOpenCalendar ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => onOpenCalendar(item)}
+                                        title="Termin anzeigen"
+                                        className={rowClass}
+                                      >
+                                        {content}
+                                      </button>
+                                    ) : (
+                                      <div className={rowClass}>{content}</div>
+                                    )}
                                     <button
                                       type="button"
                                       onClick={() => void onAttachResource("calendar_event", attachItem as Record<string, unknown>, "Termin")}
                                       title="Termin an Agent anhängen"
                                       aria-label="Termin an Agent anhängen"
-                                      className="grid h-auto w-[34px] shrink-0 cursor-pointer place-items-center rounded-[10px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                                      className={RIGHT_RAIL_ROW_ACTION_CLASS}
                                     >
                                       <Paperclip size={13} />
                                     </button>
@@ -3015,25 +3222,33 @@ function ResourcesRail({
                 <div className="grid gap-[6px] rounded-[12px] border border-[#e4d8c6] bg-[#fffaf2] px-[9px] py-[8px]">
                   <div className="flex items-center justify-between gap-[8px]">
                     <span>Zugangsdaten</span>
-                    <strong className="text-[#4c4235]">{resources.vault.item_count ?? "–"}</strong>
+                    <strong className="text-[#4c4235]">{resources.vault.exposed_count ?? resources.vault.item_count ?? "–"}</strong>
                   </div>
                   <div className="flex items-center justify-between gap-[8px]">
-                    <span>Schwache Passwörter</span>
-                    <strong className={resources.vault.weak_count ? "text-[#8a5b2e]" : "text-[#4c4235]"}>{resources.vault.weak_count ?? "–"}</strong>
+                    <span>{`Von ${assistantDativeName(assistantName)} erstellt`}</span>
+                    <strong className="text-[#4c4235]">{resources.vault.agent_created_count ?? 0}</strong>
                   </div>
-                  <div className="flex items-center justify-between gap-[8px]">
-                    <span>Mehrfach verwendet</span>
-                    <strong className={resources.vault.reused_count ? "text-[#8a5b2e]" : "text-[#4c4235]"}>{resources.vault.reused_count ?? "–"}</strong>
-                  </div>
-                  <div className="flex items-center justify-between gap-[8px]">
-                    <span>Kompromittiert</span>
-                    <strong className={resources.vault.compromised_count ? "text-[#8a3d2e]" : "text-[#4c4235]"}>
-                      {resources.vault.compromised_count ?? "im Tresor prüfen"}
-                    </strong>
-                  </div>
+                  {resources.vault.weak_count != null && (
+                    <div className="flex items-center justify-between gap-[8px]">
+                      <span>Schwach</span>
+                      <strong className={resources.vault.weak_count ? "text-[#8a5b2e]" : "text-[#4c4235]"}>{resources.vault.weak_count}</strong>
+                    </div>
+                  )}
+                  {resources.vault.reused_count != null && (
+                    <div className="flex items-center justify-between gap-[8px]">
+                      <span>Mehrfach verwendet</span>
+                      <strong className={resources.vault.reused_count ? "text-[#8a5b2e]" : "text-[#4c4235]"}>{resources.vault.reused_count}</strong>
+                    </div>
+                  )}
+                  {resources.vault.compromised_supported && resources.vault.compromised_count != null && (
+                    <div className="flex items-center justify-between gap-[8px]">
+                      <span>Kompromittiert</span>
+                      <strong className={resources.vault.compromised_count ? "text-[#8a3d2e]" : "text-[#4c4235]"}>{resources.vault.compromised_count}</strong>
+                    </div>
+                  )}
                 </div>
                 {resources.vault.status === "auth_required" && (
-                  <p className="m-0 rounded-[10px] bg-[#f6ead8] px-[9px] py-[7px] text-[#7a6141]">Tresor öffnen und entsperren, um Statistiken zu aktualisieren.</p>
+                  <p className="m-0 rounded-[10px] bg-[#f6ead8] px-[9px] py-[7px] text-[#7a6141]">Tresor öffnen und entsperren.</p>
                 )}
               </div>
             ) : (
@@ -3050,13 +3265,36 @@ function ResourcesRail({
             expanded={expanded.todos}
             onToggle={toggle}
             badge={resources?.todos.open_count ? String(resources.todos.open_count) : undefined}
-            action={refreshAction("todos", "Aufgaben")}
+            action={[
+              {
+                icon: <Plus size={13} />,
+                label: "Aufgabe hinzufügen",
+                onClick: () => setTodoModalOpen(true),
+                disabled: loading || addingTodo,
+              },
+              refreshAction("todos", "Aufgaben"),
+            ]}
           >
             {resources?.todos.items.length ? (
               <div className="grid gap-[6px]">
                 {resources.todos.items.map((item) => (
-                  <div key={item.id} className="min-w-0 rounded-[10px] border border-[#e4d8c6] bg-[#fffaf2] px-[9px] py-[7px] text-[13px] text-[#4c4235]">
-                    <span className="block truncate">{item.text}</span>
+                  <div key={item.id} className="flex min-w-0 items-stretch rounded-[10px] border border-[#e4d8c6] bg-[#fffaf2] text-[13px] text-[#4c4235]">
+                    <button
+                      type="button"
+                      className="grid w-[34px] shrink-0 place-items-center border-r border-[#e4d8c6] text-[#7b6b57] transition hover:bg-[#f4eadc] disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label={`${item.text} als erledigt markieren`}
+                      title="Als erledigt markieren"
+                      disabled={updatingTodoId === item.id}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void updateTodoDone(item.id, true);
+                      }}
+                    >
+                      <span className="grid h-[15px] w-[15px] place-items-center rounded-[4px] border border-[#b9aa93] bg-[#fffdf8] text-[11px] leading-none">
+                        {updatingTodoId === item.id ? "…" : ""}
+                      </span>
+                    </button>
+                    <span className="block min-w-0 flex-1 truncate px-[9px] py-[7px]">{item.text}</span>
                   </div>
                 ))}
               </div>
@@ -3096,7 +3334,129 @@ function ResourcesRail({
         </div>
         {resources?.checked_at && <p className="m-0 mt-[12px] text-[11px] text-[#9a8f7e]">Aktualisiert {formatResourceTime(resources.checked_at)}</p>}
       </div>
-    </aside>
+      </aside>
+      {supportModalOpen && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-[rgba(38,34,28,.32)] px-[18px]" role="dialog" aria-modal="true" aria-labelledby="support-modal-title">
+          <div className="w-full max-w-[520px] rounded-[24px] border border-[#d8cbb9] bg-[#fffaf2] p-[20px] shadow-[0_24px_70px_rgba(34,28,18,.25)]">
+            <div className="flex items-start justify-between gap-[12px]">
+              <div>
+                <p className="m-0 text-[11px] font-bold uppercase tracking-[.18em] text-[#948873]">Hilfe & Support</p>
+                <h2 id="support-modal-title" className="m-0 mt-[4px] text-[18px] text-[#302b24]">Nachricht an AIWerk senden</h2>
+              </div>
+              <button type="button" onClick={() => setSupportModalOpen(false)} className="grid h-[30px] w-[30px] shrink-0 place-items-center rounded-[9px] bg-[#2f2b24] text-[#fff8ed] hover:bg-[#4a4034]" aria-label="Schliessen">
+                <X size={15} />
+              </button>
+            </div>
+            <label className="mt-[16px] block text-[12px] font-bold text-[#5f5446]">Kategorie</label>
+            <select
+              value={supportCategory}
+              onChange={(event) => setSupportCategory(event.target.value)}
+              className="mt-[6px] w-full rounded-[12px] border border-[#d8cbb9] bg-[#fffaf2] px-[11px] py-[9px] text-[13px] text-[#3d362d] outline-none focus:border-[#b89d72]"
+            >
+              <option>Agent antwortet falsch</option>
+              <option>Agent hängt</option>
+              <option>E-Mail / Kalender / Dateien</option>
+              <option>Login / Zugriff</option>
+              <option>Sonstiges</option>
+            </select>
+            <label className="mt-[14px] block text-[12px] font-bold text-[#5f5446]">Nachricht</label>
+            <textarea
+              value={supportMessage}
+              onChange={(event) => setSupportMessage(event.target.value)}
+              rows={5}
+              maxLength={4000}
+              placeholder="Was funktioniert nicht?"
+              className="mt-[6px] w-full resize-none rounded-[14px] border border-[#d8cbb9] bg-[#fffaf2] px-[12px] py-[10px] text-[13px] leading-[1.45] text-[#3d362d] outline-none focus:border-[#b89d72]"
+            />
+            <label className="mt-[10px] flex cursor-pointer items-start gap-[8px] text-[12px] leading-[1.35] text-[#6f6557]">
+              <input
+                type="checkbox"
+                checked={supportDiagnostics}
+                onChange={(event) => setSupportDiagnostics(event.target.checked)}
+                className="mt-[2px]"
+              />
+              Sichere Diagnose mitsenden: Verbindungsstatus und Ressourcen-Zustand, keine Passwörter und kein Chat-Dump.
+            </label>
+            {supportError && <p className="mt-[10px] rounded-[12px] bg-[#f4e1da] px-[10px] py-[8px] text-[12px] text-[#7b3b2f]">{supportError}</p>}
+            <div className="mt-[16px] flex justify-end gap-[8px]">
+              <button type="button" onClick={() => setSupportModalOpen(false)} className="rounded-[12px] border border-[#dacdbb] bg-[#fffaf2] px-[13px] py-[9px] text-[12px] font-bold text-[#6b604f] hover:bg-[#f3eadc]">Abbrechen</button>
+              <button
+                type="button"
+                onClick={() => void submitSupport()}
+                disabled={!supportMessage.trim() || sendingSupport}
+                className="rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[9px] text-[12px] font-bold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {sendingSupport ? "Wird gesendet…" : "Senden"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {todoModalOpen && (
+        <div className="fixed inset-0 z-40 grid place-items-center bg-[#181611]/35 p-[20px]" role="dialog" aria-modal="true" aria-labelledby="new-todo-title">
+          <form
+            className="w-full max-w-[460px] rounded-[24px] border border-[#ded4c4] bg-[#fffaf2] p-[22px] text-[#292720] shadow-[0_28px_80px_rgba(35,29,18,.28)]"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitNewTodo();
+            }}
+          >
+            <div className="mb-[16px] flex items-start justify-between gap-[16px]">
+              <div>
+                <h2 id="new-todo-title" className="m-0 text-[21px] tracking-[-0.02em]">Aufgabe hinzufügen</h2>
+                <p className="mt-[7px] text-[14px] leading-[1.45] text-[#706655]">Neue Aufgabe in TODO.md speichern.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (addingTodo) return;
+                  setTodoModalOpen(false);
+                  setNewTodoText("");
+                }}
+                aria-label="Dialog schließen"
+                className="grid h-[36px] w-[36px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#4b4235] bg-[#292720] text-[#f8f4ed] shadow-[0_10px_24px_rgba(41,39,32,.18)] transition hover:bg-[#3a342b] focus:outline-none focus:ring-2 focus:ring-[#8b724e]/45"
+              >
+                <X className="h-[16px] w-[16px]" />
+              </button>
+            </div>
+            <label className="grid gap-[7px] text-[12px] font-bold uppercase tracking-[.12em] text-[#8a7a65]">
+              Aufgabe
+              <textarea
+                value={newTodoText}
+                onChange={(event) => setNewTodoText(event.target.value)}
+                autoFocus
+                rows={3}
+                maxLength={240}
+                placeholder="z.B. Offerte prüfen"
+                className="min-h-[92px] resize-none rounded-[14px] border border-[#d8cbb8] bg-[#fffdf8] px-[12px] py-[10px] text-[14px] font-normal normal-case tracking-normal text-[#292720] outline-none transition placeholder:text-[#a79b89] focus:border-[#9a7b51] focus:ring-2 focus:ring-[#9a7b51]/20"
+              />
+            </label>
+            <div className="mt-[18px] flex justify-end gap-[10px]">
+              <button
+                type="button"
+                onClick={() => {
+                  if (addingTodo) return;
+                  setTodoModalOpen(false);
+                  setNewTodoText("");
+                }}
+                disabled={addingTodo}
+                className="cursor-pointer rounded-[12px] border border-[#d8cbb8] bg-[#fffdf8] px-[14px] py-[9px] text-[13px] font-bold text-[#6d5f4d] transition hover:bg-[#f4eadc] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Abbrechen
+              </button>
+              <button
+                type="submit"
+                disabled={addingTodo || !newTodoText.trim()}
+                className="cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[9px] text-[13px] font-bold text-white transition hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {addingTodo ? "Speichert…" : "Hinzufügen"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -3192,28 +3552,34 @@ function SharedFolderTree({
           : canOpenFile
             ? () => openSharedFolderFile(item)
             : undefined;
+        const isInteractive = hasChildren || canOpenFile;
+        const rowClass = `relative w-full min-w-0 max-w-full overflow-hidden rounded-[10px] border border-transparent bg-[#f1e8dc] px-[9px] py-[7px] text-left ${
+          isInteractive ? "cursor-pointer transition hover:bg-[#eaddcc] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]" : "cursor-default"
+        }`;
         return (
           <div key={item.id} className={depth ? "grid min-w-0 gap-[7px] overflow-hidden" : "min-w-0 overflow-hidden"}>
-            <div className="flex min-w-0 max-w-full items-center gap-[6px] overflow-hidden">
+            <div className="flex min-w-0 max-w-full items-stretch gap-[6px] overflow-hidden">
               <button
                 type="button"
                 onClick={handleClick}
-                disabled={!hasChildren && !canOpenFile}
-                className="flex min-w-0 max-w-full flex-1 items-center gap-[8px] overflow-hidden rounded-[12px] bg-[#f5eee3] px-[10px] py-[8px] text-left transition hover:bg-[#efe4d4] disabled:cursor-default disabled:hover:bg-[#f5eee3]"
+                disabled={!isInteractive}
+                className={rowClass}
                 aria-expanded={hasChildren ? isExpanded : undefined}
                 title={canOpenFile ? "Datei öffnen" : undefined}
-                style={{ paddingLeft: 10 + depth * 14 }}
+                style={{ paddingLeft: 9 + depth * 14 }}
               >
-                <span className="grid h-[18px] w-[18px] shrink-0 place-items-center text-[#7b6b55]">
-                  {hasChildren ? <ChevronRight size={14} className={isExpanded ? "rotate-90 transition-transform" : "transition-transform"} /> : null}
-                </span>
-                <span className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[8px] bg-[#ebe1d0] text-[#78684f]">
-                  {isFolder ? <FolderOpen size={14} /> : <FileText size={14} />}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block min-w-0 max-w-full truncate text-[13px] font-semibold text-[#342f27]">{item.name}</span>
-                  <span className="block min-w-0 max-w-full truncate text-[12px] text-[#7c705f]">{isFolder ? "Ordner" : "Datei"} · {meta}</span>
-                </span>
+                <div className="flex min-w-0 max-w-full items-center gap-[8px] overflow-hidden">
+                  <span className="grid h-[18px] w-[18px] shrink-0 place-items-center text-[#7b6b55]">
+                    {hasChildren ? <ChevronRight size={14} className={isExpanded ? "rotate-90 transition-transform" : "transition-transform"} /> : null}
+                  </span>
+                  <span className="grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[8px] bg-[#ebe1d0] text-[#78684f]">
+                    {isFolder ? <FolderOpen size={14} /> : <FileText size={14} />}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block min-w-0 max-w-full truncate text-[13px] font-semibold text-[#342f27]">{item.name}</span>
+                    <span className="block min-w-0 max-w-full truncate text-[12px] text-[#7c705f]">{isFolder ? "Ordner" : "Datei"} · {meta}</span>
+                  </span>
+                </div>
               </button>
               {canOpenCloudFolder && (
                 <button
@@ -3221,7 +3587,7 @@ function SharedFolderTree({
                   onClick={() => openSharedFolderCloudUrl(item.cloud_url)}
                   title="Ordner in cloud.aiwerk.ch öffnen"
                   aria-label={`${item.name} in cloud.aiwerk.ch öffnen`}
-                  className="grid h-[34px] w-[34px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                  className={RIGHT_RAIL_ROW_ACTION_CLASS}
                 >
                   <ExternalLink size={13} />
                 </button>
@@ -3232,7 +3598,7 @@ function SharedFolderTree({
                   onClick={() => void onAttachResource("shared_file", item as unknown as Record<string, unknown>, "Datei")}
                   title="Datei an Agent anhängen"
                   aria-label={`${item.name} an Agent anhängen`}
-                  className="grid h-[34px] w-[34px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                  className={RIGHT_RAIL_ROW_ACTION_CLASS}
                 >
                   <Paperclip size={13} />
                 </button>

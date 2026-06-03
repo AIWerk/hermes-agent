@@ -288,6 +288,24 @@ export const api = {
     const query = params.toString();
     return fetchJSON<AssistantResourcesResponse>(`/api/assistant/resources${query ? `?${query}` : ""}`);
   },
+  addAssistantTodo: (text: string) =>
+    fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }),
+  updateAssistantTodo: (id: string, done: boolean) =>
+    fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, done }),
+    }),
+  sendAssistantSupport: (body: AssistantSupportRequest) =>
+    fetchJSON<AssistantSupportResponse>("/api/assistant/support", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   openAssistantSharedFolder: () => fetchJSON<{ ok: boolean }>("/api/assistant/shared-folder/open-folder", { method: "POST" }),
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
@@ -685,6 +703,28 @@ export interface AssistantAttachmentUploadResponse {
   attachments: AssistantUploadedAttachment[];
 }
 
+
+export interface AssistantSupportRequest {
+  category: string;
+  message: string;
+  include_diagnostics: boolean;
+  session_id?: string;
+  session_title?: string;
+  connection?: string;
+  page_url?: string;
+  user_agent?: string;
+  diagnostics?: Record<string, unknown>;
+  agent_name?: string;
+}
+
+export interface AssistantSupportResponse {
+  ok: boolean;
+  support_id: string;
+  delivered: boolean;
+  queued?: boolean;
+  errors?: string[];
+}
+
 export interface AssistantResourceAttachmentRequest {
   kind: "email" | "calendar_event" | "shared_file";
   item: Record<string, unknown>;
@@ -960,6 +1000,7 @@ export interface ModelsAnalyticsModelEntry {
   tool_calls: number;
   last_used_at: number;
   avg_tokens_per_session: number;
+  agent_name?: string;
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;
@@ -1042,6 +1083,7 @@ export interface ModelInfoResponse {
   auto_context_length: number;
   config_context_length: number;
   effective_context_length: number;
+  agent_name?: string;
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;

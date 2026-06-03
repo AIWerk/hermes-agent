@@ -62,6 +62,12 @@ from gateway.status import get_running_pid, read_runtime_status
 from utils import env_var_enabled
 
 try:
+    from agent.redact import redact_sensitive_text as _redact_sensitive_text
+except Exception:
+    def _redact_sensitive_text(value: Any) -> str:
+        return str(value)
+
+try:
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -145,6 +151,9 @@ _ASSISTANT_ALLOWED_API_EXACT: frozenset = frozenset({
     "/api/model/info",
     "/api/dashboard/themes",
     "/api/assistant/resources",
+    "/api/assistant/support",
+    "/api/assistant/todos/add",
+    "/api/assistant/todos/update",
     "/api/assistant/email/view",
     "/api/assistant/calendar/view",
     "/api/assistant/shared-folder/open",
@@ -884,6 +893,44 @@ def _email_account_configs(config: dict[str, Any] | None) -> list[dict[str, Any]
 def _email_sort_key(item: dict[str, Any]) -> str:
     value = item.get("received_at")
     return value if isinstance(value, str) else ""
+
+
+def _email_item_ref(item: dict[str, Any]) -> str:
+    return str(item.get("message_id") or item.get("id") or "").strip()
+
+
+def _unread_first_email_items(
+    unread_items: list[dict[str, Any]],
+    latest_items: list[dict[str, Any]] | None = None,
+    *,
+    min_items: int = _ASSISTANT_EMAIL_PREVIEW_ITEMS,
+) -> list[dict[str, Any]]:
+    """Show all unread items first, then fill short lists with latest read mail."""
+    unread_sorted = [
+        dict(item, unread=True)
+        for item in unread_items
+        if isinstance(item, dict) and not _is_dashboard_spam_email_item(item)
+    ]
+    unread_sorted.sort(key=_email_sort_key, reverse=True)
+    if len(unread_sorted) >= min_items:
+        return unread_sorted
+
+    seen = {_email_item_ref(item) for item in unread_sorted if _email_item_ref(item)}
+    combined = list(unread_sorted)
+    for item in latest_items or []:
+        if not isinstance(item, dict) or _is_dashboard_spam_email_item(item):
+            continue
+        ref = _email_item_ref(item)
+        if ref and ref in seen:
+            continue
+        next_item = dict(item)
+        next_item["unread"] = False
+        combined.append(next_item)
+        if ref:
+            seen.add(ref)
+        if len(combined) >= min_items:
+            break
+    return combined
 
 
 _ASSISTANT_EMAIL_BLOCKED_SENDER_DOMAINS = {
@@ -1653,38 +1700,25 @@ def _google_workspace_email_summary(config: dict[str, Any] | None = None, accoun
             page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
         )
         unread = len(unread_ids)
-        unread_id_set = set(unread_ids)
-        if latest_query == unread_query:
-            preview_items = _gmail_bridge_metadata_items_for_ids(
-                config,
-                server=server,
-                user_google_email=user_google_email,
-                message_ids=unread_ids,
-                unread=True,
-                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
-            )
-        else:
-            preview_items = _gmail_bridge_message_items(
+        unread_items = _gmail_bridge_metadata_items_for_ids(
+            config,
+            server=server,
+            user_google_email=user_google_email,
+            message_ids=unread_ids,
+            unread=True,
+            page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
+        )
+        latest_items: list[dict[str, Any]] = []
+        if len(unread_items) < _ASSISTANT_EMAIL_PREVIEW_ITEMS and latest_query != unread_query:
+            latest_items = _gmail_bridge_message_items(
                 config,
                 server=server,
                 user_google_email=user_google_email,
                 query=latest_query,
-                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS + len(unread_items),
                 unread=False,
             )
-            for item in preview_items:
-                message_ref = str(item.get("message_id") or item.get("id") or "")
-                if message_ref in unread_id_set:
-                    item["unread"] = True
-        if not preview_items and unread_ids:
-            preview_items = _gmail_bridge_metadata_items_for_ids(
-                config,
-                server=server,
-                user_google_email=user_google_email,
-                message_ids=unread_ids,
-                unread=True,
-                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
-            )
+        preview_items = _unread_first_email_items(unread_items, latest_items)
         for item in preview_items:
             item.setdefault("account_label", account_label)
             item.setdefault("account_address", account_address)
@@ -1733,10 +1767,15 @@ def _himalaya_email_summary(config: dict[str, Any] | None = None, account_cfg: d
         unread_items = [_himalaya_envelope_to_resource_item(item) for item in unread_raw]
         unread_items = [item for item in unread_items if item]
         unread = len(unread_items)
-        preview_items = unread_items
-        if not preview_items:
-            latest_raw = _run_himalaya_envelope_list(page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS, account=account, folder=folder)
-            preview_items = [item for item in (_himalaya_envelope_to_resource_item(item) for item in latest_raw) if item]
+        latest_items: list[dict[str, Any]] = []
+        if len(unread_items) < _ASSISTANT_EMAIL_PREVIEW_ITEMS:
+            latest_raw = _run_himalaya_envelope_list(
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS + len(unread_items),
+                account=account,
+                folder=folder,
+            )
+            latest_items = [item for item in (_himalaya_envelope_to_resource_item(item) for item in latest_raw) if item]
+        preview_items = _unread_first_email_items(unread_items, latest_items)
         for item in preview_items:
             item.setdefault("account_label", account_label)
             item.setdefault("account_address", account_address)
@@ -2342,6 +2381,14 @@ def _assistant_cached_resource(
     return payload, meta
 
 
+def _assistant_invalidate_resource_cache(name: str) -> None:
+    prefix = f"{name}:"
+    with _ASSISTANT_RESOURCE_CACHE_LOCK:
+        for key in list(_ASSISTANT_RESOURCE_CACHE.keys()):
+            if key.startswith(prefix):
+                _ASSISTANT_RESOURCE_CACHE.pop(key, None)
+
+
 def _dashboard_section(config: dict[str, Any], key: str) -> dict[str, Any]:
     dashboard = config.get("dashboard")
     if isinstance(dashboard, dict):
@@ -2648,6 +2695,292 @@ def _todo_summary(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+
+def _assistant_display_name_from_config(config: dict[str, Any]) -> str:
+    """Resolve the customer-facing assistant name for the AIWerk CUI."""
+    candidates: list[Any] = [
+        os.environ.get("AIWERK_CUI_AGENT_NAME"),
+        os.environ.get("HERMES_AGENT_NAME"),
+    ]
+    for section_name in ("assistant", "dashboard", "aiwerk", "branding"):
+        section = config.get(section_name)
+        if isinstance(section, dict):
+            for key in ("agent_name", "assistant_name", "display_name", "name"):
+                candidates.append(section.get(key))
+    display = config.get("display")
+    if isinstance(display, dict):
+        for key in ("agent_name", "assistant_name"):
+            candidates.append(display.get(key))
+        skin_name = display.get("skin")
+        if isinstance(skin_name, str) and skin_name.strip():
+            try:
+                from hermes_cli.skin_engine import load_skin
+                candidates.append(load_skin(skin_name.strip()).get_branding("agent_name", ""))
+            except Exception:
+                pass
+    for raw in candidates:
+        if isinstance(raw, str):
+            value = re.sub(r"\s+", " ", raw).strip()
+            if value and "{{" not in value and "}}" not in value:
+                return value[:80]
+    return "Agent"
+
+
+def _assistant_support_section(config: dict[str, Any]) -> dict[str, Any]:
+    section = _dashboard_section(config, "support")
+    return section if isinstance(section, dict) else {}
+
+
+def _support_log_path(config: dict[str, Any], support_cfg: dict[str, Any]) -> Path:
+    raw = support_cfg.get("local_log") or support_cfg.get("log_path") or os.environ.get("AIWERK_CUI_SUPPORT_LOG")
+    if raw:
+        return Path(str(raw)).expanduser()
+    return get_hermes_home() / "aiwerk-support" / "inbox.jsonl"
+
+
+def _safe_support_text(value: Any, *, max_len: int = 2000) -> str:
+    text = _redact_sensitive_text(str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        text = text[:max_len].rstrip() + "…"
+    return text
+
+
+def _safe_support_multiline(value: Any, *, max_len: int = 4000) -> str:
+    text = _redact_sensitive_text(str(value or ""))
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    if len(text) > max_len:
+        text = text[:max_len].rstrip() + "…"
+    return text
+
+
+def _safe_support_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed_scalar = (str, int, float, bool, type(None))
+    result: dict[str, Any] = {}
+    for key, raw in value.items():
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key or "")).strip("_")[:60]
+        if not safe_key:
+            continue
+        if isinstance(raw, allowed_scalar):
+            result[safe_key] = _safe_support_text(raw, max_len=500) if isinstance(raw, str) else raw
+        elif isinstance(raw, dict):
+            nested: dict[str, Any] = {}
+            for nkey, nraw in list(raw.items())[:20]:
+                nested_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(nkey or "")).strip("_")[:60]
+                if nested_key and isinstance(nraw, allowed_scalar):
+                    nested[nested_key] = _safe_support_text(nraw, max_len=300) if isinstance(nraw, str) else nraw
+            result[safe_key] = nested
+        elif isinstance(raw, list):
+            safe_list: list[Any] = []
+            for item in raw[:20]:
+                if isinstance(item, allowed_scalar):
+                    safe_list.append(_safe_support_text(item, max_len=300) if isinstance(item, str) else item)
+                elif isinstance(item, dict):
+                    safe_list.append(_safe_support_diagnostics(item))
+            result[safe_key] = safe_list
+    encoded = json.dumps(result, ensure_ascii=False)
+    if len(encoded) > 6000:
+        return {"summary": encoded[:6000] + "…"}
+    return result
+
+
+def _telegram_target_from_chat_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("telegram:"):
+        return raw
+    return f"telegram:{raw}"
+
+
+def _explicit_delivery_targets(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        candidates = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, list):
+        candidates = [str(part).strip() for part in raw if str(part).strip()]
+    else:
+        candidates = []
+    # Do not fall back to the Hermes gateway home channel. A bare "telegram"
+    # target would send to the normal chat, so it is deliberately ignored here.
+    return [target for target in candidates if target != "telegram"]
+
+
+def _support_delivery_targets(support_cfg: dict[str, Any]) -> list[str]:
+    dedicated_chat_id = (
+        support_cfg.get("telegram_chat_id")
+        or support_cfg.get("support_telegram_chat_id")
+        or os.environ.get("AIWERK_SUPPORT_TELEGRAM_CHAT_ID")
+        or os.environ.get("AIWERK_CUI_SUPPORT_TELEGRAM_CHAT_ID")
+    )
+    dedicated_target = _telegram_target_from_chat_id(dedicated_chat_id)
+    if dedicated_target:
+        return [dedicated_target]
+    return _explicit_delivery_targets(
+        support_cfg.get("delivery_targets")
+        or support_cfg.get("delivery_target")
+        or os.environ.get("AIWERK_CUI_SUPPORT_TARGET")
+    )
+
+
+def _system_delivery_targets(config: dict[str, Any]) -> list[str]:
+    dashboard = config.get("dashboard") if isinstance(config, dict) else {}
+    notifications = dashboard.get("notifications") if isinstance(dashboard, dict) else {}
+    notifications = notifications if isinstance(notifications, dict) else {}
+    dedicated_chat_id = (
+        notifications.get("telegram_chat_id")
+        or notifications.get("system_telegram_chat_id")
+        or os.environ.get("AIWERK_SYSTEM_TELEGRAM_CHAT_ID")
+    )
+    dedicated_target = _telegram_target_from_chat_id(dedicated_chat_id)
+    if dedicated_target:
+        return [dedicated_target]
+    return _explicit_delivery_targets(
+        notifications.get("delivery_targets")
+        or notifications.get("delivery_target")
+        or os.environ.get("AIWERK_SYSTEM_TARGET")
+    )
+
+
+def _format_support_message(record: dict[str, Any]) -> str:
+    diagnostics = record.get("diagnostics") if isinstance(record.get("diagnostics"), dict) else {}
+    lines = [
+        "AIWerk Supportmeldung",
+        "",
+        f"Support-ID: {record.get('support_id')}",
+        f"Kategorie: {record.get('category') or 'Sonstiges'}",
+        f"Agent: {record.get('agent_name') or 'Agent'}",
+        f"Session: {record.get('session_title') or 'Aktuelle Sitzung'}",
+        f"Zeitpunkt: {record.get('created_at')}",
+        "",
+        "Nachricht:",
+        str(record.get("message") or ""),
+    ]
+    if diagnostics:
+        lines.extend(["", "Status:"])
+        for key in ("connection", "email", "calendar", "shared_folder", "vault", "todos", "connectors"):
+            if key in diagnostics:
+                value = diagnostics[key]
+                if isinstance(value, dict):
+                    compact = ", ".join(f"{k}: {v}" for k, v in value.items() if v not in (None, ""))
+                    lines.append(f"- {key}: {compact or '—'}")
+                else:
+                    lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+def _deliver_support_message(targets: list[str], text: str) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    delivered = False
+    try:
+        from tools.send_message_tool import send_message_tool
+    except Exception as exc:
+        return False, [f"send_message unavailable: {_safe_support_text(exc, max_len=200)}"]
+    for target in targets:
+        try:
+            raw = send_message_tool({"action": "send", "target": target, "message": text})
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict) and parsed.get("error"):
+                errors.append(f"{target}: {_safe_support_text(parsed.get('error'), max_len=300)}")
+            else:
+                delivered = True
+        except Exception as exc:
+            errors.append(f"{target}: {_safe_support_text(exc, max_len=300)}")
+    return delivered, errors
+
+
+def _handle_assistant_support(payload: Any, request: Request | None = None) -> dict[str, Any]:
+    config = load_config()
+    support_cfg = _assistant_support_section(config)
+    if support_cfg.get("enabled") is False:
+        raise HTTPException(status_code=404, detail="Support is not enabled")
+    message = _safe_support_multiline(payload.message)
+    if not message:
+        raise HTTPException(status_code=400, detail="Support message is required")
+    now = _utc_now_iso()
+    support_id = "sup_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + secrets.token_hex(3)
+    diagnostics = _safe_support_diagnostics(payload.diagnostics if payload.include_diagnostics else {})
+    if payload.connection:
+        diagnostics.setdefault("connection", _safe_support_text(payload.connection, max_len=80))
+    agent_name = _safe_support_text(payload.agent_name, max_len=80) or _assistant_display_name_from_config(config)
+    record = {
+        "support_id": support_id,
+        "created_at": now,
+        "category": _safe_support_text(payload.category or "Sonstiges", max_len=120),
+        "agent_name": agent_name,
+        "message": message,
+        "session_id": _safe_support_text(payload.session_id, max_len=160),
+        "session_title": _safe_support_text(payload.session_title, max_len=200),
+        "page_url": _safe_support_text(payload.page_url, max_len=500),
+        "user_agent": _safe_support_text(payload.user_agent, max_len=500),
+        "diagnostics": diagnostics,
+    }
+    log_path = _support_log_path(config, support_cfg)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        _log.exception("Could not write AIWerk support log")
+        raise HTTPException(status_code=500, detail="Support message could not be saved")
+    targets = _support_delivery_targets(support_cfg)
+    delivered, errors = _deliver_support_message(targets, _format_support_message(record))
+    if errors:
+        _log.warning("AIWerk support delivery issues for %s: %s", support_id, "; ".join(errors))
+    return {"ok": True, "support_id": support_id, "delivered": delivered, "queued": not delivered, "errors": errors[:3]}
+
+
+def _update_todo_item_done(config: dict[str, Any], item_id: str, done: bool) -> dict[str, Any]:
+    match = re.fullmatch(r"todo-(\d+)", str(item_id or "").strip())
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid todo id")
+    line_number = int(match.group(1))
+    path = _todo_path_from_config(config)
+    try:
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail="TODO.md not found")
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="TODO.md could not be read")
+    if line_number < 1 or line_number > len(lines):
+        raise HTTPException(status_code=404, detail="Todo item not found")
+    line = lines[line_number - 1]
+    checkbox = re.match(r"^(\s*[-*]\s+\[)([ xX])(\]\s+.+?\s*)$", line)
+    if not checkbox:
+        raise HTTPException(status_code=400, detail="Todo line is not a markdown checkbox")
+    marker = "x" if done else " "
+    lines[line_number - 1] = f"{checkbox.group(1)}{marker}{checkbox.group(3)}"
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        raise HTTPException(status_code=500, detail="TODO.md could not be updated")
+    _assistant_invalidate_resource_cache("todos")
+    return _todo_summary(config)
+
+
+def _add_todo_item(config: dict[str, Any], text: str) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Todo text is required")
+    if len(text) > 240:
+        text = text[:240].rstrip()
+    path = _todo_path_from_config(config)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        path.write_text(f"{existing}{separator}- [ ] {text}\n", encoding="utf-8")
+    except Exception:
+        raise HTTPException(status_code=500, detail="TODO.md could not be updated")
+    _assistant_invalidate_resource_cache("todos")
+    return _todo_summary(config)
+
+
 def _assistant_resources_payload(
     request: Request | None = None,
     *,
@@ -2832,6 +3165,28 @@ class AssistantResourceAttachmentRequest(BaseModel):
     kind: str
     item: Dict[str, Any]
     session_id: str = ""
+
+
+class AssistantSupportRequest(BaseModel):
+    category: str = ""
+    message: str
+    include_diagnostics: bool = True
+    session_id: str = ""
+    session_title: str = ""
+    agent_name: str = ""
+    connection: str = ""
+    page_url: str = ""
+    user_agent: str = ""
+    diagnostics: dict[str, Any] | None = None
+
+
+class AssistantTodoAddRequest(BaseModel):
+    text: str
+
+
+class AssistantTodoUpdateRequest(BaseModel):
+    id: str
+    done: bool
 
 
 def _shared_attachment_rel_path(item: dict[str, Any]) -> str | None:
@@ -3608,6 +3963,49 @@ async def get_assistant_resources(request: Request, refresh: str | None = None, 
         raise HTTPException(status_code=500, detail="Resource summary failed")
 
 
+
+
+@app.post("/api/assistant/support")
+async def submit_assistant_support(request: Request, payload: AssistantSupportRequest):
+    """Save and deliver a sanitized AIWerk CUI support message to the admin channel."""
+    _require_token(request)
+    try:
+        return _handle_assistant_support(payload, request)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/assistant/support failed")
+        raise HTTPException(status_code=500, detail="Support message failed")
+
+
+@app.post("/api/assistant/todos/add")
+async def add_assistant_todo(request: Request, payload: AssistantTodoAddRequest):
+    """Append one Markdown TODO item for the AIWerk CUI right rail."""
+    _require_token(request)
+    try:
+        todos = _add_todo_item(load_config(), payload.text)
+        return {"ok": True, "todos": todos}
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/assistant/todos/add failed")
+        raise HTTPException(status_code=500, detail="TODO add failed")
+
+
+@app.post("/api/assistant/todos/update")
+async def update_assistant_todo(request: Request, payload: AssistantTodoUpdateRequest):
+    """Mark one Markdown TODO item done/undone for the AIWerk CUI right rail."""
+    _require_token(request)
+    try:
+        todos = _update_todo_item_done(load_config(), payload.id, payload.done)
+        return {"ok": True, "todos": todos}
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/assistant/todos/update failed")
+        raise HTTPException(status_code=500, detail="TODO update failed")
+
+
 @app.get("/api/assistant/email/view")
 async def view_assistant_email(request: Request):
     """Open a read-only sanitized CUI email view for an IMAP/Himalaya message."""
@@ -4220,6 +4618,7 @@ _EMPTY_MODEL_INFO: dict = {
     "config_context_length": 0,
     "effective_context_length": 0,
     "capabilities": {},
+    "agent_name": "Agent",
 }
 
 
@@ -4248,7 +4647,7 @@ def get_model_info():
             config_ctx = None
 
         if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider)
+            return dict(_EMPTY_MODEL_INFO, provider=provider, agent_name=_assistant_display_name_from_config(cfg))
 
         # Resolve auto-detected context length (pass config_ctx=None to get
         # purely auto-detected value, then separately report the override)
@@ -4294,6 +4693,7 @@ def get_model_info():
             "config_context_length": config_ctx_int,
             "effective_context_length": effective_ctx,
             "capabilities": caps,
+            "agent_name": _assistant_display_name_from_config(cfg),
         }
     except Exception:
         _log.exception("GET /api/model/info failed")
