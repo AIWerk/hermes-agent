@@ -1,10 +1,10 @@
-import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, Mail, Mic, Paperclip, Pencil, PlugZap, Plus, RefreshCw, Send, Square, Volume2, VolumeX, X } from "lucide-react";
+import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
 import { Fragment, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
-import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
+import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -66,9 +66,66 @@ function recentSessionDisplayTitle(session: RecentSession): string {
   return "Unbenannte Sitzung";
 }
 
-type ResourcePanelKey = "email" | "calendar" | "shared_folder" | "vault" | "todos" | "connectors";
+type ResourcePanelKey = "email" | "calendar" | "shared_folder" | "vault" | "todos" | "contacts" | "connectors";
+type ResourcePanelId = ResourcePanelKey | "shared";
 
 type ResourceCardAction = { icon: ReactNode; label: string; onClick: () => void; disabled?: boolean };
+
+function mergeAssistantResources(
+  current: AssistantResourcesResponse | null,
+  incoming: AssistantResourcesResponse,
+  resource?: ResourcePanelKey,
+): AssistantResourcesResponse {
+  if (!current || !resource) return incoming;
+  return {
+    ...current,
+    checked_at: incoming.checked_at,
+    warnings: incoming.warnings,
+    [resource]: incoming[resource],
+    cache: incoming.cache
+      ? {
+          cached: incoming.cache.cached,
+          resources: {
+            ...(current.cache?.resources ?? {}),
+            ...incoming.cache.resources,
+          },
+        }
+      : current.cache,
+  };
+}
+
+function normalizeContactSearch(value?: string | null): string {
+  return (value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function contactIdentityKeys(contact: Partial<Pick<AssistantContactItem, "id" | "email" | "phone" | "display_name">>): string[] {
+  return [
+    contact.id ? `id:${contact.id.toLowerCase()}` : "",
+    contact.email ? `email:${contact.email.toLowerCase()}` : "",
+    contact.phone ? `phone:${contact.phone.toLowerCase()}` : "",
+    contact.display_name ? `name:${normalizeContactSearch(contact.display_name)}` : "",
+  ].filter(Boolean);
+}
+
+function contactPendingKey(contact: AssistantContactItem): string {
+  return contactIdentityKeys(contact)[0] ?? contact.display_name.toLowerCase();
+}
+
+function contactMatchesKeys(contact: Partial<Pick<AssistantContactItem, "id" | "email" | "phone" | "display_name">>, keys: Set<string>): boolean {
+  return contactIdentityKeys(contact).some((key) => keys.has(key));
+}
+
+function dedupeContactList(contacts: AssistantContactItem[]): AssistantContactItem[] {
+  const seen = new Set<string>();
+  const deduped: AssistantContactItem[] = [];
+  contacts.forEach((contact) => {
+    const key = contact.email ? `email:${contact.email.toLowerCase()}` : contact.id ? `id:${contact.id}` : contact.display_name.toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    deduped.push(contact);
+  });
+  return deduped;
+}
 
 const RIGHT_RAIL_ROW_ACTION_CLASS = "grid h-auto w-[34px] shrink-0 cursor-pointer place-items-center rounded-[10px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]";
 const RIGHT_RAIL_ROW_ACTION_DISABLED_CLASS = "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[#f8f0e3]";
@@ -104,7 +161,7 @@ function openSharedFolderCloudUrl(url?: string | null): void {
   if (opened) opened.opener = null;
 }
 
-type DocumentTabKind = "email" | "calendar";
+type DocumentTabKind = "email" | "calendar" | "contact";
 
 type PanelTabId = "chat" | string;
 
@@ -116,6 +173,7 @@ interface DocumentTab {
   openUrl: string;
   status: "loading" | "ready" | "error";
   html?: string;
+  contact?: AssistantContactItem;
   error?: string;
 }
 
@@ -762,6 +820,18 @@ export default function AiwerkAssistantPage() {
     void openDocumentTab("calendar", item.open_url, item.title || "Termin", subtitle || item.account_address || item.account_label);
   }, [openDocumentTab]);
 
+  const openContactInPanel = useCallback((contact: AssistantContactItem) => {
+    const title = contact.display_name || contact.email || contact.phone || "Kontakt";
+    const subtitle = [contact.role, contact.organization].filter(Boolean).join(" · ") || contact.email || contact.phone;
+    const id = `contact:${contact.id || title}`;
+    setDocumentTabs((current) => {
+      const existing = current.find((tab) => tab.id === id);
+      if (existing) return current.map((tab) => tab.id === id ? { ...tab, title, subtitle, contact, status: "ready", error: undefined } : tab);
+      return [...current, { id, kind: "contact", title, subtitle, openUrl: id, contact, status: "ready" }];
+    });
+    setActivePanelTab(id);
+  }, []);
+
   const startRightRailResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     if (!contentGridRef.current) return;
     event.preventDefault();
@@ -945,7 +1015,7 @@ export default function AiwerkAssistantPage() {
   }, [showToast]);
 
   const attachResourceToSession = useCallback(async (
-    kind: "email" | "calendar_event" | "shared_file",
+    kind: "email" | "calendar_event" | "shared_file" | "contact",
     item: Record<string, unknown>,
     label: string,
   ) => {
@@ -968,6 +1038,41 @@ export default function AiwerkAssistantPage() {
       showToast(`${label} konnte nicht angehängt werden.`);
     }
   }, [sessionId, showToast]);
+
+  const attachTodoToComposer = useCallback((item: AssistantTodoItem) => {
+    const taskText = item.text.trim();
+    if (!taskText) return;
+    const marker = `Aufgabe-ID: ${item.id}`;
+    const prompt = [
+      "Hilf mir, diese Aufgabe zu lösen.",
+      "",
+      "Aufgabe:",
+      taskText,
+      "",
+      "Status:",
+      item.done ? "erledigt" : "offen",
+      "",
+      item.line ? `Quelle: TODO.md, Zeile ${item.line}` : "Quelle: TODO.md",
+      marker,
+      "",
+      "Bitte:",
+      "- zerlege die Aufgabe in konkrete Schritte,",
+      "- nutze den aktuellen Gesprächskontext, wenn er relevant ist,",
+      "- frage gezielt nach, falls etwas unklar ist,",
+      "- schlage den nächsten sinnvollen Schritt vor.",
+    ].join("\n");
+
+    setActivePanelTab("chat");
+    setActiveTurnMode("main");
+    conversationModeRef.current = "main";
+    setInput((current) => {
+      if (current.includes(marker)) return current;
+      const trimmed = current.trim();
+      return trimmed ? `${trimmed}\n\n${prompt}` : prompt;
+    });
+    window.setTimeout(() => mainInputRef.current?.focus(), 0);
+    showToast("Aufgabe in den Chat übernommen");
+  }, [showToast]);
 
   const stopVoiceTracks = useCallback(() => {
     if (voiceTimerRef.current !== null) {
@@ -1132,6 +1237,16 @@ export default function AiwerkAssistantPage() {
     && !isCompressing
     && (contextUsage?.percent ?? 0) >= COMPRESS_CONTEXT_PERCENT_THRESHOLD,
   );
+  const showDashboardLoader = connection !== "open" || !sessionId || !modelInfo || (!resourceSummary && !resourcesError);
+  const dashboardLoaderStep = connection !== "open"
+    ? "Verbindung zum Agenten wird hergestellt"
+    : !sessionId
+      ? "Sitzung wird geöffnet"
+      : !modelInfo
+        ? "Agentenprofil wird geladen"
+        : !resourceSummary && !resourcesError
+          ? "Ressourcen werden synchronisiert"
+          : "Dashboard ist bereit";
   const compressHelp = canCompress
     ? "Kontext jetzt komprimieren"
     : `Komprimieren wird aktiv ab ca. ${COMPRESS_CONTEXT_PERCENT_THRESHOLD}% Kontextbelegung; automatisch komprimiert Hermes erst später.`;
@@ -1198,7 +1313,7 @@ export default function AiwerkAssistantPage() {
     }
     try {
       const resources = await api.getAssistantResources({ refresh: options?.force, resource: options?.resource });
-      setResourceSummary(resources);
+      setResourceSummary((current) => mergeAssistantResources(current, resources, options?.resource));
       setResourcesError(null);
     } catch (e) {
       setResourcesError(e instanceof Error ? e.message : "Ressourcen konnten nicht geladen werden.");
@@ -1223,11 +1338,33 @@ export default function AiwerkAssistantPage() {
   }, []);
 
   const updateTodoDone = useCallback(async (id: string, done: boolean) => {
+    let previous: AssistantResourcesResponse | null = null;
+    setResourceSummary((current) => {
+      previous = current;
+      if (!current) return current;
+      const before = current.todos.items.find((item) => item.id === id);
+      if (!before || !!before.done === done) return current;
+      const items = current.todos.items.map((item) => item.id === id ? { ...item, done } : item);
+      const open_count = items.filter((item) => !item.done).length;
+      const done_count = items.filter((item) => item.done).length;
+      return {
+        ...current,
+        todos: {
+          ...current.todos,
+          items,
+          open_count,
+          done_count,
+          total_count: items.length,
+          summary: open_count ? `${open_count} offene Aufgaben` : "Keine offenen Aufgaben",
+        },
+      };
+    });
     try {
       const result = await api.updateAssistantTodo(id, done);
       setResourceSummary((current) => current ? { ...current, todos: result.todos } : current);
       setResourcesError(null);
     } catch (e) {
+      setResourceSummary(previous);
       setResourcesError(e instanceof Error ? e.message : "Aufgabe konnte nicht aktualisiert werden.");
       throw e;
     }
@@ -1839,6 +1976,14 @@ export default function AiwerkAssistantPage() {
           background: rgba(215, 185, 142, .48);
           color: #fffaf2;
         }
+        .aiwerk-assistant button:not(:disabled),
+        .aiwerk-assistant [role="button"]:not([aria-disabled="true"]) {
+          cursor: pointer;
+        }
+        .aiwerk-assistant button:disabled,
+        .aiwerk-assistant [aria-disabled="true"] {
+          cursor: not-allowed;
+        }
         @keyframes aiwerk-thinking-pulse {
           0%, 80%, 100% { opacity: .32; transform: translateY(0); }
           40% { opacity: 1; transform: translateY(-3px); }
@@ -1846,6 +1991,15 @@ export default function AiwerkAssistantPage() {
         .aiwerk-thinking-dot { animation: aiwerk-thinking-pulse 1.2s ease-in-out infinite; }
         .aiwerk-thinking-dot:nth-child(2) { animation-delay: .15s; }
         .aiwerk-thinking-dot:nth-child(3) { animation-delay: .3s; }
+        @keyframes aiwerk-loader-orbit {
+          to { transform: rotate(360deg); }
+        }
+        @keyframes aiwerk-loader-breathe {
+          0%, 100% { opacity: .48; transform: scale(.96); }
+          50% { opacity: 1; transform: scale(1); }
+        }
+        .aiwerk-dashboard-loader-ring { animation: aiwerk-loader-orbit 1.05s linear infinite; }
+        .aiwerk-dashboard-loader-dot { animation: aiwerk-loader-breathe 1.4s ease-in-out infinite; }
         .aiwerk-scrollbar { scrollbar-width: thin; scrollbar-color: rgba(139, 114, 78, .42) transparent; }
         .aiwerk-scrollbar::-webkit-scrollbar { width: 7px; height: 7px; }
         .aiwerk-scrollbar::-webkit-scrollbar-track { background: transparent; }
@@ -1879,6 +2033,32 @@ export default function AiwerkAssistantPage() {
           visibility: visible;
           transition-delay: 0s;
         }
+        .aiwerk-resource-stack > * + * {
+          position: relative;
+        }
+        .aiwerk-resource-stack > * + *::before {
+          content: "";
+          position: absolute;
+          left: 18px;
+          right: 18px;
+          top: -8px;
+          height: 1px;
+          border-radius: 999px;
+          background: linear-gradient(90deg, transparent, rgba(139, 114, 78, .28), transparent);
+          pointer-events: none;
+        }
+        .aiwerk-resource-stack > * + *::after {
+          content: "";
+          position: absolute;
+          left: 50%;
+          top: -10px;
+          width: 22px;
+          height: 3px;
+          border-radius: 999px;
+          background: rgba(139, 114, 78, .18);
+          transform: translateX(-50%);
+          pointer-events: none;
+        }
         .aiwerk-side-scrim {
           position: absolute;
           inset: 0;
@@ -1896,6 +2076,21 @@ export default function AiwerkAssistantPage() {
           .aiwerk-side-drawer { width: min(460px, 92%); }
         }
       `}</style>
+      {showDashboardLoader && (
+        <div className="fixed inset-0 z-[80] grid place-items-center bg-[#f4f1ec]/88 px-[22px] backdrop-blur-[3px]" role="status" aria-live="polite" aria-label="Dashboard wird synchronisiert">
+          <div className="w-full max-w-[360px] rounded-[26px] border border-[#dccfbd] bg-[#fffaf2] px-[24px] py-[22px] text-center shadow-[0_28px_90px_rgba(48,38,22,.20)]">
+            <div className="relative mx-auto grid h-[58px] w-[58px] place-items-center rounded-[20px] bg-[#f5eadb] text-[#705334]">
+              <div className="aiwerk-dashboard-loader-ring absolute inset-[7px] rounded-full border-2 border-[#d8c4a8] border-t-[#8a6842]" />
+              <span className="aiwerk-dashboard-loader-dot h-[10px] w-[10px] rounded-full bg-[#8a6842] shadow-[0_0_0_7px_rgba(138,104,66,.12)]" />
+            </div>
+            <h2 className="m-0 mt-[16px] text-[18px] font-bold tracking-[-0.02em] text-[#302b24]">Dashboard wird synchronisiert</h2>
+            <p className="m-0 mt-[7px] text-[13px] leading-[1.45] text-[#756a5b]">{dashboardLoaderStep}…</p>
+            <div className="mt-[15px] h-[7px] overflow-hidden rounded-full bg-[#eadfce]">
+              <div className="h-full w-2/3 rounded-full bg-[#8a6842] transition-all" />
+            </div>
+          </div>
+        </div>
+      )}
       <div className="aiwerk-assistant grid h-dvh min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[380px_1fr]">
         {/* Sidebar */}
         <aside className="hidden h-dvh min-h-0 flex-col gap-[20px] overflow-hidden bg-[#292720] p-[24px] text-[#f8f4ed] lg:flex">
@@ -2077,7 +2272,10 @@ export default function AiwerkAssistantPage() {
           >
             {/* Chat panel */}
             <div
-              className="aiwerk-chat-panel relative grid h-full min-h-0 grid-rows-[auto_auto_minmax(0,1fr)_auto] overflow-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] shadow-[0_18px_50px_rgba(56,42,20,.08)]"
+              className={
+                "aiwerk-chat-panel relative grid h-full min-h-0 overflow-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.86)] shadow-[0_18px_50px_rgba(56,42,20,.08)] " +
+                (documentTabs.length > 0 ? "grid-rows-[auto_auto_minmax(0,1fr)_auto]" : "grid-rows-[auto_minmax(0,1fr)_auto]")
+              }
               onDragEnter={(e) => {
                 if (Array.from(e.dataTransfer.types).includes("Files")) {
                   e.preventDefault();
@@ -2185,76 +2383,79 @@ export default function AiwerkAssistantPage() {
                 </div>
               </div>
 
-              <div
-                role="tablist"
-                aria-label="Geöffnete Ansichten"
-                className="flex min-w-0 items-end gap-[2px] overflow-hidden border-b border-[#d8cbb9] bg-[#f1e8da] px-[14px] pt-[8px]"
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  onClick={() => setActivePanelTab("chat")}
-                  aria-selected={activePanelTab === "chat"}
-                  className={
-                    "-mb-px flex h-[36px] shrink-0 items-center rounded-t-[9px] border px-[14px] text-[12px] font-bold transition " +
-                    (activePanelTab === "chat"
-                      ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
-                      : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
-                  }
+              {documentTabs.length > 0 && (
+                <div
+                  role="tablist"
+                  aria-label="Geöffnete Ansichten"
+                  className="flex min-w-0 items-end gap-[2px] overflow-hidden border-b border-[#d8cbb9] bg-[#f1e8da] px-[14px] pt-[8px]"
                 >
-                  Chat
-                </button>
-                {documentTabs.map((tab) => {
-                  const isActive = activePanelTab === tab.id;
-                  const Icon = tab.kind === "email" ? Mail : CalendarDays;
-                  return (
-                    <div
-                      key={tab.id}
-                      role="tab"
-                      aria-selected={isActive}
-                      tabIndex={0}
-                      onClick={() => setActivePanelTab(tab.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          setActivePanelTab(tab.id);
-                        }
-                      }}
-                      className={
-                        "-mb-px flex h-[36px] min-w-[24px] max-w-[260px] flex-[1_1_170px] cursor-pointer items-center rounded-t-[9px] border pl-[5px] pr-[1px] text-[12px] transition focus:outline-none focus:ring-2 focus:ring-[#b9a98f] " +
-                        (isActive
-                          ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
-                          : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
-                      }
-                    >
-                      <button
-                        type="button"
+                  <button
+                    type="button"
+                    role="tab"
+                    onClick={() => setActivePanelTab("chat")}
+                    aria-selected={activePanelTab === "chat"}
+                    className={
+                      "-mb-px flex h-[36px] shrink-0 items-center rounded-t-[9px] border px-[14px] text-[12px] font-bold transition " +
+                      (activePanelTab === "chat"
+                        ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
+                        : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
+                    }
+                  >
+                    Chat
+                  </button>
+                  {documentTabs.map((tab) => {
+                    const isActive = activePanelTab === tab.id;
+                    const Icon = tab.kind === "email" ? Mail : tab.kind === "calendar" ? CalendarDays : UserRound;
+                    const tabPrefix = tab.kind === "email" ? "Mail" : tab.kind === "calendar" ? "Termin" : "Kontakt";
+                    return (
+                      <div
+                        key={tab.id}
+                        role="tab"
+                        aria-selected={isActive}
+                        tabIndex={0}
                         onClick={() => setActivePanelTab(tab.id)}
-                        className="flex min-w-0 flex-1 items-center gap-[7px] overflow-hidden truncate text-left font-bold"
-                        title={tab.title}
-                      >
-                        <Icon className="h-[13px] w-[13px] shrink-0 opacity-75" />
-                        <span className="min-w-0 truncate">{tab.kind === "email" ? "Mail" : "Termin"}: {tab.title}</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          closeDocumentTab(tab.id);
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            setActivePanelTab(tab.id);
+                          }
                         }}
                         className={
-                          "ml-[1px] grid h-[16px] w-[16px] shrink-0 place-items-center rounded-[5px] opacity-70 transition hover:opacity-100 " +
-                          (isActive ? "hover:bg-[#eee5d7]" : "hover:bg-[#e6dac8]")
+                          "-mb-px flex h-[36px] min-w-[24px] max-w-[260px] flex-[1_1_170px] cursor-pointer items-center rounded-t-[9px] border pl-[5px] pr-[1px] text-[12px] transition focus:outline-none focus:ring-2 focus:ring-[#b9a98f] " +
+                          (isActive
+                            ? "border-[#d8cbb9] border-b-[#fffaf2] bg-[#fffaf2] text-[#3f382f] shadow-[0_-1px_0_rgba(255,255,255,.55)_inset]"
+                            : "border-transparent bg-transparent text-[#746956] hover:border-[#e2d7c8] hover:bg-[#f8f0e5] hover:text-[#4f4639]")
                         }
-                        aria-label={`${tab.title} schließen`}
-                        title="Tab schließen"
                       >
-                        <X size={10} />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
+                        <button
+                          type="button"
+                          onClick={() => setActivePanelTab(tab.id)}
+                          className="flex min-w-0 flex-1 items-center gap-[7px] overflow-hidden truncate text-left font-bold"
+                          title={tab.title}
+                        >
+                          <Icon className="h-[13px] w-[13px] shrink-0 opacity-75" />
+                          <span className="min-w-0 truncate">{tabPrefix}: {tab.title}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            closeDocumentTab(tab.id);
+                          }}
+                          className={
+                            "ml-[1px] grid h-[16px] w-[16px] shrink-0 place-items-center rounded-[5px] opacity-70 transition hover:opacity-100 " +
+                            (isActive ? "hover:bg-[#eee5d7]" : "hover:bg-[#e6dac8]")
+                          }
+                          aria-label={`${tab.title} schließen`}
+                          title="Tab schließen"
+                        >
+                          <X size={10} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
               {isChatPanelActive ? (
                 <div ref={messagesScrollRef} className="aiwerk-scrollbar min-h-0 overflow-y-auto overscroll-contain p-[24px]">
@@ -2531,8 +2732,10 @@ export default function AiwerkAssistantPage() {
               onAddTodo={addTodo}
               onUpdateTodoDone={updateTodoDone}
               onAttachResource={attachResourceToSession}
+              onAttachTodo={attachTodoToComposer}
               onOpenEmail={openEmailInPanel}
               onOpenCalendar={openCalendarInPanel}
+              onOpenContact={openContactInPanel}
             />
           </section>
         </main>
@@ -2679,8 +2882,46 @@ function DocumentTabPanel({ tab }: { tab: DocumentTab | null }) {
     return (
       <div className="grid min-h-0 place-items-center bg-[#fffaf2] p-[24px] text-center text-[#7b3b2f]">
         <div className="rounded-[18px] border border-[#d9aaa0] bg-[#f6e3dd] px-[18px] py-[14px]">
-          <strong className="block text-[14px]">{tab.kind === "email" ? "E-Mail konnte nicht geöffnet werden." : "Termin konnte nicht geöffnet werden."}</strong>
+          <strong className="block text-[14px]">{tab.kind === "email" ? "E-Mail konnte nicht geöffnet werden." : tab.kind === "calendar" ? "Termin konnte nicht geöffnet werden." : "Kontakt konnte nicht geöffnet werden."}</strong>
           {tab.error && <span className="mt-[4px] block text-[12px]">{tab.error}</span>}
+        </div>
+      </div>
+    );
+  }
+  if (tab.kind === "contact") {
+    const contact = tab.contact;
+    const sourceBadges = (contact?.source_badges ?? []).filter((badge, index, badges) =>
+      Boolean(badge) && badges.findIndex((candidate) => candidate.toLowerCase() === badge.toLowerCase()) === index
+    );
+    const rows = [
+      ["Name", contact?.display_name || tab.title],
+      ["Organisation", contact?.organization],
+      ["Rolle", contact?.role],
+      ["E-Mail", contact?.email],
+      ["Telefon", contact?.phone],
+      ["Quelle", sourceBadges.join(" · ")],
+    ].filter((row): row is [string, string] => Boolean(row[1]));
+    return (
+      <div className="aiwerk-scrollbar min-h-0 overflow-y-auto bg-[#fffaf2] p-[18px]">
+        <div className="mx-auto max-w-[720px] overflow-hidden rounded-[22px] border border-[#dfd4c4] bg-[#fffdf8] shadow-[0_16px_42px_rgba(56,42,20,.08)]">
+          <div className="flex items-start gap-[14px] border-b border-[#eadfce] bg-[#f8f0e5] px-[18px] py-[16px]">
+            <div className="grid h-[42px] w-[42px] shrink-0 place-items-center rounded-[14px] border border-[#d8cbb9] bg-[#fffaf2] text-[#6d5f4d]">
+              <UserRound size={20} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <h2 className="m-0 truncate text-[20px] font-bold tracking-[-0.02em] text-[#302b24]">{contact?.display_name || tab.title}</h2>
+              {tab.subtitle && <p className="m-0 mt-[4px] truncate text-[13px] text-[#776d5f]">{tab.subtitle}</p>}
+            </div>
+          </div>
+          <div className="grid gap-[8px] p-[16px]">
+            {rows.map(([label, value]) => (
+              <div key={label} className="grid grid-cols-[120px_minmax(0,1fr)] gap-[12px] rounded-[12px] border border-[#eadfce] bg-[#fffaf2] px-[12px] py-[10px] text-[13px]">
+                <span className="font-bold uppercase tracking-[.12em] text-[10px] text-[#9a8b73]">{label}</span>
+                <span className="min-w-0 break-words text-[#3f382f]">{value}</span>
+              </div>
+            ))}
+            {!rows.length && <p className="m-0 text-[13px] text-[#776d5f]">Keine Kontaktdetails verfügbar.</p>}
+          </div>
         </div>
       </div>
     );
@@ -2714,8 +2955,10 @@ function ResourcesRail({
   onAddTodo,
   onUpdateTodoDone,
   onAttachResource,
+  onAttachTodo,
   onOpenEmail,
   onOpenCalendar,
+  onOpenContact,
 }: {
   resources: AssistantResourcesResponse | null;
   loading: boolean;
@@ -2731,9 +2974,11 @@ function ResourcesRail({
   onReloadMcp: () => Promise<void>;
   onAddTodo: (text: string) => Promise<void>;
   onUpdateTodoDone: (id: string, done: boolean) => Promise<void>;
-  onAttachResource: (kind: "email" | "calendar_event" | "shared_file", item: Record<string, unknown>, label: string) => Promise<void>;
+  onAttachResource: (kind: "email" | "calendar_event" | "shared_file" | "contact", item: Record<string, unknown>, label: string) => Promise<void>;
+  onAttachTodo: (item: AssistantTodoItem) => void;
   onOpenEmail: (item: AssistantResourceMailItem) => void;
   onOpenCalendar: (item: AssistantResourceEventItem) => void;
+  onOpenContact: (item: AssistantContactItem) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({
     email: false,
@@ -2741,8 +2986,10 @@ function ResourcesRail({
     shared: false,
     vault: false,
     todos: false,
+    contacts: false,
     connectors: false,
   });
+  const [focusedResourcePanel, setFocusedResourcePanel] = useState<ResourcePanelId | null>(null);
   const [expandedSharedItems, setExpandedSharedItems] = useState<Record<string, boolean>>({});
   const [expandedConnectorItems, setExpandedConnectorItems] = useState<Record<string, boolean>>({});
   const [expandedEmailAccounts, setExpandedEmailAccounts] = useState<Record<string, boolean>>({});
@@ -2753,13 +3000,67 @@ function ResourcesRail({
   const [todoModalOpen, setTodoModalOpen] = useState(false);
   const [newTodoText, setNewTodoText] = useState("");
   const [addingTodo, setAddingTodo] = useState(false);
+  const [contactSearch, setContactSearch] = useState("");
+  const [contactSearchResults, setContactSearchResults] = useState<AssistantContactItem[] | null>(null);
+  const [contactSearchLoading, setContactSearchLoading] = useState(false);
+  const [contactModalOpen, setContactModalOpen] = useState(false);
+  const [contactForm, setContactForm] = useState({ name: "", organization: "", role: "", email: "", phone: "", note: "", link_current_context: false });
+  const [optimisticContacts, setOptimisticContacts] = useState<AssistantContactItem[]>([]);
+  const [locallyHiddenContactKeys, setLocallyHiddenContactKeys] = useState<Set<string>>(() => new Set());
+  const [savingContact, setSavingContact] = useState(false);
+  const [hidingContactKeys, setHidingContactKeys] = useState<Set<string>>(() => new Set());
+  const [contactError, setContactError] = useState<string | null>(null);
   const [supportModalOpen, setSupportModalOpen] = useState(false);
   const [supportCategory, setSupportCategory] = useState("Agent antwortet falsch");
   const [supportMessage, setSupportMessage] = useState("");
   const [supportDiagnostics, setSupportDiagnostics] = useState(true);
   const [sendingSupport, setSendingSupport] = useState(false);
   const [supportError, setSupportError] = useState<string | null>(null);
-  const toggle = (id: string) => setExpanded((current) => ({ ...current, [id]: !current[id] }));
+  const resourceCardRefs = useRef(new Map<string, HTMLDivElement>());
+  const previousResourceRectsRef = useRef<Map<string, DOMRect> | null>(null);
+  const setResourceCardRef = useCallback((id: string) => (node: HTMLDivElement | null) => {
+    if (node) resourceCardRefs.current.set(id, node);
+    else resourceCardRefs.current.delete(id);
+  }, []);
+  const captureResourcePanelRects = () => {
+    previousResourceRectsRef.current = new Map(
+      Array.from(resourceCardRefs.current.entries()).map(([id, node]) => [id, node.getBoundingClientRect()]),
+    );
+  };
+  useLayoutEffect(() => {
+    const previousRects = previousResourceRectsRef.current;
+    if (!previousRects) return;
+    previousResourceRectsRef.current = null;
+    resourceCardRefs.current.forEach((node, id) => {
+      const previous = previousRects.get(id);
+      if (!previous) return;
+      const next = node.getBoundingClientRect();
+      const deltaY = previous.top - next.top;
+      if (Math.abs(deltaY) < 1) return;
+      node.animate(
+        [
+          { transform: `translateY(${deltaY}px)` },
+          { transform: "translateY(0)" },
+        ],
+        { duration: 380, easing: "cubic-bezier(.2,.72,.18,1)", fill: "both" },
+      );
+    });
+  }, [focusedResourcePanel, expanded]);
+  const toggle = (id: string) => {
+    captureResourcePanelRects();
+    const panelId = id as ResourcePanelId;
+    setFocusedResourcePanel((current) => current === panelId ? null : panelId);
+    setExpanded((current) => {
+      if (focusedResourcePanel === panelId || current[id]) {
+        return { ...current, [id]: false };
+      }
+      return { ...current, [id]: true };
+    });
+  };
+  const clearFocusedResourcePanel = () => {
+    captureResourcePanelRects();
+    setFocusedResourcePanel(null);
+  };
   const toggleSharedItem = (id: string) => setExpandedSharedItems((current) => ({ ...current, [id]: !current[id] }));
   const toggleConnectorItem = (id: string) => setExpandedConnectorItems((current) => ({ ...current, [id]: !current[id] }));
   const toggleEmailAccount = (id: string) => setExpandedEmailAccounts((current) => ({ ...current, [id]: !current[id] }));
@@ -2771,6 +3072,82 @@ function ResourcesRail({
       await onReloadMcp();
     } finally {
       setReloadingMcp(false);
+    }
+  };
+  useEffect(() => {
+    const query = contactSearch.trim();
+    if (!query) {
+      setContactSearchResults(null);
+      setContactSearchLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setContactSearchLoading(true);
+    const timer = window.setTimeout(() => {
+      api.searchCuiContacts(query)
+        .then((result) => {
+          if (!cancelled) setContactSearchResults(result.items);
+        })
+        .catch(() => {
+          if (!cancelled) setContactSearchResults([]);
+        })
+        .finally(() => {
+          if (!cancelled) setContactSearchLoading(false);
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [contactSearch]);
+  const submitContact = async () => {
+    if (savingContact) return;
+    if (!contactForm.name.trim() && !contactForm.email.trim() && !contactForm.phone.trim()) {
+      setContactError("Name, E-Mail oder Telefon ist nötig.");
+      return;
+    }
+    setSavingContact(true);
+    setContactError(null);
+    try {
+      const result = await api.createCuiContact(contactForm);
+      setOptimisticContacts((current) => dedupeContactList([result.contact, ...current]));
+      setContactForm({ name: "", organization: "", role: "", email: "", phone: "", note: "", link_current_context: false });
+      setContactModalOpen(false);
+      setExpanded((current) => ({ ...current, contacts: true }));
+      onRefresh("contacts");
+    } catch {
+      setContactError("Kontakt konnte nicht gespeichert werden.");
+    } finally {
+      setSavingContact(false);
+    }
+  };
+  const hideContact = async (contact: AssistantContactItem) => {
+    const pendingKey = contactPendingKey(contact);
+    if (hidingContactKeys.has(pendingKey)) return;
+    const hideKeys = contactIdentityKeys(contact);
+    if (!hideKeys.length) {
+      setContactError("Kontakt konnte nicht eindeutig erkannt werden.");
+      return;
+    }
+    setHidingContactKeys((current) => new Set([...Array.from(current), pendingKey]));
+    setContactError(null);
+    setLocallyHiddenContactKeys((current) => new Set([...Array.from(current), ...hideKeys]));
+    try {
+      await api.hideCuiContact(contact);
+      onRefresh("contacts");
+    } catch {
+      setLocallyHiddenContactKeys((current) => {
+        const next = new Set(current);
+        hideKeys.forEach((key) => next.delete(key));
+        return next;
+      });
+      setContactError("Kontakt konnte nicht ausgeblendet werden.");
+    } finally {
+      setHidingContactKeys((current) => {
+        const next = new Set(current);
+        next.delete(pendingKey);
+        return next;
+      });
     }
   };
   const updateTodoDone = async (id: string, done: boolean) => {
@@ -2812,6 +3189,7 @@ function ResourcesRail({
       shared_folder: resources?.shared_folder ? { status: resources.shared_folder.status, summary: resources.shared_folder.summary, source: resources.shared_folder.source } : undefined,
       vault: resources?.vault ? { status: resources.vault.status, summary: resources.vault.summary, source: resources.vault.source } : undefined,
       todos: resources?.todos ? { status: resources.todos.status, summary: resources.todos.summary, open_count: resources.todos.open_count } : undefined,
+      contacts: resources?.contacts ? { status: resources.contacts.status, summary: resources.contacts.summary, total_count: resources.contacts.total_count } : undefined,
       connectors: { count: resources?.connectors.length ?? 0 },
     };
     try {
@@ -2856,6 +3234,7 @@ function ResourcesRail({
   const sharedStatus = resourceStatusCopy(resources?.shared_folder.status);
   const vaultStatus = resourceStatusCopy(resources?.vault.status);
   const todoStatus = resourceStatusCopy(resources?.todos.status);
+  const contactStatus = resourceStatusCopy(resources?.contacts.status);
   const vaultHintCount = (resources?.vault.weak_count ?? 0) + (resources?.vault.reused_count ?? 0) + (resources?.vault.compromised_count ?? 0);
   const connectorCount = resources?.connectors.length ?? 0;
   const connectorSummary = resources
@@ -2891,6 +3270,38 @@ function ResourcesRail({
       return { ...account, id: accountId, items: accountItems as AssistantResourceEventItem[] };
     });
   }, [resources]);
+  const contactRelevanceWindowDays = resources?.contacts.relevance_window_days ?? 10;
+  const defaultContactsSource = resources?.contacts.items?.length
+    ? resources.contacts.items
+    : resources?.contacts.relevant.length
+      ? resources.contacts.relevant
+      : resources?.contacts.frequent ?? [];
+  const searchBaseContacts = dedupeContactList([...optimisticContacts, ...defaultContactsSource]);
+  const defaultContacts = searchBaseContacts.filter(
+    (contact) => !contactMatchesKeys(contact, locallyHiddenContactKeys),
+  );
+  const contactQuery = normalizeContactSearch(contactSearch.trim());
+  const localContactMatches = contactQuery
+    ? searchBaseContacts.filter((contact) => {
+        const haystack = [contact.display_name, contact.organization, contact.role, contact.email, contact.phone, ...(contact.source_badges ?? [])]
+          .filter(Boolean)
+          .join(" ")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase();
+        return haystack.includes(contactQuery);
+      })
+    : [];
+  const displayedContacts = contactQuery
+    ? (contactSearchResults?.length ? contactSearchResults : localContactMatches).filter(
+        (contact) => !contactMatchesKeys(contact, locallyHiddenContactKeys),
+      )
+    : defaultContacts;
+  const contactSectionTitle = contactQuery
+    ? contactSearchLoading && localContactMatches.length ? "Lokale Treffer · Suche läuft…" : "Suchresultate"
+    : resources?.contacts.relevant.length
+      ? "Relevante Kontakte"
+      : "Aktive Kontakte";
   const resourceCacheUpdatedAt = resources?.cache?.resources?.email?.updated_at ?? resources?.checked_at;
   const resourceCacheCopy = resourceCacheUpdatedAt
     ? `Zuletzt aktualisiert: ${formatResourceTime(resourceCacheUpdatedAt, { year: true })}`
@@ -2909,26 +3320,6 @@ function ResourcesRail({
   return (
     <>
       <aside className="hidden h-full min-h-0 w-full flex-col gap-[14px] overflow-x-hidden overflow-y-auto overscroll-contain pr-[4px] xl:flex aiwerk-scrollbar" aria-label="Ressourcen">
-      <div className="min-w-0 shrink-0 overflow-hidden rounded-[22px] border border-[#dacdbb] bg-[rgba(255,250,242,.94)] p-[15px] shadow-[0_14px_38px_rgba(56,42,20,.07)]">
-        <div className="flex min-w-0 items-start gap-[10px]">
-          <span className="grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[12px] bg-[#efe4d4] text-[#6f5d45]">
-            <LifeBuoy size={17} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <p className="m-0 truncate text-[11px] font-bold uppercase tracking-[.16em] text-[#948873]">Hilfe & Support</p>
-            <h3 className="m-0 mt-[3px] truncate text-[15px] text-[#302b24]">{`Problem mit ${assistantDativeName(assistantName)} melden`}</h3>
-            <p className="m-0 mt-[4px] text-[12px] leading-[1.35] text-[#776d5f]">Schreiben Sie kurz, was nicht funktioniert. AIWerk erhält eine sichere Diagnose.</p>
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={() => setSupportModalOpen(true)}
-          className="mt-[12px] flex w-full cursor-pointer items-center justify-center gap-[7px] rounded-[12px] border border-[#d5c6b0] bg-[#8b724e] px-[12px] py-[9px] text-[12px] font-bold text-white transition hover:bg-[#7a6342]"
-        >
-          <Send size={13} />
-          Nachricht an AIWerk senden
-        </button>
-      </div>
       <div className="min-w-0 shrink-0 overflow-x-hidden rounded-[24px] border border-[#ded4c4] bg-[rgba(255,250,242,.9)] p-[18px] shadow-[0_18px_50px_rgba(56,42,20,.08)]">
         <div className="mb-[14px] flex min-w-0 items-start justify-between gap-[12px]">
           <div className="min-w-0 flex-1">
@@ -2948,15 +3339,19 @@ function ResourcesRail({
           </button>
         </div>
         {error && <p className="mb-[12px] rounded-[12px] bg-[#f4e1da] px-[10px] py-[8px] text-[12px] text-[#7b3b2f]">Ressourcen konnten nicht geladen werden.</p>}
-        <div className="grid gap-[10px]">
+        <div className={`grid transition-all duration-300 ${focusedResourcePanel ? "gap-0" : "aiwerk-resource-stack gap-[14px]"}`}>
           <ResourceCard
             id="email"
             icon={<Mail size={16} />}
             title="E-Mail"
             summary={resources?.email.summary ?? "Wird geprüft…"}
             status={emailStatus}
-            expanded={expanded.email}
+            expanded={focusedResourcePanel === "email" || expanded.email}
             onToggle={toggle}
+            focused={focusedResourcePanel === "email"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "email"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("email")}
             badge={resources?.email.unread_count ? String(resources.email.unread_count) : undefined}
             action={refreshAction("email", "E-Mail")}
           >
@@ -3071,8 +3466,12 @@ function ResourcesRail({
             title="Kalender"
             summary={resources?.calendar.summary ?? "Wird geprüft…"}
             status={calendarStatus}
-            expanded={expanded.calendar}
+            expanded={focusedResourcePanel === "calendar" || expanded.calendar}
             onToggle={toggle}
+            focused={focusedResourcePanel === "calendar"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "calendar"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("calendar")}
             action={refreshAction("calendar", "Kalender")}
           >
             {resources && calendarAccountSections.length ? (
@@ -3163,13 +3562,155 @@ function ResourcesRail({
           </ResourceCard>
 
           <ResourceCard
+            id="contacts"
+            icon={<UserRound size={16} />}
+            title="Kontakte"
+            summary={resources?.contacts.summary ?? "Wird geprüft…"}
+            status={contactStatus}
+            expanded={focusedResourcePanel === "contacts" || expanded.contacts}
+            onToggle={toggle}
+            focused={focusedResourcePanel === "contacts"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "contacts"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("contacts")}
+            badge={resources?.contacts.total_count ? String(resources.contacts.total_count) : undefined}
+            action={[
+              {
+                icon: <Plus size={13} />,
+                label: "Kontakt hinzufügen",
+                onClick: () => setContactModalOpen(true),
+                disabled: loading || savingContact,
+              },
+              refreshAction("contacts", "Kontakte"),
+            ]}
+          >
+            <div className="grid gap-[8px]">
+              <div className="flex min-w-0 items-center gap-[6px] rounded-[12px] border border-[#e0d4c3] bg-[#fffdf8] px-[9px] py-[7px]">
+                <Search size={13} className="shrink-0 text-[#8a7a64]" />
+                <input
+                  value={contactSearch}
+                  onChange={(event) => setContactSearch(event.target.value)}
+                  placeholder="Kontakt suchen..."
+                  className="min-w-0 flex-1 bg-transparent text-[13px] text-[#3d362d] outline-none placeholder:text-[#a79b89]"
+                />
+                {contactSearch && (
+                  <button type="button" onClick={() => setContactSearch("")} className="grid h-[20px] w-[20px] place-items-center rounded-[7px] text-[#7b6b57] hover:bg-[#f0e4d4]" aria-label="Suche löschen">
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+              <p className="m-0 flex items-center gap-[6px] px-[2px] text-[10px] font-bold uppercase tracking-[.16em] text-[#9a8b73]">
+                {contactSearchLoading && <RefreshCw size={11} className="animate-spin text-[#9c8461]" />}
+                <span>{contactSearchLoading ? "Sucht Kontakte…" : contactSectionTitle}</span>
+              </p>
+              {contactSearchLoading && (
+                <div className="h-[3px] overflow-hidden rounded-full bg-[#eadfce]" aria-label="Suche läuft">
+                  <div className="h-full w-1/2 animate-pulse rounded-full bg-[#b99b69]" />
+                </div>
+              )}
+              {!contactQuery && (
+                <p className="m-0 px-[2px] text-[11px] leading-[15px] text-[#8a7f70]">
+                  Basierend auf E-Mail-Aktivität der letzten {contactRelevanceWindowDays} Tage plus zuletzt gespeicherten Kontakten. Suche findet auch ältere Kontakte.
+                </p>
+              )}
+              {displayedContacts.length ? (
+                <div className="grid max-h-[340px] gap-[8px] overflow-y-auto pr-[2px] aiwerk-scrollbar">
+                  {displayedContacts.map((contact) => {
+                    const contactMeta = [contact.role, contact.organization].filter(Boolean).join(" · ");
+                    const contactMethods = [contact.email, contact.phone].filter(Boolean).join(" · ");
+                    const contactSourceBadges = (contact.source_badges ?? []).filter((badge, index, badges) =>
+                      Boolean(badge) && badges.findIndex((candidate) => candidate.toLowerCase() === badge.toLowerCase()) === index
+                    );
+                    const pendingHideKey = contactPendingKey(contact);
+                    const isHidePending = hidingContactKeys.has(pendingHideKey);
+                    return (
+                      <div
+                        key={contact.id}
+                        onClick={() => onOpenContact(contact)}
+                        className="flex min-w-0 cursor-pointer items-center gap-[8px] rounded-[10px] border border-[#d8cbb9] bg-[#fffdf8] px-[9px] py-[8px] text-[12px] text-[#6f6557] shadow-[0_1px_0_rgba(255,255,255,.78)_inset,0_7px_16px_rgba(84,63,32,.05)] transition hover:border-[#c8b48f] hover:bg-[#fff8ec]"
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            onOpenContact(contact);
+                          }
+                        }}
+                      >
+                        <div className="grid h-[28px] w-[28px] shrink-0 place-items-center rounded-[8px] border border-[#e4d8c6] bg-[#f7efe3] text-[#7b6b57]">
+                          <UserRound size={13} />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="m-0 truncate text-[13px] font-semibold leading-[18px] text-[#342f27]">{contact.display_name || contact.email || contact.phone || "Kontakt"}</p>
+                          {contactMeta && <p className="m-0 truncate text-[12px] leading-[16px] text-[#7c705f]">{contactMeta}</p>}
+                          {contactMethods && <p className="m-0 truncate text-[11px] leading-[15px] text-[#8a7f70]">{contactMethods}</p>}
+                          {contactSourceBadges.length ? (
+                            <div className="mt-[5px] flex flex-wrap gap-[4px]">
+                              {contactSourceBadges.map((badge) => <span key={badge} className="rounded-full border border-[#e1d3bf] bg-[#f2e8d9] px-[6px] py-[1px] text-[10px] font-bold leading-[13px] text-[#7a6850]">{badge}</span>)}
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="flex shrink-0 gap-[4px]">
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void hideContact(contact);
+                            }}
+                            disabled={isHidePending}
+                            className="grid h-[26px] w-[26px] place-items-center rounded-[8px] border border-[#e1d3bf] bg-[#fffaf2] text-[#8a7a64] transition hover:bg-[#efe4d4] disabled:cursor-wait disabled:opacity-55"
+                            title={contactQuery ? "Aus Suchresultaten ausblenden" : "Aus Liste ausblenden"}
+                            aria-label={contactQuery ? "Aus Suchresultaten ausblenden" : "Aus Liste ausblenden"}
+                          >
+                            <X size={12} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void onAttachResource("contact", contact as unknown as Record<string, unknown>, "Kontakt");
+                            }}
+                            className="grid h-[26px] w-[26px] place-items-center rounded-[8px] border border-[#d8cbb9] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]"
+                            title="Kontakt an Agent anhängen"
+                            aria-label="Kontakt an Agent anhängen"
+                          >
+                            <Paperclip size={12} />
+                          </button>
+                          {contact.email && (
+                            <a href={`mailto:${contact.email}`} onClick={(event) => event.stopPropagation()} className="grid h-[26px] w-[26px] place-items-center rounded-[8px] border border-[#d8cbb9] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]" title="E-Mail schreiben" aria-label="E-Mail schreiben">
+                              <Mail size={12} />
+                            </a>
+                          )}
+                          {contact.phone && (
+                            <a href={`tel:${contact.phone}`} onClick={(event) => event.stopPropagation()} className="grid h-[26px] w-[26px] place-items-center rounded-[8px] border border-[#d8cbb9] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4]" title="Anrufen" aria-label="Anrufen">
+                              <Phone size={12} />
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-[12px] border border-[#e4d8c6] bg-[#fffaf2] px-[10px] py-[9px] text-[12px] text-[#776d5f]">
+                  {contactSearch.trim() ? "Keine Kontakte gefunden." : `Keine relevanten Kontakte in den letzten ${contactRelevanceWindowDays} Tagen. Suche nutzen oder Kontakt hinzufügen.`}
+                </div>
+              )}
+            </div>
+          </ResourceCard>
+
+          <ResourceCard
             id="shared"
             icon={<FolderOpen size={16} />}
             title="Shared Ordner"
             summary={resources?.shared_folder.summary ?? "Wird geprüft…"}
             status={sharedStatus}
-            expanded={expanded.shared}
+            expanded={focusedResourcePanel === "shared" || expanded.shared}
             onToggle={toggle}
+            focused={focusedResourcePanel === "shared"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "shared"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("shared")}
             action={[
               {
                 icon: resources?.shared_folder.can_open_folder ? <FolderOpen size={14} /> : <ExternalLink size={14} />,
@@ -3204,8 +3745,12 @@ function ResourcesRail({
             title="Passwort-Tresor"
             summary={resources?.vault.summary ?? "Wird geprüft…"}
             status={vaultStatus}
-            expanded={expanded.vault}
+            expanded={focusedResourcePanel === "vault" || expanded.vault}
             onToggle={toggle}
+            focused={focusedResourcePanel === "vault"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "vault"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("vault")}
             badge={vaultHintCount ? String(vaultHintCount) : undefined}
             action={[
               {
@@ -3262,8 +3807,12 @@ function ResourcesRail({
             title="Aufgaben"
             summary={resources?.todos.summary ?? "Wird geprüft…"}
             status={todoStatus}
-            expanded={expanded.todos}
+            expanded={focusedResourcePanel === "todos" || expanded.todos}
             onToggle={toggle}
+            focused={focusedResourcePanel === "todos"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "todos"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("todos")}
             badge={resources?.todos.open_count ? String(resources.todos.open_count) : undefined}
             action={[
               {
@@ -3295,6 +3844,18 @@ function ResourcesRail({
                       </span>
                     </button>
                     <span className="block min-w-0 flex-1 truncate px-[9px] py-[7px]">{item.text}</span>
+                    <button
+                      type="button"
+                      className="grid w-[34px] shrink-0 place-items-center border-l border-[#e4d8c6] text-[#7b6b57] transition hover:bg-[#f4eadc] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]"
+                      aria-label={`${item.text} in den Chat übernehmen`}
+                      title="Aufgabe in den Chat übernehmen"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onAttachTodo(item);
+                      }}
+                    >
+                      <Paperclip size={13} />
+                    </button>
                   </div>
                 ))}
               </div>
@@ -3309,8 +3870,12 @@ function ResourcesRail({
             title="Konnektoren"
             summary={connectorSummary}
             status={resourceStatusCopy(connectorCount ? "connected" : "not_configured")}
-            expanded={expanded.connectors}
+            expanded={focusedResourcePanel === "connectors" || expanded.connectors}
             onToggle={toggle}
+            focused={focusedResourcePanel === "connectors"}
+            hidden={focusedResourcePanel !== null && focusedResourcePanel !== "connectors"}
+            onClearFocus={clearFocusedResourcePanel}
+            cardRef={setResourceCardRef("connectors")}
             action={{
               icon: <RefreshCw size={13} className={reloadingMcp ? "animate-spin" : undefined} />,
               label: "Alle MCP-Server neu laden",
@@ -3333,6 +3898,26 @@ function ResourcesRail({
 
         </div>
         {resources?.checked_at && <p className="m-0 mt-[12px] text-[11px] text-[#9a8f7e]">Aktualisiert {formatResourceTime(resources.checked_at)}</p>}
+      </div>
+      <div className="mt-auto min-w-0 shrink-0 overflow-hidden rounded-[22px] border border-[#dacdbb] bg-[rgba(255,250,242,.94)] p-[15px] shadow-[0_14px_38px_rgba(56,42,20,.07)]">
+        <div className="flex min-w-0 items-start gap-[10px]">
+          <span className="grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[12px] bg-[#efe4d4] text-[#6f5d45]">
+            <LifeBuoy size={17} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="m-0 truncate text-[11px] font-bold uppercase tracking-[.16em] text-[#948873]">Hilfe & Support</p>
+            <h3 className="m-0 mt-[3px] truncate text-[15px] text-[#302b24]">{`Problem mit ${assistantDativeName(assistantName)} melden`}</h3>
+            <p className="m-0 mt-[4px] text-[12px] leading-[1.35] text-[#776d5f]">Schreiben Sie kurz, was nicht funktioniert. AIWerk erhält eine sichere Diagnose.</p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setSupportModalOpen(true)}
+          className="mt-[12px] flex w-full cursor-pointer items-center justify-center gap-[7px] rounded-[12px] border border-[#d5c6b0] bg-[#8b724e] px-[12px] py-[9px] text-[12px] font-bold text-white transition hover:bg-[#7a6342]"
+        >
+          <Send size={13} />
+          Nachricht an AIWerk senden
+        </button>
       </div>
       </aside>
       {supportModalOpen && (
@@ -3390,6 +3975,83 @@ function ResourcesRail({
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {contactModalOpen && (
+        <div className="fixed inset-0 z-40 grid place-items-center bg-[#181611]/35 p-[20px]" role="dialog" aria-modal="true" aria-labelledby="new-contact-title">
+          <form
+            className="w-full max-w-[500px] rounded-[24px] border border-[#ded4c4] bg-[#fffaf2] p-[22px] text-[#292720] shadow-[0_28px_80px_rgba(35,29,18,.28)]"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitContact();
+            }}
+          >
+            <div className="mb-[16px] flex items-start justify-between gap-[16px]">
+              <div>
+                <h2 id="new-contact-title" className="m-0 text-[21px] tracking-[-0.02em]">Kontakt hinzufügen</h2>
+                <p className="mt-[7px] text-[14px] leading-[1.45] text-[#706655]">Lokalen Kontakt für die CUI speichern.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (savingContact) return;
+                  setContactModalOpen(false);
+                  setContactError(null);
+                }}
+                aria-label="Dialog schließen"
+                className="grid h-[36px] w-[36px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#4b4235] bg-[#292720] text-[#f8f4ed] shadow-[0_10px_24px_rgba(41,39,32,.18)] transition hover:bg-[#3a342b] focus:outline-none focus:ring-2 focus:ring-[#8b724e]/45"
+              >
+                <X className="h-[16px] w-[16px]" />
+              </button>
+            </div>
+            <div className="grid grid-cols-1 gap-[10px] sm:grid-cols-2">
+              {[
+                ["name", "Name", "z.B. Anna Meier"],
+                ["organization", "Firma", "z.B. Beispiel AG"],
+                ["role", "Rolle", "z.B. Geschäftsführerin"],
+                ["email", "E-Mail", "anna@example.ch"],
+                ["phone", "Telefon", "+41 ..."],
+              ].map(([field, label, placeholder]) => (
+                <label key={field} className="grid gap-[6px] text-[11px] font-bold uppercase tracking-[.12em] text-[#8a7a65]">
+                  {label}
+                  <input
+                    value={String(contactForm[field as keyof typeof contactForm] ?? "")}
+                    onChange={(event) => setContactForm((current) => ({ ...current, [field]: event.target.value }))}
+                    placeholder={placeholder}
+                    className="rounded-[12px] border border-[#d8cbb8] bg-[#fffdf8] px-[11px] py-[9px] text-[13px] font-normal normal-case tracking-normal text-[#292720] outline-none transition placeholder:text-[#a79b89] focus:border-[#9a7b51] focus:ring-2 focus:ring-[#9a7b51]/20"
+                  />
+                </label>
+              ))}
+            </div>
+            <label className="mt-[10px] grid gap-[6px] text-[11px] font-bold uppercase tracking-[.12em] text-[#8a7a65]">
+              Notiz
+              <textarea
+                value={contactForm.note}
+                onChange={(event) => setContactForm((current) => ({ ...current, note: event.target.value }))}
+                rows={3}
+                maxLength={240}
+                placeholder="Kurze interne Notiz"
+                className="resize-none rounded-[12px] border border-[#d8cbb8] bg-[#fffdf8] px-[11px] py-[9px] text-[13px] font-normal normal-case tracking-normal text-[#292720] outline-none transition placeholder:text-[#a79b89] focus:border-[#9a7b51] focus:ring-2 focus:ring-[#9a7b51]/20"
+              />
+            </label>
+            <label className="mt-[10px] flex cursor-pointer items-start gap-[8px] text-[12px] leading-[1.35] text-[#6f6557]">
+              <input
+                type="checkbox"
+                checked={contactForm.link_current_context}
+                onChange={(event) => setContactForm((current) => ({ ...current, link_current_context: event.target.checked }))}
+                className="mt-[2px]"
+              />
+              Diesen Kontakt mit dem aktuellen Kontext verknüpfen.
+            </label>
+            {contactError && <p className="mt-[10px] rounded-[12px] bg-[#f4e1da] px-[10px] py-[8px] text-[12px] text-[#7b3b2f]">{contactError}</p>}
+            <div className="mt-[18px] flex justify-end gap-[10px]">
+              <button type="button" onClick={() => setContactModalOpen(false)} disabled={savingContact} className="cursor-pointer rounded-[12px] border border-[#d8cbb8] bg-[#fffdf8] px-[14px] py-[9px] text-[13px] font-bold text-[#6d5f4d] transition hover:bg-[#f4eadc] disabled:cursor-not-allowed disabled:opacity-50">Abbrechen</button>
+              <button type="submit" disabled={savingContact} className="cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[9px] text-[13px] font-bold text-white transition hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50">
+                {savingContact ? "Speichert…" : "Hinzufügen"}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
@@ -3531,7 +4193,7 @@ function SharedFolderTree({
   items: AssistantSharedFolderItem[];
   expandedItems: Record<string, boolean>;
   onToggle: (id: string) => void;
-  onAttachResource: (kind: "email" | "calendar_event" | "shared_file", item: Record<string, unknown>, label: string) => Promise<void>;
+  onAttachResource: (kind: "email" | "calendar_event" | "shared_file" | "contact", item: Record<string, unknown>, label: string) => Promise<void>;
   showCloudFolderLinks: boolean;
   depth?: number;
 }) {
@@ -3632,6 +4294,10 @@ function ResourceCard({
   badge,
   action,
   disabled,
+  focused,
+  hidden,
+  onClearFocus,
+  cardRef,
   children,
 }: {
   id: string;
@@ -3641,15 +4307,30 @@ function ResourceCard({
   status: { label: string; dot: string };
   expanded: boolean;
   onToggle: (id: string) => void;
+  focused?: boolean;
+  hidden?: boolean;
+  onClearFocus?: () => void;
+  cardRef?: (node: HTMLDivElement | null) => void;
   badge?: string;
   action?: ResourceCardAction | ResourceCardAction[];
   disabled?: boolean;
   children?: ReactNode;
 }) {
   const actions: ResourceCardAction[] = Array.isArray(action) ? action : action ? [action] : [];
+  const resourceHeaderTone = {
+    surface: "bg-[#f5eadb]",
+    icon: "bg-[#ead7bf] text-[#705334]",
+    action: "border-[#d9c5aa] bg-[#f8efe2] text-[#705334] hover:bg-[#eedfcb]",
+    badge: "bg-[#8a6842] text-white",
+  };
+  const cardStateClass = hidden
+    ? "max-h-0 -translate-y-2 scale-[.985] overflow-hidden opacity-0 pointer-events-none"
+    : focused
+      ? "max-h-[1200px] translate-y-0 scale-100 opacity-100"
+      : "max-h-[760px] translate-y-0 scale-100 opacity-100";
   return (
-    <div className="min-w-0 overflow-hidden rounded-[18px] border border-[#dfd4c4] bg-[#fffaf2] shadow-[0_8px_24px_rgba(56,42,20,.05)]">
-      <div className="flex min-w-0 items-stretch gap-[6px] p-[12px]">
+    <div ref={cardRef} className={`min-w-0 rounded-[18px] border border-[#dfd4c4] bg-[#fffaf2] shadow-[0_8px_24px_rgba(56,42,20,.05)] transition-all duration-300 ease-out ${cardStateClass}`}>
+      <div className={`flex min-w-0 items-stretch gap-[6px] rounded-t-[18px] border-b border-[#e6daca] p-[12px] ${resourceHeaderTone.surface}`}>
         <button
           type="button"
           onClick={() => !disabled && onToggle(id)}
@@ -3657,16 +4338,27 @@ function ResourceCard({
           disabled={disabled}
           aria-expanded={expanded}
         >
-          <span className="grid h-[32px] w-[32px] shrink-0 place-items-center rounded-[12px] bg-[#eee4d6] text-[#6d5f4d]">{icon}</span>
+          <span className={`grid h-[32px] w-[32px] shrink-0 place-items-center rounded-[12px] ${resourceHeaderTone.icon}`}>{icon}</span>
           <span className="min-w-0 flex-1 overflow-hidden">
             <span className="flex min-w-0 items-center gap-[7px] text-[13px] font-bold text-[#302b24]">
               <span className="h-[7px] w-[7px] shrink-0 rounded-full" style={{ backgroundColor: status.dot }} />
               <span className="min-w-0 truncate">{title}</span>
             </span>
-            <span className="mt-[2px] block min-w-0 max-w-full truncate text-[12px] text-[#7a705f]">{summary}</span>
+            <span className="mt-[2px] block min-w-0 max-w-full truncate text-[12px] text-[#706655]">{summary}</span>
           </span>
-          {badge && <span className="shrink-0 rounded-full bg-[#8b724e] px-[8px] py-[3px] text-[11px] font-bold text-white">{badge}</span>}
+          {badge && <span className={`shrink-0 rounded-full px-[8px] py-[3px] text-[11px] font-bold ${resourceHeaderTone.badge}`}>{badge}</span>}
         </button>
+        {focused && onClearFocus && (
+          <button
+            type="button"
+            onClick={onClearFocus}
+            title="Zurück zu allen Ressourcen"
+            aria-label="Zurück zu allen Ressourcen"
+            className={`grid h-[32px] shrink-0 cursor-pointer place-items-center rounded-[11px] border px-[10px] text-[11px] font-bold transition disabled:cursor-not-allowed disabled:opacity-45 ${resourceHeaderTone.action}`}
+          >
+            Alle
+          </button>
+        )}
         {actions.map((item) => (
           <button
             key={item.label}
@@ -3675,13 +4367,13 @@ function ResourceCard({
             disabled={item.disabled}
             title={item.label}
             aria-label={item.label}
-            className="grid h-[32px] w-[32px] shrink-0 cursor-pointer place-items-center rounded-[11px] border border-[#dfd4c4] bg-[#f8f0e3] text-[#6d5f4d] transition hover:bg-[#efe4d4] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-[#f8f0e3]"
+            className={`grid h-[32px] w-[32px] shrink-0 cursor-pointer place-items-center rounded-[11px] border transition disabled:cursor-not-allowed disabled:opacity-45 ${resourceHeaderTone.action}`}
           >
             {item.icon}
           </button>
         ))}
       </div>
-      {expanded && children && <div className="border-t border-[#eadfce] px-[12px] pb-[12px] pt-[10px]">{children}</div>}
+      {expanded && children && <div className="px-[12px] pb-[12px] pt-[10px]">{children}</div>}
     </div>
   );
 }

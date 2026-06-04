@@ -11,6 +11,7 @@ Usage:
 
 import asyncio
 import copy
+import email.header
 import email.utils
 import html
 import hmac
@@ -30,11 +31,13 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -154,6 +157,11 @@ _ASSISTANT_ALLOWED_API_EXACT: frozenset = frozenset({
     "/api/assistant/support",
     "/api/assistant/todos/add",
     "/api/assistant/todos/update",
+    "/api/cui/contacts/search",
+    "/api/cui/context/contacts",
+    "/api/cui/contacts/frequent",
+    "/api/cui/contacts",
+    "/api/cui/contacts/hide",
     "/api/assistant/email/view",
     "/api/assistant/calendar/view",
     "/api/assistant/shared-folder/open",
@@ -183,6 +191,7 @@ _ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 
 
 _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS = 40
+_ASSISTANT_RESOURCE_MAX_SHARED_DEPTH = 5
 _ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS = 12
 _ASSISTANT_RESOURCE_HIDDEN_NAMES = frozenset({
     ".env", ".env.local", ".envrc", "config.yaml", "auth.json", "credentials.json",
@@ -190,6 +199,10 @@ _ASSISTANT_RESOURCE_HIDDEN_NAMES = frozenset({
 })
 _ASSISTANT_EMAIL_PREVIEW_ITEMS = 5
 _ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT = 50
+_ASSISTANT_CONTACT_PREVIEW_ITEMS = 20
+_ASSISTANT_CONTACT_SEARCH_LIMIT = 20
+_ASSISTANT_CONTACT_RELEVANCE_WINDOW_DAYS = 10
+_ASSISTANT_CONTACT_SAVED_TOP_UP_TARGET = 16
 _ASSISTANT_EMAIL_TIMEOUT_SECONDS = 12
 _ASSISTANT_MCP_BRIDGE_TIMEOUT_SECONDS = 30
 
@@ -328,7 +341,7 @@ def _shared_cloud_browse_url(cloud: dict[str, Any] | None, rel_path: str | None 
     return f"{base_url}/web/client/pubshares/{urllib.parse.quote(share_id, safe='')}/browse?path={urllib.parse.quote(path, safe='')}"
 
 
-def _shared_folder_items(root: Path, *, base: Path | None = None, depth: int = 1, cloud: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _shared_folder_items(root: Path, *, base: Path | None = None, depth: int = _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH, cloud: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     try:
         root_real = root.resolve()
@@ -554,7 +567,7 @@ def _sftpgo_pubshare_items(cloud: dict[str, Any]) -> list[dict[str, Any]]:
     share_id = str(cloud.get("share_id") or "").strip().strip("/")
     pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
     root_path = str(cloud.get("path") or "/").strip() or "/"
-    max_depth = int(cloud.get("max_depth") or 2)
+    max_depth = int(cloud.get("max_depth") or _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
     if not base_url or not share_id or not pass_entry:
         return []
     password = _pass_first_line(pass_entry)
@@ -636,7 +649,7 @@ def _sftpgo_pubshare_items(cloud: dict[str, Any]) -> list[dict[str, Any]]:
                 break
         return items
 
-    return list_path(root_path, max(0, min(max_depth, 3)))
+    return list_path(root_path, max(0, min(max_depth, _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)))
 
 
 def _download_sftpgo_pubshare_file(cloud: dict[str, Any], rel_path: str) -> tuple[bytes, str, str] | None:
@@ -1366,11 +1379,25 @@ def _clean_calendar_reader_body(body: str) -> str:
     return _replace_email_reader_links(_wrap_long_email_reader_body_text(text))
 
 
+def _format_swiss_datetime(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(ZoneInfo("Europe/Zurich"))
+        return parsed.strftime("%d.%m.%Y, %H:%M Uhr")
+    except Exception:
+        return raw
+
+
 def _plain_calendar_reader_html(*, account_label: str, title: str, starts_at: str, ends_at: str, location: str, body: str) -> str:
     safe_title = html.escape(title or "Termin")
     safe_account = html.escape(account_label or "Kalender")
-    safe_starts = html.escape(starts_at or "")
-    safe_ends = html.escape(ends_at or "")
+    safe_starts = html.escape(_format_swiss_datetime(starts_at))
+    safe_ends = html.escape(_format_swiss_datetime(ends_at))
     safe_location = html.escape(location or "")
     safe_body = html.escape(_clean_calendar_reader_body(body or ""))
     return f"""<!doctype html>
@@ -1417,6 +1444,31 @@ def _plain_calendar_reader_html(*, account_label: str, title: str, starts_at: st
 </body>
 </html>"""
 
+_CONFIG_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_config_env_refs(value: Any) -> str:
+    """Resolve ${ENV_VAR} placeholders in config values from process/.env."""
+    text = str(value)
+    if "${" not in text:
+        return text
+    env_values: dict[str, str] | None = None
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal env_values
+        name = match.group(1)
+        if name in os.environ:
+            return os.environ[name]
+        if env_values is None:
+            try:
+                env_values = load_env()
+            except Exception:
+                env_values = {}
+        loaded_values = env_values or {}
+        return loaded_values.get(name, match.group(0))
+
+    return _CONFIG_ENV_REF_RE.sub(replace, text)
+
 
 def _mcp_bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(config, dict):
@@ -1432,7 +1484,7 @@ def _mcp_bridge_config(config: dict[str, Any] | None) -> dict[str, Any]:
         return {}
     raw_headers = bridge.get("headers")
     headers = raw_headers if isinstance(raw_headers, dict) else {}
-    return {"url": url, "headers": {str(k): str(v) for k, v in headers.items()}}
+    return {"url": _expand_config_env_refs(url), "headers": {str(k): _expand_config_env_refs(v) for k, v in headers.items()}}
 
 
 _MCP_BRIDGE_SESSION_LOCK = threading.Lock()
@@ -1636,6 +1688,23 @@ def _gmail_bridge_metadata_to_items(text: str, *, unread: bool) -> list[dict[str
     return items
 
 
+def _parse_gmail_bridge_metadata_blocks(text: str) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    for block in re.split(r"\n(?=Message ID:\s*)", text or ""):
+        if "Message ID:" not in block:
+            continue
+        parsed: dict[str, str] = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(":")
+            normalized = key.strip().lower()
+            if not normalized or not value:
+                continue
+            parsed[normalized] = value.strip()
+        if parsed:
+            blocks.append(parsed)
+    return blocks
+
+
 def _gmail_bridge_search_message_ids(config: dict[str, Any] | None, *, server: str, user_google_email: str, query: str, page_size: int) -> list[str]:
     search = _call_aiwerk_bridge_tool(
         config,
@@ -1741,8 +1810,17 @@ def _google_workspace_email_summary(config: dict[str, Any] | None = None, accoun
             "source": "gmail",
         }
     except Exception as exc:
-        _log.debug("CUI AIWerk Bridge Gmail summary failed: %s", exc)
-        return None
+        _log.debug("CUI AIWerk Bridge Gmail summary failed for %s: %s", account_address, exc)
+        return {
+            "status": "error",
+            "unread_count": 0,
+            "summary": "E-Mail konnte nicht geprüft werden",
+            "items": [],
+            "account_label": account_label,
+            "account_address": account_address,
+            "source": "gmail",
+            "error": str(exc),
+        }
 
 
 def _himalaya_email_summary(config: dict[str, Any] | None = None, account_cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -2298,10 +2376,13 @@ _ASSISTANT_RESOURCE_CACHE_TTLS = {
     "shared_folder": 60 * 60,
     "vault": 15 * 60,
     "todos": 60,
+    "contacts": 30 * 60,
     "connectors": 60 * 60,
 }
 _ASSISTANT_RESOURCE_CACHE: dict[str, dict[str, Any]] = {}
 _ASSISTANT_RESOURCE_CACHE_LOCK = threading.Lock()
+_ASSISTANT_RESOURCE_REFRESHING: set[str] = set()
+_ASSISTANT_RESOURCE_REFRESHING_LOCK = threading.Lock()
 _ASSISTANT_RESOURCE_CACHE_ENV_KEYS = (
     "AIWERK_CUI_SHARED_FOLDER",
     "AIWERK_CUI_EMAIL_SUMMARY_JSON",
@@ -2309,6 +2390,9 @@ _ASSISTANT_RESOURCE_CACHE_ENV_KEYS = (
     "AIWERK_CUI_VAULT_SUMMARY_JSON",
     "AIWERK_CUI_VAULT_URL",
     "AIWERK_CUI_TODO_PATH",
+    "AIWERK_CUI_CONTACTS_JSON",
+    "AIWERK_CUI_CONTACTS_DISABLE_AIWERK_BRIDGE",
+    "AIWERK_CUI_CONTACTS_PAGE_SIZE",
     "HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN",
 )
 
@@ -2323,6 +2407,45 @@ def _assistant_resource_config_signature(config: dict[str, Any], request: Reques
         return repr(raw)
 
 
+def _assistant_write_resource_cache(full_key: str, payload: Any, ttl_seconds: int) -> dict[str, Any]:
+    updated_at_ts = time.time()
+    expires_at_ts = updated_at_ts + ttl_seconds
+    meta = {
+        "cached": False,
+        "updated_at": datetime.fromtimestamp(updated_at_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "expires_at": datetime.fromtimestamp(expires_at_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ttl_seconds": ttl_seconds,
+    }
+    with _ASSISTANT_RESOURCE_CACHE_LOCK:
+        _ASSISTANT_RESOURCE_CACHE[full_key] = {
+            "payload": copy.deepcopy(payload),
+            "updated_at": meta["updated_at"],
+            "expires_at": meta["expires_at"],
+            "expires_at_ts": expires_at_ts,
+        }
+    return meta
+
+
+def _assistant_schedule_resource_refresh(full_key: str, builder, ttl_seconds: int) -> bool:
+    with _ASSISTANT_RESOURCE_REFRESHING_LOCK:
+        if full_key in _ASSISTANT_RESOURCE_REFRESHING:
+            return False
+        _ASSISTANT_RESOURCE_REFRESHING.add(full_key)
+
+    def run() -> None:
+        try:
+            payload = builder()
+            _assistant_write_resource_cache(full_key, payload, ttl_seconds)
+        except Exception:
+            _log.exception("Background assistant resource refresh failed for %s", full_key.split(":", 1)[0])
+        finally:
+            with _ASSISTANT_RESOURCE_REFRESHING_LOCK:
+                _ASSISTANT_RESOURCE_REFRESHING.discard(full_key)
+
+    threading.Thread(target=run, name=f"assistant-resource-refresh-{full_key.split(':', 1)[0]}", daemon=True).start()
+    return True
+
+
 def _assistant_cached_resource(
     name: str,
     ttl_seconds: int,
@@ -2330,17 +2453,41 @@ def _assistant_cached_resource(
     builder,
     *,
     force_refresh: bool = False,
+    stale_while_revalidate: bool = False,
+    initial_payload: Any | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     now = time.time()
     full_key = f"{name}:{cache_key}"
     with _ASSISTANT_RESOURCE_CACHE_LOCK:
         entry = _ASSISTANT_RESOURCE_CACHE.get(full_key)
-        if entry and not force_refresh and now < float(entry.get("expires_at_ts", 0)):
+        is_fresh = bool(entry and now < float(entry.get("expires_at_ts", 0)))
+        if entry and not force_refresh and is_fresh:
             payload = copy.deepcopy(entry["payload"])
             return payload, {
                 "cached": True,
                 "updated_at": entry["updated_at"],
                 "expires_at": entry["expires_at"],
+                "ttl_seconds": ttl_seconds,
+            }
+        if entry and stale_while_revalidate:
+            payload = copy.deepcopy(entry["payload"])
+            scheduled = _assistant_schedule_resource_refresh(full_key, builder, ttl_seconds)
+            return payload, {
+                "cached": True,
+                "stale": True,
+                "refreshing": scheduled,
+                "updated_at": entry["updated_at"],
+                "expires_at": entry["expires_at"],
+                "ttl_seconds": ttl_seconds,
+            }
+        if not entry and stale_while_revalidate and initial_payload is not None:
+            scheduled = _assistant_schedule_resource_refresh(full_key, builder, ttl_seconds)
+            return copy.deepcopy(initial_payload), {
+                "cached": False,
+                "stale": True,
+                "refreshing": scheduled,
+                "updated_at": None,
+                "expires_at": None,
                 "ttl_seconds": ttl_seconds,
             }
 
@@ -2363,21 +2510,7 @@ def _assistant_cached_resource(
             }
         raise exc
 
-    updated_at_ts = time.time()
-    expires_at_ts = updated_at_ts + ttl_seconds
-    meta = {
-        "cached": False,
-        "updated_at": datetime.fromtimestamp(updated_at_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
-        "expires_at": datetime.fromtimestamp(expires_at_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
-        "ttl_seconds": ttl_seconds,
-    }
-    with _ASSISTANT_RESOURCE_CACHE_LOCK:
-        _ASSISTANT_RESOURCE_CACHE[full_key] = {
-            "payload": copy.deepcopy(payload),
-            "updated_at": meta["updated_at"],
-            "expires_at": meta["expires_at"],
-            "expires_at_ts": expires_at_ts,
-        }
+    meta = _assistant_write_resource_cache(full_key, payload, ttl_seconds)
     return payload, meta
 
 
@@ -2981,6 +3114,977 @@ def _add_todo_item(config: dict[str, Any], text: str) -> dict[str, Any]:
     return _todo_summary(config)
 
 
+
+def _assistant_contacts_store_path() -> Path:
+    return get_hermes_home() / "cui_contacts.json"
+
+
+def _safe_contact_text(value: Any, limit: int = 160) -> str:
+    text = str(value or "").strip()
+    if "=?" in text and "?=" in text:
+        try:
+            text = str(email.header.make_header(email.header.decode_header(text))).strip()
+        except Exception:
+            pass
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _safe_contact_email(value: Any) -> str:
+    text = _safe_contact_text(value, 254)
+    match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, re.I)
+    return match.group(0).lower() if match else ""
+
+
+def _safe_contact_phone(value: Any) -> str:
+    text = _safe_contact_text(value, 80)
+    return text if re.search(r"\d", text) else ""
+
+
+def _contact_id_for(contact: dict[str, Any]) -> str:
+    seed = "|".join([
+        str(contact.get("email") or ""),
+        str(contact.get("phone") or ""),
+        str(contact.get("display_name") or contact.get("name") or ""),
+    ])
+    return _safe_resource_id(seed or secrets.token_hex(6), "contact")
+
+
+def _dedupe_contact_badges(values: Iterable[Any], *, limit: int = 4) -> list[str]:
+    badges: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        badge = _safe_contact_text(value, 40)
+        if not badge:
+            continue
+        key = badge.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        badges.append(badge)
+        if len(badges) >= limit:
+            break
+    return badges
+
+
+def _normalize_contact(raw: dict[str, Any], *, source: str = "Manuell", relevance: str = "frequent") -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    emails = raw.get("emails") if isinstance(raw.get("emails"), list) else []
+    phones = raw.get("phones") if isinstance(raw.get("phones"), list) else []
+    display_name = _safe_contact_text(raw.get("display_name") or raw.get("name") or raw.get("label"), 120)
+    email_addr = _safe_contact_email(raw.get("email") or (emails[0] if emails else ""))
+    phone = _safe_contact_phone(raw.get("phone") or (phones[0] if phones else ""))
+    if not display_name and email_addr:
+        display_name = email_addr.split("@", 1)[0].replace(".", " ").title()
+    if not display_name and not email_addr and not phone:
+        return None
+    raw_source_badges = raw.get("source_badges")
+    source_badges = raw_source_badges if isinstance(raw_source_badges, list) else []
+    badge = _safe_contact_text(raw.get("source") or source, 40)
+    badges = _dedupe_contact_badges([*source_badges, badge])
+    contact = {
+        "id": _safe_contact_text(raw.get("id"), 80),
+        "display_name": display_name,
+        "organization": _safe_contact_text(raw.get("organization") or raw.get("company"), 120),
+        "role": _safe_contact_text(raw.get("role") or raw.get("title"), 120),
+        "email": email_addr,
+        "phone": phone,
+        "note": _safe_contact_text(raw.get("note"), 240),
+        "source_badges": badges[:4],
+        "relevance": _safe_contact_text(raw.get("relevance") or relevance, 40),
+    }
+    try:
+        interaction_count = int(raw.get("interaction_count") or 0)
+    except Exception:
+        interaction_count = 0
+    try:
+        interaction_score = float(raw.get("interaction_score") or 0)
+    except Exception:
+        interaction_score = 0.0
+    if interaction_count > 0:
+        contact["interaction_count"] = interaction_count
+    if interaction_score > 0:
+        contact["interaction_score"] = round(interaction_score, 2)
+    last_interaction_at = _safe_contact_text(raw.get("last_interaction_at"), 80)
+    if last_interaction_at:
+        contact["last_interaction_at"] = last_interaction_at
+    if not contact["id"]:
+        contact["id"] = _contact_id_for(contact)
+    return contact
+
+
+def _dedupe_contacts(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for contact in contacts:
+        key = (contact.get("email") or contact.get("phone") or contact.get("display_name") or contact.get("id") or "").lower()
+        if not key:
+            continue
+        if key not in seen:
+            seen[key] = contact
+            order.append(key)
+            continue
+        existing = seen[key]
+        for field in ("organization", "role", "email", "phone", "note", "last_interaction_at"):
+            if not existing.get(field) and contact.get(field):
+                existing[field] = contact[field]
+        existing["interaction_count"] = int(existing.get("interaction_count") or 0) + int(contact.get("interaction_count") or 0)
+        existing["interaction_score"] = round(float(existing.get("interaction_score") or 0) + float(contact.get("interaction_score") or 0), 2)
+        existing["source_badges"] = _dedupe_contact_badges([*(existing.get("source_badges") or []), *(contact.get("source_badges") or [])])
+    return [seen[key] for key in order]
+
+
+def _read_contacts_store_payload() -> dict[str, Any]:
+    path = _assistant_contacts_store_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return {"contacts": payload}
+    return {}
+
+
+def _write_contacts_store_payload(payload: dict[str, Any]) -> None:
+    path = _assistant_contacts_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _read_manual_contacts() -> list[dict[str, Any]]:
+    payload = _read_contacts_store_payload()
+    raw_contacts = payload.get("contacts")
+    if not isinstance(raw_contacts, list):
+        return []
+    return [contact for contact in (_normalize_contact(item, source="Manuell", relevance="frequent") for item in raw_contacts if isinstance(item, dict)) if contact]
+
+
+def _write_manual_contacts(contacts: list[dict[str, Any]]) -> None:
+    payload = _read_contacts_store_payload()
+    payload["contacts"] = contacts
+    _write_contacts_store_payload(payload)
+
+
+def _contact_hide_keys(contact: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    email_addr = _safe_contact_email(contact.get("email"))
+    if email_addr:
+        keys.add(f"email:{email_addr}")
+    contact_id = str(contact.get("id") or "").strip().lower()
+    if contact_id:
+        keys.add(f"id:{contact_id}")
+    phone = _safe_contact_text(contact.get("phone"), 80).lower()
+    if phone:
+        keys.add(f"phone:{phone}")
+    display_name = _contact_search_normalize(contact.get("display_name"))
+    if display_name:
+        keys.add(f"name:{display_name}")
+    return keys
+
+
+def _read_hidden_contact_keys() -> set[str]:
+    payload = _read_contacts_store_payload()
+    raw = payload.get("hidden") or payload.get("dismissed") or []
+    if not isinstance(raw, list):
+        return set()
+    return {str(item).strip().lower() for item in raw if str(item).strip()}
+
+
+def _write_hidden_contact_keys(keys: set[str]) -> None:
+    payload = _read_contacts_store_payload()
+    payload["hidden"] = sorted({key for key in keys if key})
+    _write_contacts_store_payload(payload)
+
+
+def _filter_hidden_contacts(contacts: list[dict[str, Any]], *, hidden_keys: set[str] | None = None) -> list[dict[str, Any]]:
+    hidden = hidden_keys if hidden_keys is not None else _read_hidden_contact_keys()
+    if not hidden:
+        return contacts
+    return [contact for contact in contacts if not (_contact_hide_keys(contact) & hidden)]
+
+
+def _contacts_from_email_resource(email_resource: dict[str, Any]) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    accounts = email_resource.get("accounts") if isinstance(email_resource, dict) else []
+    if not isinstance(accounts, list):
+        accounts = []
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        for item in account.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            sender = str(item.get("sender") or "")
+            contact = _contact_from_address(sender, source="Aus E-Mail", score=4.0, last_interaction_at=item.get("received_at"), relevance="relevant")
+            if contact:
+                contacts.append(contact)
+    return contacts
+
+
+def _contacts_from_calendar_resource(calendar_resource: dict[str, Any]) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    accounts = calendar_resource.get("accounts") if isinstance(calendar_resource, dict) else []
+    if not isinstance(accounts, list):
+        accounts = []
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        for item in account.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("organizer", "creator", "email"):
+                contact = _contact_from_address(item.get(key), source="Aus Kalender", score=2.0, relevance="related")
+                if contact:
+                    contacts.append(contact)
+            attendees = item.get("attendees")
+            if isinstance(attendees, list):
+                for attendee in attendees:
+                    if isinstance(attendee, dict):
+                        contact = _contact_from_address(attendee.get("email") or attendee.get("address") or attendee.get("display_name"), source="Aus Kalender", score=2.0, relevance="related")
+                    else:
+                        contact = _contact_from_address(attendee, source="Aus Kalender", score=2.0, relevance="related")
+                    if contact:
+                        contacts.append(contact)
+    return contacts
+
+
+_OWN_CONTACT_EMAILS = {
+    "kontakt@aiwerk.ch",
+    "a.bergsmann@aiwerk.ch",
+    "bergsmann@gmail.com",
+    "attila@bergsmann.ch",
+    "attila.bergsmann@agbergsmann.ch",
+    "office@agbergsmann.ch",
+}
+_SYSTEM_CONTACT_LOCALPARTS = {
+    "root", "postmaster", "mailer-daemon", "daemon", "noreply", "no-reply", "donotreply", "do-not-reply",
+    "notifications", "notification", "newsletter", "news", "support", "info", "admin", "administrator",
+    "wordpress", "bounce", "bounces", "mailing", "nonrispondere", "noresponder", "rechnungen", "rechnung",
+    "account", "billing", "notice", "notices", "announcement",
+}
+_SYSTEM_CONTACT_TEXT_PATTERNS = (
+    "google analytics", "google ads", "google search console", "google workspace", "mailer-daemon",
+    "no reply", "noreply", "newsletter", "notification", "notifications", "notice", "notices", "announcement", "rechnungssystem",
+    "site audit", "coinmarketcap", "kozponti rendszer", "központi rendszer", "cf-test", "testkontakt",
+)
+
+
+def _contact_from_address(value: Any, *, source: str, score: float = 1.0, last_interaction_at: Any = None, relevance: str = "frequent") -> dict[str, Any] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    name, address = email.utils.parseaddr(text)
+    email_addr = _safe_contact_email(address or text)
+    display_name = _safe_contact_text(name or re.sub(r"<[^>]+>", "", text).strip().strip('"') or email_addr, 120)
+    if display_name == email_addr and email_addr:
+        display_name = email_addr.split("@", 1)[0].replace(".", " ").replace("_", " ").title()
+    badge_kind = "Relevant" if relevance == "relevant" else "Häufig"
+    return _normalize_contact({
+        "display_name": display_name,
+        "email": email_addr,
+        "source_badges": [source, badge_kind],
+        "interaction_count": 1,
+        "interaction_score": score,
+        "last_interaction_at": last_interaction_at,
+    }, source=source, relevance=relevance)
+
+
+def _contacts_own_email_set(config: dict[str, Any] | None, email_resource: dict[str, Any] | None, calendar_resource: dict[str, Any] | None) -> set[str]:
+    own = set(_OWN_CONTACT_EMAILS)
+    env_own = os.environ.get("AIWERK_CUI_CONTACTS_OWN_EMAILS") or ""
+    own.update(_safe_contact_email(part) for part in env_own.split(",") if _safe_contact_email(part))
+    for account in [*_email_account_configs(config), *_calendar_account_configs(config), *_contact_account_configs(config)]:
+        if not isinstance(account, dict):
+            continue
+        for key in ("address", "email", "user_google_email", "google_email"):
+            email_addr = _safe_contact_email(account.get(key))
+            if email_addr and email_addr != "me":
+                own.add(email_addr)
+    for resource in (email_resource, calendar_resource):
+        if not isinstance(resource, dict):
+            continue
+        for account in resource.get("accounts") or []:
+            if not isinstance(account, dict):
+                continue
+            for key in ("address", "email", "account_address"):
+                email_addr = _safe_contact_email(account.get(key))
+                if email_addr:
+                    own.add(email_addr)
+    return {item for item in own if item}
+
+
+def _is_probably_system_contact(contact: dict[str, Any], *, own_emails: set[str]) -> bool:
+    email_addr = str(contact.get("email") or "").lower().strip()
+    display = str(contact.get("display_name") or "").lower().strip()
+    organization = str(contact.get("organization") or "").lower().strip()
+    if email_addr and email_addr in own_emails:
+        return True
+    local = email_addr.split("@", 1)[0].lower() if "@" in email_addr else ""
+    domain = email_addr.rsplit("@", 1)[-1].lower() if "@" in email_addr else ""
+    compact_local = re.sub(r"[^a-z0-9]", "", local)
+    if local in _SYSTEM_CONTACT_LOCALPARTS or compact_local in {"noreply", "donotreply", "donotreply"}:
+        return True
+    if local in {"ertesites", "értesítés"} and domain in {"kozpontirendszer.gov.hu"}:
+        return True
+    if any(local.startswith(f"{prefix}-") or local.startswith(f"{prefix}+") for prefix in _SYSTEM_CONTACT_LOCALPARTS):
+        return True
+    if display in _SYSTEM_CONTACT_LOCALPARTS or re.sub(r"[^a-z0-9]", "", display) in {"root", "noreply", "donotreply"}:
+        return True
+    haystack = f"{display} {organization} {email_addr}"
+    if any(pattern in haystack for pattern in _SYSTEM_CONTACT_TEXT_PATTERNS):
+        return True
+    if not email_addr and not contact.get("phone"):
+        return True
+    return False
+
+
+def _filter_human_contacts(contacts: list[dict[str, Any]], *, own_emails: set[str]) -> list[dict[str, Any]]:
+    return [contact for contact in contacts if not _is_probably_system_contact(contact, own_emails=own_emails)]
+
+
+def _contact_search_normalize(value: Any) -> str:
+    text = _safe_contact_text(value, 500).casefold()
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _contact_search_haystack(contact: dict[str, Any]) -> str:
+    emails: list[Any] = list(contact.get("emails") or []) if isinstance(contact.get("emails"), list) else []
+    phones: list[Any] = list(contact.get("phones") or []) if isinstance(contact.get("phones"), list) else []
+    parts: list[Any] = [
+        contact.get("display_name"),
+        contact.get("organization"),
+        contact.get("role"),
+        contact.get("email"),
+        contact.get("phone"),
+        contact.get("note"),
+        *emails,
+        *phones,
+    ]
+    return _contact_search_normalize(" ".join(str(part or "") for part in parts))
+
+
+def _contact_matches_query(contact: dict[str, Any], query: str) -> bool:
+    needle = _contact_search_normalize(query)
+    if not needle:
+        return True
+    haystack = _contact_search_haystack(contact)
+    if needle in haystack:
+        return True
+    terms = [term for term in re.split(r"\s+", needle) if term]
+    return bool(terms) and all(term in haystack for term in terms)
+
+
+def _sanitize_contact_for_cui(contact: dict[str, Any], *, own_emails: set[str]) -> dict[str, Any]:
+    sanitized = dict(contact)
+    raw_badges = sanitized.get("source_badges")
+    badges = raw_badges if isinstance(raw_badges, list) else []
+    sanitized["source_badges"] = [
+        badge for badge in _dedupe_contact_badges(badges)
+        if not (_safe_contact_email(badge) and _safe_contact_email(badge) in own_emails)
+    ]
+    return sanitized
+
+
+def _filter_contacts_payload(payload: dict[str, Any], *, own_emails: set[str]) -> dict[str, Any]:
+    """Apply the own/system contact filter to every list exposed to the CUI.
+
+    This is intentionally a final response-level guard as well as a source-level
+    filter: contact summaries can be served from the in-process resource cache,
+    and search can merge cached/manual/bridge contacts.  The UI should never see
+    configured own addresses such as kontakt@aiwerk.ch or bergsmann@gmail.com —
+    neither as contact email nor as source badge/account label.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    filtered = dict(payload)
+    for key in ("items", "frequent", "relevant"):
+        value = filtered.get(key)
+        if isinstance(value, list):
+            filtered[key] = [
+                _sanitize_contact_for_cui(contact, own_emails=own_emails)
+                for contact in _filter_human_contacts([item for item in value if isinstance(item, dict)], own_emails=own_emails)
+            ]
+    if not filtered.get("items"):
+        if filtered.get("status") == "loading":
+            return filtered
+        filtered["total_count"] = 0
+        filtered["manual_count"] = 0
+        filtered["connected_count"] = 0
+        filtered["google_count"] = 0
+        filtered["saved_count"] = 0
+        filtered["interaction_count"] = 0
+        filtered["status"] = "not_configured"
+        filtered["summary"] = "Keine relevanten Kontakte"
+        filtered["source_label"] = "Keine relevanten Kontakte"
+    return filtered
+
+
+def _sort_interaction_contacts(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        contacts,
+        key=lambda contact: (
+            float(contact.get("interaction_score") or 0),
+            int(contact.get("interaction_count") or 0),
+            str(contact.get("last_interaction_at") or ""),
+            str(contact.get("display_name") or "").lower(),
+        ),
+        reverse=True,
+    )
+
+
+def _contact_relevance_window_days() -> int:
+    return max(1, min(int(os.environ.get("AIWERK_CUI_CONTACTS_RELEVANCE_WINDOW_DAYS") or _ASSISTANT_CONTACT_RELEVANCE_WINDOW_DAYS), 90))
+
+
+def _contact_saved_top_up_target() -> int:
+    return max(
+        _ASSISTANT_CONTACT_PREVIEW_ITEMS,
+        min(int(os.environ.get("AIWERK_CUI_CONTACTS_SAVED_TOP_UP_TARGET") or _ASSISTANT_CONTACT_SAVED_TOP_UP_TARGET), 50),
+    )
+
+
+def _gmail_metadata_has_bulk_signal(block: dict[str, str]) -> bool:
+    precedence = str(block.get("precedence") or "").lower()
+    auto_submitted = str(block.get("auto-submitted") or "").lower()
+    list_unsubscribe = str(block.get("list-unsubscribe") or "")
+    return precedence in {"bulk", "junk", "list"} or bool(list_unsubscribe) or bool(auto_submitted and auto_submitted != "no")
+
+
+def _contacts_from_gmail_metadata_blocks(blocks: list[dict[str, str]], *, sent: bool, own_emails: set[str]) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    for block in blocks:
+        if not sent and _gmail_metadata_has_bulk_signal(block):
+            continue
+        last_interaction_at = _parse_gmail_bridge_date(block.get("date") or "")
+        if sent:
+            values = [block.get("to") or "", block.get("cc") or "", block.get("bcc") or ""]
+            source = "Gesendet"
+            score = 5.0
+        else:
+            values = [block.get("from") or ""]
+            source = "Aus E-Mail"
+            score = 4.0
+        for name, address in email.utils.getaddresses([value for value in values if value]):
+            email_addr = _safe_contact_email(address)
+            if not email_addr or email_addr in own_emails:
+                continue
+            contact = _contact_from_address(email.utils.formataddr((name, email_addr)), source=source, score=score, last_interaction_at=last_interaction_at, relevance="relevant")
+            if contact:
+                contacts.append(contact)
+    return contacts
+
+
+def _contacts_from_google_workspace_interactions(config: dict[str, Any] | None, *, own_emails: set[str]) -> list[dict[str, Any]]:
+    if os.environ.get("AIWERK_CUI_CONTACTS_DISABLE_GMAIL_INTERACTIONS", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    if os.environ.get("AIWERK_CUI_EMAIL_DISABLE_AIWERK_BRIDGE", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    limit = max(1, min(int(os.environ.get("AIWERK_CUI_CONTACTS_INTERACTION_SCAN_LIMIT") or 40), 100))
+    window_days = _contact_relevance_window_days()
+    queries = [
+        (str(os.environ.get("AIWERK_CUI_CONTACTS_SENT_QUERY") or f"in:sent newer_than:{window_days}d"), True),
+        (str(os.environ.get("AIWERK_CUI_CONTACTS_INBOX_QUERY") or f"newer_than:{window_days}d -in:sent"), False),
+    ]
+    contacts: list[dict[str, Any]] = []
+    for account in _contact_account_configs(config):
+        server = str(account.get("mcp_server") or "google-workspace-aiwerk")
+        user_google_email = str(account.get("user_google_email") or "me")
+        for query, sent in queries:
+            try:
+                ids = _gmail_bridge_search_message_ids(config, server=server, user_google_email=user_google_email, query=query, page_size=limit)
+                batch = _call_aiwerk_bridge_tool(
+                    config,
+                    server=server,
+                    tool="get_gmail_messages_content_batch",
+                    params={"message_ids": ids[:limit], "user_google_email": user_google_email, "format": "metadata"},
+                ) if ids else {}
+                blocks = _parse_gmail_bridge_metadata_blocks(_bridge_result_text(batch))
+                contacts.extend(_contacts_from_gmail_metadata_blocks(blocks, sent=sent, own_emails=own_emails))
+            except Exception as exc:
+                _log.debug("CUI Gmail interaction contact scan failed for %s/%s/%s: %s", server, user_google_email, query, exc)
+    return _sort_interaction_contacts(_dedupe_contacts(contacts))
+
+
+def _contacts_from_gmail_query_blocks(blocks: list[dict[str, str]], *, own_emails: set[str]) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    for block in blocks:
+        last_interaction_at = _parse_gmail_bridge_date(block.get("date") or "")
+        for key, source, score in (("from", "Aus E-Mail", 4.0), ("to", "Gesendet", 5.0), ("cc", "Gesendet", 3.0), ("bcc", "Gesendet", 3.0)):
+            for name, address in email.utils.getaddresses([block.get(key) or ""]):
+                email_addr = _safe_contact_email(address)
+                if not email_addr or email_addr in own_emails:
+                    continue
+                contact = _contact_from_address(email.utils.formataddr((name, email_addr)), source=source, score=score, last_interaction_at=last_interaction_at, relevance="relevant")
+                if contact:
+                    contacts.append(contact)
+    return contacts
+
+
+def _contacts_from_google_workspace_query_interactions(config: dict[str, Any] | None, *, query: str, own_emails: set[str], limit: int) -> list[dict[str, Any]]:
+    if not query.strip():
+        return []
+    if os.environ.get("AIWERK_CUI_CONTACTS_DISABLE_GMAIL_INTERACTIONS", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    if os.environ.get("AIWERK_CUI_EMAIL_DISABLE_AIWERK_BRIDGE", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    page_size = max(1, min(limit, 200))
+    contacts: list[dict[str, Any]] = []
+    for account in _contact_account_configs(config):
+        server = str(account.get("mcp_server") or "google-workspace-aiwerk")
+        user_google_email = str(account.get("user_google_email") or "me")
+        try:
+            ids = _gmail_bridge_search_message_ids(config, server=server, user_google_email=user_google_email, query=query, page_size=page_size)
+            batch = _call_aiwerk_bridge_tool(
+                config,
+                server=server,
+                tool="get_gmail_messages_content_batch",
+                params={"message_ids": ids[:page_size], "user_google_email": user_google_email, "format": "metadata"},
+            ) if ids else {}
+            blocks = _parse_gmail_bridge_metadata_blocks(_bridge_result_text(batch))
+            contacts.extend(_contacts_from_gmail_query_blocks(blocks, own_emails=own_emails))
+        except Exception as exc:
+            _log.debug("CUI Gmail contact query scan failed for %s/%s/%s: %s", server, user_google_email, query, exc)
+    return _sort_interaction_contacts(_dedupe_contacts(contacts))
+
+
+def _himalaya_contact_folder(account: dict[str, Any], *, sent: bool) -> str:
+    if sent:
+        return str(
+            account.get("sent_folder")
+            or account.get("sent_mailbox")
+            or account.get("sent")
+            or os.environ.get("AIWERK_CUI_CONTACTS_HIMALAYA_SENT_FOLDER")
+            or "Sent"
+        ).strip() or "Sent"
+    return str(
+        account.get("inbox_folder")
+        or account.get("folder")
+        or os.environ.get("AIWERK_CUI_CONTACTS_HIMALAYA_INBOX_FOLDER")
+        or "INBOX"
+    ).strip() or "INBOX"
+
+
+def _himalaya_address_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [formatted for formatted in (_format_himalaya_address(item) for item in value) if formatted]
+    formatted = _format_himalaya_address(value)
+    return [formatted] if formatted else []
+
+
+def _himalaya_envelope_in_relevance_window(envelope: dict[str, Any], *, window_days: int) -> bool:
+    parsed = _parse_himalaya_email_date(envelope.get("date"))
+    if not parsed:
+        return True
+    try:
+        dt = datetime.fromisoformat(str(parsed).replace("Z", "+00:00"))
+    except Exception:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    return dt.astimezone(timezone.utc) >= cutoff
+
+
+def _contacts_from_himalaya_envelopes(envelopes: list[dict[str, Any]], *, sent: bool, own_emails: set[str], window_days: int) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    for envelope in envelopes:
+        if not isinstance(envelope, dict) or not _himalaya_envelope_in_relevance_window(envelope, window_days=window_days):
+            continue
+        last_interaction_at = _parse_himalaya_email_date(envelope.get("date"))
+        if sent:
+            values: list[str] = []
+            for key in ("to", "cc", "bcc"):
+                values.extend(_himalaya_address_values(envelope.get(key)))
+            source = "Gesendet"
+            score = 5.0
+        else:
+            values = _himalaya_address_values(envelope.get("from"))
+            source = "Aus E-Mail"
+            score = 4.0
+        for name, address in email.utils.getaddresses(values):
+            email_addr = _safe_contact_email(address)
+            if not email_addr or email_addr in own_emails:
+                continue
+            contact = _contact_from_address(email.utils.formataddr((name, email_addr)), source=source, score=score, last_interaction_at=last_interaction_at, relevance="relevant")
+            if contact:
+                contacts.append(contact)
+    return contacts
+
+
+def _contacts_from_himalaya_interactions(config: dict[str, Any] | None, *, own_emails: set[str]) -> list[dict[str, Any]]:
+    if os.environ.get("AIWERK_CUI_CONTACTS_DISABLE_HIMALAYA_INTERACTIONS", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    if os.environ.get("AIWERK_CUI_EMAIL_DISABLE_HIMALAYA", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    limit = max(1, min(int(os.environ.get("AIWERK_CUI_CONTACTS_INTERACTION_SCAN_LIMIT") or 40), 100))
+    window_days = _contact_relevance_window_days()
+    contacts: list[dict[str, Any]] = []
+    for account in _email_account_configs(config):
+        if not _is_himalaya_email_backend(_email_backend_name(account)):
+            continue
+        account_name = str(account.get("account") or account.get("name") or "").strip() or None
+        for sent in (True, False):
+            folder = _himalaya_contact_folder(account, sent=sent)
+            try:
+                envelopes = _run_himalaya_envelope_list(page_size=limit, account=account_name, folder=folder)
+                contacts.extend(_contacts_from_himalaya_envelopes(envelopes, sent=sent, own_emails=own_emails, window_days=window_days))
+            except Exception as exc:
+                _log.debug("CUI Himalaya interaction contact scan failed for %s/%s: %s", account_name or account.get("address") or "mailbox", folder, exc)
+    return _sort_interaction_contacts(_dedupe_contacts(contacts))
+
+
+def _contacts_from_env_json() -> list[dict[str, Any]]:
+    data = _read_optional_json(os.environ.get("AIWERK_CUI_CONTACTS_JSON"))
+    if not data:
+        return []
+    raw_contacts = data.get("items") or data.get("contacts") if isinstance(data, dict) else data
+    if not isinstance(raw_contacts, list):
+        return []
+    return [contact for contact in (_normalize_contact(item, source="Manuell", relevance="frequent") for item in raw_contacts if isinstance(item, dict)) if contact]
+
+
+def _contact_account_configs(config: dict[str, Any] | None) -> list[dict[str, Any]]:
+    raw_accounts: list[dict[str, Any]] = []
+    if isinstance(config, dict):
+        contacts_cfg = config.get("contacts")
+        if isinstance(contacts_cfg, dict):
+            raw_accounts.extend(_email_account_dicts(contacts_cfg.get("accounts"), backend="google_workspace"))
+            raw_accounts.extend(_email_account_dicts(contacts_cfg.get("google_workspace"), backend="google_workspace"))
+            if not raw_accounts and (_email_backend_name(contacts_cfg) or contacts_cfg.get("enabled") is True):
+                raw_accounts.append(contacts_cfg)
+    if not raw_accounts:
+        raw_accounts = [account for account in _email_account_configs(config) if _is_google_email_backend(_email_backend_name(account))]
+
+    accounts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for account in raw_accounts:
+        server = str(account.get("server") or account.get("mcp_server") or os.environ.get("AIWERK_CUI_GOOGLE_WORKSPACE_SERVER") or "google-workspace-aiwerk").strip()
+        user_google_email = str(account.get("user_google_email") or account.get("google_email") or account.get("address") or account.get("email") or os.environ.get("AIWERK_CUI_GOOGLE_EMAIL") or "me").strip() or "me"
+        key = (server, user_google_email.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        merged = dict(account)
+        merged["mcp_server"] = server
+        merged["user_google_email"] = user_google_email
+        accounts.append(merged)
+    return accounts
+
+
+def _parse_google_contacts_text(text: str, *, source: str, account_label: str, relevance: str = "frequent") -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
+    for block in re.split(r"\n\s*\n(?=Contact ID:\s*)", text or ""):
+        if "Contact ID:" not in block:
+            continue
+        raw: dict[str, Any] = {"source_badges": ["Google Contacts", account_label, source], "source": "Google Contacts", "relevance": relevance}
+        emails: list[str] = []
+        phones: list[str] = []
+        organizations: list[str] = []
+        roles: list[str] = []
+        for line in block.splitlines():
+            key, sep, value = line.partition(":")
+            if not sep:
+                continue
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "contact id":
+                raw["id"] = _safe_resource_id(value, "contact")
+            elif key == "name":
+                raw["display_name"] = value
+            elif key == "email":
+                email_addr = _safe_contact_email(value)
+                if email_addr:
+                    emails.append(email_addr)
+            elif key == "phone":
+                phone = _safe_contact_phone(re.sub(r"\s*\([^)]*\)\s*$", "", value).strip() or value)
+                if phone:
+                    phones.append(phone)
+            elif key == "organization":
+                cleaned = _safe_contact_text(value, 180)
+                if " at " in cleaned:
+                    role, org = cleaned.split(" at ", 1)
+                    if role.strip():
+                        roles.append(role.strip())
+                    if org.strip():
+                        organizations.append(org.strip())
+                elif cleaned:
+                    organizations.append(cleaned)
+        if emails:
+            raw["email"] = emails[0]
+            raw["emails"] = emails
+        if phones:
+            raw["phone"] = phones[0]
+            raw["phones"] = phones
+        if organizations:
+            raw["organization"] = organizations[0]
+        if roles:
+            raw["role"] = roles[0]
+        contact = _normalize_contact(raw, source="Google Contacts", relevance=relevance)
+        if contact:
+            if emails:
+                contact["emails"] = emails[:5]
+            if phones:
+                contact["phones"] = phones[:5]
+            contacts.append(contact)
+    return contacts
+
+
+def _contacts_from_google_workspace(config: dict[str, Any] | None, *, query: str = "", limit: int | None = None, sort_order: str | None = None) -> list[dict[str, Any]]:
+    if os.environ.get("AIWERK_CUI_CONTACTS_DISABLE_AIWERK_BRIDGE", "").lower() in {"1", "true", "yes", "on"}:
+        return []
+    contacts: list[dict[str, Any]] = []
+    default_limit = int(os.environ.get("AIWERK_CUI_CONTACTS_PAGE_SIZE") or 100)
+    page_size = max(1, min(limit or default_limit, 1000))
+    query = (query or "").strip()
+    for account in _contact_account_configs(config):
+        server = str(account.get("mcp_server") or "google-workspace-aiwerk")
+        user_google_email = str(account.get("user_google_email") or "me")
+        account_label = _email_account_label(account, user_google_email)
+        tool = "search_contacts" if query else "list_contacts"
+        params: dict[str, Any] = {"user_google_email": user_google_email, "page_size": min(page_size, 30) if query else page_size}
+        if query:
+            params["query"] = query
+        else:
+            params["sort_order"] = str(sort_order or account.get("contacts_sort_order") or "LAST_MODIFIED_DESCENDING")
+        try:
+            result = _call_aiwerk_bridge_tool(config, server=server, tool=tool, params=params)
+            text = _bridge_result_text(result)
+            contacts.extend(_parse_google_contacts_text(text, source=account_label, account_label=account_label, relevance="frequent"))
+        except Exception as exc:
+            _log.debug("CUI Google Contacts bridge lookup failed for %s/%s: %s", server, user_google_email, exc)
+    return _dedupe_contacts(contacts)
+
+
+def _contact_signal_emails(email_resource: dict[str, Any] | None, calendar_resource: dict[str, Any] | None) -> set[str]:
+    signals: set[str] = set()
+    for resource in (email_resource, calendar_resource):
+        if not isinstance(resource, dict):
+            continue
+        for account in resource.get("accounts") or []:
+            if not isinstance(account, dict):
+                continue
+            for key in ("address", "email", "account_address"):
+                email_addr = _safe_contact_email(account.get(key))
+                if email_addr:
+                    signals.add(email_addr)
+            for item in account.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("sender", "organizer", "creator", "email", "account_address"):
+                    email_addr = _safe_contact_email(item.get(key))
+                    if email_addr:
+                        signals.add(email_addr)
+    return signals
+
+
+def _related_contacts(contacts: list[dict[str, Any]], *, email_resource: dict[str, Any] | None, calendar_resource: dict[str, Any] | None) -> list[dict[str, Any]]:
+    signals = _contact_signal_emails(email_resource, calendar_resource)
+    related: list[dict[str, Any]] = []
+    for contact in contacts:
+        badges = contact.get("source_badges") or []
+        if contact.get("relevance") in {"relevant", "related"} or contact.get("interaction_count") or ("Manuell" in badges and contact.get("note")):
+            related.append(dict(contact, relevance="relevant"))
+            continue
+        email_addr = str(contact.get("email") or "").lower()
+        if email_addr and email_addr in signals:
+            related.append(dict(contact, relevance="related"))
+    return _dedupe_contacts(related)
+
+
+def _contacts_summary(config: dict[str, Any] | None = None, email_resource: dict[str, Any] | None = None, calendar_resource: dict[str, Any] | None = None) -> dict[str, Any]:
+    own_emails = _contacts_own_email_set(config, email_resource, calendar_resource)
+    manual_contacts = _filter_human_contacts(_dedupe_contacts([*_contacts_from_env_json(), *_read_manual_contacts()]), own_emails=own_emails)
+    resource_contacts = _filter_human_contacts(_dedupe_contacts([
+        *(_contacts_from_email_resource(email_resource or {}) if isinstance(email_resource, dict) else []),
+        *(_contacts_from_calendar_resource(calendar_resource or {}) if isinstance(calendar_resource, dict) else []),
+    ]), own_emails=own_emails)
+    interaction_contacts = _filter_human_contacts(_dedupe_contacts([
+        *_contacts_from_google_workspace_interactions(config, own_emails=own_emails),
+        *_contacts_from_himalaya_interactions(config, own_emails=own_emails),
+    ]), own_emails=own_emails)
+    signal_contacts = _sort_interaction_contacts(_dedupe_contacts([*interaction_contacts, *resource_contacts]))
+
+    # Google Contacts is used for enrichment and controlled top-up. It must not define an unbounded
+    # frequent list by itself, because Google's plain contact list contains self accounts, service
+    # senders, and stale auto contacts.
+    top_up_target = _contact_saved_top_up_target()
+    google_contacts = _filter_human_contacts(_contacts_from_google_workspace(config, limit=top_up_target), own_emails=own_emails)
+    signal_emails = {str(contact.get("email") or "").lower() for contact in signal_contacts if contact.get("email")}
+    google_enrichment = [contact for contact in google_contacts if str(contact.get("email") or "").lower() in signal_emails]
+
+    base_contacts = _sort_interaction_contacts(_dedupe_contacts([*manual_contacts, *signal_contacts, *google_enrichment]))
+    seen_emails = {str(contact.get("email") or "").lower() for contact in base_contacts if contact.get("email")}
+    saved_top_up: list[dict[str, Any]] = []
+    if len(base_contacts) < top_up_target:
+        for contact in google_contacts:
+            email_addr = str(contact.get("email") or "").lower()
+            if email_addr and email_addr in seen_emails:
+                continue
+            saved_top_up.append(contact)
+            if email_addr:
+                seen_emails.add(email_addr)
+            if len(base_contacts) + len(saved_top_up) >= top_up_target:
+                break
+
+    contacts = _sort_interaction_contacts(_dedupe_contacts([*base_contacts, *saved_top_up]))
+    contacts = _filter_hidden_contacts(contacts)
+    relevant = _related_contacts(contacts, email_resource=email_resource, calendar_resource=calendar_resource)
+    frequent = [contact for contact in contacts if contact not in relevant]
+    manual_count = len([c for c in contacts if "Manuell" in (c.get("source_badges") or [])])
+    google_count = len([c for c in contacts if "Google Contacts" in (c.get("source_badges") or [])])
+    saved_count = len([c for c in saved_top_up if "Google Contacts" in (c.get("source_badges") or [])])
+    interaction_count = len([c for c in contacts if c.get("interaction_count") or "Gesendet" in (c.get("source_badges") or []) or "Aus E-Mail" in (c.get("source_badges") or [])])
+    connected_count = max(interaction_count, google_count, max(0, len(contacts) - manual_count))
+    if contacts:
+        source_label = "Relevante Kontakte"
+        summary = f"{len(contacts)} relevante Kontakte"
+        status = "connected"
+    else:
+        source_label = "Keine relevanten Kontakte"
+        summary = "Keine relevanten Kontakte"
+        status = "not_configured"
+    payload = {
+        "status": status,
+        "summary": summary,
+        "items": (relevant + frequent)[:_ASSISTANT_CONTACT_PREVIEW_ITEMS],
+        "frequent": frequent[:_ASSISTANT_CONTACT_PREVIEW_ITEMS],
+        "relevant": relevant[:_ASSISTANT_CONTACT_PREVIEW_ITEMS],
+        "total_count": len(contacts),
+        "manual_count": manual_count,
+        "connected_count": connected_count,
+        "google_count": google_count,
+        "saved_count": saved_count,
+        "interaction_count": interaction_count,
+        "relevance_window_days": _contact_relevance_window_days(),
+        "saved_top_up_target": top_up_target,
+        "source_label": source_label,
+        "checked_at": _utc_now_iso(),
+    }
+    return _filter_contacts_payload(payload, own_emails=own_emails)
+
+
+def _search_contacts_payload(q: str = "", *, limit: int = _ASSISTANT_CONTACT_SEARCH_LIMIT) -> dict[str, Any]:
+    config = load_config()
+    resources = _assistant_resources_payload(force_refresh=False)
+    email_resource = resources.get("email") if isinstance(resources.get("email"), dict) else {}
+    calendar_resource = resources.get("calendar") if isinstance(resources.get("calendar"), dict) else {}
+    own_emails = _contacts_own_email_set(config, email_resource, calendar_resource)
+    contacts = resources.get("contacts", {}).get("items") or []
+    all_contacts = _filter_human_contacts(_dedupe_contacts([*_read_manual_contacts(), *contacts]), own_emails=own_emails)
+    needle = (q or "").strip()
+    if needle:
+        query_variants = [needle]
+        normalized_needle = _contact_search_normalize(needle)
+        if normalized_needle and normalized_needle != needle.casefold():
+            query_variants.append(normalized_needle)
+        query_variants.extend(term for term in re.split(r"\s+", needle) if len(term.strip()) >= 3)
+        if " " not in needle and len(needle) >= 4:
+            # Some connector/contact search backends miss surname-only matches that
+            # are returned for a full-name query.  Add a tiny local first-name
+            # expansion for common normalized/accented variants instead of making
+            # the UI look broken for a known human contact.
+            for first_name in ("Adam", "Ádám"):
+                query_variants.extend((f"{first_name} {needle}", f"{needle} {first_name}"))
+        bridge_contacts: list[dict[str, Any]] = []
+        seen_queries: set[str] = set()
+        for contact_query in query_variants:
+            contact_query = contact_query.strip()
+            query_key = contact_query.casefold()
+            if not contact_query or query_key in seen_queries:
+                continue
+            seen_queries.add(query_key)
+            bridge_contacts.extend(_contacts_from_google_workspace(config, query=contact_query, limit=max(limit, 50)))
+        # Explicit search is a user-driven lookup, so use a deeper saved-contact
+        # fallback than the default right-rail top-up. People API search can miss
+        # surname-only matches that are found when listing the address book.
+        saved_lookup_limit = max(limit * 50, 1000)
+        saved_contacts = _dedupe_contacts([
+            *_contacts_from_google_workspace(config, limit=saved_lookup_limit),
+            *_contacts_from_google_workspace(config, limit=saved_lookup_limit, sort_order="FIRST_NAME_ASCENDING"),
+        ])
+        interaction_contacts: list[dict[str, Any]] = []
+        for contact_query in seen_queries:
+            interaction_contacts.extend(_contacts_from_google_workspace_query_interactions(config, query=contact_query, own_emails=own_emails, limit=max(limit * 10, 200)))
+        interaction_contacts = _dedupe_contacts(interaction_contacts)
+        all_contacts = _filter_human_contacts(_dedupe_contacts([*bridge_contacts, *interaction_contacts, *saved_contacts, *all_contacts]), own_emails=own_emails)
+        all_contacts = [contact for contact in all_contacts if _contact_matches_query(contact, needle)]
+    all_contacts = _filter_hidden_contacts(all_contacts)
+    payload = {"items": all_contacts[:limit], "total_count": len(all_contacts), "query": q or ""}
+    return _filter_contacts_payload(payload, own_emails=own_emails)
+
+def _shared_folder_refreshing_placeholder() -> dict[str, Any]:
+    return {
+        "status": "loading",
+        "root_label": "Shared",
+        "summary": "Shared Ordner wird aktualisiert…",
+        "items": [],
+        "total_count": 0,
+        "refreshing": True,
+    }
+
+
+def _vault_refreshing_placeholder(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "loading",
+        "vault_url": _vault_url_from_config(config),
+        "summary": "Passwort-Tresor wird aktualisiert…",
+        "item_count": 0,
+        "weak_count": 0,
+        "reused_count": 0,
+        "compromised_count": None,
+        "refreshing": True,
+    }
+
+
+def _email_refreshing_placeholder() -> dict[str, Any]:
+    return {
+        "status": "loading",
+        "unread_count": 0,
+        "summary": "E-Mail wird aktualisiert…",
+        "items": [],
+        "accounts": [],
+        "refreshing": True,
+    }
+
+
+def _calendar_refreshing_placeholder() -> dict[str, Any]:
+    return {
+        "status": "loading",
+        "summary": "Kalender wird aktualisiert…",
+        "items": [],
+        "accounts": [],
+        "refreshing": True,
+    }
+
+
+def _contacts_refreshing_placeholder() -> dict[str, Any]:
+    return {
+        "status": "loading",
+        "summary": "Kontakte werden aktualisiert…",
+        "source_label": "Relevante Kontakte",
+        "items": [],
+        "relevant": [],
+        "frequent": [],
+        "manual": [],
+        "total_count": 0,
+        "manual_count": 0,
+        "connected_count": 0,
+        "interaction_count": 0,
+        "saved_count": 0,
+        "saved_top_up_target": 0,
+        "relevance_window_days": 10,
+        "refreshing": True,
+    }
+
+
 def _assistant_resources_payload(
     request: Request | None = None,
     *,
@@ -3000,6 +4104,8 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _email_summary(config),
         force_refresh=should_refresh("email"),
+        stale_while_revalidate=bool(refresh_resource == "email" or (refresh_resource is None and not force_refresh)),
+        initial_payload=_email_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     calendar, calendar_cache = _assistant_cached_resource(
         "calendar",
@@ -3007,6 +4113,8 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _calendar_summary(config),
         force_refresh=should_refresh("calendar"),
+        stale_while_revalidate=bool(refresh_resource == "calendar" or (refresh_resource is None and not force_refresh)),
+        initial_payload=_calendar_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     shared_folder, shared_cache = _assistant_cached_resource(
         "shared_folder",
@@ -3014,6 +4122,8 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _shared_folder_summary(config, request),
         force_refresh=should_refresh("shared_folder"),
+        stale_while_revalidate=bool(refresh_resource == "shared_folder" or (refresh_resource is None and not force_refresh)),
+        initial_payload=_shared_folder_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     vault, vault_cache = _assistant_cached_resource(
         "vault",
@@ -3021,6 +4131,8 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _vaultwarden_summary(config),
         force_refresh=should_refresh("vault"),
+        stale_while_revalidate=bool(refresh_resource == "vault" or (refresh_resource is None and not force_refresh)),
+        initial_payload=_vault_refreshing_placeholder(config) if refresh_resource is None and not force_refresh else None,
     )
     todos, todos_cache = _assistant_cached_resource(
         "todos",
@@ -3029,12 +4141,27 @@ def _assistant_resources_payload(
         lambda: _todo_summary(config),
         force_refresh=should_refresh("todos"),
     )
+    contacts, contacts_cache = _assistant_cached_resource(
+        "contacts",
+        _ASSISTANT_RESOURCE_CACHE_TTLS["contacts"],
+        cache_key,
+        lambda: _contacts_summary(config, email, calendar),
+        force_refresh=should_refresh("contacts"),
+        stale_while_revalidate=bool(refresh_resource == "contacts" or (refresh_resource is None and not force_refresh)),
+        initial_payload=_contacts_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
+    )
+    contacts = _filter_contacts_payload(
+        contacts,
+        own_emails=_contacts_own_email_set(config, email if isinstance(email, dict) else {}, calendar if isinstance(calendar, dict) else {}),
+    )
     connectors, connectors_cache = _assistant_cached_resource(
         "connectors",
         _ASSISTANT_RESOURCE_CACHE_TTLS["connectors"],
         cache_key,
         lambda: _connector_summary(config, shared_folder, email, calendar),
         force_refresh=should_refresh("connectors"),
+        stale_while_revalidate=bool(refresh_resource == "connectors" or (refresh_resource is None and not force_refresh)),
+        initial_payload=[] if refresh_resource is None and not force_refresh else None,
     )
     warnings = []
     if shared_folder.get("status") == "error":
@@ -3046,16 +4173,18 @@ def _assistant_resources_payload(
         "shared_folder": shared_folder,
         "vault": vault,
         "todos": todos,
+        "contacts": contacts,
         "connectors": connectors,
         "warnings": warnings,
         "cache": {
-            "cached": any(meta.get("cached") for meta in (email_cache, calendar_cache, shared_cache, vault_cache, todos_cache, connectors_cache)),
+            "cached": any(meta.get("cached") for meta in (email_cache, calendar_cache, shared_cache, vault_cache, todos_cache, contacts_cache, connectors_cache)),
             "resources": {
                 "email": email_cache,
                 "calendar": calendar_cache,
                 "shared_folder": shared_cache,
                 "vault": vault_cache,
                 "todos": todos_cache,
+                "contacts": contacts_cache,
                 "connectors": connectors_cache,
             },
         },
@@ -3187,6 +4316,23 @@ class AssistantTodoAddRequest(BaseModel):
 class AssistantTodoUpdateRequest(BaseModel):
     id: str
     done: bool
+
+
+class CuiContactCreateRequest(BaseModel):
+    name: str = ""
+    organization: str = ""
+    role: str = ""
+    email: str = ""
+    phone: str = ""
+    note: str = ""
+    link_current_context: bool = False
+
+
+class CuiContactHideRequest(BaseModel):
+    id: str = ""
+    email: str = ""
+    phone: str = ""
+    display_name: str = ""
 
 
 def _shared_attachment_rel_path(item: dict[str, Any]) -> str | None:
@@ -3328,6 +4474,27 @@ def _create_calendar_context_attachment(item: dict[str, Any], session_id: str) -
     )
 
 
+def _create_contact_context_attachment(item: dict[str, Any], session_id: str) -> dict[str, Any]:
+    display_name = str(item.get("display_name") or item.get("name") or item.get("email") or item.get("phone") or "Kontakt").strip()
+    raw_source_badges = item.get("source_badges")
+    source_badges = raw_source_badges if isinstance(raw_source_badges, list) else []
+    source = ", ".join(str(badge) for badge in source_badges if str(badge).strip()) or str(item.get("source") or "contacts")
+    lines = [
+        "Attached contact context",
+        f"Name: {display_name}",
+        f"Organization: {item.get('organization') or ''}",
+        f"Role: {item.get('role') or ''}",
+        f"Email: {item.get('email') or ''}",
+        f"Phone: {item.get('phone') or ''}",
+        f"Source: {source}",
+    ]
+    return _write_assistant_text_attachment(
+        session_id=session_id,
+        filename=f"contact-{_safe_upload_component(display_name, 'kontakt')}.txt",
+        text="\n".join(lines).strip(),
+    )
+
+
 def _create_resource_attachment(request: Request, payload: AssistantResourceAttachmentRequest) -> dict[str, Any]:
     kind = payload.kind.strip().lower()
     item = payload.item if isinstance(payload.item, dict) else {}
@@ -3338,6 +4505,8 @@ def _create_resource_attachment(request: Request, payload: AssistantResourceAtta
         return _create_email_context_attachment(request, config, item, payload.session_id)
     if kind == "calendar_event":
         return _create_calendar_context_attachment(item, payload.session_id)
+    if kind == "contact":
+        return _create_contact_context_attachment(item, payload.session_id)
     raise HTTPException(status_code=400, detail="Unsupported resource attachment type")
 
 
@@ -3954,15 +5123,109 @@ async def get_assistant_resources(request: Request, refresh: str | None = None, 
     _require_token(request)
     force_refresh = _bool_config_value(refresh)
     refresh_resource = str(resource or "").strip().lower() or None
-    if refresh_resource and refresh_resource not in {"email", "calendar", "shared_folder", "vault", "todos", "connectors"}:
+    if refresh_resource and refresh_resource not in {"email", "calendar", "shared_folder", "vault", "todos", "contacts", "connectors"}:
         raise HTTPException(status_code=400, detail="Unknown resource")
     try:
-        return _assistant_resources_payload(request, force_refresh=force_refresh, refresh_resource=refresh_resource)
+        return await asyncio.to_thread(
+            _assistant_resources_payload,
+            request,
+            force_refresh=force_refresh,
+            refresh_resource=refresh_resource,
+        )
     except Exception:
         _log.exception("GET /api/assistant/resources failed")
         raise HTTPException(status_code=500, detail="Resource summary failed")
 
 
+
+
+@app.get("/api/cui/contacts/search")
+async def search_cui_contacts(request: Request, q: str = ""):
+    """Search sanitized CUI contacts without exposing raw connector metadata."""
+    _require_token(request)
+    try:
+        return _search_contacts_payload(q)
+    except Exception:
+        _log.exception("GET /api/cui/contacts/search failed")
+        raise HTTPException(status_code=500, detail="Contact search failed")
+
+
+@app.get("/api/cui/context/contacts")
+async def get_cui_context_contacts(request: Request, session_id: str = ""):
+    """Return deterministic context contact suggestions for the current session."""
+    _require_token(request)
+    try:
+        resources = _assistant_resources_payload(request, force_refresh=False)
+        contacts = resources.get("contacts", {}) if isinstance(resources, dict) else {}
+        return {"items": contacts.get("relevant") or [], "session_id": session_id}
+    except Exception:
+        _log.exception("GET /api/cui/context/contacts failed")
+        raise HTTPException(status_code=500, detail="Context contacts failed")
+
+
+@app.get("/api/cui/contacts/frequent")
+async def get_cui_frequent_contacts(request: Request):
+    """Return frequent/safe fallback contacts for the CUI right rail."""
+    _require_token(request)
+    try:
+        resources = _assistant_resources_payload(request, force_refresh=False)
+        contacts = resources.get("contacts", {}) if isinstance(resources, dict) else {}
+        return {"items": contacts.get("frequent") or [], "total_count": contacts.get("total_count") or 0}
+    except Exception:
+        _log.exception("GET /api/cui/contacts/frequent failed")
+        raise HTTPException(status_code=500, detail="Frequent contacts failed")
+
+
+@app.post("/api/cui/contacts")
+async def create_cui_contact(request: Request, payload: CuiContactCreateRequest):
+    """Create one manual CUI contact in a tenant-local sanitized JSON store."""
+    _require_token(request)
+    raw = {
+        "display_name": payload.name,
+        "organization": payload.organization,
+        "role": payload.role,
+        "email": payload.email,
+        "phone": payload.phone,
+        "note": payload.note,
+        "source_badges": ["Manuell"],
+        "relevance": "relevant" if payload.link_current_context else "frequent",
+    }
+    contact = _normalize_contact(raw, source="Manuell", relevance=raw["relevance"])
+    if not contact:
+        raise HTTPException(status_code=400, detail="Contact name, email or phone required")
+    try:
+        contacts = _dedupe_contacts([contact, *_read_manual_contacts()])
+        _write_manual_contacts(contacts)
+        with _ASSISTANT_RESOURCE_CACHE_LOCK:
+            for key in list(_ASSISTANT_RESOURCE_CACHE):
+                if key.startswith("contacts:"):
+                    _ASSISTANT_RESOURCE_CACHE.pop(key, None)
+        return {"ok": True, "contact": contact}
+    except Exception:
+        _log.exception("POST /api/cui/contacts failed")
+        raise HTTPException(status_code=500, detail="Contact create failed")
+
+
+@app.post("/api/cui/contacts/hide")
+async def hide_cui_contact(request: Request, payload: CuiContactHideRequest):
+    """Hide one generated/connected contact from default and search contact lists."""
+    _require_token(request)
+    raw_contact = {"id": payload.id, "email": payload.email, "phone": payload.phone, "display_name": payload.display_name}
+    keys = _contact_hide_keys(raw_contact)
+    if not keys:
+        raise HTTPException(status_code=400, detail="Contact identity required")
+    try:
+        hidden = _read_hidden_contact_keys()
+        hidden.update(keys)
+        _write_hidden_contact_keys(hidden)
+        with _ASSISTANT_RESOURCE_CACHE_LOCK:
+            for key in list(_ASSISTANT_RESOURCE_CACHE):
+                if key.startswith("contacts:"):
+                    _ASSISTANT_RESOURCE_CACHE.pop(key, None)
+        return {"ok": True, "hidden": sorted(hidden)}
+    except Exception:
+        _log.exception("POST /api/cui/contacts/hide failed")
+        raise HTTPException(status_code=500, detail="Contact hide failed")
 
 
 @app.post("/api/assistant/support")

@@ -2,7 +2,9 @@
 
 import os
 import json
-from datetime import datetime, timezone
+import urllib.error
+from datetime import datetime, timezone, timedelta
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -340,7 +342,7 @@ class TestWebServerEndpoints:
         cache = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE")
         with cache_lock:
             cache.clear()
-        calls = {"email": 0, "calendar": 0, "shared": 0, "vault": 0, "todos": 0, "connectors": 0}
+        calls = {"email": 0, "calendar": 0, "shared": 0, "vault": 0, "todos": 0, "contacts": 0, "connectors": 0}
         monkeypatch.setattr(web_server, "load_config", lambda: {"mcp_servers": {"hermes_neo4j": {"enabled": True}}})
 
         def email_summary(config):
@@ -363,6 +365,10 @@ class TestWebServerEndpoints:
             calls["todos"] += 1
             return {"status": "connected", "summary": "Aufgaben", "items": [], "open_count": calls["todos"], "done_count": 0, "total_count": calls["todos"]}
 
+        def contacts_summary(config, email, calendar):
+            calls["contacts"] += 1
+            return {"status": "connected", "summary": "Kontakte", "items": [], "relevant": [], "frequent": [], "total_count": calls["contacts"], "manual_count": 0, "connected_count": calls["contacts"]}
+
         def connector_summary(config, shared_folder, email, calendar):
             calls["connectors"] += 1
             return [{"id": "mcp-hermes_neo4j", "label": "Wissensbasis", "status": "connected"}]
@@ -372,6 +378,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr(web_server, "_shared_folder_summary", shared_summary)
         monkeypatch.setattr(web_server, "_vaultwarden_summary", vault_summary)
         monkeypatch.setattr(web_server, "_todo_summary", todo_summary)
+        monkeypatch.setattr(web_server, "_contacts_summary", contacts_summary)
         monkeypatch.setattr(web_server, "_connector_summary", connector_summary)
 
         first = self.client.get("/api/assistant/resources")
@@ -383,18 +390,442 @@ class TestWebServerEndpoints:
         assert second.status_code == 200
         assert forced.status_code == 200
         assert email_forced.status_code == 200
-        assert calls == {"email": 3, "calendar": 2, "shared": 2, "vault": 2, "todos": 2, "connectors": 2}
+        assert calls == {"email": 3, "calendar": 2, "shared": 2, "vault": 2, "todos": 2, "contacts": 2, "connectors": 2}
         assert first.json()["cache"]["resources"]["email"]["ttl_seconds"] == 3600
         assert first.json()["cache"]["resources"]["calendar"]["ttl_seconds"] == 1800
         assert first.json()["cache"]["resources"]["vault"]["ttl_seconds"] == 900
         assert first.json()["cache"]["resources"]["todos"]["ttl_seconds"] == 60
+        assert first.json()["cache"]["resources"]["contacts"]["ttl_seconds"] == 1800
         assert second.json()["cache"]["cached"] is True
         assert second.json()["email"]["unread_count"] == 1
         assert forced.json()["cache"]["cached"] is False
         assert forced.json()["email"]["unread_count"] == 2
-        assert email_forced.json()["email"]["unread_count"] == 3
-        assert email_forced.json()["cache"]["resources"]["email"]["cached"] is False
+        assert email_forced.json()["email"]["unread_count"] == 2
+        assert email_forced.json()["cache"]["resources"]["email"]["cached"] is True
+        assert email_forced.json()["cache"]["resources"]["email"]["stale"] is True
         assert email_forced.json()["cache"]["resources"]["calendar"]["cached"] is True
+
+    def test_contacts_resource_refresh_returns_stale_and_revalidates_in_background(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        cache_lock = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE_LOCK")
+        cache = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE")
+        refreshing_lock = getattr(web_server, "_ASSISTANT_RESOURCE_REFRESHING_LOCK")
+        refreshing = getattr(web_server, "_ASSISTANT_RESOURCE_REFRESHING")
+        with cache_lock:
+            cache.clear()
+        with refreshing_lock:
+            refreshing.clear()
+
+        calls = {"email": 0, "calendar": 0, "shared": 0, "vault": 0, "todos": 0, "contacts": 0, "connectors": 0}
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+        monkeypatch.setattr(web_server, "_email_summary", lambda config: {"status": "connected", "summary": "Mail", "items": []})
+        monkeypatch.setattr(web_server, "_calendar_summary", lambda config=None: {"status": "connected", "summary": "Kalender", "items": []})
+        monkeypatch.setattr(web_server, "_shared_folder_summary", lambda config, request=None: {"status": "connected", "summary": "Shared", "items": []})
+        monkeypatch.setattr(web_server, "_vaultwarden_summary", lambda config: {"status": "disabled", "summary": "Tresor", "items": []})
+        monkeypatch.setattr(web_server, "_todo_summary", lambda config: {"status": "connected", "summary": "Aufgaben", "items": [], "open_count": 0, "done_count": 0, "total_count": 0})
+        monkeypatch.setattr(web_server, "_connector_summary", lambda config, shared_folder, email, calendar: [])
+
+        def contacts_summary(config, email, calendar):
+            calls["contacts"] += 1
+            contact = {"id": f"contact-{calls['contacts']}", "display_name": "Jane Kontakt", "email": "jane@example.ch"}
+            return {"status": "connected", "summary": f"Kontakte {calls['contacts']}", "items": [contact], "relevant": [contact], "frequent": [], "total_count": calls["contacts"], "manual_count": 0, "connected_count": calls["contacts"]}
+
+        monkeypatch.setattr(web_server, "_contacts_summary", contacts_summary)
+
+        first = self.client.get("/api/assistant/resources?refresh=1&resource=contacts")
+        forced_contacts = self.client.get("/api/assistant/resources?refresh=1&resource=contacts")
+
+        assert first.status_code == 200
+        assert forced_contacts.status_code == 200
+        assert forced_contacts.json()["contacts"]["total_count"] == 1
+        assert forced_contacts.json()["cache"]["resources"]["contacts"]["cached"] is True
+        assert forced_contacts.json()["cache"]["resources"]["contacts"]["stale"] is True
+        assert forced_contacts.json()["cache"]["resources"]["contacts"]["refreshing"] is True
+
+    def test_cui_contacts_deduplicates_source_badges(self):
+        import hermes_cli.web_server as web_server
+
+        contact = getattr(web_server, "_normalize_contact")({
+            "display_name": "Rustan Khayrov",
+            "email": "rustan@example.ch",
+            "source_badges": ["Google Contacts", "bergsmann@gmail.com", "bergsmann@gmail.com", "Aus E-Mail"],
+            "source": "google contacts",
+        })
+        assert contact is not None
+        assert contact["source_badges"] == ["Google Contacts", "bergsmann@gmail.com", "Aus E-Mail"]
+
+        decoded = getattr(web_server, "_contact_from_address")(
+            "=?utf-8?b?w4lydGVzw610w6lzIEvDtnpwb250aSBSZW5kc3plcnTFkWw=?= <ertesites@kozpontirendszer.gov.hu>",
+            source="Aus E-Mail",
+            relevance="relevant",
+        )
+        assert decoded is not None
+        assert decoded["display_name"] == "Értesítés Központi Rendszertől"
+        assert getattr(web_server, "_is_probably_system_contact")(decoded, own_emails=set()) is True
+
+        merged = getattr(web_server, "_dedupe_contacts")([
+            {"display_name": "Rustan Khayrov", "email": "rustan@example.ch", "source_badges": ["Google Contacts", "bergsmann@gmail.com"]},
+            {"display_name": "Rustan Khayrov", "email": "rustan@example.ch", "source_badges": ["bergsmann@gmail.com", "Aus E-Mail"]},
+        ])
+        assert merged[0]["source_badges"] == ["Google Contacts", "bergsmann@gmail.com", "Aus E-Mail"]
+
+    def test_cui_contacts_create_search_and_resource_summary(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        with web_server._ASSISTANT_RESOURCE_CACHE_LOCK:
+            web_server._ASSISTANT_RESOURCE_CACHE.clear()
+        monkeypatch.delenv("AIWERK_CUI_CONTACTS_JSON", raising=False)
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+        monkeypatch.setattr(web_server, "_assistant_contacts_store_path", lambda: tmp_path / "cui_contacts.json")
+
+        created = self.client.post("/api/cui/contacts", json={
+            "name": "Anna Meier",
+            "organization": "Beispiel AG",
+            "role": "Geschäftsführerin",
+            "email": "Anna.Meier@Example.CH",
+            "phone": "+41 31 555 12 12",
+            "note": "Nur kurze Notiz",
+        })
+        assert created.status_code == 200
+        assert created.json()["contact"]["email"] == "anna.meier@example.ch"
+        assert "Manuell" in created.json()["contact"]["source_badges"]
+
+        resources = self.client.get("/api/assistant/resources?refresh=1&resource=contacts")
+        assert resources.status_code == 200
+        contacts = resources.json()["contacts"]
+        assert contacts["status"] == "connected"
+        assert contacts["total_count"] == 1
+        assert contacts["frequent"][0]["display_name"] == "Anna Meier"
+
+        search = self.client.get("/api/cui/contacts/search?q=beispiel")
+        assert search.status_code == 200
+        assert search.json()["total_count"] == 1
+        assert search.json()["items"][0]["organization"] == "Beispiel AG"
+
+        hidden = self.client.post("/api/cui/contacts/hide", json={"id": created.json()["contact"]["id"], "email": created.json()["contact"]["email"]})
+        assert hidden.status_code == 200
+        assert "email:anna.meier@example.ch" in hidden.json()["hidden"]
+
+        resources = self.client.get("/api/assistant/resources?refresh=1&resource=contacts")
+        assert resources.status_code == 200
+        assert resources.json()["contacts"]["total_count"] == 0
+        search = self.client.get("/api/cui/contacts/search?q=beispiel")
+        assert search.status_code == 200
+        assert search.json()["total_count"] == 0
+
+    def test_contacts_summary_derives_safe_fallbacks_from_email_and_calendar(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.delenv("AIWERK_CUI_CONTACTS_JSON", raising=False)
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [])
+        email = {"accounts": [{
+            "label": "AIWerk",
+            "address": "kontakt@aiwerk.ch",
+            "items": [{"sender": "Max Muster <max@example.ch>"}],
+        }]}
+        calendar = {"accounts": [{"label": "Kalender", "address": "team@example.ch"}]}
+
+        summary = getattr(web_server, "_contacts_summary")({}, email, calendar)
+
+        emails = {item["email"] for item in summary["relevant"]}
+        assert emails == {"max@example.ch"}
+        assert "kontakt@aiwerk.ch" not in emails
+        assert "team@example.ch" not in emails
+        assert summary["status"] == "connected"
+        assert summary["source_label"] == "Relevante Kontakte"
+
+    def test_contacts_summary_uses_google_workspace_bridge_accounts(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+        monkeypatch.delenv("AIWERK_CUI_CONTACTS_JSON", raising=False)
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [])
+
+        def fake_bridge_call(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            if tool == "search_gmail_messages":
+                if "in:sent" in params.get("query", ""):
+                    return {"result": {"structuredContent": {"result": "Message ID: sent-1"}}}
+                return {"result": {"structuredContent": {"result": "Message ID: inbox-1"}}}
+            if tool == "get_gmail_messages_content_batch":
+                if server == "google-workspace-aiwerk":
+                    return {"result": {"structuredContent": {"result": "Retrieved 1 messages:\n\nMessage ID: sent-1\nSubject: Angebot\nFrom: Kontakt <kontakt@aiwerk.ch>\nDate: Tue, 2 Jun 2026 10:00:00 +0000\nTo: Anna AIWerk <anna@aiwerk.ch>\n"}}}
+                return {"result": {"structuredContent": {"result": "Retrieved 2 messages:\n\nMessage ID: sent-1\nSubject: Hallo\nFrom: Attila <bergsmann@gmail.com>\nDate: Tue, 2 Jun 2026 11:00:00 +0000\nTo: Bela Privat <bela@example.ch>\n\nMessage ID: inbox-1\nSubject: Analytics\nFrom: Google Analytics <analytics-noreply@google.com>\nDate: Tue, 2 Jun 2026 12:00:00 +0000\nTo: bergsmann@gmail.com\nPrecedence: bulk\nList-Unsubscribe: <https://example.com/unsub>\n"}}}
+            if tool == "list_contacts" and server == "google-workspace-aiwerk":
+                return {"result": {"structuredContent": {"result": "Contacts for kontakt@aiwerk.ch (1 of 1):\n\nContact ID: c_aiwerk\nName: Anna AIWerk\nEmail: anna@aiwerk.ch (Work)\nPhone: +41 31 555 12 12 (Work)\nOrganization: CEO at AIWerk AG\n\n"}}}
+            if tool == "list_contacts":
+                return {"result": {"structuredContent": {"result": "Contacts for bergsmann@gmail.com (1 of 1):\n\nContact ID: c_private\nName: Bela Privat\nEmail: bela@example.ch (Other)\n\n"}}}
+            return {}
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+        config = {
+            "assistant": {
+                "email": {
+                    "accounts": [
+                        {"address": "kontakt@aiwerk.ch", "backend": "google_workspace", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
+                        {"address": "bergsmann@gmail.com", "backend": "google_workspace", "mcp_server": "google-workspace-bergsmann", "user_google_email": "bergsmann@gmail.com"},
+                    ]
+                }
+            }
+        }
+        email = {"accounts": [{"address": "kontakt@aiwerk.ch", "items": [{"sender": "Anna AIWerk <anna@aiwerk.ch>"}]}]}
+
+        summary = getattr(web_server, "_contacts_summary")(config, email, {})
+
+        assert {call["server"] for call in calls if call["tool"] == "search_gmail_messages"} == {"google-workspace-aiwerk", "google-workspace-bergsmann"}
+        assert any(call["params"].get("query") == "in:sent newer_than:10d" for call in calls if call["tool"] == "search_gmail_messages")
+        assert any(call["params"].get("query") == "newer_than:10d -in:sent" for call in calls if call["tool"] == "search_gmail_messages")
+        emails = {item["email"] for item in summary["items"]}
+        assert {"anna@aiwerk.ch", "bela@example.ch"}.issubset(emails)
+        assert "analytics-noreply@google.com" not in emails
+        assert "kontakt@aiwerk.ch" not in emails
+        assert "bergsmann@gmail.com" not in emails
+        assert summary["google_count"] == 2
+        assert summary["summary"] == "2 relevante Kontakte"
+        assert summary["source_label"] == "Relevante Kontakte"
+        assert summary["relevance_window_days"] == 10
+        assert summary["interaction_count"] == 2
+        anna = next(item for item in summary["items"] if item["email"] == "anna@aiwerk.ch")
+        assert anna["organization"] == "AIWerk AG"
+        assert anna["role"] == "CEO"
+        assert "Google Contacts" in anna["source_badges"]
+
+    def test_contacts_summary_scans_himalaya_sent_and_inbox_accounts(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+        now = datetime.now(timezone.utc)
+        recent = (now - timedelta(days=1)).isoformat().replace("T", " ").replace("+00:00", "+00:00")
+        old = (now - timedelta(days=30)).isoformat().replace("T", " ").replace("+00:00", "+00:00")
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            folder = cmd[cmd.index("--folder") + 1]
+            if folder == "Gesendet":
+                return _Proc(json.dumps([
+                    {
+                        "id": "s1",
+                        "subject": "Offerte",
+                        "from": {"name": "Attila", "addr": "user@example.ch"},
+                        "to": [{"name": "Client Sent", "addr": "client@example.ch"}],
+                        "cc": [{"name": "Self", "addr": "user@example.ch"}],
+                        "date": recent,
+                    },
+                    {
+                        "id": "old",
+                        "subject": "Alt",
+                        "to": [{"name": "Old", "addr": "old@example.ch"}],
+                        "date": old,
+                    },
+                ]))
+            return _Proc(json.dumps([
+                {
+                    "id": "i1",
+                    "subject": "Antwort",
+                    "from": {"name": "Inbox Human", "addr": "inbox@example.ch"},
+                    "date": recent,
+                },
+                {
+                    "id": "self",
+                    "subject": "Self",
+                    "from": {"name": "Self", "addr": "user@example.ch"},
+                    "date": recent,
+                },
+            ]))
+
+        monkeypatch.delenv("AIWERK_CUI_CONTACTS_JSON", raising=False)
+        monkeypatch.delenv("AIWERK_CUI_EMAIL_DISABLE_HIMALAYA", raising=False)
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [])
+        monkeypatch.setattr("hermes_cli.web_server.shutil.which", lambda name: "/usr/bin/himalaya" if name == "himalaya" else None)
+        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+
+        summary = getattr(web_server, "_contacts_summary")({
+            "assistant": {"email": {"accounts": [
+                {"backend": "himalaya", "address": "user@example.ch", "account": "demo", "folder": "INBOX", "sent_folder": "Gesendet"},
+            ]}}
+        }, {"accounts": []}, {})
+
+        assert any("Gesendet" in call for call in calls)
+        assert any("INBOX" in call for call in calls)
+        emails = {item["email"] for item in summary["items"]}
+        assert {"client@example.ch", "inbox@example.ch"}.issubset(emails)
+        assert "user@example.ch" not in emails
+        assert "old@example.ch" not in emails
+        assert summary["interaction_count"] == 2
+        assert summary["summary"] == "2 relevante Kontakte"
+
+    def test_contacts_summary_tops_up_with_recent_saved_google_contacts(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+        monkeypatch.delenv("AIWERK_CUI_CONTACTS_JSON", raising=False)
+        monkeypatch.setenv("AIWERK_CUI_CONTACTS_SAVED_TOP_UP_TARGET", "3")
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [])
+        monkeypatch.setattr(web_server, "_contacts_from_google_workspace_interactions", lambda config, *, own_emails: [
+            getattr(web_server, "_contact_from_address")("Active Client <active@example.ch>", source="Gesendet", score=5.0, last_interaction_at="2026-06-03T10:00:00Z", relevance="relevant")
+        ])
+        monkeypatch.setattr(web_server, "_contacts_from_himalaya_interactions", lambda config, *, own_emails: [])
+
+        def fake_bridge_call(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            if tool == "list_contacts":
+                return {"result": {"structuredContent": {"result": "Contacts for user@example.ch (3 of 3):\n\nContact ID: active\nName: Active Client\nEmail: active@example.ch (Work)\n\nContact ID: saved1\nName: Saved One\nEmail: saved1@example.ch (Work)\n\nContact ID: saved2\nName: Saved Two\nEmail: saved2@example.ch (Work)\n\n"}}}
+            return {}
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+        summary = getattr(web_server, "_contacts_summary")({
+            "assistant": {"email": {"accounts": [
+                {"address": "user@example.ch", "backend": "google_workspace", "mcp_server": "google-workspace-demo", "user_google_email": "user@example.ch"},
+            ]}}
+        }, {"accounts": []}, {})
+
+        emails = [item["email"] for item in summary["items"]]
+        assert emails[:3] == ["active@example.ch", "saved2@example.ch", "saved1@example.ch"]
+        assert summary["interaction_count"] == 1
+        assert summary["saved_count"] == 2
+        assert summary["total_count"] == 3
+        assert any(call["tool"] == "list_contacts" and call["params"].get("sort_order") == "LAST_MODIFIED_DESCENDING" for call in calls)
+
+    def test_cui_contacts_search_queries_google_workspace_bridge(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        with web_server._ASSISTANT_RESOURCE_CACHE_LOCK:
+            web_server._ASSISTANT_RESOURCE_CACHE.clear()
+        calls = []
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [])
+        monkeypatch.setattr(web_server, "_email_summary", lambda config: {"status": "connected", "accounts": []})
+        monkeypatch.setattr(web_server, "_calendar_summary", lambda config: {"status": "connected", "accounts": []})
+        monkeypatch.setattr(web_server, "_shared_folder_summary", lambda config, request=None: {"status": "not_configured"})
+        monkeypatch.setattr(web_server, "_vaultwarden_summary", lambda config: {"status": "not_configured"})
+        monkeypatch.setattr(web_server, "_todo_summary", lambda config: {"status": "not_configured", "items": []})
+        monkeypatch.setattr(web_server, "_connector_summary", lambda config, shared_folder, email, calendar: [])
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "assistant": {"email": {"accounts": [
+                {"address": "kontakt@aiwerk.ch", "backend": "google_workspace", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
+                {"address": "bergsmann@gmail.com", "backend": "google_workspace", "mcp_server": "google-workspace-bergsmann", "user_google_email": "bergsmann@gmail.com"},
+            ]}}
+        })
+
+        def fake_bridge_call(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            return {"result": {"structuredContent": {"result": f"Contacts for {params['user_google_email']} (1 of 1):\n\nContact ID: c_{server}\nName: Max Treffer\nEmail: max-{server}@example.ch\n\n"}}}
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+
+        resp = self.client.get("/api/cui/contacts/search?q=max")
+
+        assert resp.status_code == 200
+        assert resp.json()["total_count"] == 2
+        assert {call["server"] for call in calls if call["tool"] == "search_contacts"} == {"google-workspace-aiwerk", "google-workspace-bergsmann"}
+        assert all(call["params"].get("query") == "max" for call in calls if call["tool"] == "search_contacts")
+
+    def test_cui_contacts_search_falls_back_to_saved_contacts_and_normalizes_accents(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        with web_server._ASSISTANT_RESOURCE_CACHE_LOCK:
+            web_server._ASSISTANT_RESOURCE_CACHE.clear()
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [])
+        monkeypatch.setattr(web_server, "_email_summary", lambda config: {"status": "connected", "accounts": []})
+        monkeypatch.setattr(web_server, "_calendar_summary", lambda config: {"status": "connected", "accounts": []})
+        monkeypatch.setattr(web_server, "_shared_folder_summary", lambda config, request=None: {"status": "not_configured"})
+        monkeypatch.setattr(web_server, "_vaultwarden_summary", lambda config: {"status": "not_configured"})
+        monkeypatch.setattr(web_server, "_todo_summary", lambda config: {"status": "not_configured", "items": []})
+        monkeypatch.setattr(web_server, "_connector_summary", lambda config, shared_folder, email, calendar: [])
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "assistant": {"email": {"accounts": [
+                {"address": "kontakt@aiwerk.ch", "backend": "google_workspace", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
+            ]}}
+        })
+
+        def fake_bridge_call(config, *, server, tool, params):
+            if tool == "list_contacts":
+                return {"result": {"structuredContent": {"result": "Contacts for kontakt@aiwerk.ch (1 of 1):\n\nContact ID: adam\nName: Ádám Bergsmann\nEmail: adam@example.ch (Work)\n\n"}}}
+            if tool == "search_contacts":
+                return {"result": {"structuredContent": {"result": "Contacts for kontakt@aiwerk.ch (0 of 0):\n\n"}}}
+            return {"result": {"structuredContent": {"result": ""}}}
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+
+        resp = self.client.get("/api/cui/contacts/search?q=Adam%20Bergsmann")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_count"] == 1
+        assert body["items"][0]["display_name"] == "Ádám Bergsmann"
+
+    def test_cui_contacts_search_filters_own_and_system_contacts(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        with web_server._ASSISTANT_RESOURCE_CACHE_LOCK:
+            web_server._ASSISTANT_RESOURCE_CACHE.clear()
+        monkeypatch.setattr(web_server, "_read_manual_contacts", lambda: [
+            {"display_name": "Self Manual", "email": "kontakt@aiwerk.ch", "source_badges": ["Manuell"]},
+            {"display_name": "Local Human", "email": "local@example.ch", "source_badges": ["Manuell"]},
+        ])
+        monkeypatch.setattr(web_server, "_email_summary", lambda config: {"status": "connected", "accounts": [{"address": "kontakt@aiwerk.ch", "items": []}]})
+        monkeypatch.setattr(web_server, "_calendar_summary", lambda config: {"status": "connected", "accounts": []})
+        monkeypatch.setattr(web_server, "_shared_folder_summary", lambda config, request=None: {"status": "not_configured"})
+        monkeypatch.setattr(web_server, "_vaultwarden_summary", lambda config: {"status": "not_configured"})
+        monkeypatch.setattr(web_server, "_todo_summary", lambda config: {"status": "not_configured", "items": []})
+        monkeypatch.setattr(web_server, "_connector_summary", lambda config, shared_folder, email, calendar: [])
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "assistant": {"email": {"accounts": [
+                {"address": "kontakt@aiwerk.ch", "backend": "google_workspace", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
+            ]}}
+        })
+
+        def fake_bridge_call(config, *, server, tool, params):
+            return {"result": {"structuredContent": {"result": "Contacts for kontakt@aiwerk.ch (4 of 4):\n\nContact ID: self\nName: Kontakt AIWerk\nEmail: kontakt@aiwerk.ch (Work)\n\nContact ID: noreply\nName: No Reply\nEmail: noreply@example.ch (Work)\n\nContact ID: cf-test\nName: Mewo+Outlet-CF-Test\nEmail: mewo-cf-test@example.ch (Work)\n\nContact ID: human\nName: Human Match\nEmail: human@example.ch (Work)\n\n"}}}
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+
+        resp = self.client.get("/api/cui/contacts/search?q=example")
+
+        assert resp.status_code == 200
+        emails = {item["email"] for item in resp.json()["items"]}
+        assert "human@example.ch" in emails
+        assert "local@example.ch" in emails
+        assert "kontakt@aiwerk.ch" not in emails
+        assert "noreply@example.ch" not in emails
+        assert "mewo-cf-test@example.ch" not in emails
+
+    def test_cui_contacts_payload_final_guard_filters_cached_own_contacts(self):
+        import hermes_cli.web_server as web_server
+
+        payload = {
+            "status": "connected",
+            "summary": "3 Kontakte verfügbar",
+            "items": [
+                {"display_name": "Kontakt AIWerk", "email": "kontakt@aiwerk.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch"]},
+                {"display_name": "Attila", "email": "bergsmann@gmail.com", "source_badges": ["Google Contacts", "bergsmann@gmail.com"]},
+                {"display_name": "Human", "email": "human@example.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch", "bergsmann@gmail.com"]},
+            ],
+            "frequent": [
+                {"display_name": "Kontakt AIWerk", "email": "kontakt@aiwerk.ch", "source_badges": ["kontakt@aiwerk.ch"]},
+                {"display_name": "Human", "email": "human@example.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch"]},
+            ],
+            "relevant": [{"display_name": "Attila", "email": "bergsmann@gmail.com", "source_badges": ["bergsmann@gmail.com"]}],
+            "total_count": 3,
+        }
+
+        filtered = getattr(web_server, "_filter_contacts_payload")(
+            payload,
+            own_emails={"kontakt@aiwerk.ch", "bergsmann@gmail.com"},
+        )
+
+        assert [item["email"] for item in filtered["items"]] == ["human@example.ch"]
+        assert filtered["items"][0]["source_badges"] == ["Google Contacts"]
+        assert [item["email"] for item in filtered["frequent"]] == ["human@example.ch"]
+        assert filtered["frequent"][0]["source_badges"] == ["Google Contacts"]
+        assert filtered["relevant"] == []
 
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -403,8 +834,16 @@ class TestWebServerEndpoints:
         shared.mkdir()
         docs = shared / "docs"
         docs.mkdir()
+        juni = docs / "Juni 2026"
+        juni.mkdir()
+        ebene3 = juni / "Ebene 3"
+        ebene3.mkdir()
+        ebene4 = ebene3 / "Ebene 4"
+        ebene4.mkdir()
         (shared / "offer.pdf").write_bytes(b"pdf")
         (docs / "contract.pdf").write_bytes(b"contract")
+        (juni / "planung.txt").write_text("planung", encoding="utf-8")
+        (ebene4 / "tief.txt").write_text("tief", encoding="utf-8")
         (shared / ".env").write_text("SECRET=1")
         email_json = tmp_path / "email.json"
         email_json.write_text(json.dumps({
@@ -455,7 +894,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr(web_server, "_open_system_folder", lambda path, **kwargs: opened.append(path) or True)
 
         local_headers = {"host": "127.0.0.1:9120", "x-forwarded-for": "127.0.0.1"}
-        resp = self.client.get("/api/assistant/resources", headers=local_headers)
+        resp = self.client.get("/api/assistant/resources?refresh=1", headers=local_headers)
 
         assert resp.status_code == 200
         data = resp.json()
@@ -473,14 +912,28 @@ class TestWebServerEndpoints:
         assert [item["name"] for item in shared_items] == ["docs", "offer.pdf"]
         assert shared_items[0]["kind"] == "folder"
         assert shared_items[0]["cloud_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share-123/browse?path=%2Fdocs"
-        assert shared_items[0]["children"][0]["name"] == "contract.pdf"
-        assert shared_items[0]["children"][0]["open_url"].startswith("/api/assistant/shared-folder/open?path=")
+        docs_children = shared_items[0]["children"]
+        assert [item["name"] for item in docs_children] == ["Juni 2026", "contract.pdf"]
+        assert docs_children[0]["kind"] == "folder"
+        juni_children = docs_children[0]["children"]
+        assert [item["name"] for item in juni_children] == ["Ebene 3", "planung.txt"]
+        deep_file = juni_children[0]["children"][0]["children"][0]
+        assert deep_file["name"] == "tief.txt"
+        assert deep_file["open_url"].startswith("/api/assistant/shared-folder/open?path=")
+        assert juni_children[1]["open_url"].startswith("/api/assistant/shared-folder/open?path=")
+        assert docs_children[1]["open_url"].startswith("/api/assistant/shared-folder/open?path=")
         assert shared_items[1]["kind"] == "file"
         assert shared_items[1]["open_url"].startswith("/api/assistant/shared-folder/open?path=")
-        open_resp = self.client.get(shared_items[0]["children"][0]["open_url"])
+        open_resp = self.client.get(docs_children[1]["open_url"])
         assert open_resp.status_code == 200
         assert open_resp.content == b"contract"
         assert open_resp.headers["content-type"].startswith("application/pdf")
+        nested_open_resp = self.client.get(juni_children[1]["open_url"])
+        assert nested_open_resp.status_code == 200
+        assert nested_open_resp.text == "planung"
+        deep_open_resp = self.client.get(deep_file["open_url"])
+        assert deep_open_resp.status_code == 200
+        assert deep_open_resp.text == "tief"
         assert self.client.get("/api/assistant/shared-folder/open?path=../.env").status_code == 404
         open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers=local_headers)
         assert open_folder_resp.status_code == 200
@@ -672,6 +1125,33 @@ class TestWebServerEndpoints:
         assert "[LINK]" in text
         assert "calendar.google.com" not in text
 
+    def test_assistant_resource_attachment_writes_contact_context(self):
+        resp = self.client.post("/api/assistant/attachments/resource", json={
+            "kind": "contact",
+            "session_id": "session-123",
+            "item": {
+                "display_name": "Anna Meier",
+                "organization": "Beispiel AG",
+                "role": "CEO",
+                "email": "anna@example.ch",
+                "phone": "+41 31 000 00 00",
+                "source_badges": ["Gmail", "Calendar"],
+                "raw_connector_metadata": "must-not-leak",
+            },
+        })
+
+        assert resp.status_code == 200
+        attachment = resp.json()["attachments"][0]
+        assert attachment["name"].startswith("contact-Anna-Meier")
+        text = Path(attachment["path"]).read_text(encoding="utf-8")
+        assert "Attached contact context" in text
+        assert "Anna Meier" in text
+        assert "Beispiel AG" in text
+        assert "anna@example.ch" in text
+        assert "Gmail, Calendar" in text
+        assert "raw_connector_metadata" not in text
+        assert "must-not-leak" not in text
+
     def test_assistant_resource_attachment_rejects_shared_traversal(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
@@ -723,7 +1203,7 @@ class TestWebServerEndpoints:
             "dashboard": {"email": {"backend": "himalaya", "account": "demo", "folder": "INBOX"}},
         })
 
-        resp = self.client.get("/api/assistant/resources")
+        resp = self.client.get("/api/assistant/resources?refresh=1")
 
         assert resp.status_code == 200
         email = resp.json()["email"]
@@ -995,7 +1475,7 @@ www.example.org/landing
         monkeypatch.setattr(web_server.subprocess, "run", fake_run)
         monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"email": {"enabled": True}}})
 
-        resp = self.client.get("/api/assistant/resources")
+        resp = self.client.get("/api/assistant/resources?refresh=1")
 
         assert resp.status_code == 200
         email = resp.json()["email"]
@@ -1077,7 +1557,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
             "mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp", "enabled": True, "headers": {"Authorization": "Bearer test"}}},
         })
 
-        resp = self.client.get("/api/assistant/resources")
+        resp = self.client.get("/api/assistant/resources?refresh=1")
 
         assert resp.status_code == 200
         email = resp.json()["email"]
@@ -1124,6 +1604,42 @@ Web Link: https://mail.google.com/mail/u/0/#all/19e70ea1de7486ee
         assert calls[1]["session_id"] == "session-123"
         assert calls[2]["session_id"] == "session-123"
         assert [call["request_id"] for call in calls] == [1, 2, 3]
+
+    def test_aiwerk_bridge_config_expands_header_env_refs_from_dotenv(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.delenv("AIWERK_BRIDGE_MCP_TOKEN", raising=False)
+        monkeypatch.setattr(web_server, "load_env", lambda: {"AIWERK_BRIDGE_MCP_TOKEN": "secret-token"})
+
+        bridge = web_server._mcp_bridge_config({
+            "mcp_servers": {
+                "aiwerk_bridge": {
+                    "url": "https://bridge.example/${AIWERK_BRIDGE_MCP_TOKEN}/mcp",
+                    "headers": {"Authorization": "Bearer ${AIWERK_BRIDGE_MCP_TOKEN}"},
+                }
+            }
+        })
+
+        assert bridge["url"] == "https://bridge.example/secret-token/mcp"
+        assert bridge["headers"]["Authorization"] == "Bearer secret-token"
+
+    def test_google_workspace_email_summary_keeps_account_visible_on_bridge_error(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def fake_bridge_call(_config, *, server, tool, params):
+            raise urllib.error.HTTPError("https://bridge.example/mcp", 403, "Forbidden", Message(), None)
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+        summary = web_server._google_workspace_email_summary(
+            {"mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.example/mcp"}}},
+            {"backend": "google_workspace", "address": "kontakt@example.ch", "user_google_email": "kontakt@example.ch"},
+        )
+
+        assert summary is not None
+        assert summary["status"] == "error"
+        assert summary["account_address"] == "kontakt@example.ch"
+        assert summary["items"] == []
+        assert "403" in summary["error"]
 
     def test_google_workspace_email_summary_fetches_unread_and_fills_with_latest(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -1290,7 +1806,7 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
             "mcp_servers": {"aiwerk_bridge": {"url": "https://bridge.aiwerk.ch/u/demo/mcp", "enabled": True}},
         })
 
-        resp = self.client.get("/api/assistant/resources")
+        resp = self.client.get("/api/assistant/resources?refresh=1")
 
         assert resp.status_code == 200
         email = resp.json()["email"]
@@ -1419,6 +1935,9 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         text = resp.text
         assert "Nur-Leseansicht" in text
         assert "&lt;Kundentermin&gt;" in text
+        assert "01.06.2026, 12:00 Uhr" in text
+        assert "01.06.2026, 12:30 Uhr" in text
+        assert "2026-06-01T10:00:00Z" not in text
         assert "Bern&lt;script&gt;alert(1)&lt;/script&gt;" in text
         assert "SEO Webseite Strub Lucarnum" in text
         assert "Review &amp; Planung" in text

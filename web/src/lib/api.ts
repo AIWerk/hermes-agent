@@ -281,13 +281,31 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, session_id: sessionId }),
     }),
-  getAssistantResources: (options?: { refresh?: boolean; resource?: "email" | "calendar" | "shared_folder" | "vault" | "todos" | "connectors" }) => {
+  getAssistantResources: (options?: { refresh?: boolean; resource?: "email" | "calendar" | "shared_folder" | "vault" | "todos" | "contacts" | "connectors" }) => {
     const params = new URLSearchParams();
     if (options?.refresh) params.set("refresh", "1");
     if (options?.resource) params.set("resource", options.resource);
     const query = params.toString();
     return fetchJSON<AssistantResourcesResponse>(`/api/assistant/resources${query ? `?${query}` : ""}`);
   },
+  searchCuiContacts: (q: string) => {
+    const params = new URLSearchParams();
+    if (q.trim()) params.set("q", q.trim());
+    const query = params.toString();
+    return fetchJSON<{ items: AssistantContactItem[]; total_count: number; query: string }>(`/api/cui/contacts/search${query ? `?${query}` : ""}`);
+  },
+  createCuiContact: (body: AssistantContactCreateRequest) =>
+    fetchJSON<{ ok: boolean; contact: AssistantContactItem }>("/api/cui/contacts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  hideCuiContact: (contact: Pick<AssistantContactItem, "id" | "email" | "phone" | "display_name">) =>
+    fetchJSON<{ ok: boolean; hidden: string[] }>("/api/cui/contacts/hide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: contact.id, email: contact.email ?? "", phone: contact.phone ?? "", display_name: contact.display_name ?? "" }),
+    }),
   addAssistantTodo: (text: string) =>
     fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/add", {
       method: "POST",
@@ -726,7 +744,7 @@ export interface AssistantSupportResponse {
 }
 
 export interface AssistantResourceAttachmentRequest {
-  kind: "email" | "calendar_event" | "shared_file";
+  kind: "email" | "calendar_event" | "shared_file" | "contact";
   item: Record<string, unknown>;
   session_id?: string;
 }
@@ -845,6 +863,46 @@ export interface AssistantTodoSummary {
   checked_at?: string;
 }
 
+export interface AssistantContactItem {
+  id: string;
+  display_name: string;
+  organization?: string;
+  role?: string;
+  email?: string;
+  phone?: string;
+  note?: string;
+  source_badges?: string[];
+  relevance?: "relevant" | "frequent" | string;
+}
+
+export interface AssistantContactSummary {
+  status: AssistantResourceStatus;
+  summary: string;
+  items: AssistantContactItem[];
+  relevant: AssistantContactItem[];
+  frequent: AssistantContactItem[];
+  total_count: number;
+  manual_count: number;
+  connected_count: number;
+  google_count?: number;
+  saved_count?: number;
+  interaction_count?: number;
+  relevance_window_days?: number;
+  saved_top_up_target?: number;
+  source_label?: string;
+  checked_at?: string;
+}
+
+export interface AssistantContactCreateRequest {
+  name: string;
+  organization?: string;
+  role?: string;
+  email?: string;
+  phone?: string;
+  note?: string;
+  link_current_context?: boolean;
+}
+
 export interface AssistantResourcesResponse {
   checked_at: string;
   email: {
@@ -872,6 +930,7 @@ export interface AssistantResourcesResponse {
   };
   vault: AssistantVaultSummary;
   todos: AssistantTodoSummary;
+  contacts: AssistantContactSummary;
   connectors: AssistantConnectorSummary[];
   warnings: string[];
   cache?: {
