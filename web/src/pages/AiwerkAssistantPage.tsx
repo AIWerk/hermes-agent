@@ -3076,14 +3076,16 @@ function ResourcesRail({
   };
   useEffect(() => {
     const query = contactSearch.trim();
-    if (!query) {
-      setContactSearchResults(null);
-      setContactSearchLoading(false);
-      return;
-    }
     let cancelled = false;
-    setContactSearchLoading(true);
     const timer = window.setTimeout(() => {
+      if (!query) {
+        if (!cancelled) {
+          setContactSearchResults(null);
+          setContactSearchLoading(false);
+        }
+        return;
+      }
+      setContactSearchLoading(true);
       api.searchCuiContacts(query)
         .then((result) => {
           if (!cancelled) setContactSearchResults(result.items);
@@ -3094,7 +3096,7 @@ function ResourcesRail({
         .finally(() => {
           if (!cancelled) setContactSearchLoading(false);
         });
-    }, 180);
+    }, query ? 180 : 0);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);

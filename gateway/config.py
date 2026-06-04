@@ -361,10 +361,17 @@ class StreamingConfig:
     #             fall back to edit-based when not.
     #   "draft" — explicitly request native drafts; falls back to edit when
     #             the platform/chat doesn't support them.
-    #   "edit"  — progressive editMessageText only (legacy/default
-    #             behaviour).
+    #   "edit"  — progressive editMessageText only (legacy behaviour).
     #   "off"   — disable streaming entirely.
-    transport: str = "edit"
+    #
+    # Default is "auto": prefer native draft streaming on platforms that
+    # support it (Telegram DMs via sendMessageDraft, Bot API 9.5+) and fall
+    # back to edit-based streaming everywhere else.  This is safe as a global
+    # default because adapters without draft support (Discord, Slack, Matrix,
+    # …) report supports_draft_streaming() == False and transparently use the
+    # edit path — so "auto" never regresses non-Telegram platforms, it only
+    # upgrades the chats that can render the smoother native preview.
+    transport: str = "auto"
     edit_interval: float = DEFAULT_STREAMING_EDIT_INTERVAL
     buffer_threshold: int = DEFAULT_STREAMING_BUFFER_THRESHOLD
     cursor: str = DEFAULT_STREAMING_CURSOR
@@ -393,7 +400,7 @@ class StreamingConfig:
             return cls()
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
-            transport=data.get("transport", "edit"),
+            transport=data.get("transport", "auto"),
             edit_interval=_coerce_float(
                 data.get("edit_interval"), DEFAULT_STREAMING_EDIT_INTERVAL,
             ),
@@ -801,7 +808,7 @@ def load_gateway_config() -> GatewayConfig:
                         existing = {}
                     # Deep-merge extra dicts so gateway.json defaults survive
                     merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
-                    if plat_name == Platform.SLACK.value and "enabled" in plat_block:
+                    if "enabled" in plat_block:
                         merged_extra["_enabled_explicit"] = True
                     merged = {**existing, **plat_block}
                     if merged_extra:
@@ -836,6 +843,25 @@ def load_gateway_config() -> GatewayConfig:
                 if plat == Platform.LOCAL:
                     continue
                 platform_cfg = yaml_cfg.get(plat.value)
+                _cfg_toplevel = isinstance(platform_cfg, dict)
+                # Fall back to the platform's block under ``platforms`` /
+                # ``gateway.platforms`` so shared-key bridging (allow_from,
+                # require_mention, free_response_channels, …) still runs when
+                # the user configured the platform only under those nested paths
+                # and not via a top-level block.  Mirrors the identical fallback
+                # already applied to the apply_yaml_config_fn dispatch below
+                # (#44f3e51).
+                # Note: ``enabled`` is only written to plat_data from a
+                # top-level block (``_cfg_toplevel``); for nested-only configs
+                # ``_merge_platform_map`` already merged it with the correct
+                # precedence, so re-applying it here would overwrite that.
+                if not _cfg_toplevel:
+                    for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                        if isinstance(_src, dict):
+                            _candidate = _src.get(plat.value)
+                            if isinstance(_candidate, dict):
+                                platform_cfg = _candidate
+                                break
                 if not isinstance(platform_cfg, dict):
                     continue
                 # Collect bridgeable keys from this platform section
@@ -896,7 +922,7 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
-                enabled_was_explicit = "enabled" in platform_cfg
+                enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
@@ -1247,14 +1273,23 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
+
+    def _enable_from_env(platform: Platform) -> PlatformConfig:
+        if platform not in config.platforms:
+            config.platforms[platform] = PlatformConfig(enabled=True)
+            return config.platforms[platform]
+
+        platform_config = config.platforms[platform]
+        enabled_was_explicit = bool(platform_config.extra.pop("_enabled_explicit", False))
+        if not platform_config.enabled and not enabled_was_explicit:
+            platform_config.enabled = True
+        return platform_config
     
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
-        if Platform.TELEGRAM not in config.platforms:
-            config.platforms[Platform.TELEGRAM] = PlatformConfig()
-        config.platforms[Platform.TELEGRAM].enabled = True
-        config.platforms[Platform.TELEGRAM].token = telegram_token
+        telegram_config = _enable_from_env(Platform.TELEGRAM)
+        telegram_config.token = telegram_token
     
     # Reply threading mode for Telegram (off/first/all)
     telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
@@ -1283,10 +1318,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")
     if discord_token:
-        if Platform.DISCORD not in config.platforms:
-            config.platforms[Platform.DISCORD] = PlatformConfig()
-        config.platforms[Platform.DISCORD].enabled = True
-        config.platforms[Platform.DISCORD].token = discord_token
+        discord_config = _enable_from_env(Platform.DISCORD)
+        discord_config.token = discord_token
     
     discord_home = os.getenv("DISCORD_HOME_CHANNEL")
     if discord_home and Platform.DISCORD in config.platforms:
@@ -1358,10 +1391,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     signal_url = os.getenv("SIGNAL_HTTP_URL")
     signal_account = os.getenv("SIGNAL_ACCOUNT")
     if signal_url and signal_account:
-        if Platform.SIGNAL not in config.platforms:
-            config.platforms[Platform.SIGNAL] = PlatformConfig()
-        config.platforms[Platform.SIGNAL].enabled = True
-        config.platforms[Platform.SIGNAL].extra.update({
+        signal_config = _enable_from_env(Platform.SIGNAL)
+        signal_config.extra.update({
             "http_url": signal_url,
             "account": signal_account,
             "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower() in {"true", "1", "yes"},
@@ -1381,11 +1412,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         mattermost_url = os.getenv("MATTERMOST_URL", "")
         if not mattermost_url:
             logger.warning("MATTERMOST_TOKEN set but MATTERMOST_URL is missing")
-        if Platform.MATTERMOST not in config.platforms:
-            config.platforms[Platform.MATTERMOST] = PlatformConfig()
-        config.platforms[Platform.MATTERMOST].enabled = True
-        config.platforms[Platform.MATTERMOST].token = mattermost_token
-        config.platforms[Platform.MATTERMOST].extra["url"] = mattermost_url
+        mattermost_config = _enable_from_env(Platform.MATTERMOST)
+        mattermost_config.token = mattermost_token
+        mattermost_config.extra["url"] = mattermost_url
     mattermost_home = os.getenv("MATTERMOST_HOME_CHANNEL")
     if mattermost_home and Platform.MATTERMOST in config.platforms:
         config.platforms[Platform.MATTERMOST].home_channel = HomeChannel(
@@ -1401,23 +1430,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if matrix_token or os.getenv("MATRIX_PASSWORD"):
         if not matrix_homeserver:
             logger.warning("MATRIX_ACCESS_TOKEN/MATRIX_PASSWORD set but MATRIX_HOMESERVER is missing")
-        if Platform.MATRIX not in config.platforms:
-            config.platforms[Platform.MATRIX] = PlatformConfig()
-        config.platforms[Platform.MATRIX].enabled = True
+        matrix_config = _enable_from_env(Platform.MATRIX)
         if matrix_token:
-            config.platforms[Platform.MATRIX].token = matrix_token
-        config.platforms[Platform.MATRIX].extra["homeserver"] = matrix_homeserver
+            matrix_config.token = matrix_token
+        matrix_config.extra["homeserver"] = matrix_homeserver
         matrix_user = os.getenv("MATRIX_USER_ID", "")
         if matrix_user:
-            config.platforms[Platform.MATRIX].extra["user_id"] = matrix_user
+            matrix_config.extra["user_id"] = matrix_user
         matrix_password = os.getenv("MATRIX_PASSWORD", "")
         if matrix_password:
-            config.platforms[Platform.MATRIX].extra["password"] = matrix_password
+            matrix_config.extra["password"] = matrix_password
         matrix_e2ee = os.getenv("MATRIX_ENCRYPTION", "").lower() in {"true", "1", "yes"}
-        config.platforms[Platform.MATRIX].extra["encryption"] = matrix_e2ee
+        matrix_config.extra["encryption"] = matrix_e2ee
         matrix_device_id = os.getenv("MATRIX_DEVICE_ID", "")
         if matrix_device_id:
-            config.platforms[Platform.MATRIX].extra["device_id"] = matrix_device_id
+            matrix_config.extra["device_id"] = matrix_device_id
     matrix_home = os.getenv("MATRIX_HOME_ROOM")
     if matrix_home and Platform.MATRIX in config.platforms:
         config.platforms[Platform.MATRIX].home_channel = HomeChannel(
@@ -1721,6 +1748,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "webhook_path": os.getenv("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
             "send_read_receipts": os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in {"true", "1", "yes"},
         })
+        bluebubbles_require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
+        if bluebubbles_require_mention is not None:
+            config.platforms[Platform.BLUEBUBBLES].extra["require_mention"] = (
+                bluebubbles_require_mention.lower() in {"true", "1", "yes", "on"}
+            )
+        bluebubbles_mention_patterns = os.getenv("BLUEBUBBLES_MENTION_PATTERNS")
+        if bluebubbles_mention_patterns:
+            try:
+                parsed_patterns = json.loads(bluebubbles_mention_patterns)
+            except Exception:
+                parsed_patterns = [
+                    part.strip()
+                    for part in bluebubbles_mention_patterns.replace("\n", ",").split(",")
+                    if part.strip()
+                ]
+            config.platforms[Platform.BLUEBUBBLES].extra["mention_patterns"] = parsed_patterns
     bluebubbles_home = os.getenv("BLUEBUBBLES_HOME_CHANNEL")
     if bluebubbles_home and Platform.BLUEBUBBLES in config.platforms:
         config.platforms[Platform.BLUEBUBBLES].home_channel = HomeChannel(
@@ -1956,3 +1999,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                     )
     except Exception as e:
         logger.debug("Plugin platform enable pass failed: %s", e)
+
+    for platform_config in config.platforms.values():
+        platform_config.extra.pop("_enabled_explicit", None)
