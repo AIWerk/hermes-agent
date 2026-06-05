@@ -294,7 +294,7 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    return raw if raw in {"queue", "steer", "interrupt"} else "steer"
 
 
 def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
@@ -4414,12 +4414,11 @@ def _(rid, params: dict) -> dict:
 
 @method("session.steer")
 def _(rid, params: dict) -> dict:
-    """Inject a user message into the next tool result without interrupting.
+    """Inject a user message into the current in-flight turn.
 
-    Mirrors AIAgent.steer(). Safe to call while a turn is running — the text
-    lands on the last tool result of the next tool batch and the model sees
-    it on its next iteration. No interrupt, no new user turn, no role
-    alternation violation.
+    Mirrors AIAgent.steer(). Only accept while a turn is actually in flight:
+    otherwise a stale steer can be queued after the visible response already
+    completed and later leak into an unrelated turn.
     """
     text = (params.get("text") or "").strip()
     if not text:
@@ -4427,7 +4426,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    agent = session.get("agent")
+    if session is None:
+        return _err(rid, 4001, "no active session")
+    with session["history_lock"]:
+        inflight = session.get("inflight_turn")
+        if not session.get("running") or not isinstance(inflight, dict):
+            return _err(rid, 4009, "no active running turn to steer")
+        agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
     try:
@@ -4722,6 +4727,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         approval_token = None
         session_tokens = []
         goal_followup = None  # set by the post-turn goal hook below
+        pending_steer_followup = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -4910,6 +4916,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
+                pending_steer = result.get("pending_steer")
+                if isinstance(pending_steer, str) and pending_steer.strip():
+                    pending_steer_followup = pending_steer.strip()
             else:
                 raw = str(result)
                 status = "complete"
@@ -5068,6 +5077,28 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
+
+        # If a steer arrived too late to piggyback on a tool result, the
+        # agent returns it as pending_steer. Deliver it as the next user turn
+        # instead of dropping it or letting it leak into a later unrelated turn.
+        if pending_steer_followup:
+            with session["history_lock"]:
+                if session.get("running"):
+                    return
+                session["running"] = True
+                _start_inflight_turn(session, pending_steer_followup)
+            try:
+                _run_prompt_submit(rid, sid, session, pending_steer_followup)
+            except Exception as _steer_exc:
+                print(
+                    f"[tui_gateway] pending steer dispatch failed: "
+                    f"{type(_steer_exc).__name__}: {_steer_exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+            return
 
         # Chain a goal-continuation turn if the judge said so. We do
         # this AFTER the finally releases session["running"], so the
@@ -6591,7 +6622,11 @@ def _(rid, params: dict) -> dict:
         if not arg:
             return _err(rid, 4004, "usage: /steer <prompt>")
         agent = session.get("agent") if session else None
-        if agent and hasattr(agent, "steer"):
+        can_steer = False
+        if session:
+            with session["history_lock"]:
+                can_steer = bool(session.get("running")) and isinstance(session.get("inflight_turn"), dict)
+        if can_steer and agent and hasattr(agent, "steer"):
             try:
                 accepted = agent.steer(arg)
                 if accepted:

@@ -1613,7 +1613,7 @@ def test_config_get_busy_survives_non_dict_display(monkeypatch):
         {"id": "1", "method": "config.get", "params": {"key": "busy"}}
     )
 
-    assert resp["result"]["value"] == "interrupt"
+    assert resp["result"]["value"] == "steer"
 
 
 def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
@@ -2898,7 +2898,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         def interrupt(self, *args, **kwargs):
             calls["interrupt_called"] = True
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    server._sessions["sid"] = _session(agent=_Agent(), running=True, inflight_turn={"text": "active"})
     try:
         resp = server.handle_request(
             {
@@ -2936,8 +2936,60 @@ def test_session_steer_rejects_empty_text():
     assert resp["error"]["code"] == 4002
 
 
+def test_session_steer_rejects_when_no_turn_is_running():
+    calls = {"count": 0}
+
+    class _Agent:
+        def steer(self, text):
+            calls["count"] += 1
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent(), running=False)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "too late"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == 4009
+    assert calls["count"] == 0
+
+
+def test_session_steer_rejects_after_inflight_turn_was_cleared():
+    calls = {"count": 0}
+
+    class _Agent:
+        def steer(self, text):
+            calls["count"] += 1
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent(), running=True, inflight_turn=None)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "post complete race"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == 4009
+    assert calls["count"] == 0
+
+
 def test_session_steer_errors_when_agent_has_no_steer_method():
-    server._sessions["sid"] = _session(agent=types.SimpleNamespace())  # no steer()
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(), running=True, inflight_turn={"text": "active"}
+    )  # no steer()
     try:
         resp = server.handle_request(
             {
@@ -3164,6 +3216,60 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         assert len(complete_calls) == 1
         _, _, payload = complete_calls[0]
         assert "warning" not in payload
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_delivers_pending_steer_as_next_turn(monkeypatch):
+    prompts = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return {
+                    "final_response": "first reply",
+                    "messages": [{"role": "assistant", "content": "first reply"}],
+                    "pending_steer": "late guidance",
+                }
+            return {
+                "final_response": "steered reply",
+                "messages": [
+                    {"role": "assistant", "content": "first reply"},
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "steered reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    emits: list[tuple] = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+        assert resp.get("result")
+
+        assert prompts == ["hi", "late guidance"]
+        complete_payloads = [a[2] for a in emits if a[0] == "message.complete"]
+        assert [p["text"] for p in complete_payloads] == ["first reply", "steered reply"]
     finally:
         server._sessions.pop("sid", None)
 

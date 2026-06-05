@@ -655,12 +655,24 @@ function completeAssistant(
   status: ChatMessage["status"],
 ): ChatMessage[] {
   const next = [...messages];
-  const last = next[next.length - 1];
-  if (last?.role === "agent" && last.status === "streaming") {
-    next[next.length - 1] = { ...last, text: text || last.text, status };
+  const lastStreamingIndex = next.findLastIndex((message) => message.role === "agent" && message.status === "streaming");
+  if (lastStreamingIndex >= 0) {
+    const current = next[lastStreamingIndex];
+    next[lastStreamingIndex] = { ...current, text: text || current.text, status };
     return next;
   }
   next.push({ id: newId("agent"), role: "agent", text, status });
+  return next;
+}
+
+function insertUserGuidance(messages: ChatMessage[], message: ChatMessage): ChatMessage[] {
+  const next = [...messages];
+  const last = next[next.length - 1];
+  if (last?.role === "agent" && last.status === "streaming") {
+    next.splice(next.length - 1, 0, message);
+    return next;
+  }
+  next.push(message);
   return next;
 }
 
@@ -1755,10 +1767,41 @@ export default function AiwerkAssistantPage() {
     const text = (target === "side" ? sideInput : input).trim();
     const gateway = gatewayRef.current;
     const attachments = target === "main" ? attachedFiles : [];
-    if ((!text && attachments.length === 0) || !gateway || !sessionId || busy) return;
+    if ((!text && attachments.length === 0) || !gateway || !sessionId) return;
     const attachmentNames = attachments.map((file) => file.name).join(", ");
     const submitText = text || `Anhänge: ${attachmentNames || "Dateien"}`;
     const gatewayText = text && attachmentNames ? `${text}\n\nAnhänge: ${attachmentNames}` : submitText;
+
+    if (busy) {
+      if (!text) return;
+      const steerText = text;
+      try {
+        const result = await gateway.request<{ status?: string }>("session.steer", { session_id: sessionId, text: steerText }, 15_000);
+        if (result.status !== "queued") {
+          setError("Lenkung wurde nicht übernommen.");
+          return;
+        }
+        const userMessageId = newId("user");
+        const userMessage: ChatMessage = { id: userMessageId, role: "user", text: steerText, status: "complete" };
+        if (target === "side") {
+          setSideInput("");
+          setSideMessages((prev) => insertUserGuidance(prev, userMessage));
+        } else {
+          setInput("");
+          setMessages((prev) => insertUserGuidance(prev, userMessage));
+        }
+        setError(null);
+        showToast(
+          attachments.length > 0
+            ? "Lenkung gesendet · Anhänge bleiben für die nächste Nachricht bereit"
+            : "Lenkung an die laufende Antwort gesendet",
+        );
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+
     activeTurnModeRef.current = target;
     setActiveTurnMode(target);
     setBusy(true);
@@ -1976,8 +2019,8 @@ export default function AiwerkAssistantPage() {
           background: rgba(215, 185, 142, .48);
           color: #fffaf2;
         }
-        .aiwerk-assistant button:not(:disabled),
-        .aiwerk-assistant [role="button"]:not([aria-disabled="true"]) {
+        .aiwerk-assistant button:not(:disabled):not([data-aiwerk-resize-handle="true"]),
+        .aiwerk-assistant [role="button"]:not([aria-disabled="true"]):not([data-aiwerk-resize-handle="true"]) {
           cursor: pointer;
         }
         .aiwerk-assistant button:disabled,
@@ -2564,7 +2607,7 @@ export default function AiwerkAssistantPage() {
                   <button
                     type="button"
                     onClick={() => void submit("main")}
-                    disabled={(!input.trim() && attachedFiles.length === 0) || !sessionId || busy || connection !== "open"}
+                    disabled={(!input.trim() && attachedFiles.length === 0) || !sessionId || connection !== "open" || (busy && !input.trim())}
                     className="h-[46px] shrink-0 cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[10px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     Senden
@@ -2693,7 +2736,7 @@ export default function AiwerkAssistantPage() {
                     <button
                       type="button"
                       onClick={() => void submit("side")}
-                      disabled={!sideInput.trim() || !sessionId || busy || connection !== "open"}
+                      disabled={!sideInput.trim() || !sessionId || connection !== "open"}
                       className="h-[44px] shrink-0 cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[13px] py-[9px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Senden
@@ -2710,6 +2753,7 @@ export default function AiwerkAssistantPage() {
               title="Ressourcenbereich ziehen · Doppelklick setzt zurück"
               onPointerDown={startRightRailResize}
               onDoubleClick={resetRightRailWidth}
+              data-aiwerk-resize-handle="true"
               className="group hidden h-full cursor-col-resize items-center justify-center rounded-full focus:outline-none focus:ring-2 focus:ring-[#b89d72]/40 xl:flex"
             >
               <span className="h-[72px] w-[3px] rounded-full bg-[#d8cdbd] transition group-hover:bg-[#b89d72] group-focus-visible:bg-[#b89d72]" />
