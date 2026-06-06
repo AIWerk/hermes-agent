@@ -1414,6 +1414,31 @@ class TestWebServerEndpoints:
         assert filtered["frequent"][0]["source_badges"] == ["Google Contacts"]
         assert filtered["relevant"] == []
 
+    def test_shared_folder_open_neutralizes_active_content(self, tmp_path, monkeypatch):
+        # Attacker-supplied markup dropped into the shared folder must not be
+        # served as renderable content (it would execute in the dashboard origin
+        # via the frontend's blob: URL navigation and could steal the session
+        # token). Active-content types are forced to a non-renderable download.
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "evil.html").write_text("<script>alert(document.cookie)</script>", encoding="utf-8")
+        (shared / "evil.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>", encoding="utf-8")
+        (shared / "report.txt").write_text("hello", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+
+        for name in ("evil.html", "evil.svg"):
+            resp = self.client.get(f"/api/assistant/shared-folder/open?path={name}")
+            assert resp.status_code == 200, name
+            assert resp.headers["content-type"].startswith("application/octet-stream"), name
+            assert resp.headers["content-disposition"].startswith("attachment"), name
+            assert resp.headers["x-content-type-options"] == "nosniff", name
+
+        # Benign types remain inline-previewable but still get the nosniff guard.
+        resp = self.client.get("/api/assistant/shared-folder/open?path=report.txt")
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("inline")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
