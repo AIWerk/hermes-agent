@@ -4563,11 +4563,23 @@ def _create_resource_attachment(request: Request, payload: AssistantResourceAtta
     raise HTTPException(status_code=400, detail="Unsupported resource attachment type")
 
 
-def _assistant_api_allowed(path: str) -> bool:
-    """Return True for HTTP API paths exposed in assistant mode."""
+_ASSISTANT_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _assistant_api_allowed(path: str, method: str = "GET") -> bool:
+    """Return True for HTTP API paths exposed in assistant mode.
+
+    Exact-match entries are allowed for any method (they are individually
+    chosen). Prefix (wildcard) grants are read-only on the customer surface:
+    mutating verbs are refused so the coarse ``/api/sessions/`` grant cannot
+    reach destructive admin endpoints (bulk-delete, empty DELETE, prune,
+    per-session DELETE/PATCH), which the CUI never needs.
+    """
     if path in _ASSISTANT_ALLOWED_API_EXACT:
         return True
-    return any(path.startswith(prefix) for prefix in _ASSISTANT_ALLOWED_API_PREFIXES)
+    if any(path.startswith(prefix) for prefix in _ASSISTANT_ALLOWED_API_PREFIXES):
+        return method.upper() in _ASSISTANT_SAFE_METHODS
+    return False
 
 
 def _assistant_mode_enabled() -> bool:
@@ -4746,7 +4758,7 @@ async def _dashboard_auth_gate(request: Request, call_next):
 async def auth_middleware(request: Request, call_next):
     """Require the session token on /api/ routes and gate assistant-mode APIs."""
     path = request.url.path
-    if path.startswith("/api/") and _assistant_mode_enabled() and not _assistant_api_allowed(path):
+    if path.startswith("/api/") and _assistant_mode_enabled() and not _assistant_api_allowed(path, request.method):
         return JSONResponse(
             status_code=404,
             content={"detail": "Not found"},

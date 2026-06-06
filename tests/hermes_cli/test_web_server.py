@@ -1414,6 +1414,34 @@ class TestWebServerEndpoints:
         assert filtered["frequent"][0]["source_badges"] == ["Google Contacts"]
         assert filtered["relevant"] == []
 
+    def test_assistant_api_allowed_is_method_aware(self):
+        import hermes_cli.web_server as web_server
+
+        allowed = web_server._assistant_api_allowed
+        # Read-only session reads stay reachable under the /api/sessions/ prefix.
+        assert allowed("/api/sessions/stats", "GET") is True
+        assert allowed("/api/sessions/abc/messages", "GET") is True
+        # Destructive verbs under the same prefix are refused.
+        assert allowed("/api/sessions/bulk-delete", "POST") is False
+        assert allowed("/api/sessions/empty", "DELETE") is False
+        assert allowed("/api/sessions/prune", "POST") is False
+        assert allowed("/api/sessions/abc", "DELETE") is False
+        assert allowed("/api/sessions/abc", "PATCH") is False
+        # Exact-match entries remain allowed for their (non-GET) methods.
+        assert allowed("/api/assistant/todos/add", "POST") is True
+
+    def test_assistant_mode_blocks_destructive_session_http(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_DASHBOARD_MODE", "assistant")
+        # bulk-delete with a valid body would be 200/422 in admin mode; a 404
+        # here proves the assistant-mode gate refused the destructive verb.
+        assert self.client.post("/api/sessions/bulk-delete", json={"ids": ["x"]}).status_code == 404
+        assert self.client.delete("/api/sessions/empty").status_code == 404
+        assert self.client.post("/api/sessions/prune", json={}).status_code == 404
+        # A read-only session endpoint is not blocked by the gate.
+        assert self.client.get("/api/sessions/stats").status_code != 404
+
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
