@@ -1,5 +1,7 @@
 """Tests for deterministic memory routing policy."""
 
+import pytest
+
 from agent.memory_router import (
     MemoryDestination,
     MemorySensitivity,
@@ -7,6 +9,51 @@ from agent.memory_router import (
     should_mirror_to_honcho,
     should_write_builtin_memory,
 )
+
+
+def test_connection_string_password_is_discarded_not_injected():
+    # A user-preference keyword ("user") used to flip this to INJECT, leaking the
+    # embedded password into prompt-injected memory. The credential gate must win.
+    password = "p4ss" + "w0rd"
+    ok, route = should_write_builtin_memory(
+        f"connection string postgres://user:{password}@db.host:5432/app",
+        target="user",
+    )
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+    assert route.inject_allowed is False
+    assert route.honcho_store_allowed is False
+
+
+@pytest.mark.parametrize(
+    "prefix,body",
+    [
+        ("sk_live_", "0123456789abcdefABCD"),  # Stripe live key (underscore form)
+        ("AKIA", "ABCDEFGHIJKLMNOP"),          # AWS access key id
+        ("xoxb-", "123456789012-abcdefghijkl"),  # Slack token
+    ],
+)
+def test_high_entropy_secret_formats_are_discarded(prefix, body):
+    secret = prefix + body
+    ok, route = should_write_builtin_memory(f"User likes this value: {secret}", target="user")
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+    assert route.inject_allowed is False
+
+
+def test_jwt_is_discarded():
+    jwt = ".".join(
+        ["eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxMjM0NTY3In0", "SflKxwRJSMeKKF2QT4fw"]
+    )
+    ok, route = should_write_builtin_memory(f"User token is {jwt}", target="user")
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.inject_allowed is False
 
 
 def test_user_preference_routes_to_injected_memory_and_honcho():
