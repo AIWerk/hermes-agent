@@ -1113,17 +1113,34 @@ class SessionDB:
             ).fetchone()
             return dict(row) if row else None
 
-    def pop_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
-        """Mark and return the newest active side-session stack entry."""
+    def pop_side_session(
+        self, source: str = "cli", side_session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Mark and return the newest active side-session stack entry.
+
+        When *side_session_id* is given, only an entry parked from that exact
+        side session is popped. Callers pass the returning client's current
+        session id so that, in a gateway process shared by multiple clients
+        (all keyed by the same process-wide ``source``), one client's ``/back``
+        cannot pop another client's parked session and load its history.
+        """
         now = time.time()
 
         def _do(conn):
-            row = conn.execute(
-                """SELECT * FROM session_stack
-                   WHERE source = ? AND status = 'active'
-                   ORDER BY id DESC LIMIT 1""",
-                (source,),
-            ).fetchone()
+            if side_session_id is not None:
+                row = conn.execute(
+                    """SELECT * FROM session_stack
+                       WHERE source = ? AND side_session_id = ? AND status = 'active'
+                       ORDER BY id DESC LIMIT 1""",
+                    (source, side_session_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM session_stack
+                       WHERE source = ? AND status = 'active'
+                       ORDER BY id DESC LIMIT 1""",
+                    (source,),
+                ).fetchone()
             if not row:
                 return None
             conn.execute(
