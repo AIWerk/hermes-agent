@@ -220,11 +220,25 @@ class TodoStore:
             match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$", line)
             if not match:
                 continue
-            content = re.sub(r"<!--.*?-->", "", match.group(2)).strip()
+            raw = match.group(2)
+            # Recover the stable id + precise status persisted by _sync_markdown
+            # (so merge-by-id keeps working and cancelled/in_progress survive the
+            # round-trip) before the comment is stripped from the visible text.
+            meta = re.search(r"<!--\s*hermes:id=(\S+)\s+status=(\S+)\s*-->", raw)
+            content = re.sub(r"<!--.*?-->", "", raw).strip()
             if not content:
                 continue
-            status = "completed" if match.group(1).lower() == "x" else "pending"
-            items.append({"id": f"todo-{line_no}", "content": content, "status": status})
+            checked = match.group(1).lower() == "x"
+            meta_status = meta.group(2) if meta else None
+            # The checkbox is authoritative for the done/not-done axis (so a CUI
+            # user toggling it is honoured); the comment disambiguates within each
+            # state (completed vs cancelled, pending vs in_progress).
+            if checked:
+                status = meta_status if meta_status in {"completed", "cancelled"} else "completed"
+            else:
+                status = meta_status if meta_status in {"pending", "in_progress"} else "pending"
+            item_id = meta.group(1) if meta else f"todo-{line_no}"
+            items.append({"id": item_id, "content": content, "status": status})
         self._items = items
         self._markdown_mtime_ns = self._markdown_mtime()
 
@@ -251,7 +265,11 @@ class TodoStore:
             for item in self._items:
                 marker = "x" if item["status"] in {"completed", "cancelled"} else " "
                 content = item["content"].replace("\n", " ").strip()
-                lines.append(f"- [{marker}] {content}")
+                # Persist id + precise status in an HTML comment (invisible in the
+                # rendered CUI panel, stripped from the loaded text) so the
+                # round-trip preserves agent ids and all four statuses.
+                meta = f"<!-- hermes:id={item['id']} status={item['status']} -->"
+                lines.append(f"- [{marker}] {content} {meta}")
             self._markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
             self._markdown_mtime_ns = self._markdown_mtime()
         except Exception:
