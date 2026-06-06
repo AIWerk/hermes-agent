@@ -189,6 +189,12 @@ ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCH
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
+# Gateway identity kwargs that scope memory per user (multi-user bots). These
+# are threaded in at initialize() but not by session-switch callers, so they
+# must be preserved across switches or per-user peer scoping is lost.
+_HONCHO_IDENTITY_KEYS = ("user_id", "user_id_alt", "gateway_session_key", "session_title")
+
+
 class HonchoMemoryProvider(MemoryProvider):
     """Honcho AI-native memory with dialectic Q&A and persistent user modeling."""
 
@@ -229,6 +235,9 @@ class HonchoMemoryProvider(MemoryProvider):
         self._session_initialized = False
         self._lazy_init_kwargs: Optional[dict] = None
         self._lazy_init_session_id: Optional[str] = None
+        # Gateway identity captured at initialize(); preserved across session
+        # switches (whose kwargs are sparse) so per-user peer scoping survives.
+        self._identity_kwargs: dict = {}
         self._init_thread: Optional[threading.Thread] = None
         self._init_lock = threading.Lock()
         self._init_error = ""
@@ -337,6 +346,9 @@ class HonchoMemoryProvider(MemoryProvider):
 
             self._lazy_init_kwargs = dict(kwargs)
             self._lazy_init_session_id = session_id
+            self._identity_kwargs = {
+                k: v for k, v in kwargs.items() if k in _HONCHO_IDENTITY_KEYS
+            }
             self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
 
             # Network-backed session creation can block on Honcho service or DB
@@ -425,8 +437,14 @@ class HonchoMemoryProvider(MemoryProvider):
         from plugins.memory.honcho.client import get_honcho_client
         from plugins.memory.honcho.session import HonchoSessionManager
 
+        # Capture the session generation up front. A concurrent session switch
+        # bumps it (via _reset_runtime_context_cache); if that happens while this
+        # — possibly background — init is running, we abandon our self-state
+        # writes so a stale init cannot clobber the freshly-created manager/key.
+        _generation = self._session_generation
+
         client = get_honcho_client(cfg)
-        self._manager = HonchoSessionManager(
+        manager = HonchoSessionManager(
             honcho=client,
             config=cfg,
             context_tokens=cfg.context_tokens,
@@ -435,15 +453,20 @@ class HonchoMemoryProvider(MemoryProvider):
         )
 
         # ----- B3: resolve_session_name -----
-        self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
-        logger.debug("Honcho session key resolved: %s", self._session_key)
+        session_key = self._resolve_session_key(cfg, session_id, **kwargs)
+        logger.debug("Honcho session key resolved: %s", session_key)
+
+        # Abandon if a session switch superseded this init before we committed.
+        if _generation != self._session_generation:
+            return
+        self._manager = manager
+        self._session_key = session_key
 
         # Create the remote session before running startup-only migration and
         # prewarm work. Do not mark the provider ready until this method's
-        # synchronous setup has finished; background startup sets _manager before
-        # get_or_create()/migration/prewarm are complete, and lifecycle hooks must
-        # not treat that partially initialized state as usable.
-        session = self._manager.get_or_create(self._session_key)
+        # synchronous setup has finished; lifecycle hooks must not treat a
+        # partially initialized state as usable.
+        session = manager.get_or_create(session_key)
 
         # ----- B6: Memory file migration (one-time, for new sessions) -----
         # Skip under per-session strategy: every Hermes run creates a fresh
@@ -454,12 +477,12 @@ class HonchoMemoryProvider(MemoryProvider):
             if not session.messages and cfg.session_strategy != "per-session":
                 from hermes_constants import get_hermes_home
                 mem_dir = str(get_hermes_home() / "memories")
-                self._manager.migrate_memory_files(self._session_key, mem_dir)
-                logger.debug("Honcho memory file migration attempted for new session: %s", self._session_key)
+                manager.migrate_memory_files(session_key, mem_dir)
+                logger.debug("Honcho memory file migration attempted for new session: %s", session_key)
             elif cfg.session_strategy == "per-session":
                 logger.debug(
                     "Honcho memory file migration skipped: per-session strategy creates a fresh session per run (%s)",
-                    self._session_key,
+                    session_key,
                 )
         except Exception as e:
             logger.debug("Honcho memory file migration skipped: %s", e)
@@ -471,7 +494,7 @@ class HonchoMemoryProvider(MemoryProvider):
         # consumes the result directly.
         if self._recall_mode in {"context", "hybrid"}:
             try:
-                self._manager.prefetch_context(self._session_key)
+                manager.prefetch_context(session_key)
             except Exception as e:
                 logger.debug("Honcho context prewarm failed: %s", e)
 
@@ -480,7 +503,6 @@ class HonchoMemoryProvider(MemoryProvider):
                 "Who is this user and what should the assistant remember? "
                 "Focus on preferences, current projects, and working style."
             )
-            _generation = self._session_generation
 
             def _prewarm_dialectic() -> None:
                 try:
@@ -507,8 +529,11 @@ class HonchoMemoryProvider(MemoryProvider):
             )
             prewarm_thread.start()
             self._prefetch_thread = prewarm_thread
-            logger.debug("Honcho pre-warm started for session: %s", self._session_key)
+            logger.debug("Honcho pre-warm started for session: %s", session_key)
 
+        # Final guard: a switch may have superseded this init while it ran.
+        if _generation != self._session_generation:
+            return
         self._session_initialized = True
 
     def _ensure_session(self) -> bool:
@@ -1182,6 +1207,11 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
+        # Also wait for any in-flight background init from the previous session,
+        # so its self-state writes complete before we reset and re-initialize.
+        # The generation guard in _do_session_init is the backstop if it overruns.
+        if self._init_thread and self._init_thread.is_alive():
+            self._init_thread.join(timeout=5.0)
 
         if self._manager is not None:
             try:
@@ -1203,13 +1233,22 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._config is None:
             return
 
+        # Session-switch callers forward only sparse kwargs (reason/rewound/...),
+        # so merge in the gateway identity captured at initialize() — otherwise
+        # the rebuilt manager loses runtime_user_peer_name and memory is routed
+        # to the wrong (possibly shared) peer in multi-user deployments.
+        merged = {**self._identity_kwargs, **kwargs}
+        self._identity_kwargs = {
+            k: v for k, v in merged.items() if k in _HONCHO_IDENTITY_KEYS
+        }
+
         if self._recall_mode == "tools" and not self._config.init_on_session_start:
-            self._lazy_init_kwargs = kwargs
+            self._lazy_init_kwargs = merged
             self._lazy_init_session_id = new_session_id
             return
 
         try:
-            self._do_session_init(self._config, new_session_id, **kwargs)
+            self._do_session_init(self._config, new_session_id, **merged)
         except Exception as e:
             logger.warning("Honcho session switch failed: %s", e)
 
