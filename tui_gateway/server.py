@@ -16,7 +16,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    get_hermes_home_override,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tui_gateway.transport import (
@@ -460,6 +465,31 @@ def _db_unavailable_error(rid, *, code: int):
     return _err(rid, code, f"state.db unavailable: {detail}")
 
 
+# ── per-session profile scoping (global remote mode) ───────────────────────────
+# One dashboard normally serves its launch profile. But the desktop's app-global
+# remote mode points every profile at this single backend, so resume/prompt must
+# be able to act on ANOTHER local profile's state.db + home. The desktop passes
+# ``profile`` on those calls; we open that profile's db and bind its HERMES_HOME
+# (a ContextVar override) for the duration of the call so config/skills/model and
+# message persistence all resolve to the right profile. Omitted/own profile → the
+# launch profile (unchanged for single-profile and per-profile-remote setups).
+def _profile_home(profile: str | None) -> Path | None:
+    """Resolve a named profile's home on THIS host, or None for the launch profile."""
+    name = (profile or "").strip()
+    if not name:
+        return None
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        home = Path(profiles_mod.get_profile_dir(name))
+    except Exception:
+        return None
+    # Already the launch profile? No override needed.
+    if home.resolve() == Path(_hermes_home).resolve():
+        return None
+    return home if (home / "state.db").exists() or home.exists() else None
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -650,10 +680,24 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
         worker = None
         notify_registered = False
+        home_token = None
+        profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
+            # Build against the session's profile (global-remote): bind its
+            # HERMES_HOME so config/skills/model resolve to it, and hand the
+            # agent that profile's db so turns persist to the right state.db.
+            session_db = None
+            if profile_home:
+                home_token = set_hermes_home_override(profile_home)
+                try:
+                    from hermes_state import SessionDB
+
+                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                except Exception:
+                    session_db = None
             try:
-                agent = _make_agent(sid, key)
+                agent = _make_agent(sid, key, session_db=session_db)
             finally:
                 _clear_session_context(tokens)
 
@@ -682,6 +726,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 pass
 
             _wire_callbacks(sid)
+            # Hydrate credits notices at session OPEN (not just on the first
+            # message), so depletion / usage-band warnings show at "ready". Runs
+            # off the build thread, after the notice_callback is wired. Fail-open.
+            try:
+                from agent.credits_tracker import seed_credits_at_session_start
+
+                seed_credits_at_session_start(agent)
+            except Exception:
+                pass
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
@@ -697,6 +750,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
             with _sessions_lock:
                 replaced = _sessions.get(sid) is not current
             if replaced:
@@ -822,7 +877,22 @@ def _ensure_session_db_row(session: dict) -> None:
     key = session.get("session_key")
     if not key:
         return
-    db = _get_db()
+    # Persist into the session's own profile db (global remote mode), not the
+    # launch profile's — otherwise the row lands in the wrong state.db, the
+    # unified list mis-tags it, and resume 404s ("session not found").
+    profile_home = session.get("profile_home")
+    if profile_home:
+        from hermes_state import SessionDB
+
+        try:
+            db = SessionDB(db_path=Path(profile_home) / "state.db")
+        except Exception:
+            logger.debug("failed to open profile db for session row", exc_info=True)
+            return
+        close_db = True
+    else:
+        db = _get_db()
+        close_db = False
     if db is None:
         return
     try:
@@ -834,6 +904,12 @@ def _ensure_session_db_row(session: dict) -> None:
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
+    finally:
+        if close_db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
@@ -875,7 +951,13 @@ def _load_cfg() -> dict:
     try:
         import yaml
 
-        p = _hermes_home / "config.yaml"
+        # Honor a per-session profile override (see session.resume) so a resumed
+        # remote profile loads ITS config (model, skills, prompt); otherwise the
+        # launch profile's _hermes_home. Cache is keyed on the resolved path, so
+        # profiles don't clobber each other.
+        override = get_hermes_home_override()
+        home = override if isinstance(override, str) and override else _hermes_home
+        p = Path(home) / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -1608,6 +1690,15 @@ def _get_usage(agent) -> dict:
             usage["cost_usd"] = float(cost.amount_usd)
     except Exception:
         pass
+    # Dev-only live credits-spent readout (L0 usage-aware-credits). Gated on
+    # HERMES_DEV_CREDITS so the payload stays clean when the flag is off.
+    if is_truthy_value(os.environ.get("HERMES_DEV_CREDITS")):
+        try:
+            spent = agent.get_credits_spent_micros()
+            if spent is not None:
+                usage["dev_credits_spent_micros"] = int(spent)
+        except Exception:
+            pass
     return usage
 
 
@@ -2085,6 +2176,24 @@ def _agent_cbs(sid: str) -> dict:
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
+        # Credits/notice spine (L1): an AgentNotice fired by the agent becomes a
+        # notification.show WS event; a recovery clear becomes notification.clear.
+        # Snake_case payload to match the existing gateway-event convention.
+        "notice_callback": lambda n: _emit(
+            "notification.show",
+            sid,
+            {
+                "text": n.text,
+                "level": n.level,
+                "kind": n.kind,
+                "ttl_ms": n.ttl_ms,
+                "key": n.key,
+                "id": n.id,
+            },
+        ),
+        "notice_clear_callback": lambda key: _emit(
+            "notification.clear", sid, {"key": key}
+        ),
         "clarify_callback": lambda q, c: _block(
             "clarify.request", sid, {"question": q, "choices": c}
         ),
@@ -2510,7 +2619,7 @@ def _side_source() -> str:
     return os.environ.get("HERMES_SESSION_SOURCE", "tui")
 
 
-def _make_agent(sid: str, key: str, session_id: str | None = None):
+def _make_agent(sid: str, key: str, session_id: str | None = None, session_db=None):
     from run_agent import AIAgent
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -2570,7 +2679,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         enabled_toolsets=_load_enabled_toolsets(),
         platform="tui",
         session_id=session_id or key,
-        session_db=_get_db(),
+        session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
@@ -3057,6 +3166,13 @@ def _(rid, params: dict) -> dict:
     resolved_cwd = _completion_cwd(params)
     _enable_gateway_prompts()
 
+    # ``profile`` (app-global remote mode): a new chat started under a non-launch
+    # profile must build its agent + persist against THAT profile's home/state.db,
+    # not the dashboard's launch profile. Stored on the session so _start_agent_build
+    # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+
     ready = threading.Event()
     now = time.time()
 
@@ -3078,6 +3194,7 @@ def _(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "pending_title": title or None,
+            "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -3229,21 +3346,36 @@ def _(rid, params: dict) -> dict:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
-    live = _find_live_session(str(target))
-    if live is not None:
-        sid, session = live
-        payload = _live_session_payload(
-            sid,
-            session,
-            cols=cols,
-            touch=True,
-            transport=current_transport() or _stdio_transport,
-        )
-        payload["resumed"] = session.get("session_key") or sid
-        return _ok(rid, payload)
-    db = _get_db()
+    # ``profile`` (app-global remote mode): resume a session that lives in another
+    # local profile's state.db. None/own profile → the launch profile (unchanged).
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+
+    if profile_home is None:
+        live = _find_live_session(str(target))
+        if live is not None:
+            sid, session = live
+            payload = _live_session_payload(
+                sid,
+                session,
+                cols=cols,
+                touch=True,
+                transport=current_transport() or _stdio_transport,
+            )
+            payload["resumed"] = session.get("session_key") or sid
+            return _ok(rid, payload)
+
+    # In a profile scope, the agent OWNS a long-lived db handle bound to that
+    # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
+    if profile_home is not None:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=profile_home / "state.db")
+    else:
+        db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5000)
+
     found = db.get_session(target)
     if not found:
         found = db.get_session_by_title(target)
@@ -3272,6 +3404,9 @@ def _(rid, params: dict) -> dict:
     # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
     sid = uuid.uuid4().hex[:8]
     _enable_gateway_prompts()
+    home_token = (
+        set_hermes_home_override(str(profile_home)) if profile_home is not None else None
+    )
     try:
         db.reopen_session(target)
         history = db.get_messages_as_conversation(target)
@@ -3284,11 +3419,17 @@ def _(rid, params: dict) -> dict:
         messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
         try:
-            agent = _make_agent(sid, target, session_id=target)
+            # Pass the profile's db so the agent persists turns to the right
+            # state.db; home override is active here so config/skills/model
+            # resolve to the profile too.
+            agent = _make_agent(sid, target, session_id=target, session_db=db)
         finally:
             _clear_session_context(tokens)
     except Exception as e:
         return _err(rid, 5000, f"resume failed: {e}")
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
     # Double-checked locking: another concurrent resume may have created the
     # live session while we were building. Re-check under the lock; if it won,
@@ -3315,6 +3456,11 @@ def _(rid, params: dict) -> dict:
             _init_session(sid, target, agent, history, cols=cols)
             if sid in _sessions:
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
+                # Remember the profile home so each turn re-binds HERMES_HOME (the
+                # agent persists to its own db, but mid-turn home reads — memory,
+                # skills — must resolve to the resumed profile too).
+                if profile_home is not None:
+                    _sessions[sid]["profile_home"] = str(profile_home)
         except Exception as e:
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
@@ -3814,7 +3960,7 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     agent = session.get("agent")
-    usage = (
+    usage: dict = (
         _get_usage(agent)
         if agent is not None
         else {"calls": 0, "input": 0, "output": 0, "total": 0}
@@ -3842,6 +3988,18 @@ def _(rid, params: dict) -> dict:
                 usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
         except Exception:
             pass
+# Nous credits block — agent-independent (a portal fetch), so it shows even
+    # with zero API calls or on a resumed session. The TUI /usage panel renders
+    # these lines regardless of `calls`. Fail-open: [] when not logged into Nous
+    # or on any portal hiccup.
+    try:
+        from agent.account_usage import nous_credits_lines
+
+        credits = nous_credits_lines()
+        if credits:
+            usage["credits_lines"] = credits
+    except Exception:
+        pass
     return _ok(rid, usage)
 
 
@@ -4742,6 +4900,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     def run():
         approval_token = None
         session_tokens = []
+        home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
         pending_steer_followup = None
         try:
@@ -4752,6 +4911,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(session["session_key"])
+            _profile_home_str = session.get("profile_home")
+            if _profile_home_str:
+                home_token = set_hermes_home_override(_profile_home_str)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -5087,6 +5249,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
