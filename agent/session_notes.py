@@ -16,12 +16,23 @@ _MAX_ITEMS = 12
 _MAX_TEXT = 500
 
 _SECRET_PATTERNS = [
+    # Keyed forms: group(1) is the label and is kept; the value is redacted.
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+"),
     re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)\S+"),
     re.compile(r"(?i)(password\s*[=:]\s*)\S+"),
     re.compile(r"(?i)(token\s*[=:]\s*)\S+"),
     re.compile(r"(?i)(token\s+)\S+"),
-    re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{6,}"),
+    # scheme://user:password@host — keep "scheme://user:", redact the password.
+    re.compile(r"(?i)((?:[a-z][a-z0-9+.-]*)://[^\s:/@]+:)[^@/\s]+(?=@)"),
+    # Value-only forms: the whole match is the secret and is fully redacted.
+    re.compile(r"sk[-_][A-Za-z0-9][A-Za-z0-9_-]{6,}"),
+    re.compile(r"(?i)(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{12,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
+    re.compile(r"(?i)https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"),
     re.compile(r"AIza[0-9A-Za-z_-]{8,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
 ]

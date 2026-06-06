@@ -326,8 +326,8 @@ CREATE TABLE IF NOT EXISTS session_scratchpads (
 CREATE TABLE IF NOT EXISTS session_stack (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
-    parent_session_id TEXT NOT NULL REFERENCES sessions(id),
-    side_session_id TEXT NOT NULL REFERENCES sessions(id),
+    parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     title TEXT,
     pushed_at REAL NOT NULL,
     popped_at REAL,
@@ -796,6 +796,57 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    def _reconcile_session_stack_fk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild session_stack if its FKs to sessions lack ON DELETE CASCADE.
+
+        session_stack originally referenced sessions(id) without ON DELETE
+        CASCADE (unlike its sibling per-session tables), so deleting or pruning a
+        session referenced by a parked side-session stack entry aborted with a
+        foreign-key constraint error. SQLite can't ALTER a foreign key, so the
+        table is rebuilt once (the new-DB SCHEMA_SQL already has CASCADE, so this
+        is a no-op there).
+        """
+        try:
+            exists = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_stack'"
+            ).fetchone()
+            if not exists:
+                return
+            fk_rows = cursor.execute("PRAGMA foreign_key_list('session_stack')").fetchall()
+            # PRAGMA columns: id, seq, table, from, to, on_update, on_delete, match
+            session_fks = [row for row in fk_rows if row[2] == "sessions"]
+            if not session_fks:
+                return
+            if all((str(row[6]) or "").upper() == "CASCADE" for row in session_fks):
+                return
+            cursor.executescript(
+                """
+                CREATE TABLE session_stack_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    title TEXT,
+                    pushed_at REAL NOT NULL,
+                    popped_at REAL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                );
+                INSERT INTO session_stack_new
+                    SELECT id, source, parent_session_id, side_session_id, title,
+                           pushed_at, popped_at, status
+                    FROM session_stack
+                    WHERE parent_session_id IN (SELECT id FROM sessions)
+                      AND side_session_id IN (SELECT id FROM sessions);
+                DROP TABLE session_stack;
+                ALTER TABLE session_stack_new RENAME TO session_stack;
+                CREATE INDEX IF NOT EXISTS idx_session_stack_active
+                    ON session_stack(source, status, id DESC);
+                """
+            )
+            logger.info("session_stack rebuilt with ON DELETE CASCADE foreign keys")
+        except sqlite3.OperationalError as exc:
+            logger.debug("session_stack FK reconcile skipped: %s", exc)
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -819,6 +870,10 @@ class SessionDB:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Rebuild session_stack on legacy DBs whose FKs to sessions lack
+        # ON DELETE CASCADE (column reconciliation can't fix a foreign key).
+        self._reconcile_session_stack_fk(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL

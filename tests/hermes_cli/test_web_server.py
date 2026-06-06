@@ -213,6 +213,38 @@ class TestSessionTokenInjection:
         assert ws._SESSION_TOKEN and len(ws._SESSION_TOKEN) >= 32
 
 
+class TestAssistantUserDisplayName:
+    def test_prefers_explicit_user_name_over_assistant_identity(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "User wants to call the assistant golem.\n"
+            "User's name is Attila.\n"
+            "golem is Attila's AIWerk test base agent.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+
+        assert ws._assistant_user_display_name() == "Attila"
+
+    def test_ignores_generic_assistant_identity_names(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "golem is a test assistant.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+
+        assert ws._assistant_user_display_name() is None
+
+
 # ---------------------------------------------------------------------------
 # web_server tests (FastAPI endpoints)
 # ---------------------------------------------------------------------------
@@ -1413,6 +1445,58 @@ class TestWebServerEndpoints:
         assert [item["email"] for item in filtered["frequent"]] == ["human@example.ch"]
         assert filtered["frequent"][0]["source_badges"] == ["Google Contacts"]
         assert filtered["relevant"] == []
+
+    def test_assistant_api_allowed_is_method_aware(self):
+        import hermes_cli.web_server as web_server
+
+        allowed = web_server._assistant_api_allowed
+        # Read-only session reads stay reachable under the /api/sessions/ prefix.
+        assert allowed("/api/sessions/stats", "GET") is True
+        assert allowed("/api/sessions/abc/messages", "GET") is True
+        # Destructive verbs under the same prefix are refused.
+        assert allowed("/api/sessions/bulk-delete", "POST") is False
+        assert allowed("/api/sessions/empty", "DELETE") is False
+        assert allowed("/api/sessions/prune", "POST") is False
+        assert allowed("/api/sessions/abc", "DELETE") is False
+        assert allowed("/api/sessions/abc", "PATCH") is False
+        # Exact-match entries remain allowed for their (non-GET) methods.
+        assert allowed("/api/assistant/todos/add", "POST") is True
+
+    def test_assistant_mode_blocks_destructive_session_http(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_DASHBOARD_MODE", "assistant")
+        # bulk-delete with a valid body would be 200/422 in admin mode; a 404
+        # here proves the assistant-mode gate refused the destructive verb.
+        assert self.client.post("/api/sessions/bulk-delete", json={"ids": ["x"]}).status_code == 404
+        assert self.client.delete("/api/sessions/empty").status_code == 404
+        assert self.client.post("/api/sessions/prune", json={}).status_code == 404
+        # A read-only session endpoint is not blocked by the gate.
+        assert self.client.get("/api/sessions/stats").status_code != 404
+    def test_shared_folder_open_neutralizes_active_content(self, tmp_path, monkeypatch):
+        # Attacker-supplied markup dropped into the shared folder must not be
+        # served as renderable content (it would execute in the dashboard origin
+        # via the frontend's blob: URL navigation and could steal the session
+        # token). Active-content types are forced to a non-renderable download.
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "evil.html").write_text("<script>alert(document.cookie)</script>", encoding="utf-8")
+        (shared / "evil.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>", encoding="utf-8")
+        (shared / "report.txt").write_text("hello", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+
+        for name in ("evil.html", "evil.svg"):
+            resp = self.client.get(f"/api/assistant/shared-folder/open?path={name}")
+            assert resp.status_code == 200, name
+            assert resp.headers["content-type"].startswith("application/octet-stream"), name
+            assert resp.headers["content-disposition"].startswith("attachment"), name
+            assert resp.headers["x-content-type-options"] == "nosniff", name
+
+        # Benign types remain inline-previewable but still get the nosniff guard.
+        resp = self.client.get("/api/assistant/shared-folder/open?path=report.txt")
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("inline")
+        assert resp.headers["x-content-type-options"] == "nosniff"
 
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -5746,6 +5830,17 @@ class TestPtyWebSocket:
                 pass
         assert exc.value.code == 4404
 
+    def test_rejects_raw_pty_in_assistant_mode(self, monkeypatch):
+        # The raw terminal must not be reachable on the customer surface, even
+        # with a valid session token and embedded chat enabled.
+        monkeypatch.setattr(self.ws_module, "_DASHBOARD_MODE", "assistant")
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(self._url()):
+                pass
+        assert exc.value.code == 4403
+
     def test_rejects_missing_token(self, monkeypatch):
         monkeypatch.setattr(
             self.ws_module,
@@ -6229,3 +6324,30 @@ class TestDocxExtractionHardening:
         text, note = web_server._extract_uploaded_text(path)
         assert note == "docx-too-large"
         assert text == ""
+def test_clean_todo_text_strips_agent_metadata_comment():
+    from hermes_cli.web_server import _clean_todo_text
+
+    assert _clean_todo_text("Angebot prüfen <!-- hermes:id=a status=pending -->") == "Angebot prüfen"
+
+
+def test_todo_summary_does_not_leak_agent_metadata_into_cui(tmp_path, monkeypatch):
+    # The agent writes TODO.md with hidden round-trip metadata; the customer
+    # Aufgaben panel (_todo_summary) must not render it.
+    import hermes_cli.web_server as web_server
+    from tools.todo_tool import TodoStore
+
+    todo_file = tmp_path / "TODO.md"
+    store = TodoStore(markdown_path=todo_file)
+    store.write([
+        {"id": "a", "content": "Angebot prüfen", "status": "pending"},
+        {"id": "b", "content": "Rechnung senden", "status": "in_progress"},
+    ])
+    raw = todo_file.read_text(encoding="utf-8")
+    assert "hermes:id=a" in raw  # metadata really is in the file...
+
+    monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+    summary = web_server._todo_summary({})
+    texts = [item["text"] for item in summary["items"]]
+
+    assert texts == ["Angebot prüfen", "Rechnung senden"]
+    assert all("<!--" not in t and "hermes:id" not in t and "status=" not in t for t in texts)

@@ -1992,3 +1992,83 @@ class TestGetSessionContextFallback:
         peer_id, target = fetch_calls[0]
         assert peer_id == "ai-peer", f"expected ai-peer, got {peer_id}"
         assert target == "ai-peer"
+
+
+class TestSessionSwitchIdentityAndRace:
+    """Gateway identity must survive a session switch; a stale init must not
+    mark the provider ready after a switch bumped the session generation."""
+
+    @staticmethod
+    def _patches(provider, cfg, mock_manager):
+        from unittest.mock import patch, MagicMock
+
+        return [
+            patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg),
+            patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()),
+            patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager),
+            patch("hermes_constants.get_hermes_home", return_value=MagicMock()),
+        ]
+
+    def test_identity_preserved_across_session_switch(self):
+        from contextlib import ExitStack
+        from unittest.mock import MagicMock
+        from plugins.memory.honcho import HonchoMemoryProvider
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="k", enabled=True, recall_mode="tools",
+            init_on_session_start=True, peer_name=None,
+        )
+        provider = HonchoMemoryProvider()
+        mock_manager = MagicMock()
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_manager.get_or_create.return_value = mock_session
+
+        from unittest.mock import patch
+        with ExitStack() as stack:
+            mgr_cls = stack.enter_context(
+                patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager)
+            )
+            stack.enter_context(patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg))
+            stack.enter_context(patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()))
+            stack.enter_context(patch("hermes_constants.get_hermes_home", return_value=MagicMock()))
+
+            provider.initialize(session_id="s1", user_id="8439114563", user_id_alt="alt-id")
+            assert mgr_cls.call_args.kwargs["runtime_user_peer_name"] == "8439114563"
+
+            # Real switch callers pass only sparse kwargs (no identity).
+            provider.on_session_switch("s2", reset=True, reason="new")
+            assert mgr_cls.call_args.kwargs["runtime_user_peer_name"] == "8439114563"
+            assert mgr_cls.call_args.kwargs["runtime_user_peer_name_alt"] == "alt-id"
+
+    def test_stale_init_does_not_mark_ready_after_generation_bump(self):
+        from unittest.mock import patch, MagicMock
+        from plugins.memory.honcho import HonchoMemoryProvider
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="k", enabled=True, recall_mode="tools",
+            init_on_session_start=False, peer_name=None,
+        )
+        provider = HonchoMemoryProvider()
+        provider._recall_mode = "tools"
+
+        mock_manager = MagicMock()
+        mock_session = MagicMock()
+        mock_session.messages = []
+
+        def _bump(_key):
+            # Simulate a session switch landing mid-init.
+            provider._session_generation += 1
+            return mock_session
+
+        mock_manager.get_or_create.side_effect = _bump
+
+        with patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
+             patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager), \
+             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
+            provider._do_session_init(cfg, "old-session", user_id="u1")
+
+        # A superseded init must not mark the provider ready.
+        assert provider._session_initialized is False
