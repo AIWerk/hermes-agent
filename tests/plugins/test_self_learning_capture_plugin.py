@@ -17,10 +17,27 @@ def _setup_paths(tmp_path: Path, monkeypatch):
     return wiki / "feedback" / "_inbox.md"
 
 
-def test_pre_llm_call_captures_correction_candidate(tmp_path, monkeypatch):
+_ENABLED = {"enabled": True}
+
+
+def test_capture_disabled_by_default(tmp_path, monkeypatch):
+    # With no config the plugin must NOT persist anything (opt-in only).
     inbox = _setup_paths(tmp_path, monkeypatch)
 
     pre_llm_call(user_message="Ezt rosszul csináltad, legközelebb ne így.", session_id="s1")
+    post_tool_call(
+        tool_name="terminal",
+        result={"success": False, "error": "boom", "exit_code": 1},
+        session_id="s1",
+    )
+
+    assert not inbox.exists()
+
+
+def test_pre_llm_call_captures_correction_candidate(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(user_message="Ezt rosszul csináltad, legközelebb ne így.", session_id="s1", config=_ENABLED)
 
     text = inbox.read_text(encoding="utf-8")
     assert "correction-detector" in text
@@ -32,12 +49,12 @@ def test_pre_llm_call_captures_correction_candidate(tmp_path, monkeypatch):
 def test_pre_llm_call_ignores_and_deduplicates_non_corrections(tmp_path, monkeypatch):
     inbox = _setup_paths(tmp_path, monkeypatch)
 
-    pre_llm_call(user_message="Kérlek nézd meg a logot.", session_id="s1")
+    pre_llm_call(user_message="Kérlek nézd meg a logot.", session_id="s1", config=_ENABLED)
     assert not inbox.exists()
 
     msg = "Nem ezt kértem, jegyezd meg így."
-    pre_llm_call(user_message=msg, session_id="s1")
-    pre_llm_call(user_message=msg, session_id="s1")
+    pre_llm_call(user_message=msg, session_id="s1", config=_ENABLED)
+    pre_llm_call(user_message=msg, session_id="s1", config=_ENABLED)
 
     text = inbox.read_text(encoding="utf-8")
     assert text.count("correction-detector") == 1
@@ -58,7 +75,7 @@ def test_configured_feedback_inbox_path_overrides_wiki_path(tmp_path, monkeypatc
     pre_llm_call(
         user_message="Nem ezt kértem, jegyezd meg így.",
         session_id="s4",
-        config={"feedback_inbox": str(custom_inbox)},
+        config={"enabled": True, "feedback_inbox": str(custom_inbox)},
     )
 
     assert custom_inbox.exists()
@@ -75,6 +92,7 @@ def test_post_tool_call_captures_failed_tool_and_sanitizes_secrets(tmp_path, mon
         result={"success": False, "error": "token=abcd1234 failed", "exit_code": 1},
         session_id="s2",
         duration_ms=12,
+        config=_ENABLED,
     )
 
     text = inbox.read_text(encoding="utf-8")

@@ -59,7 +59,10 @@ def _truthy(value: Any, *, default: bool = False) -> bool:
 def _settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     cfg: Mapping[str, Any] = config if isinstance(config, Mapping) else _load_plugin_config()
     return {
-        "enabled": _truthy(cfg.get("enabled"), default=True),
+        # Opt-in: once the plugin is loaded it still persists tool args/results
+        # (which routinely contain credentials and PII) to a plaintext,
+        # curator-ingested inbox, so capture must be explicitly enabled.
+        "enabled": _truthy(cfg.get("enabled"), default=False),
         "feedback_inbox": str(cfg.get("feedback_inbox") or "").strip(),
     }
 
