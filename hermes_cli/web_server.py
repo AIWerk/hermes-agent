@@ -241,6 +241,29 @@ _ASSISTANT_UPLOAD_EXTENSIONS = frozenset({
 _ASSISTANT_AUDIO_EXTENSIONS = frozenset({".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
 _ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 
+# Files whose content can execute script in the dashboard origin if rendered
+# (directly, or via a client-created blob: URL which inherits the page origin).
+# The shared-folder open endpoint serves these as a non-renderable download.
+_SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS = frozenset({
+    ".html", ".htm", ".xhtml", ".shtml", ".svg", ".svgz",
+    ".xml", ".xsl", ".xslt", ".mhtml", ".mht", ".htc",
+})
+
+
+def _safe_shared_open_disposition(name: str, media_type: str) -> tuple[str, str]:
+    """Return (media_type, content_disposition) for serving a shared file.
+
+    Active-content types are forced to application/octet-stream + attachment so
+    attacker-supplied markup placed in the shared folder cannot execute in the
+    dashboard origin when opened. The frontend turns the response body into a
+    blob: URL (which inherits the page origin), so the Content-Type — not the
+    Content-Disposition — is what actually prevents script execution; we set
+    both, plus X-Content-Type-Options: nosniff at the call site.
+    """
+    if Path(name).suffix.lower() in _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS:
+        return "application/octet-stream", "attachment"
+    return media_type, "inline"
+
 
 
 _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS = 40
@@ -5594,11 +5617,15 @@ async def open_assistant_shared_folder_file(request: Request):
         if not target:
             raise HTTPException(status_code=404, detail="File not found")
         media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        media_type, disposition = _safe_shared_open_disposition(target.name, media_type)
         return FileResponse(
             target,
             media_type=media_type,
             filename=target.name,
-            headers={"Content-Disposition": f"inline; filename*=UTF-8''{urllib.parse.quote(target.name)}"},
+            headers={
+                "Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(target.name)}",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     cloud = _shared_cloud_config(config)
@@ -5607,10 +5634,14 @@ async def open_assistant_shared_folder_file(request: Request):
         if not downloaded:
             raise HTTPException(status_code=404, detail="File not found")
         data, media_type, filename = downloaded
+        media_type, disposition = _safe_shared_open_disposition(filename, media_type)
         return Response(
             data,
             media_type=media_type,
-            headers={"Content-Disposition": f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}"},
+            headers={
+                "Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(filename)}",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     raise HTTPException(status_code=404, detail="Shared folder not configured")
