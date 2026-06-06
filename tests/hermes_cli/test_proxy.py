@@ -1157,3 +1157,69 @@ def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypa
     assert rc == 2
     err = capsys.readouterr().err
     assert "hermes auth add nous" in err
+
+
+# ---------------------------------------------------------------------------
+# Regression guard for the missing `import json` (the codex chat shim crashed
+# on every request — silently breaking Honcho's memory deriver, which is wired
+# to this proxy via /chat/completions in the AIWerk base-agent overlay).
+# The pre-existing tests never booted the HTTP app, so they missed it.
+# ---------------------------------------------------------------------------
+
+class _FakeCodexAdapter(UpstreamAdapter):
+    """Minimal openai-codex adapter so create_app routes /chat/completions into
+    _handle_codex_chat_completion without a real Codex OAuth login."""
+
+    @property
+    def name(self) -> str:
+        return "openai-codex"
+
+    @property
+    def display_name(self) -> str:
+        return "Fake Codex"
+
+    @property
+    def allowed_paths(self):
+        return frozenset({"/chat/completions", "/responses", "/models"})
+
+    def is_authenticated(self) -> bool:
+        return True
+
+    def get_credential(self) -> UpstreamCredential:
+        return UpstreamCredential(bearer="fake-bearer", base_url="http://upstream.invalid")
+
+    def get_retry_credential(self, *args, **kwargs) -> UpstreamCredential:
+        return self.get_credential()
+
+    def describe(self) -> str:
+        return "fake"
+
+
+def test_safe_model_from_body_parses_json():
+    # Returned None on the bug (json.loads raised NameError, swallowed).
+    from hermes_cli.proxy.server import _safe_model_from_body
+
+    assert _safe_model_from_body(b'{"model": "gpt-5-codex"}') == "gpt-5-codex"
+    assert _safe_model_from_body(b"") is None
+
+
+def test_chat_completions_shim_does_not_crash_on_missing_json_import():
+    # Boot the real aiohttp app and POST a malformed body so the codex shim
+    # reaches its json.loads. With `import json` missing this raised NameError,
+    # surfaced as "name 'json' is not defined" in the 400 body.
+    import asyncio
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from hermes_cli.proxy.server import create_app
+
+    app = create_app(_FakeCodexAdapter())
+
+    async def _run():
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/v1/chat/completions", data=b"{ not valid json ")
+            return resp.status, await resp.text()
+
+    status, text = asyncio.run(_run())
+    assert status == 400
+    assert "is not defined" not in text
+    assert "invalid json request body" in text.lower()
