@@ -2843,6 +2843,9 @@ def _todo_path_from_config(config: dict[str, Any]) -> Path:
 
 
 def _clean_todo_text(text: str) -> str:
+    # Drop the agent's hidden round-trip metadata (<!-- hermes:id=.. status=.. -->)
+    # so it never renders in the customer Aufgaben panel.
+    text = re.sub(r"<!--.*?-->", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()[:180]

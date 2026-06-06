@@ -186,3 +186,57 @@ class TestTodoToolFunction:
     def test_no_store_returns_error(self):
         result = json.loads(todo_tool())
         assert "error" in result
+
+
+class TestMarkdownRoundTrip:
+    """The TODO.md round-trip must preserve agent ids and all four statuses."""
+
+    @staticmethod
+    def _touch(path):
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000_000))
+
+    def test_roundtrip_preserves_ids_and_statuses(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        store = TodoStore(markdown_path=path)
+        store.write([
+            {"id": "a", "content": "Pending one", "status": "pending"},
+            {"id": "b", "content": "Working", "status": "in_progress"},
+            {"id": "c", "content": "Done", "status": "completed"},
+            {"id": "d", "content": "Dropped", "status": "cancelled"},
+        ])
+        self._touch(path)
+
+        by_id = {i["id"]: i for i in TodoStore(markdown_path=path).read()}
+        assert set(by_id) == {"a", "b", "c", "d"}
+        assert by_id["a"]["status"] == "pending"
+        assert by_id["b"]["status"] == "in_progress"
+        assert by_id["c"]["status"] == "completed"
+        assert by_id["d"]["status"] == "cancelled"
+
+    def test_merge_after_external_touch_does_not_duplicate(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        store = TodoStore(markdown_path=path)
+        store.write([{"id": "build-api", "content": "Build the API", "status": "pending"}])
+        self._touch(path)  # simulate a CUI write between agent writes
+
+        store.write(
+            [{"id": "build-api", "content": "Build the API", "status": "completed"}],
+            merge=True,
+        )
+        matches = [i for i in store.read() if i["content"] == "Build the API"]
+        assert len(matches) == 1
+        assert matches[0]["status"] == "completed"
+
+    def test_cui_checkbox_toggle_overrides_stale_comment(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        store = TodoStore(markdown_path=path)
+        store.write([{"id": "x", "content": "Task", "status": "in_progress"}])
+
+        # CUI user checks the box; the persisted comment still says in_progress.
+        text = path.read_text(encoding="utf-8").replace("- [ ] Task", "- [x] Task")
+        path.write_text(text, encoding="utf-8")
+        self._touch(path)
+
+        item = TodoStore(markdown_path=path).read()[0]
+        assert item["status"] == "completed"  # checkbox is authoritative for done
+        assert item["id"] == "x"               # id preserved across the round-trip

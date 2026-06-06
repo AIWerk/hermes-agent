@@ -6278,3 +6278,32 @@ class TestValidateProviderCredential:
     def test_empty_value_rejected(self):
         data = self._post("OPENAI_API_KEY", "   ").json()
         assert data["ok"] is False
+
+
+def test_clean_todo_text_strips_agent_metadata_comment():
+    from hermes_cli.web_server import _clean_todo_text
+
+    assert _clean_todo_text("Angebot prüfen <!-- hermes:id=a status=pending -->") == "Angebot prüfen"
+
+
+def test_todo_summary_does_not_leak_agent_metadata_into_cui(tmp_path, monkeypatch):
+    # The agent writes TODO.md with hidden round-trip metadata; the customer
+    # Aufgaben panel (_todo_summary) must not render it.
+    import hermes_cli.web_server as web_server
+    from tools.todo_tool import TodoStore
+
+    todo_file = tmp_path / "TODO.md"
+    store = TodoStore(markdown_path=todo_file)
+    store.write([
+        {"id": "a", "content": "Angebot prüfen", "status": "pending"},
+        {"id": "b", "content": "Rechnung senden", "status": "in_progress"},
+    ])
+    raw = todo_file.read_text(encoding="utf-8")
+    assert "hermes:id=a" in raw  # metadata really is in the file...
+
+    monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+    summary = web_server._todo_summary({})
+    texts = [item["text"] for item in summary["items"]]
+
+    assert texts == ["Angebot prüfen", "Rechnung senden"]
+    assert all("<!--" not in t and "hermes:id" not in t and "status=" not in t for t in texts)
