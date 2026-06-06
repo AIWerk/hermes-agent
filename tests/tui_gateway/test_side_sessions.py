@@ -112,3 +112,35 @@ def test_gateway_side_back_restores_parked_main_session(tmp_path, monkeypatch):
         {"role": "assistant", "content": "Main answer"},
     ]
     assert db.get_active_side_session(source="tui-test") is None
+
+
+def test_side_start_reregisters_approval_notify_for_new_session(tmp_path, monkeypatch):
+    import hermes_state
+    import tools.approval as approval
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    db = hermes_state.SessionDB()
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_side_source", lambda: "tui-test")
+    monkeypatch.setattr(server, "_reset_session_agent", lambda sid, session: {"model": "test-model"})
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    registered = []
+    monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: registered.append(key))
+    monkeypatch.setattr(approval, "unregister_gateway_notify", lambda key: None)
+
+    sid = "sid1"
+    sess = _session()
+    sess["agent_ready"].set()
+    server._sessions[sid] = sess
+    try:
+        resp = server._methods["session.side.start"]("r1", {"session_id": sid, "title": "Side"})
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert "error" not in resp
+    side_id = resp["result"]["side_session_id"]
+    # The switched-in side session must have an approval notify registered, else
+    # tool-approval prompts silently block in the side session.
+    assert side_id in registered

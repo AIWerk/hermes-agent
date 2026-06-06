@@ -213,6 +213,38 @@ class TestSessionTokenInjection:
         assert ws._SESSION_TOKEN and len(ws._SESSION_TOKEN) >= 32
 
 
+class TestAssistantUserDisplayName:
+    def test_prefers_explicit_user_name_over_assistant_identity(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "User wants to call the assistant golem.\n"
+            "User's name is Attila.\n"
+            "golem is Attila's AIWerk test base agent.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+
+        assert ws._assistant_user_display_name() == "Attila"
+
+    def test_ignores_generic_assistant_identity_names(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "golem is a test assistant.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+
+        assert ws._assistant_user_display_name() is None
+
+
 # ---------------------------------------------------------------------------
 # web_server tests (FastAPI endpoints)
 # ---------------------------------------------------------------------------
@@ -1441,6 +1473,30 @@ class TestWebServerEndpoints:
         assert self.client.post("/api/sessions/prune", json={}).status_code == 404
         # A read-only session endpoint is not blocked by the gate.
         assert self.client.get("/api/sessions/stats").status_code != 404
+    def test_shared_folder_open_neutralizes_active_content(self, tmp_path, monkeypatch):
+        # Attacker-supplied markup dropped into the shared folder must not be
+        # served as renderable content (it would execute in the dashboard origin
+        # via the frontend's blob: URL navigation and could steal the session
+        # token). Active-content types are forced to a non-renderable download.
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "evil.html").write_text("<script>alert(document.cookie)</script>", encoding="utf-8")
+        (shared / "evil.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>", encoding="utf-8")
+        (shared / "report.txt").write_text("hello", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+
+        for name in ("evil.html", "evil.svg"):
+            resp = self.client.get(f"/api/assistant/shared-folder/open?path={name}")
+            assert resp.status_code == 200, name
+            assert resp.headers["content-type"].startswith("application/octet-stream"), name
+            assert resp.headers["content-disposition"].startswith("attachment"), name
+            assert resp.headers["x-content-type-options"] == "nosniff", name
+
+        # Benign types remain inline-previewable but still get the nosniff guard.
+        resp = self.client.get("/api/assistant/shared-folder/open?path=report.txt")
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].startswith("inline")
+        assert resp.headers["x-content-type-options"] == "nosniff"
 
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -5773,6 +5829,17 @@ class TestPtyWebSocket:
             with self.client.websocket_connect(self._url()):
                 pass
         assert exc.value.code == 4404
+
+    def test_rejects_raw_pty_in_assistant_mode(self, monkeypatch):
+        # The raw terminal must not be reachable on the customer surface, even
+        # with a valid session token and embedded chat enabled.
+        monkeypatch.setattr(self.ws_module, "_DASHBOARD_MODE", "assistant")
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(self._url()):
+                pass
+        assert exc.value.code == 4403
 
     def test_rejects_missing_token(self, monkeypatch):
         monkeypatch.setattr(

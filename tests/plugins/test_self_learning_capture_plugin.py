@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from plugins.self_learning_capture import (
+    _sanitize,
     post_tool_call,
     pre_llm_call,
     register,
@@ -91,6 +94,53 @@ def test_post_tool_call_ignores_successful_result(tmp_path, monkeypatch):
     post_tool_call(tool_name="terminal", result={"success": True, "exit_code": 0}, session_id="s3")
 
     assert not inbox.exists()
+
+
+# Synthetic secrets are assembled from fragments at runtime so the contiguous
+# token literal never appears in this file — that avoids GitHub secret-scanning
+# push-protection false positives on test fixtures while still exercising the
+# regexes on the full assembled value.
+@pytest.mark.parametrize(
+    "prefix,body",
+    [
+        ("ghp_", "0123456789abcdefghij"),       # bare GitHub token (was kept verbatim)
+        ("sk-", "anttest0123456789ABCDEF"),      # bare OpenAI/Anthropic-style token
+        ("AKIA", "ABCDEFGHIJKLMNOP"),            # AWS access key id
+        ("sk_live_", "0123456789abcdefABCD"),    # Stripe live key
+        ("xoxb-", "123456789012-abcdefghijkl"),  # Slack token
+    ],
+)
+def test_sanitize_redacts_bare_high_entropy_tokens(prefix, body):
+    secret = prefix + body
+    out = _sanitize(f"the value is {secret} ok")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_quoted_json_values():
+    # The exact shape _excerpt produces via json.dumps for dict args/results.
+    api_key = "AKIA" + "_my_real_key_value"
+    payload = '{"api_key": "' + api_key + '", "password": "hunter2"}'
+    out = _sanitize(payload)
+    assert api_key not in out
+    assert "hunter2" not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_url_embedded_password():
+    password = "p4ss" + "w0rd"
+    out = _sanitize(f"connection string postgres://user:{password}@db.host:5432/app")
+    assert password not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_jwt():
+    jwt = ".".join(
+        ["eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0", "SflKxwRJSMeKKF2QT4fwpMeJf36"]
+    )
+    out = _sanitize(f"token {jwt}")
+    assert jwt not in out
+    assert "[REDACTED]" in out
 
 
 def test_register_hooks():

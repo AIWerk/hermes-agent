@@ -80,8 +80,14 @@ class MemoryRoute:
 
 _SECRET_RE = re.compile(
     r"(api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key|"
-    r"BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY|sk-[A-Za-z0-9]|xox[baprs]-|"
-    r"gh[pousr]_[A-Za-z0-9_]+|AIza[0-9A-Za-z_-]{20,})",
+    r"BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY|"
+    r"sk[-_][A-Za-z0-9]|(sk|pk|rk)_(live|test)_[A-Za-z0-9]{8,}|"
+    r"xox[baprs]-|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]{20,}|"
+    r"AIza[0-9A-Za-z_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
+    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+|"
+    r"hooks\.slack\.com/services/|"
+    # credentials embedded in URLs: scheme://user:password@host
+    r"[a-z][a-z0-9+.-]*://[^\s:/@]+:[^@/\s]+@)",
     re.IGNORECASE,
 )
 
