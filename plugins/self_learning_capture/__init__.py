@@ -8,12 +8,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-_SECRET_PATTERNS = [
+# ``label <sep> value`` forms — keep the label, redact the value. The key/value
+# matchers are quote-aware so the JSON form this plugin actually serializes
+# (e.g. ``"password": "hunter2"``) is redacted, not just the bare ``token=...`` form.
+_SECRET_KEYED_PATTERNS = [
     re.compile(r"(?i)(authorization\s*:\s*bearer)\s+[^\s'\",;]+"),
     re.compile(r"(?i)(bearer)\s+[^\s'\",;]+"),
-    re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*[^\s'\",;]+"),
-    re.compile(r"(?i)\b(sk-[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,})\b"),
+    re.compile(
+        r"(?i)(\"?(?:api[_-]?key|secret|token|password|passwd|credential"
+        r"|access[_-]?key|client[_-]?secret|private[_-]?key|authorization)\"?)"
+        r"\s*[:=]\s*\"?[^\s'\",;]+\"?"
+    ),
 ]
+
+# Whole-match secrets — there is no label to keep, so the entire match is the
+# secret and must be replaced in full (the previous single regex kept it verbatim
+# by appending ``=[REDACTED]`` to ``group(1)``, which was the secret itself).
+_SECRET_VALUE_PATTERNS = [
+    re.compile(
+        r"(?i)\b(?:"
+        r"sk-[A-Za-z0-9_-]{8,}"                       # OpenAI-style
+        r"|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"  # Stripe live/test keys
+        r"|xox[baprs]-[A-Za-z0-9-]{10,}"               # Slack tokens
+        r"|gh[pousr]_[A-Za-z0-9_]{12,}"                # GitHub tokens
+        r"|github_pat_[A-Za-z0-9_]{20,}"               # GitHub fine-grained PAT
+        r"|AIza[0-9A-Za-z_-]{20,}"                     # Google API key
+        r"|(?:AKIA|ASIA)[0-9A-Z]{16}"                  # AWS access key id
+        r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"  # JWT
+        r")\b"
+    ),
+    re.compile(r"(?i)https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"),
+    re.compile(r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
+]
+
+# ``scheme://user:password@host`` — keep ``scheme://user:``, redact the password.
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s/@]+(@)")
 
 _CORRECTION_PATTERNS = [
     r"\b(ne mentsd|ne írd|ne ird|ne tedd|ezt ne|nem így|nem igy|rosszul|hibás|hibas|tévedtél|tevedtel)\b",
@@ -84,8 +113,11 @@ def _now() -> str:
 
 def _sanitize(text: str) -> str:
     value = text.replace("\x00", "")
-    for pattern in _SECRET_PATTERNS:
-        value = pattern.sub(lambda m: m.group(1) + "=[REDACTED]" if m.groups() else "[REDACTED]", value)
+    for pattern in _SECRET_KEYED_PATTERNS:
+        value = pattern.sub(lambda m: m.group(1) + "=[REDACTED]", value)
+    value = _URL_CRED_RE.sub(lambda m: m.group(1) + "[REDACTED]" + m.group(2), value)
+    for pattern in _SECRET_VALUE_PATTERNS:
+        value = pattern.sub("[REDACTED]", value)
     return value
 
 
