@@ -6183,3 +6183,49 @@ class TestValidateProviderCredential:
     def test_empty_value_rejected(self):
         data = self._post("OPENAI_API_KEY", "   ").json()
         assert data["ok"] is False
+
+
+class TestDocxExtractionHardening:
+    """_extract_uploaded_text must not be a zip-bomb / XML-entity DoS vector."""
+
+    @staticmethod
+    def _make_docx(path, document_xml: bytes) -> None:
+        import zipfile
+
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("word/document.xml", document_xml)
+
+    def test_normal_docx_extracts_text(self, tmp_path):
+        from hermes_cli.web_server import _extract_uploaded_text
+
+        path = tmp_path / "ok.docx"
+        self._make_docx(path, b"<document><t>Hello world</t></document>")
+        text, note = _extract_uploaded_text(path)
+        assert note == "docx"
+        assert "Hello world" in text
+
+    def test_docx_with_dtd_entities_is_rejected(self, tmp_path):
+        from hermes_cli.web_server import _extract_uploaded_text
+
+        # Classic billion-laughs shape: must be refused, not expanded.
+        bomb = (
+            b"<?xml version='1.0'?>"
+            b"<!DOCTYPE lolz [<!ENTITY lol 'lol'>"
+            b"<!ENTITY lol2 '&lol;&lol;&lol;&lol;&lol;'>]>"
+            b"<document><t>&lol2;</t></document>"
+        )
+        path = tmp_path / "bomb.docx"
+        self._make_docx(path, bomb)
+        text, note = _extract_uploaded_text(path)
+        assert note == "docx-extraction-failed"
+        assert text == ""
+
+    def test_docx_oversized_xml_is_rejected(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_ASSISTANT_DOCX_MAX_XML_BYTES", 100)
+        path = tmp_path / "big.docx"
+        self._make_docx(path, b"<document><t>" + b"A" * 500 + b"</t></document>")
+        text, note = web_server._extract_uploaded_text(path)
+        assert note == "docx-too-large"
+        assert text == ""
