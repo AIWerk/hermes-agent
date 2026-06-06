@@ -34,7 +34,7 @@ from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
 from utils import atomic_replace
-from agent.memory_router import should_write_builtin_memory
+from agent.memory_router import MemorySensitivity, should_write_builtin_memory
 from hermes_cli.config import cfg_get, load_config
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -602,20 +602,34 @@ class MemoryStore:
 
 
 def _memory_router_enabled() -> bool:
-    """Return whether prompt-injected memory write routing is enabled."""
+    """Return whether the (curation) memory-write routing policy is enabled."""
     try:
         cfg = load_config()
         return bool(cfg_get(cfg, "memory", "router", "enabled", default=True)) and bool(
             cfg_get(cfg, "memory", "router", "block_non_inject_writes", default=True)
         )
     except Exception:
-        return True
+        # The curation policy can't be read (transient/corrupt config). Fail
+        # OPEN for curation so a config glitch doesn't silently reject the
+        # agent's legitimate writes. The credential gate in
+        # _router_block_response stays active regardless, so this never relaxes
+        # the secret-leak protection.
+        return False
 
 
 def _router_block_response(content: str, target: str) -> Optional[str]:
+    ok, route = should_write_builtin_memory(content, target=target)
+    # Credential safety is an unconditional invariant: never let secrets reach
+    # prompt-injected memory, even when the curation policy is disabled or its
+    # config can't be read.
+    if route.sensitivity == MemorySensitivity.CREDENTIAL:
+        return json.dumps({
+            "success": False,
+            "error": "Memory router blocked a credential/secret from prompt-injected memory.",
+            "route": route.to_dict(),
+        }, ensure_ascii=False)
     if not _memory_router_enabled():
         return None
-    ok, route = should_write_builtin_memory(content, target=target)
     if ok:
         return None
     return json.dumps({
