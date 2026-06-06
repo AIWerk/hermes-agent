@@ -234,6 +234,9 @@ _ASSISTANT_UPLOAD_MAX_FILES = 10
 _ASSISTANT_UPLOAD_MAX_FILE_BYTES = 12 * 1024 * 1024
 _ASSISTANT_UPLOAD_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 _ASSISTANT_TEXT_EXTRACT_LIMIT = 60_000
+# Cap the decompressed size of a .docx word/document.xml so a small (<=12 MB)
+# upload cannot decompress to many GB (zip bomb) and exhaust server memory.
+_ASSISTANT_DOCX_MAX_XML_BYTES = 50 * 1024 * 1024
 _ASSISTANT_UPLOAD_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp",
     ".pdf", ".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".docx",
@@ -4351,7 +4354,22 @@ def _extract_uploaded_text(path: Path, content_type: str = "") -> tuple[str, str
             import xml.etree.ElementTree as ET
 
             with zipfile.ZipFile(path) as zf:
-                xml = zf.read("word/document.xml")
+                try:
+                    info = zf.getinfo("word/document.xml")
+                except KeyError:
+                    return "", "docx-extraction-failed"
+                if info.file_size > _ASSISTANT_DOCX_MAX_XML_BYTES:
+                    return "", "docx-too-large"
+                # Bounded read: never decompress more than the cap into memory,
+                # even if the zip header understates the real size.
+                with zf.open(info) as member:
+                    xml = member.read(_ASSISTANT_DOCX_MAX_XML_BYTES + 1)
+            if len(xml) > _ASSISTANT_DOCX_MAX_XML_BYTES:
+                return "", "docx-too-large"
+            # Reject DTD / entity declarations (billion-laughs / XXE vector);
+            # a real word/document.xml never declares them.
+            if b"<!DOCTYPE" in xml[:65536] or b"<!ENTITY" in xml[:65536]:
+                return "", "docx-extraction-failed"
             root = ET.fromstring(xml)
             parts = [node.text for node in root.iter() if node.text]
             text = " ".join(parts).strip()[:_ASSISTANT_TEXT_EXTRACT_LIMIT]
