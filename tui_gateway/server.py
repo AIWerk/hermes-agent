@@ -2457,6 +2457,20 @@ def _switch_live_session(
     session["session_key"] = target_session_id
     session["pending_title"] = None
     info = _reset_session_agent(sid, session)
+    # Re-arm the approval notify for the switched-in session. The gateway
+    # approval callback dict is keyed by session_key and is only populated at
+    # initial session creation; without re-registering here, the first tool
+    # approval in a side/back session would silently block (no approval.request
+    # ever reaches the frontend). Mirrors the branch-switch helper.
+    try:
+        from tools.approval import register_gateway_notify
+
+        register_gateway_notify(
+            target_session_id,
+            lambda data: _emit("approval.request", sid, data),
+        )
+    except Exception:
+        pass
     with session["history_lock"]:
         session["history"] = list(history or [])
         session["history_version"] = int(session.get("history_version", 0)) + 1
