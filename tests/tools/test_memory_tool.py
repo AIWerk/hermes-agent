@@ -446,6 +446,54 @@ class TestMemoryToolDispatcher:
         ))
         assert result["success"] is True
 
+    def _break_config(self, monkeypatch):
+        def _raise():
+            raise RuntimeError("config unreadable")
+        monkeypatch.setattr("tools.memory_tool.load_config", _raise)
+
+    def test_router_fails_open_for_curation_on_config_error(self, store, monkeypatch):
+        # A wiki-candidate write is normally blocked; on a config-read error the
+        # curation policy must fail open so legitimate writes aren't silently lost.
+        self._break_config(monkeypatch)
+        result = json.loads(memory_tool(
+            action="add",
+            target="memory",
+            content="AIWerk architecture: Smart Website is the customer-facing surface.",
+            store=store,
+        ))
+        assert result["success"] is True
+
+    def test_router_blocks_credential_even_on_config_error(self, store, monkeypatch):
+        # The credential gate is unconditional — a config error must NOT open a
+        # secret-leak window into prompt-injected memory.
+        self._break_config(monkeypatch)
+        result = json.loads(memory_tool(
+            action="add",
+            target="memory",
+            content="The API key is sk-abc1234567890secretvalue.",
+            store=store,
+        ))
+        assert result["success"] is False
+        assert "credential" in result["error"].lower()
+
+    def test_router_blocks_credential_when_disabled(self, store, monkeypatch):
+        monkeypatch.setattr(
+            "tools.memory_tool.load_config",
+            lambda: {"memory": {"router": {"enabled": False, "block_non_inject_writes": False}}},
+        )
+        # Generic write is allowed (router disabled)...
+        ok = json.loads(memory_tool(
+            action="add", target="memory", content="Just a plain note.", store=store,
+        ))
+        assert ok["success"] is True
+        # ...but a credential is still blocked.
+        blocked = json.loads(memory_tool(
+            action="add", target="memory",
+            content="password = hunter2supersecretvalue", store=store,
+        ))
+        assert blocked["success"] is False
+        assert "credential" in blocked["error"].lower()
+
     def test_replace_requires_old_text(self, store):
         result = json.loads(memory_tool(action="replace", content="new", store=store))
         assert result["success"] is False

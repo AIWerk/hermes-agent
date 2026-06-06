@@ -5,6 +5,17 @@ injection, wiki/skill candidates, tenant-private facts, and discard paths.
 It is intentionally deterministic and local: no LLM calls, no network calls,
 and no writes. Callers can use it before writing memory or mirroring facts to
 external providers.
+
+Enforcement model (important): the only destinations enforced by current
+callers are INJECT (``should_write_builtin_memory``) and STORE_HONCHO
+(``should_mirror_to_honcho``). The remaining destinations — TENANT_PRIVATE,
+WIKI_CANDIDATE, SKILL_CANDIDATE, SESSION_INDEX — are advisory *classification*:
+content routed to them is simply kept out of prompt-injected built-in memory
+(it stays EXPLICIT_RECALL_ONLY). There is no separate in-process tenant-private
+store; tenant isolation is structural — each customer runs an isolated agent
+home / Honcho namespace, so a clone's own memory *is* its tenant-private memory.
+The CREDENTIAL rule (secrets -> DISCARD, never injected/mirrored) is the one
+hard security guarantee.
 """
 
 from __future__ import annotations
