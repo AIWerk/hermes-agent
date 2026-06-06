@@ -1480,8 +1480,11 @@ class TestWebServerEndpoints:
         opened = []
         monkeypatch.setattr(web_server, "_open_system_folder", lambda path, **kwargs: opened.append(path) or True)
 
-        local_headers = {"host": "127.0.0.1:9120", "x-forwarded-for": "127.0.0.1"}
-        resp = self.client.get("/api/assistant/resources?refresh=1", headers=local_headers)
+        # can_open_folder is True here via the explicit operator opt-in; a
+        # spoofable X-Forwarded-For: 127.0.0.1 no longer grants "local" status
+        # (see _request_looks_local / TestRequestLooksLocalSpoofing).
+        monkeypatch.setenv("HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN", "1")
+        resp = self.client.get("/api/assistant/resources?refresh=1", headers={"host": "127.0.0.1:9120"})
 
         assert resp.status_code == 200
         data = resp.json()
@@ -1522,7 +1525,7 @@ class TestWebServerEndpoints:
         assert deep_open_resp.status_code == 200
         assert deep_open_resp.text == "tief"
         assert self.client.get("/api/assistant/shared-folder/open?path=../.env").status_code == 404
-        open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers=local_headers)
+        open_folder_resp = self.client.post("/api/assistant/shared-folder/open-folder", headers={"host": "127.0.0.1:9120"})
         assert open_folder_resp.status_code == 200
         assert opened == [shared]
         labels = {connector["label"] for connector in data["connectors"]}
@@ -6183,3 +6186,39 @@ class TestValidateProviderCredential:
     def test_empty_value_rejected(self):
         data = self._post("OPENAI_API_KEY", "   ").json()
         assert data["ok"] is False
+
+
+class TestRequestLooksLocalSpoofing:
+    """_request_looks_local must not trust client-supplied forwarding headers."""
+
+    class _Client:
+        host = "127.0.0.1"
+
+    class _Req:
+        def __init__(self, headers):
+            self.headers = headers
+            self.client = TestRequestLooksLocalSpoofing._Client()
+
+    def test_direct_loopback_is_local(self):
+        import hermes_cli.web_server as web_server
+
+        assert web_server._request_looks_local(self._Req({"host": "127.0.0.1"})) is True
+
+    def test_spoofed_x_forwarded_for_is_not_local(self):
+        import hermes_cli.web_server as web_server
+
+        req = self._Req({"host": "127.0.0.1", "x-forwarded-for": "127.0.0.1"})
+        assert web_server._request_looks_local(req) is False
+
+    def test_spoofed_x_real_ip_is_not_local(self):
+        import hermes_cli.web_server as web_server
+
+        req = self._Req({"host": "127.0.0.1", "x-real-ip": "127.0.0.1"})
+        assert web_server._request_looks_local(req) is False
+
+    def test_remote_peer_is_not_local(self):
+        import hermes_cli.web_server as web_server
+
+        req = self._Req({"host": "127.0.0.1"})
+        req.client = type("C", (), {"host": "203.0.113.7"})()
+        assert web_server._request_looks_local(req) is False

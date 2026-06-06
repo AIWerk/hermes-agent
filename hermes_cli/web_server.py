@@ -505,9 +505,15 @@ def _shared_folder_remote_open_allowed(config: dict[str, Any]) -> bool:
 def _request_looks_local(request: Request | None) -> bool:
     if request is None:
         return False
-    forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-    real_ip = request.headers.get("x-real-ip", "").strip()
-    client_host = forwarded_for or real_ip or (request.client.host if request.client else "")
+    # Trust only the real socket peer for the loopback decision — never the
+    # client-supplied X-Forwarded-For / X-Real-IP headers, which a remote client
+    # can set to 127.0.0.1 to spoof "local". If a forwarding header is present
+    # the request was proxied, so the real client is not on this host; remote
+    # access is instead gated by the explicit _shared_folder_remote_open_allowed
+    # operator opt-in.
+    if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
+        return False
+    client_host = request.client.host if request.client else ""
     try:
         if not ipaddress.ip_address(client_host).is_loopback:
             return False
