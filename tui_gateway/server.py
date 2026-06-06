@@ -3408,7 +3408,9 @@ def _(rid, params: dict) -> dict:
     source = _side_source()
     current_session_id = session.get("session_key") or sid
     try:
-        entry = db.pop_side_session(source=source)
+        # Scope the pop to THIS client's current (side) session so a shared
+        # gateway process can't let one client's /back pop another's parked stack.
+        entry = db.pop_side_session(source=source, side_session_id=current_session_id)
         if not entry:
             return _ok(rid, {"mode": "main", "returned": False})
         parent_session_id = entry["parent_session_id"]
