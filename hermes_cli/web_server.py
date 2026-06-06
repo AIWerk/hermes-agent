@@ -4609,17 +4609,26 @@ def _assistant_user_display_name() -> Optional[str]:
     except OSError:
         return None
 
-    patterns = (
-        r"^\s*([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,39})\s+is\b",
+    explicit_patterns = (
+        r"\bUser['’]s\s+name\s+is\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,39})\b",
         r"\bname\s+is\s+([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,39})\b",
     )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
-        if not match:
-            continue
-        name = match.group(1).strip(" '’-\t\r\n")
-        if 1 < len(name) <= 40 and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", name):
-            return name
+    generic_patterns = (
+        r"^\s*([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,39})\s+is\b",
+    )
+    blocked_names = {"assistant", "bot", "golem", "cody", "hermes"}
+    for patterns, allow_blocked in ((explicit_patterns, True), (generic_patterns, False)):
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
+            if not match:
+                continue
+            name = match.group(1).strip(" '’-\t\r\n")
+            if (
+                1 < len(name) <= 40
+                and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", name)
+                and (allow_blocked or name.casefold() not in blocked_names)
+            ):
+                return name
     return None
 
 

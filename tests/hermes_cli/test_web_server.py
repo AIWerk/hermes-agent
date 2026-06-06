@@ -213,6 +213,38 @@ class TestSessionTokenInjection:
         assert ws._SESSION_TOKEN and len(ws._SESSION_TOKEN) >= 32
 
 
+class TestAssistantUserDisplayName:
+    def test_prefers_explicit_user_name_over_assistant_identity(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "User wants to call the assistant golem.\n"
+            "User's name is Attila.\n"
+            "golem is Attila's AIWerk test base agent.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+
+        assert ws._assistant_user_display_name() == "Attila"
+
+    def test_ignores_generic_assistant_identity_names(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "golem is a test assistant.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+
+        assert ws._assistant_user_display_name() is None
+
+
 # ---------------------------------------------------------------------------
 # web_server tests (FastAPI endpoints)
 # ---------------------------------------------------------------------------
