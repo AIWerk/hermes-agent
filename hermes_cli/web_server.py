@@ -12901,6 +12901,17 @@ def _ws_close_reason(text: str) -> str:
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
 
+    # The raw /api/pty terminal spawns a full `hermes --tui` PTY (slash
+    # commands like /config, /model, shell access). It is strictly larger than
+    # the structured customer chat (/api/ws) and must not be reachable in
+    # customer "assistant" mode, where the HTTP /api admin allowlist already
+    # blocks the equivalent surfaces. (WS routes bypass the HTTP middleware, so
+    # this gate is enforced here directly.)
+    if _assistant_mode_enabled():
+        _log.warning("pty refused: raw terminal not available in assistant mode peer=%s", peer)
+        await ws.close(code=4403, reason="pty disabled in assistant mode")
+        return
+
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         _log.info("pty refused: embedded chat disabled peer=%s", peer)
         await ws.close(code=4404, reason="embedded chat disabled")

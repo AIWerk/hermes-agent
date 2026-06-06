@@ -5746,6 +5746,17 @@ class TestPtyWebSocket:
                 pass
         assert exc.value.code == 4404
 
+    def test_rejects_raw_pty_in_assistant_mode(self, monkeypatch):
+        # The raw terminal must not be reachable on the customer surface, even
+        # with a valid session token and embedded chat enabled.
+        monkeypatch.setattr(self.ws_module, "_DASHBOARD_MODE", "assistant")
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(self._url()):
+                pass
+        assert exc.value.code == 4403
+
     def test_rejects_missing_token(self, monkeypatch):
         monkeypatch.setattr(
             self.ws_module,
