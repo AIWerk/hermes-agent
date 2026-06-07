@@ -89,18 +89,43 @@ class MemoryRoute:
         }
 
 
+# Only the first _SECRET_SCAN_LIMIT bytes of content are scanned for secrets.
+# A credential in a memory write appears near the top in every realistic case,
+# and bounding the scan keeps _SECRET_RE.search() linear even on attacker-
+# controlled multi-KB blobs (see the URL-credential alternative below).
+_SECRET_SCAN_LIMIT = 8192
+
 _SECRET_RE = re.compile(
     r"(api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key|"
     r"BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY|"
     r"sk[-_][A-Za-z0-9]|(sk|pk|rk)_(live|test)_[A-Za-z0-9]{8,}|"
     r"xox[baprs]-|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]{20,}|"
     r"AIza[0-9A-Za-z_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
+    r"GOCSPX-[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{36,}|"
+    r"Authorization:\s*Bearer\s+[A-Za-z0-9._-]{8,}|"
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+|"
     r"hooks\.slack\.com/services/|"
-    # credentials embedded in URLs: scheme://user:password@host
-    r"[a-z][a-z0-9+.-]*://[^\s:/@]+:[^@/\s]+@)",
+    # raw high-entropy run: 64+ hex chars (signing secrets, key material)
+    r"\b[a-fA-F0-9]{64,}\b|"
+    # credentials embedded in URLs: scheme://[user]:password@host. The scheme
+    # run and the user/pass quantifiers are bounded so the alternative cannot
+    # backtrack quadratically on long non-matching input; the userless form
+    # (scheme://:password@) is also covered.
+    r"\b[a-z][a-z0-9+.-]{1,15}://[^\s:/@]{0,256}:[^@/\s]{1,256}@)",
     re.IGNORECASE,
 )
+
+
+def _secret_scan_window(text: str) -> str:
+    """Return the bounded prefix of ``text`` that ``_SECRET_RE`` should scan.
+
+    Secrets in a memory write appear near the start in every realistic case,
+    so scanning a generous prefix keeps the credential gate intact while
+    capping the work done on attacker-controlled multi-KB blobs.
+    """
+    if len(text) > _SECRET_SCAN_LIMIT:
+        return text[:_SECRET_SCAN_LIMIT]
+    return text
 
 _CUSTOMER_RE = re.compile(
     r"\b(customer|client|tenant|kunde|kundin|mandant|pilot customer|call handling|"
@@ -221,7 +246,7 @@ def classify_memory_route(
             metadata={"source": source, "target": target},
         )
 
-    if _SECRET_RE.search(text):
+    if _SECRET_RE.search(_secret_scan_window(text)):
         return MemoryRoute(
             destinations=_dest_tuple(MemoryDestination.DISCARD),
             sensitivity=MemorySensitivity.CREDENTIAL,
