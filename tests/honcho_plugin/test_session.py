@@ -631,8 +631,8 @@ class TestConcludeToolDispatch:
             peer="user",
         )
 
-    def test_sync_turn_redacts_secrets_before_honcho_ingest(self):
-        """Credentials pasted into a turn are redacted before durable add_message."""
+    def test_sync_turn_withholds_secret_bearing_message(self):
+        """A turn message containing a credential is withheld before add_message."""
         provider = HonchoMemoryProvider()
         provider._session_key = "telegram:123"
         provider._manager = MagicMock()
@@ -654,7 +654,7 @@ class TestConcludeToolDispatch:
             call.args[1] for call in session.add_message.call_args_list
         )
         assert raw_secret not in all_payloads
-        assert "[REDACTED-SECRET]" in all_payloads
+        assert "withheld" in all_payloads
 
     def test_sync_turn_passes_benign_content_unchanged(self):
         """Non-secret turn content flows through sync_turn untouched."""
@@ -673,33 +673,37 @@ class TestConcludeToolDispatch:
         assert session.add_message.call_args_list[0].args == ("user", "what is the weather today")
         assert session.add_message.call_args_list[1].args == ("assistant", "it is sunny in Bern")
 
-    def test_redact_secrets_redacts_the_value_not_just_the_label(self):
-        """Keyed credential forms must redact the VALUE, not only the keyword.
+    def test_sync_turn_withholds_non_adjacent_free_form_value(self):
+        """Regression: a value not adjacent to its keyword must not reach Honcho.
 
-        Regression: redact_secrets reused the detection regex _SECRET_RE, whose
-        keyed alternatives match only the label word, so the credential value
-        leaked through (e.g. "password: hunter2" -> "[REDACTED] hunter2").
+        "my password is hunter2" / "the token is abc.def.ghi" place the value
+        past intervening words, so pattern redaction can't locate it. The whole
+        message is withheld rather than partially redacted — the raw value must
+        never appear in add_message.
         """
-        from agent.memory_router import redact_secrets
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
 
-        # (input, the secret value that must NOT survive)
-        cases = [
-            ("password hunter2", "hunter2"),
-            ("password: hunter2", "hunter2"),
-            ("api_key = abcdef1234567890", "abcdef1234567890"),
-            ("token abc.def.ghi", "abc.def.ghi"),
-            ("client_secret=9f8e7d6c5b4a", "9f8e7d6c5b4a"),
-        ]
-        for text, value in cases:
-            out = redact_secrets(text)
-            assert value not in out, f"value leaked: {text!r} -> {out!r}"
-            assert "[REDACTED-SECRET]" in out, f"not redacted: {text!r} -> {out!r}"
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
 
-        # Value-shaped credentials and benign text behave as before.
-        assert redact_secrets("sk_live_ABCDEFGH12345678") == "[REDACTED-SECRET]"
-        assert redact_secrets("what is the weather today") == "what is the weather today"
+        provider.sync_turn(
+            "my password is hunter2",
+            "ok, noted the token is abc.def.ghi",
+        )
+        provider._sync_thread.join(timeout=1.0)
 
-    def test_sync_turn_redacts_keyed_credential_value(self):
+        all_payloads = "".join(
+            call.args[1] for call in session.add_message.call_args_list
+        )
+        assert "hunter2" not in all_payloads
+        assert "abc.def.ghi" not in all_payloads
+        assert "withheld" in all_payloads
+
+    def test_sync_turn_withholds_keyed_credential_value(self):
         """A label:value credential in a turn must not reach durable add_message."""
         provider = HonchoMemoryProvider()
         provider._session_key = "telegram:123"
@@ -721,7 +725,7 @@ class TestConcludeToolDispatch:
         )
         assert "abcdef1234567890SECRET" not in all_payloads
         assert "hunter2supersecret" not in all_payloads
-        assert "[REDACTED-SECRET]" in all_payloads
+        assert "withheld" in all_payloads
 
 
 # ---------------------------------------------------------------------------
