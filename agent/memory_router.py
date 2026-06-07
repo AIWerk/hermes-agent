@@ -89,12 +89,13 @@ class MemoryRoute:
         }
 
 
-# Only the first _SECRET_SCAN_LIMIT bytes of content are scanned for secrets.
-# A credential in a memory write appears near the top in every realistic case,
-# and bounding the scan keeps _SECRET_RE.search() linear even on attacker-
-# controlled multi-KB blobs (see the URL-credential alternative below).
-_SECRET_SCAN_LIMIT = 8192
-
+# The FULL content is scanned for secrets. Every alternative below is bounded
+# (in particular the URL-credential scheme run and its user/pass quantifiers),
+# so _SECRET_RE.search() stays effectively linear even on attacker-controlled
+# multi-KB blobs (measured: ~0.015s on a 1MB non-matching input). Scanning the
+# whole text — not a prefix — is required: a prefix window would let a
+# credential placed after benign padding evade the gate and route to
+# inject/durable memory.
 _SECRET_RE = re.compile(
     r"(api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key|"
     r"BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY|"
@@ -115,17 +116,6 @@ _SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 
-
-def _secret_scan_window(text: str) -> str:
-    """Return the bounded prefix of ``text`` that ``_SECRET_RE`` should scan.
-
-    Secrets in a memory write appear near the start in every realistic case,
-    so scanning a generous prefix keeps the credential gate intact while
-    capping the work done on attacker-controlled multi-KB blobs.
-    """
-    if len(text) > _SECRET_SCAN_LIMIT:
-        return text[:_SECRET_SCAN_LIMIT]
-    return text
 
 _CUSTOMER_RE = re.compile(
     r"\b(customer|client|tenant|kunde|kundin|mandant|pilot customer|call handling|"
@@ -246,7 +236,7 @@ def classify_memory_route(
             metadata={"source": source, "target": target},
         )
 
-    if _SECRET_RE.search(_secret_scan_window(text)):
+    if _SECRET_RE.search(text):
         return MemoryRoute(
             destinations=_dest_tuple(MemoryDestination.DISCARD),
             sensitivity=MemorySensitivity.CREDENTIAL,

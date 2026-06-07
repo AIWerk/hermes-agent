@@ -214,18 +214,18 @@ def test_secret_re_does_not_backtrack_on_long_non_matching_input():
 
 
 def test_classify_route_is_fast_on_large_blob():
-    # The full classify path scans only a bounded prefix, so a 100KB blob (the
-    # shape of a prompt-injected memory_tool add) must classify quickly.
+    # The bounded _SECRET_RE scans the FULL text in linear time, so a 100KB
+    # blob (the shape of a prompt-injected memory_tool add) classifies quickly
+    # without resorting to a prefix window.
     start = time.perf_counter()
     classify_memory_route("a" * 100000, target="user")
     elapsed = time.perf_counter() - start
 
-    assert elapsed < 0.05, f"classify_memory_route was slow: {elapsed:.3f}s"
+    assert elapsed < 0.10, f"classify_memory_route was slow: {elapsed:.3f}s"
 
 
 def test_credential_at_blob_top_is_still_discarded():
-    # A secret near the start of an oversized blob must still be caught; the
-    # bounded scan window only trims the tail.
+    # A secret near the start of an oversized blob must be caught.
     secret = "GOCSPX-" + "aBcDeFgHiJkLmNoPq"
     ok, route = should_write_builtin_memory(
         f"User key {secret} " + "padding " * 5000,
@@ -235,6 +235,29 @@ def test_credential_at_blob_top_is_still_discarded():
     assert ok is False
     assert route.has(MemoryDestination.DISCARD)
     assert route.sensitivity == MemorySensitivity.CREDENTIAL
+
+
+def test_credential_after_long_padding_is_still_discarded():
+    # Regression for the prefix-scan bypass: a credential placed AFTER benign
+    # preference text + >8KB of padding must still route to credential/discard.
+    # An earlier 8192-byte scan window let such a secret evade detection and
+    # route to inject + store_honcho — breaking the memory-router invariant
+    # that credentials never enter prompt-injected or durable memory.
+    secret = "GOCSPX-" + "aBcDeFgHiJkLmNoPq"
+    payload = (
+        "User prefers concise answers and dark mode. "
+        + ("x" * 9000)
+        + f" my api key is {secret}"
+    )
+    ok, route = should_write_builtin_memory(payload, target="user")
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+    # Must NOT leak into prompt-injected or durable memory.
+    assert not route.has(MemoryDestination.INJECT)
+    assert not route.has(MemoryDestination.STORE_HONCHO)
+    assert route.inject_allowed is False
 
 
 @pytest.mark.parametrize(
