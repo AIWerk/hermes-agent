@@ -49,6 +49,44 @@ def test_record_session_event_redacts_and_updates_scratchpad(tmp_path):
     ]
 
 
+def test_record_session_event_redacts_structured_json_secret(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-1", source="cli")
+
+    token = "ya29." + "A0ABCDEFG12345678901234567890"
+    record_session_event(
+        db,
+        "sess-1",
+        "decision",
+        {"summary": 'tool returned {"access_token":"' + token + '"}'},
+    )
+
+    events = db.get_session_events("sess-1")
+    persisted = events[0]["content"]["summary"]
+    assert token not in persisted
+    assert "[REDACTED]" in persisted
+
+
+def test_record_session_event_redacts_private_key_block_straddling_cap(tmp_path):
+    from agent.session_notes import _MAX_SCAN
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-1", source="cli")
+
+    # BEGIN header within the scan cap, END marker pushed well beyond it.
+    body = "B" * (_MAX_SCAN + 2000)
+    keyblock = (
+        "-----BEGIN TEST PRIVATE KEY-----\n" + body + "\n-----END TEST PRIVATE KEY-----"
+    )
+    record_session_event(db, "sess-1", "decision", {"summary": keyblock})
+
+    events = db.get_session_events("sess-1")
+    persisted = events[0]["content"]["summary"]
+    assert "BEGIN TEST PRIVATE KEY" not in persisted
+    assert "BBBB" not in persisted  # no raw key body persisted
+    assert "[REDACTED]" in persisted
+
+
 def test_record_session_event_keeps_scratchpad_compact(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     db.create_session("sess-1", source="cli")
