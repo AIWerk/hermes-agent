@@ -182,3 +182,34 @@ def test_redaction_input_capped_for_large_blobs():
     redact_sensitive_text(blob)
     elapsed_ms = (time.perf_counter() - start) * 1000
     assert elapsed_ms < 50, f"redaction took {elapsed_ms:.1f}ms (ReDoS regression)"
+
+
+def test_redacts_private_key_block_straddling_scan_cap():
+    """A PEM block whose BEGIN is within the scan cap but END is beyond it must
+    still be redacted. The cap used to truncate before the (complete-block)
+    regex could match, leaving the raw header/body in the retained text.
+    """
+    from agent.session_notes import _MAX_SCAN
+
+    header = "-----BEGIN TEST PRIVATE KEY-----"
+    footer = "-----END TEST PRIVATE KEY-----"
+    payload = "intro\n" + header + "\n" + ("A" * (_MAX_SCAN + 2000)) + "\n" + footer
+    out = redact_sensitive_text(payload)
+
+    assert "BEGIN TEST PRIVATE KEY" not in out
+    assert "AAAA" not in out  # no raw key body survives
+    assert "[REDACTED]" in out
+
+
+def test_redacts_private_key_block_without_end_marker():
+    """A BEGIN header with no END marker at all (truncated dump) is redacted to
+    end-of-text rather than passing through unmatched.
+    """
+    from agent.session_notes import _MAX_SCAN
+
+    payload = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + ("Z" * (_MAX_SCAN + 500))
+    out = redact_sensitive_text(payload)
+
+    assert "BEGIN OPENSSH PRIVATE KEY" not in out
+    assert "ZZZZ" not in out
+    assert "[REDACTED]" in out

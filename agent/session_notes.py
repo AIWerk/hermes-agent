@@ -80,19 +80,33 @@ _SECRET_PATTERNS = [
         r"(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=]))"
         r"[A-Za-z0-9/+]*[A-Z/+][A-Za-z0-9/+]*"
     ),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
 ]
+
+# Block secrets (PEM private keys) can span past _MAX_SCAN. They are redacted on
+# the FULL text BEFORE the scan cap (see redact_sensitive_text), so a key whose
+# END marker sits beyond the cap — or is missing — can't survive truncation.
+# The header is a literal prefix (fast O(n) search) and the lazy body stops at
+# the first END marker, else runs to end-of-text, so the whole block (header
+# included) is always redacted without eating a benign tail after END.
+_BLOCK_SECRET_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+    re.S,
+)
 
 
 def redact_sensitive_text(text: str) -> str:
     """Mask common credential shapes in note/event content.
 
-    Input is capped at ``_MAX_SCAN`` characters before the regex scan to bound
-    worst-case matching time on adversarial no-delimiter input. The output is
-    sliced to ``_MAX_TEXT`` by callers anyway, so the cap discards only content
-    that would be dropped downstream.
+    PEM private-key blocks are redacted on the full text first, since they can
+    straddle the ``_MAX_SCAN`` cap (header inside the window, END marker beyond
+    it). The remaining single-line patterns then run on the capped text to bound
+    worst-case matching time on adversarial no-delimiter input; callers slice the
+    output to ``_MAX_TEXT`` anyway, so the cap only discards content that would
+    be dropped downstream.
     """
-    redacted = str(text or "")[:_MAX_SCAN]
+    # Redact whole private-key blocks BEFORE capping: the END marker may sit
+    # beyond _MAX_SCAN, where the single-line patterns below would never see it.
+    redacted = _BLOCK_SECRET_RE.sub("[REDACTED]", str(text or ""))[:_MAX_SCAN]
     for pattern in _SECRET_PATTERNS:
         def repl(match: re.Match[str]) -> str:
             if match.lastindex:
