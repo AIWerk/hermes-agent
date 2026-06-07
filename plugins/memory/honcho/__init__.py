@@ -24,10 +24,25 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
-from agent.memory_router import should_mirror_to_honcho
+from agent.memory_router import (
+    contains_secret,
+    should_mirror_to_honcho,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+# Placeholder substituted for a whole turn message that contains a credential.
+# Durable Honcho memory must never carry a raw secret; pattern-based redaction
+# cannot reliably locate a value that is not adjacent to its keyword
+# (e.g. "my password is hunter2"), so the turn-sync path withholds the entire
+# message rather than risk a partial leak. honcho_conclude refuses instead.
+_WITHHELD_SECRET_PLACEHOLDER = "[message withheld: contained a credential]"
+
+
+def _scrub_turn_message(text: str) -> str:
+    """Withhold a turn message wholesale if it contains any credential."""
+    return _WITHHELD_SECRET_PLACEHOLDER if contains_secret(text) else text
 
 
 # ---------------------------------------------------------------------------
@@ -1369,8 +1384,15 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
-        clean_user_content = sanitize_context(user_content or "").strip()
-        clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        # sanitize_context strips internal fences but does ZERO secret redaction.
+        # Withhold any message that contains a credential outright: durable
+        # Honcho memory must never carry a raw secret, and a free-form value not
+        # adjacent to its keyword ("my password is hunter2") can't be located by
+        # pattern, so partial redaction would still leak it.
+        clean_user_content = _scrub_turn_message(sanitize_context(user_content or "")).strip()
+        clean_assistant_content = _scrub_turn_message(
+            sanitize_context(assistant_content or "")
+        ).strip()
 
         def _sync():
             try:
@@ -1550,6 +1572,14 @@ class HonchoMemoryProvider(MemoryProvider):
                     if ok:
                         return json.dumps({"result": f"Conclusion {delete_id} deleted."})
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
+                # Credential safety: conclusions are persisted durably into the
+                # peer card and re-injected into future prompts. Route through the
+                # SAME secret detection as the gated mirror path before writing.
+                if contains_secret(conclusion):
+                    return tool_error(
+                        "Memory router blocked a credential/secret from durable "
+                        "Honcho memory (conclusion not saved)."
+                    )
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})

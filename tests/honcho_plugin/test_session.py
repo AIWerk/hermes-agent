@@ -593,6 +593,140 @@ class TestConcludeToolDispatch:
         assert session.add_message.call_args_list[0].args == ("user", "hello")
         assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
 
+    def test_honcho_conclude_blocks_credential_before_durable_write(self):
+        """A secret passed to honcho_conclude must never reach create_conclusion."""
+        import json
+        provider = HonchoMemoryProvider()
+        provider._session_initialized = True
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._manager.create_conclusion.return_value = True
+
+        secret = "Stripe key is sk_live_ABCDEFGH12345678ZZZ"
+        result = provider.handle_tool_call("honcho_conclude", {"conclusion": secret})
+
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "credential" in parsed["error"].lower()
+        # The raw secret must not have been persisted.
+        provider._manager.create_conclusion.assert_not_called()
+
+    def test_honcho_conclude_allows_benign_conclusion(self):
+        """Non-secret conclusions still flow through to create_conclusion unchanged."""
+        provider = HonchoMemoryProvider()
+        provider._session_initialized = True
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._manager.create_conclusion.return_value = True
+
+        result = provider.handle_tool_call(
+            "honcho_conclude",
+            {"conclusion": "User prefers dark mode"},
+        )
+
+        assert "Conclusion saved for user" in result
+        provider._manager.create_conclusion.assert_called_once_with(
+            "telegram:123",
+            "User prefers dark mode",
+            peer="user",
+        )
+
+    def test_sync_turn_withholds_secret_bearing_message(self):
+        """A turn message containing a credential is withheld before add_message."""
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        raw_secret = "sk_live_ABCDEFGH12345678ZZZ"
+        provider.sync_turn(
+            f"here is my key: {raw_secret} please store it",
+            f"acknowledged, your token is {raw_secret}",
+        )
+        provider._sync_thread.join(timeout=1.0)
+
+        # No add_message call may contain the raw secret.
+        all_payloads = "".join(
+            call.args[1] for call in session.add_message.call_args_list
+        )
+        assert raw_secret not in all_payloads
+        assert "withheld" in all_payloads
+
+    def test_sync_turn_passes_benign_content_unchanged(self):
+        """Non-secret turn content flows through sync_turn untouched."""
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        provider.sync_turn("what is the weather today", "it is sunny in Bern")
+        provider._sync_thread.join(timeout=1.0)
+
+        assert session.add_message.call_args_list[0].args == ("user", "what is the weather today")
+        assert session.add_message.call_args_list[1].args == ("assistant", "it is sunny in Bern")
+
+    def test_sync_turn_withholds_non_adjacent_free_form_value(self):
+        """Regression: a value not adjacent to its keyword must not reach Honcho.
+
+        "my password is hunter2" / "the token is abc.def.ghi" place the value
+        past intervening words, so pattern redaction can't locate it. The whole
+        message is withheld rather than partially redacted — the raw value must
+        never appear in add_message.
+        """
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        provider.sync_turn(
+            "my password is hunter2",
+            "ok, noted the token is abc.def.ghi",
+        )
+        provider._sync_thread.join(timeout=1.0)
+
+        all_payloads = "".join(
+            call.args[1] for call in session.add_message.call_args_list
+        )
+        assert "hunter2" not in all_payloads
+        assert "abc.def.ghi" not in all_payloads
+        assert "withheld" in all_payloads
+
+    def test_sync_turn_withholds_keyed_credential_value(self):
+        """A label:value credential in a turn must not reach durable add_message."""
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        provider.sync_turn(
+            "set it up, api_key = abcdef1234567890SECRET",
+            "done, your password: hunter2supersecret is saved",
+        )
+        provider._sync_thread.join(timeout=1.0)
+
+        all_payloads = "".join(
+            call.args[1] for call in session.add_message.call_args_list
+        )
+        assert "abcdef1234567890SECRET" not in all_payloads
+        assert "hunter2supersecret" not in all_payloads
+        assert "withheld" in all_payloads
+
 
 # ---------------------------------------------------------------------------
 # Message chunking

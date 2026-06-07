@@ -374,3 +374,13 @@ def should_mirror_to_honcho(
 
 def dominant_destination(destinations: Iterable[MemoryDestination]) -> MemoryDestination:
     return max(destinations, key=lambda d: _PRIORITY_DESTINATION.get(d, 0))
+
+
+def contains_secret(content: str) -> bool:
+    """Return True if content matches the router's credential/secret detection.
+
+    Shares the exact ``_SECRET_RE`` pattern that drives the CREDENTIAL
+    classification in :func:`classify_memory_route`, so callers cannot drift
+    into a weaker detection.
+    """
+    return bool(_SECRET_RE.search(content or ""))
