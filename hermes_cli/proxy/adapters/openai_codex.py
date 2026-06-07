@@ -70,6 +70,22 @@ _ALLOWED_PATHS: FrozenSet[str] = frozenset({
 })
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Best-effort int coercion that never raises on malformed input.
+
+    Upstream usage counts are nominally integers, but a flaky Codex response
+    can ship a non-numeric string (e.g. ``"NOTANUMBER"``) or other junk. A bare
+    ``int(...)`` there raises ValueError and the proxy returns an opaque 500, so
+    coerce defensively and fall back to ``default`` instead.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _jwt_claims(token: str) -> Dict[str, Any]:
     try:
         parts = str(token or "").split(".")
@@ -272,9 +288,9 @@ def responses_payload_to_chat_completion(payload: Dict[str, Any], model: str) ->
 
     raw_usage = payload.get("usage")
     usage_in: Dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
-    prompt_tokens = int(usage_in.get("input_tokens") or usage_in.get("prompt_tokens") or 0)
-    completion_tokens = int(usage_in.get("output_tokens") or usage_in.get("completion_tokens") or 0)
-    total_tokens = int(usage_in.get("total_tokens") or (prompt_tokens + completion_tokens))
+    prompt_tokens = _coerce_int(usage_in.get("input_tokens") or usage_in.get("prompt_tokens"))
+    completion_tokens = _coerce_int(usage_in.get("output_tokens") or usage_in.get("completion_tokens"))
+    total_tokens = _coerce_int(usage_in.get("total_tokens")) or (prompt_tokens + completion_tokens)
 
     return {
         "id": payload.get("id") or f"chatcmpl-codex-proxy-{int(time.time())}",
@@ -345,6 +361,71 @@ class OpenAICodexAdapter(UpstreamAdapter):
             base_url=base_url,
             expires_at=_token_expiry_iso(access_token),
             headers=_codex_headers(access_token),
+        )
+
+    def get_retry_credential(
+        self,
+        *,
+        failed_credential: UpstreamCredential,
+        status_code: int,
+    ) -> Optional[UpstreamCredential]:
+        """Rotate to another pooled Codex credential after a 401/429.
+
+        Without this override the adapter inherited the base no-op and the
+        proxy server's retry block could never rotate for Codex, so a single
+        expired/rate-limited pool entry took down every request. We mark the
+        offending entry exhausted (so a stuck/expired key isn't reselected)
+        and hand back the next available pooled credential.
+
+        Note: this only covers the generic forward path. The Codex chat shim
+        (``_handle_codex_chat_completion`` in server.py) returns before the
+        server's retry block, so the ``/chat/completions`` shim path does not
+        rotate today — that remains a documented limitation.
+        """
+        if status_code not in {401, 429}:
+            return None
+
+        try:
+            from agent.credential_pool import load_pool
+        except Exception as exc:  # pragma: no cover - import/env failure
+            logger.warning("proxy: Codex credential pool unavailable for retry: %s", exc)
+            return None
+
+        try:
+            pool = load_pool("openai-codex")
+        except Exception as exc:
+            logger.warning("proxy: failed to load Codex credential pool: %s", exc)
+            return None
+        if pool is None:
+            return None
+
+        # Mark the failed key exhausted (1-hour cooldown for 429, terminal
+        # handling for 401) and rotate to the next available pool entry. The
+        # api_key_hint pins rotation to the bearer that actually failed even
+        # when this pool was freshly loaded from disk.
+        refreshed = pool.mark_exhausted_and_rotate(
+            status_code=status_code,
+            api_key_hint=failed_credential.bearer or None,
+        )
+        if refreshed is None:
+            return None
+
+        bearer = str(getattr(refreshed, "runtime_api_key", "") or "").strip()
+        if not bearer or bearer == failed_credential.bearer:
+            return None
+
+        base_url = str(
+            getattr(refreshed, "runtime_base_url", None) or DEFAULT_CODEX_BASE_URL
+        ).strip().rstrip("/")
+        logger.info(
+            "proxy: Codex upstream returned %s; retrying with rotated pool credential",
+            status_code,
+        )
+        return UpstreamCredential(
+            bearer=bearer,
+            base_url=base_url or DEFAULT_CODEX_BASE_URL,
+            expires_at=_token_expiry_iso(bearer),
+            headers=_codex_headers(bearer),
         )
 
 
