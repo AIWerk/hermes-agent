@@ -85,7 +85,7 @@ class TodoStore:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
             for t in self._dedupe_by_id(todos):
-                item_id = str(t.get("id", "")).strip()
+                item_id = self._normalize_id(t.get("id", ""))
                 if not item_id:
                     continue  # Can't merge without an id
 
@@ -159,9 +159,36 @@ class TodoStore:
         lines = ["[Your active task list was preserved across context compression]"]
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            content = self._sanitize_for_injection(item["content"])
+            lines.append(f"- {marker} {item['id']}. {content} ({item['status']})")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _sanitize_for_injection(content: str) -> str:
+        """Threat-scan task content before it re-enters the prompt.
+
+        The fork syncs TODO.md bidirectionally, and the customer-facing CUI
+        endpoint (/api/assistant/todos/add) lets an authenticated customer
+        append arbitrary text into TODO.md, which format_for_injection then
+        re-reads and appends verbatim as a user message after compression.
+        That is the same trust boundary the memory tool defends when a
+        file-backed entry enters the system prompt, so we reuse the exact
+        same scanner (tools.threat_patterns, "strict" scope) and the same
+        placeholder pattern as MemoryStore._sanitize_entries_for_snapshot.
+        Clean task text flows through unchanged.
+        """
+        if not content:
+            return content
+        from tools.threat_patterns import scan_for_threats
+
+        findings = scan_for_threats(content, scope="strict")
+        if findings:
+            return (
+                f"[BLOCKED: TODO.md task contained threat pattern(s): "
+                f"{', '.join(findings)}. Removed from compression injection.]"
+            )
+        return content
 
     @staticmethod
     def _validate(item: Dict[str, Any]) -> Dict[str, str]:
@@ -171,7 +198,7 @@ class TodoStore:
         Ensures required fields exist and status is valid.
         Returns a clean dict with only {id, content, status}.
         """
-        item_id = str(item.get("id", "")).strip()
+        item_id = TodoStore._normalize_id(item.get("id", ""))
         if not item_id:
             item_id = "?"
 
@@ -190,7 +217,7 @@ class TodoStore:
         """Collapse duplicate ids, keeping the last occurrence in its position."""
         last_index: Dict[str, int] = {}
         for i, item in enumerate(todos):
-            item_id = str(item.get("id", "")).strip() or "?"
+            item_id = TodoStore._normalize_id(item.get("id", "")) or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 
@@ -198,6 +225,31 @@ class TodoStore:
     def _content_key(content: str) -> str:
         """Normalize task text for duplicate detection across file/tool ids."""
         return re.sub(r"\s+", " ", str(content or "")).strip().casefold()
+
+    @staticmethod
+    def _normalize_id(item_id: str) -> str:
+        """Collapse any whitespace in an id to a single token.
+
+        The id is persisted into the ``hermes:id=<id> status=<status>``
+        metadata comment and recovered with ``(\\S+)``; internal whitespace
+        would truncate recovery at the first space and silently mint a
+        synthetic ``todo-N`` id (re-introducing duplicate tasks + losing the
+        precise status). Replacing whitespace with ``_`` keeps the id a
+        single ``\\S+`` token so the round-trip stays lossless.
+        """
+        return re.sub(r"\s+", "_", str(item_id or "").strip())
+
+    @staticmethod
+    def _strip_meta_comments(content: str) -> str:
+        """Remove any ``<!-- ... -->`` comments embedded in task content.
+
+        Content is written to TODO.md as ``- [m] {content} <!-- hermes:id=... -->``.
+        An embedded comment in ``content`` (whether agent- or CUI-authored)
+        could otherwise be mistaken for the trailing metadata on recovery
+        (#27 bypass). Stripping it before persisting guarantees the only
+        comment on the line is the one ``_sync_markdown`` appends.
+        """
+        return re.sub(r"<!--.*?-->", "", str(content or "")).strip()
 
     def _markdown_mtime(self) -> Optional[int]:
         if not self._markdown_path or not self._markdown_path.exists():
@@ -224,7 +276,14 @@ class TodoStore:
             # Recover the stable id + precise status persisted by _sync_markdown
             # (so merge-by-id keeps working and cancelled/in_progress survive the
             # round-trip) before the comment is stripped from the visible text.
-            meta = re.search(r"<!--\s*hermes:id=(\S+)\s+status=(\S+)\s*-->", raw)
+            # Anchor the metadata comment to the END of the line so a comment
+            # embedded earlier in the visible content (e.g. a spoofed
+            # "<!-- hermes:id=spoof status=... -->" pasted into a task) can't
+            # win the recovery over the trailing one _sync_markdown appends
+            # (#27 bypass). _sync_markdown also strips embedded comments before
+            # persisting, but recovery must stay safe for files written by
+            # other tools / older code paths too.
+            meta = re.search(r"<!--\s*hermes:id=(\S+)\s+status=(\S+)\s*-->\s*$", raw)
             content = re.sub(r"<!--.*?-->", "", raw).strip()
             if not content:
                 continue
@@ -264,10 +323,15 @@ class TodoStore:
             ]
             for item in self._items:
                 marker = "x" if item["status"] in {"completed", "cancelled"} else " "
-                content = item["content"].replace("\n", " ").strip()
+                # Strip any comment embedded in the content so the ONLY comment
+                # on the persisted line is the trailing metadata one — otherwise
+                # an embedded "<!-- hermes:id=... -->" could hijack recovery.
+                content = self._strip_meta_comments(item["content"].replace("\n", " "))
                 # Persist id + precise status in an HTML comment (invisible in the
                 # rendered CUI panel, stripped from the loaded text) so the
-                # round-trip preserves agent ids and all four statuses.
+                # round-trip preserves agent ids and all four statuses. The id is
+                # already whitespace-normalized in _validate, so it stays a single
+                # \S+ token that recovery can parse.
                 meta = f"<!-- hermes:id={item['id']} status={item['status']} -->"
                 lines.append(f"- [{marker}] {content} {meta}")
             self._markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
