@@ -821,6 +821,7 @@ class SessionDB:
                 return
             cursor.executescript(
                 """
+                DROP TABLE IF EXISTS session_stack_new;
                 CREATE TABLE session_stack_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source TEXT NOT NULL,
@@ -4135,6 +4136,7 @@ class SessionDB:
                 if needs_rebuild:
                     conn.executescript(
                         """
+                        DROP TABLE IF EXISTS telegram_dm_topic_bindings_new;
                         CREATE TABLE telegram_dm_topic_bindings_new (
                             chat_id TEXT NOT NULL,
                             thread_id TEXT NOT NULL,
