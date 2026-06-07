@@ -321,13 +321,35 @@ _ASSISTANT_UPLOAD_EXTENSIONS = frozenset({
 _ASSISTANT_AUDIO_EXTENSIONS = frozenset({".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
 _ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 
-# Files whose content can execute script in the dashboard origin if rendered
-# (directly, or via a client-created blob: URL which inherits the page origin).
-# The shared-folder open endpoint serves these as a non-renderable download.
-_SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS = frozenset({
-    ".html", ".htm", ".xhtml", ".shtml", ".svg", ".svgz",
-    ".xml", ".xsl", ".xslt", ".mhtml", ".mht", ".htc",
+# Media types a browser parses as an active document — rendering them can
+# execute script in the dashboard origin (directly, or via a client-created
+# blob: URL which inherits the page origin). The shared-folder open endpoint
+# serves anything resolving to one of these as a non-renderable download.
+# Anything ending in "+xml" (xhtml+xml, svg+xml, xslt+xml, ...) is treated as
+# active too, so future MIME aliases cannot re-open the hole.
+_SHARED_FOLDER_ACTIVE_CONTENT_MEDIA_TYPES = frozenset({
+    "text/html", "application/xhtml+xml", "image/svg+xml",
+    "application/xml", "text/xml", "application/xslt+xml",
+    "text/x-component", "message/rfc822",
 })
+
+# Extensions kept as a belt-and-suspenders denylist for active-content types
+# whose registered MIME does not obviously flag them (or is platform-dependent).
+_SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS = frozenset({
+    ".html", ".htm", ".xhtml", ".xht", ".xhtm", ".shtml",
+    ".svg", ".svgz", ".xml", ".xsl", ".xslt",
+    ".mhtml", ".mht", ".htc",
+})
+
+
+def _is_active_shared_media_type(name: str, media_type: str) -> bool:
+    """Whether serving *name* inline could execute script in the dashboard origin."""
+    guessed = (mimetypes.guess_type(name)[0] or "").lower()
+    candidate = (media_type or "").split(";", 1)[0].strip().lower()
+    for mt in (guessed, candidate):
+        if mt in _SHARED_FOLDER_ACTIVE_CONTENT_MEDIA_TYPES or mt.endswith("+xml"):
+            return True
+    return Path(name).suffix.lower() in _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS
 
 
 def _safe_shared_open_disposition(name: str, media_type: str) -> tuple[str, str]:
@@ -339,8 +361,13 @@ def _safe_shared_open_disposition(name: str, media_type: str) -> tuple[str, str]
     blob: URL (which inherits the page origin), so the Content-Type — not the
     Content-Disposition — is what actually prevents script execution; we set
     both, plus X-Content-Type-Options: nosniff at the call site.
+
+    The decision is driven by the resolved media type (an active-document MIME
+    such as text/html or application/xhtml+xml, or any "+xml" subtype) rather
+    than an extension denylist, so aliases like .xht/.xhtm — which resolve to
+    application/xhtml+xml — cannot slip through.
     """
-    if Path(name).suffix.lower() in _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS:
+    if _is_active_shared_media_type(name, media_type):
         return "application/octet-stream", "attachment"
     return media_type, "inline"
 

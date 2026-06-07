@@ -1508,23 +1508,39 @@ class TestWebServerEndpoints:
         # token). Active-content types are forced to a non-renderable download.
         shared = tmp_path / "shared"
         shared.mkdir()
+        xhtml_payload = (
+            "<html xmlns='http://www.w3.org/1999/xhtml'>"
+            "<script>alert(document.cookie)</script></html>"
+        )
         (shared / "evil.html").write_text("<script>alert(document.cookie)</script>", encoding="utf-8")
         (shared / "evil.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>", encoding="utf-8")
+        # .xht / .xhtm resolve to application/xhtml+xml — a browser-parsed,
+        # script-executing document type that the extension denylist missed.
+        (shared / "evil.xht").write_text(xhtml_payload, encoding="utf-8")
+        (shared / "evil.xhtm").write_text(xhtml_payload, encoding="utf-8")
         (shared / "report.txt").write_text("hello", encoding="utf-8")
+        (shared / "offer.pdf").write_bytes(b"%PDF-1.4 benign")
+        (shared / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
         monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
 
-        for name in ("evil.html", "evil.svg"):
+        for name in ("evil.html", "evil.svg", "evil.xht", "evil.xhtm"):
             resp = self.client.get(f"/api/assistant/shared-folder/open?path={name}")
             assert resp.status_code == 200, name
             assert resp.headers["content-type"].startswith("application/octet-stream"), name
             assert resp.headers["content-disposition"].startswith("attachment"), name
+            # Exactly one Content-Disposition header is set.
+            assert resp.headers.get_list("content-disposition") == [
+                resp.headers["content-disposition"]
+            ], name
             assert resp.headers["x-content-type-options"] == "nosniff", name
 
         # Benign types remain inline-previewable but still get the nosniff guard.
-        resp = self.client.get("/api/assistant/shared-folder/open?path=report.txt")
-        assert resp.status_code == 200
-        assert resp.headers["content-disposition"].startswith("inline")
-        assert resp.headers["x-content-type-options"] == "nosniff"
+        for name in ("report.txt", "offer.pdf", "photo.png"):
+            resp = self.client.get(f"/api/assistant/shared-folder/open?path={name}")
+            assert resp.status_code == 200, name
+            assert not resp.headers["content-type"].startswith("application/octet-stream"), name
+            assert resp.headers["content-disposition"].startswith("inline"), name
+            assert resp.headers["x-content-type-options"] == "nosniff", name
 
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
