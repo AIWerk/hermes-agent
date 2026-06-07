@@ -4914,12 +4914,16 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
-            # The sudo password callback is thread-local (tools.terminal_tool
-            # _callback_tls), so wiring it on the build thread doesn't reach this
-            # turn thread — terminal sudo prompts would fall through to /dev/tty
-            # and hang the headless gateway. Re-wire here so the prompt routes to
-            # the sudo.request overlay. (secret capture is a module global, so
-            # re-running is a harmless no-op.)
+            # The sudo password and secret-capture callbacks are both
+            # thread-local (tools.terminal_tool / tools.skills_tool
+            # _callback_tls), so wiring them on the build thread doesn't reach
+            # this turn thread — terminal sudo prompts would fall through to
+            # /dev/tty and hang the headless gateway, and secret prompts would
+            # have no callback at all. Re-wire here so each routes to its
+            # overlay on THIS turn's transport. This re-wire is also what keeps
+            # two concurrent sessions from cross-wiring: because the slots are
+            # thread-local, session A's secret.request stays on A's turn thread
+            # and can't be delivered to client B (and vice versa).
             _wire_callbacks(sid)
             cwd = _session_cwd(session)
             _register_session_cwd(session)

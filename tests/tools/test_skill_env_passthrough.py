@@ -7,6 +7,7 @@ import pytest
 
 import tools.env_passthrough as _ep_mod
 from tools.env_passthrough import clear_env_passthrough, is_env_passthrough
+from tools.skills_tool import set_secret_capture_callback
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +17,7 @@ def _clean_passthrough():
     yield
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
+    set_secret_capture_callback(None)
 
 
 def _create_skill(tmp_path, name, frontmatter_extra=""):
@@ -54,10 +56,11 @@ class TestSkillViewRegistersPassthrough:
         monkeypatch.setenv("TENOR_API_KEY", "test-value-123")
 
         # Patch the secret capture callback to not prompt
-        with patch("tools.skills_tool._secret_capture_callback", None):
-            from tools.skills_tool import skill_view
+        # No secret-capture callback registered → no prompting.
+        set_secret_capture_callback(None)
+        from tools.skills_tool import skill_view
 
-            result = json.loads(skill_view(name="test-skill"))
+        result = json.loads(skill_view(name="test-skill"))
 
         assert result["success"] is True
         assert is_env_passthrough("TENOR_API_KEY")
@@ -81,10 +84,11 @@ class TestSkillViewRegistersPassthrough:
         save_env_value("TENOR_API_KEY", "persisted-value-123")
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
-            from tools.skills_tool import skill_view
+        # No secret-capture callback registered → no prompting.
+        set_secret_capture_callback(None)
+        from tools.skills_tool import skill_view
 
-            result = json.loads(skill_view(name="test-skill"))
+        result = json.loads(skill_view(name="test-skill"))
 
         assert result["success"] is True
         assert result["setup_needed"] is False
@@ -108,10 +112,11 @@ class TestSkillViewRegistersPassthrough:
         )
         monkeypatch.delenv("NONEXISTENT_SKILL_KEY_XYZ", raising=False)
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
-            from tools.skills_tool import skill_view
+        # No secret-capture callback registered → no prompting.
+        set_secret_capture_callback(None)
+        from tools.skills_tool import skill_view
 
-            result = json.loads(skill_view(name="test-skill"))
+        result = json.loads(skill_view(name="test-skill"))
 
         assert result["success"] is True
         assert not is_env_passthrough("NONEXISTENT_SKILL_KEY_XYZ")
@@ -123,10 +128,11 @@ class TestSkillViewRegistersPassthrough:
             "tools.skills_tool.SKILLS_DIR", tmp_path
         )
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
-            from tools.skills_tool import skill_view
+        # No secret-capture callback registered → no prompting.
+        set_secret_capture_callback(None)
+        from tools.skills_tool import skill_view
 
-            result = json.loads(skill_view(name="simple-skill"))
+        result = json.loads(skill_view(name="simple-skill"))
 
         assert result["success"] is True
         from tools.env_passthrough import get_all_passthrough
