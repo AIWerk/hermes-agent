@@ -15,15 +15,43 @@ from typing import Any, Dict, Optional
 _MAX_ITEMS = 12
 _MAX_TEXT = 500
 
+# Upper bound on the input we feed to the regex scan. The redacted output is
+# sliced to _MAX_TEXT downstream anyway, and the auxiliary summarizer/title
+# paths slice their transcript well below this, so anything past this cap is
+# discarded regardless. Capping here keeps a single 60KB no-delimiter tool
+# result from amplifying any (even linear) regex into a multi-second scan and
+# closes the ReDoS amplification window in session_summarizer._format_transcript,
+# which redacts the FULL message before slicing.
+_MAX_SCAN = 4096
+
 _SECRET_PATTERNS = [
     # Keyed forms: group(1) is the label and is kept; the value is redacted.
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+"),
+    re.compile(r"(?i)(authorization\s*:\s*basic\s+)\S+"),
     re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)\S+"),
     re.compile(r"(?i)(password\s*[=:]\s*)\S+"),
     re.compile(r"(?i)(token\s*[=:]\s*)\S+"),
     re.compile(r"(?i)(token\s+)\S+"),
+    # ENV-style assignments whose name looks secret-bearing:
+    #   STRIPE_WEBHOOK_SECRET=...  MY_API_KEY=...  *PASSWORD=...  *TOKEN=...
+    # Keep the "NAME=" label, redact the value.
+    re.compile(
+        r"(?i)([A-Z0-9_]{0,50}(?:SECRET|API[_-]?KEY|PASSWORD|PASSWD|TOKEN|CREDENTIAL)"
+        r"[A-Z0-9_]{0,50}\s*=\s*)\S+"
+    ),
+    # JSON / structured quoted key:value secrets, incl. nested ones:
+    #   "access_token":"...", "refresh_token":"...", "client_secret":"...",
+    #   "password":"...", "api_key":"...", "Authorization":"Bearer ...".
+    # Keep the quoted key + colon, redact the quoted value.
+    re.compile(
+        r'(?i)("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret'
+        r"|secret|password|passwd|api[_-]?key|apikey|auth(?:orization)?|token"
+        r'|private[_-]?key|key)"\s*:\s*)"[^"]*"'
+    ),
     # scheme://user:password@host — keep "scheme://user:", redact the password.
-    re.compile(r"(?i)((?:[a-z][a-z0-9+.-]*)://[^\s:/@]+:)[^@/\s]+(?=@)"),
+    # Scheme run is anchored (no preceding alnum) and bounded ({0,30}) so the
+    # engine cannot backtrack quadratically on a long no-delimiter blob.
+    re.compile(r"(?i)(?<![A-Za-z0-9])([a-z][a-z0-9+.-]{0,30}://[^\s:/@]+:)[^@/\s]+(?=@)"),
     # Value-only forms: the whole match is the secret and is fully redacted.
     re.compile(r"sk[-_][A-Za-z0-9][A-Za-z0-9_-]{6,}"),
     re.compile(r"(?i)(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"),
@@ -34,13 +62,37 @@ _SECRET_PATTERNS = [
     re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
     re.compile(r"(?i)https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"),
     re.compile(r"AIza[0-9A-Za-z_-]{8,}"),
+    # Vendor key prefixes not covered above.
+    re.compile(r"(?<![A-Za-z0-9_-])xai-[A-Za-z0-9]{20,}"),          # xAI (Grok)
+    re.compile(r"(?<![A-Za-z0-9_-])SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # SendGrid
+    re.compile(r"(?<![A-Za-z0-9_-])hf_[A-Za-z0-9]{10,}"),           # HuggingFace
+    re.compile(r"(?<![A-Za-z0-9_-])pplx-[A-Za-z0-9]{10,}"),         # Perplexity
+    re.compile(r"(?<![A-Za-z0-9_-])tvly-[A-Za-z0-9]{10,}"),         # Tavily
+    # Telegram bot token: bot<digits>:<token> (or bare <digits>:<token>).
+    re.compile(r"(?<![A-Za-z0-9])(?:bot)?\d{8,}:[-A-Za-z0-9_]{30,}"),
+    # AWS SECRET access key. Labeled form keeps the label, redacts the value.
+    re.compile(r"(?i)(aws_secret_access_key\s*[=:]\s*)\S+"),
+    # Bare 40-char base64-ish blob. Constrained to exactly 40 [A-Za-z0-9/+]
+    # chars that contain at least one uppercase letter, "/" or "+", so a
+    # lowercase-hex git SHA-1 (40 hex chars) or a lowercase 40-char identifier
+    # is NOT redacted — only the mixed-case base64 shape AWS uses.
+    re.compile(
+        r"(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=]))"
+        r"[A-Za-z0-9/+]*[A-Z/+][A-Za-z0-9/+]*"
+    ),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
 ]
 
 
 def redact_sensitive_text(text: str) -> str:
-    """Mask common credential shapes in note/event content."""
-    redacted = str(text or "")
+    """Mask common credential shapes in note/event content.
+
+    Input is capped at ``_MAX_SCAN`` characters before the regex scan to bound
+    worst-case matching time on adversarial no-delimiter input. The output is
+    sliced to ``_MAX_TEXT`` by callers anyway, so the cap discards only content
+    that would be dropped downstream.
+    """
+    redacted = str(text or "")[:_MAX_SCAN]
     for pattern in _SECRET_PATTERNS:
         def repl(match: re.Match[str]) -> str:
             if match.lastindex:
