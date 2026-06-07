@@ -194,6 +194,95 @@ def test_responses_stream_to_payload_collapses_sse_text():
     assert chat["usage"]["total_tokens"] == 3
 
 
+def test_responses_payload_to_chat_completion_coerces_malformed_usage():
+    """A non-numeric upstream usage field must not raise (pre-fix: ValueError
+    escaped the server's try/except and the proxy returned a bare 500).
+
+    The conversion still yields a valid chat.completion with the bad count
+    coerced to 0 instead of crashing.
+    """
+    chat = responses_payload_to_chat_completion({
+        "id": "resp_bad_usage",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "still works"}],
+        }],
+        "usage": {
+            "input_tokens": "NOTANUMBER",
+            "output_tokens": 4,
+            "total_tokens": None,
+        },
+    }, model="gpt-5.4-mini")
+
+    assert chat["choices"][0]["message"]["content"] == "still works"
+    # Malformed input_tokens -> 0; total falls back to prompt+completion sum.
+    assert chat["usage"]["prompt_tokens"] == 0
+    assert chat["usage"]["completion_tokens"] == 4
+    assert chat["usage"]["total_tokens"] == 4
+
+
+def test_codex_adapter_retry_credential_rotates_on_401(monkeypatch):
+    """A 401 from Codex must rotate to a different pooled credential.
+
+    Pre-fix the adapter inherited the base no-op ``get_retry_credential``,
+    so the server's retry block could never rotate for Codex — a single
+    expired pool key took down every request.
+    """
+    class Entry:
+        def __init__(self, key, base_url="https://chatgpt.com/backend-api/codex"):
+            self.runtime_api_key = key
+            self.runtime_base_url = base_url
+
+    rotated_to = Entry("second-codex-token")
+
+    class Pool:
+        def __init__(self):
+            self.calls = []
+
+        def mark_exhausted_and_rotate(self, *, status_code, api_key_hint=None):
+            self.calls.append((status_code, api_key_hint))
+            return rotated_to
+
+    pool = Pool()
+    with patch("agent.credential_pool.load_pool", return_value=pool):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(
+            bearer="first-codex-token",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        retry = adapter.get_retry_credential(failed_credential=failed, status_code=401)
+
+    assert retry is not None, "401 must rotate to next pooled Codex credential"
+    assert retry.bearer == "second-codex-token"
+    assert retry.base_url == "https://chatgpt.com/backend-api/codex"
+    # The failed bearer is pinned as the hint so the right entry is exhausted.
+    assert pool.calls == [(401, "first-codex-token")]
+
+
+def test_codex_adapter_retry_credential_skips_unrelated_status(monkeypatch):
+    """Non-{401, 429} statuses must not touch the pool at all."""
+    def _load_pool_must_not_run(*args, **kwargs):
+        raise AssertionError("pool must not be loaded for unrelated statuses")
+
+    with patch("agent.credential_pool.load_pool", _load_pool_must_not_run):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(bearer="x", base_url="https://example/codex")
+        assert adapter.get_retry_credential(failed_credential=failed, status_code=500) is None
+
+
+def test_codex_adapter_retry_credential_none_when_no_rotation(monkeypatch):
+    """If rotation yields nothing (or the same bearer), return None so the
+    upstream 401/429 flows back to the client unchanged."""
+    class Pool:
+        def mark_exhausted_and_rotate(self, *, status_code, api_key_hint=None):
+            return None  # single-entry pool: nowhere to rotate
+
+    with patch("agent.credential_pool.load_pool", return_value=Pool()):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(bearer="only-token", base_url="https://example/codex")
+        assert adapter.get_retry_credential(failed_credential=failed, status_code=429) is None
+
+
 # ---------------------------------------------------------------------------
 # NousPortalAdapter
 # ---------------------------------------------------------------------------
