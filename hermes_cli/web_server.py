@@ -262,11 +262,14 @@ _ASSISTANT_ALLOWED_CONFIG_KEYS: frozenset = frozenset({
     "yolo",
 })
 # slash.exec runs an arbitrary slash command through the slash worker (/config,
-# /model, ...). The assistant UI only needs its two buttons (compress +
-# reload-mcp); anything else must be refused on the customer surface.
+# /model, ...). The assistant UI only needs its own buttons: compress + the
+# reload-mcp refresh, and stop (the "Laufende Antwort stoppen" control, routed
+# through the shared sendSlash helper as /stop). Anything else must be refused
+# on the customer surface.
 _ASSISTANT_ALLOWED_SLASH_COMMANDS: frozenset = frozenset({
     "compress",
     "reload-mcp",
+    "stop",
 })
 
 

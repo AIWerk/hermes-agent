@@ -6534,7 +6534,7 @@ class TestAssistantWsGate:
 
     def test_slash_exec_command_allowlist(self):
         gate = self._gate()
-        for cmd in ["compress", "reload-mcp", "/compress", "/reload-mcp"]:
+        for cmd in ["compress", "reload-mcp", "stop", "/compress", "/reload-mcp", "/stop"]:
             assert gate({"method": "slash.exec", "params": {"command": cmd}}) is None, cmd
         for cmd in ["config", "/config set model x", "model", "shell", "snapshot restore", ""]:
             assert gate(
