@@ -6471,3 +6471,156 @@ class TestRequestLooksLocalSpoofing:
         req.client = type("C", (), {"host": "203.0.113.7"})()
         assert web_server._request_looks_local(req) is False
 
+
+class TestAssistantWsGate:
+    """Regression tests for the /api/ws assistant-mode confinement
+    (_assistant_ws_request_gate). The WebSocket gateway bypasses the HTTP
+    auth_middleware, so this predicate is the only thing stopping a confined
+    customer from calling admin RPCs — shell.exec / cli.exec / config.set
+    model=... / config.get full / slash.exec /config — straight through
+    tui_gateway.server.dispatch.
+    """
+
+    def _gate(self):
+        import hermes_cli.web_server as web_server
+
+        return web_server._assistant_ws_request_gate
+
+    def test_allows_chat_methods(self):
+        gate = self._gate()
+        for method in [
+            "session.create", "session.resume", "session.title", "session.notes",
+            "session.usage", "session.steer", "session.side.start",
+            "session.side.back", "prompt.submit", "approval.respond",
+        ]:
+            assert gate({"id": 1, "method": method, "params": {}}) is None, method
+
+    def test_blocks_admin_methods(self):
+        gate = self._gate()
+        for method in [
+            "shell.exec", "cli.exec", "reload.env", "reload.mcp", "skills.manage",
+            "skills.reload", "cron.manage", "browser.manage", "model.save_key",
+            "config.show", "process.stop", "rollback.restore", "command.dispatch",
+            "session.delete", "tools.configure",
+        ]:
+            reason = gate({"id": 1, "method": method, "params": {}})
+            assert reason is not None and "assistant mode" in reason, method
+
+    def test_shell_exec_is_refused(self):
+        gate = self._gate()
+        reason = gate(
+            {"method": "shell.exec", "params": {"command": "id; cat ~/.hermes/.env"}}
+        )
+        assert reason is not None
+
+    def test_config_key_allowlist(self):
+        gate = self._gate()
+        for key in ["busy", "reasoning", "fast", "yolo"]:
+            assert gate({"method": "config.get", "params": {"key": key}}) is None
+            assert gate(
+                {"method": "config.set", "params": {"key": key, "value": "on"}}
+            ) is None
+        # Powerful keys the SPA never touches must be refused on both verbs.
+        for key in ["model", "full", "prompt", "provider", "profile", "project", ""]:
+            assert gate({"method": "config.get", "params": {"key": key}}) is not None, key
+            assert gate(
+                {"method": "config.set", "params": {"key": key, "value": "x"}}
+            ) is not None, key
+
+    def test_config_get_full_dump_is_refused(self):
+        # config.get key="full" returns the entire config.yaml incl. API keys.
+        gate = self._gate()
+        assert gate({"method": "config.get", "params": {"key": "full"}}) is not None
+
+    def test_slash_exec_command_allowlist(self):
+        gate = self._gate()
+        for cmd in ["compress", "reload-mcp", "stop", "/compress", "/reload-mcp", "/stop"]:
+            assert gate({"method": "slash.exec", "params": {"command": cmd}}) is None, cmd
+        for cmd in ["config", "/config set model x", "model", "shell", "snapshot restore", ""]:
+            assert gate(
+                {"method": "slash.exec", "params": {"command": cmd}}
+            ) is not None, cmd
+
+    def test_unknown_and_malformed_requests(self):
+        gate = self._gate()
+        assert gate({"method": "totally.bogus", "params": {}}) is not None
+        # Malformed frames fall through to dispatch's own JSON-RPC validation.
+        assert gate("not-a-dict") is None
+        assert gate({"params": {}}) is None
+        assert gate({"method": "", "params": {}}) is None
+
+
+class TestAssistantWsGateWiring:
+    """Prove handle_ws actually applies the injected gate *before* dispatch,
+    and that admin mode (gate=None) leaves the full method table reachable.
+    """
+
+    class _FakeWS:
+        def __init__(self, frames):
+            self._frames = list(frames)
+            self.sent = []
+            self.client = type("C", (), {"host": "127.0.0.1", "port": 5})()
+
+        async def accept(self):
+            return None
+
+        async def receive_text(self):
+            if self._frames:
+                return self._frames.pop(0)
+            import tui_gateway.ws as wsmod
+
+            raise wsmod._WebSocketDisconnect(1000)
+
+        async def send_text(self, line):
+            self.sent.append(line)
+
+        def close(self):
+            return None
+
+    def _run(self, frames, gate, monkeypatch):
+        import asyncio
+        import tui_gateway.ws as wsmod
+
+        dispatched = []
+
+        def fake_dispatch(req, transport=None):
+            dispatched.append(req.get("method"))
+            return {"jsonrpc": "2.0", "id": req.get("id"), "result": {"ok": True}}
+
+        monkeypatch.setattr(wsmod.server, "dispatch", fake_dispatch)
+        ws = self._FakeWS(frames)
+        asyncio.run(wsmod.handle_ws(ws, request_gate=gate))
+        return ws, dispatched
+
+    def test_refused_request_never_reaches_dispatch(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        frames = [json.dumps({"jsonrpc": "2.0", "id": 9, "method": "shell.exec",
+                              "params": {"command": "id"}})]
+        ws, dispatched = self._run(
+            frames, web_server._assistant_ws_request_gate, monkeypatch
+        )
+        assert dispatched == []  # shell.exec is refused before dispatch
+        errors = [json.loads(s) for s in ws.sent if '"error"' in s]
+        assert any(
+            e.get("error", {}).get("code") == -32601 and e.get("id") == 9
+            for e in errors
+        )
+
+    def test_allowed_request_reaches_dispatch(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        frames = [json.dumps({"jsonrpc": "2.0", "id": 3, "method": "session.usage",
+                              "params": {"session_id": "s1"}})]
+        _ws, dispatched = self._run(
+            frames, web_server._assistant_ws_request_gate, monkeypatch
+        )
+        assert dispatched == ["session.usage"]
+
+    def test_no_gate_admin_mode_allows_shell_exec(self, monkeypatch):
+        # gateway_ws passes request_gate=None in admin mode — nothing filtered.
+        frames = [json.dumps({"jsonrpc": "2.0", "id": 7, "method": "shell.exec",
+                              "params": {"command": "id"}})]
+        _ws, dispatched = self._run(frames, None, monkeypatch)
+        assert dispatched == ["shell.exec"]
+

@@ -27,7 +27,7 @@ import asyncio
 import json
 import logging
 import socket
-from typing import Any
+from typing import Any, Callable, Optional
 
 from tui_gateway import server
 
@@ -156,8 +156,19 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(
+    ws: Any, request_gate: Optional[Callable[[Any], Optional[str]]] = None
+) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    ``request_gate``, when provided, is invoked with each inbound JSON-RPC
+    request dict *before* it reaches :func:`server.dispatch`. Returning a
+    non-``None`` string refuses that request with a JSON-RPC error carrying the
+    string as the message; returning ``None`` lets it through. The web
+    entrypoint injects this in customer "assistant" mode to confine /api/ws to
+    the handful of chat methods the UI needs — WS routes bypass the HTTP
+    middleware, so the admin-API allowlist is not otherwise enforced here.
+    """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -244,6 +255,38 @@ async def handle_ws(ws: Any) -> None:
             # response dict, which we write here from the loop.
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
+
+            # Refuse requests the injected gate rejects (assistant-mode
+            # confinement) before they ever reach dispatch.
+            if request_gate is not None:
+                deny_reason = request_gate(req)
+                if deny_reason is not None:
+                    _log.warning(
+                        "ws request refused peer=%s id=%s method=%s reason=%s",
+                        peer,
+                        req_id,
+                        req_method,
+                        deny_reason,
+                    )
+                    ok = await transport.write_async(
+                        {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32601, "message": deny_reason},
+                            "id": req_id if req_id is not None else None,
+                        }
+                    )
+                    if not ok:
+                        disconnect_reason = "send_failed_after_gate_refusal"
+                        send_failures += 1
+                        _log.warning(
+                            "ws gate-refusal reply send failed peer=%s id=%s method=%s",
+                            peer,
+                            req_id,
+                            req_method,
+                        )
+                        break
+                    continue
+
             try:
                 resp = await asyncio.to_thread(server.dispatch, req, transport)
             except Exception:

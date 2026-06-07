@@ -228,6 +228,83 @@ _ASSISTANT_ALLOWED_API_PREFIXES: tuple[str, ...] = (
     "/api/sessions/",
 )
 
+# JSON-RPC methods the customer "assistant" chat UI legitimately drives over
+# the /api/ws gateway. This is the WebSocket-transport counterpart to
+# _ASSISTANT_ALLOWED_API_EXACT: WS routes bypass the HTTP auth_middleware, so
+# without an explicit gate a confined customer could call admin RPCs straight
+# through tui_gateway.server.dispatch (shell.exec, cli.exec, reload.env,
+# skills.manage, cron.manage, browser.manage, model.save_key, ...). Default
+# deny — the set below is exactly what web/src/pages/AiwerkAssistantPage.tsx
+# sends (verified against every gateway.request(...) call site).
+_ASSISTANT_ALLOWED_RPC_METHODS: frozenset = frozenset({
+    "session.create",
+    "session.resume",
+    "session.title",
+    "session.notes",
+    "session.usage",
+    "session.steer",
+    "session.side.start",
+    "session.side.back",
+    "prompt.submit",
+    "approval.respond",
+    "config.get",
+    "config.set",
+    "slash.exec",
+})
+# config.get / config.set reach powerful keys (key="model" repoints the model
+# and base_url; config.get key="full" dumps the whole config.yaml including
+# provider API keys). The assistant UI only ever reads/writes these runtime
+# toggles, so confine the key in assistant mode.
+_ASSISTANT_ALLOWED_CONFIG_KEYS: frozenset = frozenset({
+    "busy",
+    "reasoning",
+    "fast",
+    "yolo",
+})
+# slash.exec runs an arbitrary slash command through the slash worker (/config,
+# /model, ...). The assistant UI only needs its own buttons: compress + the
+# reload-mcp refresh, and stop (the "Laufende Antwort stoppen" control, routed
+# through the shared sendSlash helper as /stop). Anything else must be refused
+# on the customer surface.
+_ASSISTANT_ALLOWED_SLASH_COMMANDS: frozenset = frozenset({
+    "compress",
+    "reload-mcp",
+    "stop",
+})
+
+
+def _assistant_ws_request_gate(req: Any) -> Optional[str]:
+    """Confine an inbound /api/ws JSON-RPC request to the customer chat surface.
+
+    Returns a human-readable denial reason when the request must be refused in
+    assistant mode, or None to allow it. Default-deny by method, with
+    parameter-level allowlists for the few powerful methods the chat needs.
+    Injected into tui_gateway.ws.handle_ws by gateway_ws only when
+    _assistant_mode_enabled() is true, so admin-mode dispatch is untouched.
+    """
+    if not isinstance(req, dict):
+        # Malformed frame — let dispatch's own JSON-RPC validation handle it.
+        return None
+    method = req.get("method")
+    if not isinstance(method, str) or not method:
+        return None
+    if method not in _ASSISTANT_ALLOWED_RPC_METHODS:
+        return f"method not available in assistant mode: {method}"
+    params = req.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if method in ("config.get", "config.set"):
+        key = str(params.get("key", "")).strip().lower()
+        if key not in _ASSISTANT_ALLOWED_CONFIG_KEYS:
+            return f"config key not available in assistant mode: {key or '(none)'}"
+    elif method == "slash.exec":
+        raw_cmd = str(params.get("command", "")).strip()
+        base = raw_cmd.lstrip("/").split(maxsplit=1)[0].lower() if raw_cmd else ""
+        if base not in _ASSISTANT_ALLOWED_SLASH_COMMANDS:
+            return f"slash command not available in assistant mode: /{base or '(none)'}"
+    return None
+
+
 # Customer UI attachment upload limits. Files are stored under HERMES_HOME only,
 # scoped by session id, and never under arbitrary user supplied paths.
 _ASSISTANT_UPLOAD_MAX_FILES = 10
@@ -13599,7 +13676,13 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    # In customer "assistant" mode, /api/ws bypasses the HTTP admin-API
+    # allowlist (auth_middleware never runs for WebSocket routes), so confine
+    # the JSON-RPC surface here — otherwise dispatch exposes shell.exec /
+    # cli.exec / config.set model=... / reload.env / skills.manage to the
+    # customer. Admin mode passes no gate and keeps the full method table.
+    request_gate = _assistant_ws_request_gate if _assistant_mode_enabled() else None
+    await handle_ws(ws, request_gate=request_gate)
 
 
 # ---------------------------------------------------------------------------
