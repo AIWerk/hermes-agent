@@ -359,3 +359,49 @@ def should_mirror_to_honcho(
 
 def dominant_destination(destinations: Iterable[MemoryDestination]) -> MemoryDestination:
     return max(destinations, key=lambda d: _PRIORITY_DESTINATION.get(d, 0))
+
+
+def contains_secret(content: str) -> bool:
+    """Return True if content matches the router's credential/secret detection.
+
+    Shares the exact ``_SECRET_RE`` pattern that drives the CREDENTIAL
+    classification in :func:`classify_memory_route`, so callers cannot drift
+    into a weaker detection.
+    """
+    return bool(_SECRET_RE.search(content or ""))
+
+
+def redact_secrets(content: str, *, placeholder: str = "[REDACTED-SECRET]") -> str:
+    """Redact credential/secret substrings using the router's secret detection.
+
+    Uses the same ``_SECRET_RE`` that classifies content as CREDENTIAL, so any
+    raw secret the router would refuse to mirror is stripped before durable
+    writes (e.g. Honcho turn sync).  Non-secret content is returned unchanged.
+
+    ``_SECRET_RE`` is tuned for *detection* (``search``); some alternatives
+    match only a short prefix of a token (e.g. ``sk_`` of an ``sk_live_...``
+    key).  To avoid leaving the bulk of a secret behind, each match span is
+    expanded to cover the full surrounding non-whitespace token before
+    replacement.
+    """
+    if not content:
+        return content
+
+    out: list[str] = []
+    cursor = 0
+    for match in _SECRET_RE.finditer(content):
+        start, end = match.start(), match.end()
+        # Expand left/right over contiguous non-whitespace so a partial-prefix
+        # match still redacts the whole credential token.
+        while start > 0 and not content[start - 1].isspace():
+            start -= 1
+        while end < len(content) and not content[end].isspace():
+            end += 1
+        if start < cursor:
+            # Overlaps an already-redacted span; skip.
+            continue
+        out.append(content[cursor:start])
+        out.append(placeholder)
+        cursor = end
+    out.append(content[cursor:])
+    return "".join(out)

@@ -24,7 +24,11 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
-from agent.memory_router import should_mirror_to_honcho
+from agent.memory_router import (
+    contains_secret,
+    redact_secrets,
+    should_mirror_to_honcho,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1369,8 +1373,11 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
-        clean_user_content = sanitize_context(user_content or "").strip()
-        clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        # sanitize_context strips internal fences but does ZERO secret redaction;
+        # apply the router's credential detection so raw API keys / passwords /
+        # JWTs / connection strings never reach durable Honcho memory.
+        clean_user_content = redact_secrets(sanitize_context(user_content or "")).strip()
+        clean_assistant_content = redact_secrets(sanitize_context(assistant_content or "")).strip()
 
         def _sync():
             try:
@@ -1550,6 +1557,14 @@ class HonchoMemoryProvider(MemoryProvider):
                     if ok:
                         return json.dumps({"result": f"Conclusion {delete_id} deleted."})
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
+                # Credential safety: conclusions are persisted durably into the
+                # peer card and re-injected into future prompts. Route through the
+                # SAME secret detection as the gated mirror path before writing.
+                if contains_secret(conclusion):
+                    return tool_error(
+                        "Memory router blocked a credential/secret from durable "
+                        "Honcho memory (conclusion not saved)."
+                    )
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})
