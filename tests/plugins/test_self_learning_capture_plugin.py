@@ -134,6 +134,40 @@ def test_sanitize_redacts_url_embedded_password():
     assert "[REDACTED]" in out
 
 
+def test_sanitize_redacts_single_quoted_secret():
+    # Single-quoting is the dominant shell form; the previous value class only
+    # made the double quote optional and excluded ``'`` from the value, so the
+    # secret leaked verbatim.
+    secret = "opaque" + "-secret-value"
+    out = _sanitize(f"export API_KEY='{secret}'")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_multi_word_quoted_passphrase():
+    # A quoted multi-word value previously leaked everything after the first
+    # space because the value class stopped at whitespace.
+    passphrase = "correct horse battery staple"
+    out = _sanitize(f'"password": "{passphrase}"')
+    for word in passphrase.split():
+        assert word not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_userless_url_password():
+    # ``scheme://:pass@host`` has no user segment; the previous regex required a
+    # non-empty user before ``:`` and left it unredacted.
+    password = "myp" + "assword"
+    out = _sanitize(f"redis://:{password}@cache:6379")
+    assert password not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_leaves_benign_text_untouched():
+    benign = "The token of appreciation was a small token; password reset is at 5pm."
+    assert _sanitize(benign) == benign
+
+
 def test_sanitize_redacts_jwt():
     jwt = ".".join(
         ["eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0", "SflKxwRJSMeKKF2QT4fwpMeJf36"]

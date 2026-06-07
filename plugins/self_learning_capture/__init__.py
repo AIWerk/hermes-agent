@@ -17,7 +17,11 @@ _SECRET_KEYED_PATTERNS = [
     re.compile(
         r"(?i)(\"?(?:api[_-]?key|secret|token|password|passwd|credential"
         r"|access[_-]?key|client[_-]?secret|private[_-]?key|authorization)\"?)"
-        r"\s*[:=]\s*\"?[^\s'\",;]+\"?"
+        # Quote-aware value: a fully single- or double-quoted string (which may
+        # contain whitespace, ``,`` or ``;``), else an unquoted token. Matching
+        # the closing quote closes the single-quote leak and the multi-word /
+        # ``,``/``;`` remainder leak the bare token class left behind.
+        r"\s*[:=]\s*(?:'[^']*'|\"[^\"]*\"|[^\s'\",;]+)"
     ),
 ]
 
@@ -42,7 +46,9 @@ _SECRET_VALUE_PATTERNS = [
 ]
 
 # ``scheme://user:password@host`` — keep ``scheme://user:``, redact the password.
-_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s/@]+(@)")
+# The user segment is optional so userless creds (``redis://:pass@host``) are
+# covered too.
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/@]+(@)")
 
 _CORRECTION_PATTERNS = [
     r"\b(ne mentsd|ne írd|ne ird|ne tedd|ezt ne|nem így|nem igy|rosszul|hibás|hibas|tévedtél|tevedtel)\b",
