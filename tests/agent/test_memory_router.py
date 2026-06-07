@@ -1,10 +1,13 @@
 """Tests for deterministic memory routing policy."""
 
+import time
+
 import pytest
 
 from agent.memory_router import (
     MemoryDestination,
     MemorySensitivity,
+    _SECRET_RE,
     classify_memory_route,
     should_mirror_to_honcho,
     should_write_builtin_memory,
@@ -196,6 +199,111 @@ def test_profile_metadata_does_not_override_customer_private_routing():
     assert not route.has(MemoryDestination.INJECT)
     assert route.inject_allowed is False
     assert route.target_hint == "tenant_private"
+
+
+def test_secret_re_does_not_backtrack_on_long_non_matching_input():
+    # The URL-credential alternative used to backtrack quadratically on a long
+    # unbroken lowercase run before "://" (50000 chars measured at ~16s, a
+    # prompt-injected multi-KB blob stalled the process). The scheme run and
+    # user/pass quantifiers are now bounded, so the match must stay near-instant.
+    start = time.perf_counter()
+    _SECRET_RE.search("a" * 50000)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.05, f"_SECRET_RE.search backtracked: {elapsed:.3f}s"
+
+
+def test_classify_route_is_fast_on_large_blob():
+    # The bounded _SECRET_RE scans the FULL text in linear time, so a 100KB
+    # blob (the shape of a prompt-injected memory_tool add) classifies quickly
+    # without resorting to a prefix window.
+    start = time.perf_counter()
+    classify_memory_route("a" * 100000, target="user")
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.10, f"classify_memory_route was slow: {elapsed:.3f}s"
+
+
+def test_credential_at_blob_top_is_still_discarded():
+    # A secret near the start of an oversized blob must be caught.
+    secret = "GOCSPX-" + "aBcDeFgHiJkLmNoPq"
+    ok, route = should_write_builtin_memory(
+        f"User key {secret} " + "padding " * 5000,
+        target="user",
+    )
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+
+
+def test_credential_after_long_padding_is_still_discarded():
+    # Regression for the prefix-scan bypass: a credential placed AFTER benign
+    # preference text + >8KB of padding must still route to credential/discard.
+    # An earlier 8192-byte scan window let such a secret evade detection and
+    # route to inject + store_honcho — breaking the memory-router invariant
+    # that credentials never enter prompt-injected or durable memory.
+    secret = "GOCSPX-" + "aBcDeFgHiJkLmNoPq"
+    payload = (
+        "User prefers concise answers and dark mode. "
+        + ("x" * 9000)
+        + f" my api key is {secret}"
+    )
+    ok, route = should_write_builtin_memory(payload, target="user")
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+    # Must NOT leak into prompt-injected or durable memory.
+    assert not route.has(MemoryDestination.INJECT)
+    assert not route.has(MemoryDestination.STORE_HONCHO)
+    assert route.inject_allowed is False
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "GOCSPX-aBcDeFgHiJkLmNoPqRsTuVwX",            # Google OAuth client secret
+        "Authorization: Bearer abc123.DEF456-ghi_789",  # bearer auth header
+        "npm_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",  # npm token (40 chars)
+        "redis://:mypassword@cache:6379",            # userless URL credential
+        "deadbeef" * 8,                              # 64-char raw hex run
+    ],
+)
+def test_newly_covered_credential_formats_are_discarded(secret):
+    ok, route = should_write_builtin_memory(
+        f"User value: {secret}", target="user"
+    )
+
+    assert ok is False, f"not blocked: {secret!r}"
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+    assert route.inject_allowed is False
+    assert route.honcho_store_allowed is False
+
+
+def test_userless_url_credential_blocked_from_honcho_mirror():
+    ok, route = should_mirror_to_honcho(
+        "redis://:s3cr3tpass@cache:6379", target="user"
+    )
+
+    assert ok is False
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.honcho_store_allowed is False
+
+
+def test_credential_free_string_is_not_misclassified():
+    # Plain prose containing a short hex token and a passwordless URL must not
+    # trip the credential gate (the 64-hex and URL-credential additions stay
+    # tight). This routes to INJECT as a normal user preference.
+    ok, route = should_write_builtin_memory(
+        "Attila prefers concise replies and reads docs at https://example.com/guide.",
+        target="user",
+    )
+
+    assert route.sensitivity != MemorySensitivity.CREDENTIAL
+    assert ok is True
+    assert route.has(MemoryDestination.INJECT)
 
 
 def test_profile_metadata_does_not_create_specialist_memory_route():

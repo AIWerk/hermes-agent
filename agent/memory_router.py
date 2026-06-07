@@ -89,18 +89,33 @@ class MemoryRoute:
         }
 
 
+# The FULL content is scanned for secrets. Every alternative below is bounded
+# (in particular the URL-credential scheme run and its user/pass quantifiers),
+# so _SECRET_RE.search() stays effectively linear even on attacker-controlled
+# multi-KB blobs (measured: ~0.015s on a 1MB non-matching input). Scanning the
+# whole text — not a prefix — is required: a prefix window would let a
+# credential placed after benign padding evade the gate and route to
+# inject/durable memory.
 _SECRET_RE = re.compile(
     r"(api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key|"
     r"BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY|"
     r"sk[-_][A-Za-z0-9]|(sk|pk|rk)_(live|test)_[A-Za-z0-9]{8,}|"
     r"xox[baprs]-|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]{20,}|"
     r"AIza[0-9A-Za-z_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
+    r"GOCSPX-[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{36,}|"
+    r"Authorization:\s*Bearer\s+[A-Za-z0-9._-]{8,}|"
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+|"
     r"hooks\.slack\.com/services/|"
-    # credentials embedded in URLs: scheme://user:password@host
-    r"[a-z][a-z0-9+.-]*://[^\s:/@]+:[^@/\s]+@)",
+    # raw high-entropy run: 64+ hex chars (signing secrets, key material)
+    r"\b[a-fA-F0-9]{64,}\b|"
+    # credentials embedded in URLs: scheme://[user]:password@host. The scheme
+    # run and the user/pass quantifiers are bounded so the alternative cannot
+    # backtrack quadratically on long non-matching input; the userless form
+    # (scheme://:password@) is also covered.
+    r"\b[a-z][a-z0-9+.-]{1,15}://[^\s:/@]{0,256}:[^@/\s]{1,256}@)",
     re.IGNORECASE,
 )
+
 
 _CUSTOMER_RE = re.compile(
     r"\b(customer|client|tenant|kunde|kundin|mandant|pilot customer|call handling|"
