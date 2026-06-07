@@ -14,11 +14,21 @@ from tools.skills_tool import (
     _parse_tags,
     _get_category_from_path,
     _find_all_skills,
+    set_secret_capture_callback,
     skill_matches_platform,
     skills_list,
     skill_view,
     MAX_DESCRIPTION_LENGTH,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_secret_capture_callback():
+    """The secret-capture callback is thread-local; clear it after each test
+    so a callback set in one test can't leak into the next on the same
+    (main) thread."""
+    yield
+    set_secret_capture_callback(None)
 
 
 def _make_skill(
@@ -573,12 +583,7 @@ class TestSkillViewSecureSetupOnLoad:
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
+        set_secret_capture_callback(fake_secret_callback)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -622,12 +627,7 @@ class TestSkillViewSecureSetupOnLoad:
                 "skipped": True,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
+        set_secret_capture_callback(fake_secret_callback)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -977,12 +977,7 @@ class TestSkillViewPrerequisites:
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
+        set_secret_capture_callback(fake_secret_callback)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -1075,12 +1070,7 @@ Do the legacy thing.
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
+        set_secret_capture_callback(fake_secret_callback)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -1267,3 +1257,145 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+class TestThreadLocalSecretCaptureCallback:
+    """Two concurrent gateway sessions run each prompt.submit turn in its own
+    daemon thread and re-register the secret-capture callback per turn. The
+    slot must be thread-local so session A's secret.request can't be routed to
+    client B's transport (and B's typed value stored into A's profile .env).
+
+    Mirrors the sudo/approval thread-local isolation tests in
+    tests/acp/test_approval_isolation.py."""
+
+    def test_set_and_get_in_same_thread(self):
+        from tools.skills_tool import (
+            set_secret_capture_callback,
+            _get_secret_capture_callback,
+        )
+
+        cb = lambda name, prompt, metadata=None: {"success": True}  # noqa: E731
+        set_secret_capture_callback(cb)
+        assert _get_secret_capture_callback() is cb
+        set_secret_capture_callback(None)
+
+    def test_callback_not_visible_in_different_thread(self):
+        """Thread A's callback is NOT visible to thread B — last-writer-wins
+        across two concurrent sessions is exactly the bug being fixed."""
+        import threading
+
+        from tools.skills_tool import (
+            set_secret_capture_callback,
+            _get_secret_capture_callback,
+        )
+
+        cb_a = lambda name, prompt, metadata=None: {"who": "a"}  # noqa: E731
+        cb_b = lambda name, prompt, metadata=None: {"who": "b"}  # noqa: E731
+
+        seen_in_a = []
+        seen_in_b = []
+        both_set = threading.Barrier(2)
+
+        def thread_a():
+            set_secret_capture_callback(cb_a)
+            # Wait until thread B has also set ITS callback, so a module-global
+            # would already have been clobbered to cb_b by now.
+            both_set.wait(timeout=2)
+            seen_in_a.append(_get_secret_capture_callback())
+
+        def thread_b():
+            set_secret_capture_callback(cb_b)
+            both_set.wait(timeout=2)
+            seen_in_b.append(_get_secret_capture_callback())
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        # Each thread must see ONLY its own callback — no cross-wire.
+        assert seen_in_a == [cb_a]
+        assert seen_in_b == [cb_b]
+
+    def test_concurrent_invocation_routes_to_own_callback(self, tmp_path):
+        """End-to-end through the invocation site: two threads each load a
+        skill whose missing env var triggers the secret-capture callback. Each
+        thread must observe ITS OWN callback being invoked, proving session A's
+        secret prompt is never delivered to session B."""
+        import threading
+
+        from tools.skills_tool import set_secret_capture_callback
+
+        # Two distinct skills, each requiring a distinct env var.
+        _make_skill(
+            tmp_path,
+            "skill-a",
+            frontmatter_extra=(
+                "required_environment_variables:\n"
+                "  - name: KEY_A\n"
+                "    prompt: Key A\n"
+            ),
+        )
+        _make_skill(
+            tmp_path,
+            "skill-b",
+            frontmatter_extra=(
+                "required_environment_variables:\n"
+                "  - name: KEY_B\n"
+                "    prompt: Key B\n"
+            ),
+        )
+
+        os.environ.pop("KEY_A", None)
+        os.environ.pop("KEY_B", None)
+
+        captured_a = []
+        captured_b = []
+        both_wired = threading.Barrier(2)
+
+        def make_cb(sink, env_value):
+            def cb(var_name, prompt, metadata=None):
+                # Record which var name THIS callback was asked for.
+                sink.append(var_name)
+                os.environ[var_name] = env_value
+                return {
+                    "success": True,
+                    "stored_as": var_name,
+                    "validated": False,
+                    "skipped": False,
+                }
+
+            return cb
+
+        results = {}
+
+        def run(session, skill, sink, env_value):
+            set_secret_capture_callback(make_cb(sink, env_value))
+            # Ensure the OTHER session has also wired its callback before either
+            # invokes — a module global would now be the loser's callback.
+            both_wired.wait(timeout=2)
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                results[session] = json.loads(skill_view(skill))
+
+        ta = threading.Thread(
+            target=run, args=("a", "skill-a", captured_a, "value-a")
+        )
+        tb = threading.Thread(
+            target=run, args=("b", "skill-b", captured_b, "value-b")
+        )
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        try:
+            # Session A's callback was asked ONLY for KEY_A, B's ONLY for KEY_B.
+            assert captured_a == ["KEY_A"]
+            assert captured_b == ["KEY_B"]
+            assert results["a"]["success"] is True
+            assert results["b"]["success"] is True
+        finally:
+            os.environ.pop("KEY_A", None)
+            os.environ.pop("KEY_B", None)

@@ -7,12 +7,21 @@ from unittest.mock import patch
 import pytest
 
 import tools.skills_tool as skills_tool_module
+from tools.skills_tool import set_secret_capture_callback
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
     resolve_skill_command_key,
     scan_skill_commands,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_secret_capture_callback():
+    """The secret-capture callback is thread-local; clear it after each test
+    so a callback set in one test can't leak into the next."""
+    yield
+    set_secret_capture_callback(None)
 
 
 def _make_skill(
@@ -514,12 +523,7 @@ Generate some audio.
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
+        set_secret_capture_callback(fake_secret_callback)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -549,12 +553,7 @@ Generate some audio.
                 "gateway flow should not try secure in-band secret capture"
             )
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fail_if_called,
-            raising=False,
-        )
+        set_secret_capture_callback(fail_if_called)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             from gateway.session_context import clear_session_vars, set_session_vars
@@ -581,12 +580,7 @@ Generate some audio.
     def test_preserves_remaining_remote_setup_warning(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            None,
-            raising=False,
-        )
+        set_secret_capture_callback(None)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(

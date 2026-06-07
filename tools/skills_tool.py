@@ -68,6 +68,7 @@ Usage:
 
 import json
 import logging
+import threading
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -105,7 +106,22 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona"}
 )
-_secret_capture_callback = None
+# Optional UI callback for interactive secret-capture prompts. Stored in
+# thread-local state so overlapping gateway sessions — each prompt.submit
+# turn runs in its own daemon thread — don't stomp on each other's
+# callbacks. A module global would be last-writer-wins: two concurrent
+# sessions in one gateway process would cross-wire, delivering session A's
+# secret.request to client B's transport and storing B's typed value into
+# A's profile .env. Mirrors the sudo/approval thread-local slots in
+# tools/terminal_tool.py (see GHSA-qg5c-hvr5-hjgr).
+#
+# CLI mode is single-threaded, so the only thread holds its own callback
+# exactly as before — single-session behavior is identical.
+_callback_tls = threading.local()
+
+
+def _get_secret_capture_callback():
+    return getattr(_callback_tls, "secret_capture", None)
 
 
 def load_env() -> Dict[str, str]:
@@ -145,8 +161,14 @@ _INJECTION_PATTERNS: list = [
 
 
 def set_secret_capture_callback(callback) -> None:
-    global _secret_capture_callback
-    _secret_capture_callback = callback
+    """Register a callback for interactive secret-capture prompts.
+
+    Per-thread scope — overlapping gateway sessions that each run their
+    prompt.submit turn in a separate daemon thread have their own callback
+    slot, so a re-wire on one turn thread can't cross-wire another live
+    session. See GHSA-qg5c-hvr5-hjgr.
+    """
+    _callback_tls.secret_capture = callback
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -330,7 +352,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    secret_capture_callback = _get_secret_capture_callback()
+    if secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -348,7 +371,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
