@@ -4455,7 +4455,8 @@ def _extract_uploaded_text(path: Path, content_type: str = "") -> tuple[str, str
     if ext == ".docx":
         try:
             import zipfile
-            import xml.etree.ElementTree as ET
+
+            from defusedxml.ElementTree import fromstring as _safe_fromstring
 
             with zipfile.ZipFile(path) as zf:
                 try:
@@ -4470,11 +4471,12 @@ def _extract_uploaded_text(path: Path, content_type: str = "") -> tuple[str, str
                     xml = member.read(_ASSISTANT_DOCX_MAX_XML_BYTES + 1)
             if len(xml) > _ASSISTANT_DOCX_MAX_XML_BYTES:
                 return "", "docx-too-large"
-            # Reject DTD / entity declarations (billion-laughs / XXE vector);
-            # a real word/document.xml never declares them.
-            if b"<!DOCTYPE" in xml[:65536] or b"<!ENTITY" in xml[:65536]:
-                return "", "docx-extraction-failed"
-            root = ET.fromstring(xml)
+            # Reject DTD / entity declarations (billion-laughs / XXE vector) at
+            # the parser level. A substring window check can be bypassed by
+            # padding the document with a >64KB comment before the DOCTYPE;
+            # defusedxml refuses any DTD/entity-bearing document regardless of
+            # where the declaration sits. A real word/document.xml never has one.
+            root = _safe_fromstring(xml, forbid_dtd=True)
             parts = [node.text for node in root.iter() if node.text]
             text = " ".join(parts).strip()[:_ASSISTANT_TEXT_EXTRACT_LIMIT]
             return text, "docx" if text else "empty-docx"

@@ -87,6 +87,11 @@ dependencies = [
   "psutil==7.2.2",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1",
+  # Hardened XML parser (drop-in for stdlib xml.etree) — the customer-facing
+  # web_server parses untrusted .docx uploads (word/document.xml) and must
+  # block billion-laughs / XXE regardless of where a DOCTYPE sits. On the
+  # default web UI path, so it ships everywhere, not just the wecom extra.
+  "defusedxml==0.7.1",
   "fastapi>=0.104.0,<1",
   "uvicorn[standard]>=0.24.0,<1",
   "ptyprocess>=0.7.0,<1; sys_platform != 'win32'",
@@ -118,8 +123,9 @@ matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0",
 # WeCom callback-mode adapter — parses untrusted XML POST bodies from
 # WeCom-controlled callback endpoints, so we use defusedxml (drop-in
 # replacement for stdlib xml.etree.ElementTree) to block billion-laughs
-# and XXE. aiohttp/httpx are already in [messaging]; defusedxml lands
-# here to keep the dependency local to wecom_callback's threat model.
+# and XXE. aiohttp/httpx are already in [messaging]. defusedxml is now a
+# core dependency (the web UI's .docx upload path needs it too); this pin
+# is kept for back-compat / explicit threat-model documentation.
 wecom = ["defusedxml==0.7.1"]
 cli = ["simple-term-menu==1.6.6"]
 tts-premium = ["elevenlabs==1.59.0"]

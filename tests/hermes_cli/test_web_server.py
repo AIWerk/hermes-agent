@@ -6414,6 +6414,26 @@ class TestDocxExtractionHardening:
         assert note == "docx-extraction-failed"
         assert text == ""
 
+    def test_docx_dtd_after_large_comment_is_rejected(self, tmp_path):
+        from hermes_cli.web_server import _extract_uploaded_text
+
+        # Bypass attempt: a >64KB leading comment pushes the DOCTYPE/ENTITY
+        # declarations past the old 64KB substring window. The parser-level
+        # guard must still refuse it, with the entity never expanded.
+        padding = b"<!-- " + b"A" * (70 * 1024) + b" -->"
+        bomb = (
+            b"<?xml version='1.0'?>"
+            + padding
+            + b"<!DOCTYPE lolz [<!ENTITY lol 'PWNED'>]>"
+            + b"<document><t>&lol;</t></document>"
+        )
+        path = tmp_path / "padded-bomb.docx"
+        self._make_docx(path, bomb)
+        text, note = _extract_uploaded_text(path)
+        assert note == "docx-extraction-failed"
+        assert text == ""
+        assert "PWNED" not in text
+
     def test_docx_oversized_xml_is_rejected(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
