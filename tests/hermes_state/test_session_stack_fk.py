@@ -65,3 +65,42 @@ def test_deleting_referenced_session_cascades_stack_row(tmp_path):
     conn.commit()
 
     assert conn.execute("SELECT COUNT(*) FROM session_stack").fetchone()[0] == 0
+
+
+def test_reconcile_recovers_from_leftover_session_stack_new(tmp_path):
+    """A leftover session_stack_new (crash mid-rebuild) must not wedge the migration.
+
+    If a previous reconcile was killed after CREATE TABLE session_stack_new but
+    before DROP TABLE session_stack, the temp table persists on disk.  Without a
+    leading DROP TABLE IF EXISTS, the next CREATE raises 'table already exists',
+    aborting the whole executescript and leaving session_stack without CASCADE
+    forever.  The reconcile must instead drop the stale temp table and succeed.
+    """
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent", source="cli")
+    db.create_session("side", source="cli")
+
+    conn = db._conn
+    _install_legacy_session_stack(conn)
+    conn.execute(
+        "INSERT INTO session_stack (source, parent_session_id, side_session_id, pushed_at, status) "
+        "VALUES ('cli', 'parent', 'side', 1.0, 'active')"
+    )
+    # Simulate the crash residue: a leftover temp table from a half-done rebuild.
+    conn.execute("CREATE TABLE session_stack_new (bogus INTEGER)")
+    conn.commit()
+
+    legacy = conn.execute("PRAGMA foreign_key_list('session_stack')").fetchall()
+    assert legacy and all((str(row[6]) or "").upper() != "CASCADE" for row in legacy)
+
+    db._init_schema()  # triggers _reconcile_session_stack_fk
+
+    migrated = conn.execute("PRAGMA foreign_key_list('session_stack')").fetchall()
+    assert len(migrated) == 2
+    assert all((str(row[6]) or "").upper() == "CASCADE" for row in migrated)
+    # Original row survived the rebuild, and the stale temp table is gone.
+    assert conn.execute("SELECT COUNT(*) FROM session_stack").fetchone()[0] == 1
+    leftover = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_stack_new'"
+    ).fetchall()
+    assert leftover == []
