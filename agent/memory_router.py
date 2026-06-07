@@ -371,37 +371,53 @@ def contains_secret(content: str) -> bool:
     return bool(_SECRET_RE.search(content or ""))
 
 
+# Redaction (not detection) regex. _SECRET_RE answers "does this contain a
+# secret?"; for the keyed labels it matches only the label keyword, so reusing
+# it for redaction left the credential *value* in place (e.g. "password: X" ->
+# "[REDACTED] X"). This pattern instead consumes the value:
+#   * keyed label + separator (":"/"=") + value  -> whole thing redacted
+#   * keyed label + whitespace + adjacent value  -> whole thing redacted
+#   * value-shaped credentials (sk-, JWT, GOCSPX-, URL creds, ...) -> redacted
+#   * a bare keyword with no adjacent value       -> the keyword redacted
+# Every quantifier is bounded so the redaction pass stays linear on large turn
+# content (the URL-credential alternative in particular).
+_SECRET_REDACT_RE = re.compile(
+    r"\b(?:api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key"
+    r"|aws[_ -]?secret[_ -]?access[_ -]?key|client[_ -]?secret)\b\s*[:=]\s*\S+"
+    r"|\b(?:api[_ -]?key|secret|token|password|passwd|credential)\b\s+\S+"
+    r"|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"
+    r"|sk[-_][A-Za-z0-9][A-Za-z0-9_-]{6,}"
+    r"|xox[baprs]-[A-Za-z0-9-]+"
+    r"|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AIza[0-9A-Za-z_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r"|GOCSPX-[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{36,}"
+    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"
+    r"|Authorization:\s*Bearer\s+[A-Za-z0-9._-]{8,}"
+    r"|https?://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"
+    r"|BEGIN (?:RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY"
+    r"|\b[a-fA-F0-9]{64,}\b"
+    r"|\b[a-z][a-z0-9+.-]{1,15}://[^\s:/@]{0,256}:[^@/\s]{1,256}@"
+    r"|\b(?:api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key)\b",
+    re.IGNORECASE,
+)
+
+
 def redact_secrets(content: str, *, placeholder: str = "[REDACTED-SECRET]") -> str:
-    """Redact credential/secret substrings using the router's secret detection.
+    """Redact credential/secret substrings (including the value) from content.
 
-    Uses the same ``_SECRET_RE`` that classifies content as CREDENTIAL, so any
-    raw secret the router would refuse to mirror is stripped before durable
-    writes (e.g. Honcho turn sync).  Non-secret content is returned unchanged.
+    Used to scrub conversation turns before they reach durable Honcho memory.
+    For keyed forms (``password: X``, ``api_key = X``, ``token X``) the value is
+    redacted along with the label, not just the label keyword. Value-shaped
+    credentials (``sk_live_...``, JWTs, ``GOCSPX-...``, ``scheme://user:pass@``)
+    are redacted whole. Non-secret content is returned unchanged.
 
-    ``_SECRET_RE`` is tuned for *detection* (``search``); some alternatives
-    match only a short prefix of a token (e.g. ``sk_`` of an ``sk_live_...``
-    key).  To avoid leaving the bulk of a secret behind, each match span is
-    expanded to cover the full surrounding non-whitespace token before
-    replacement.
+    Limitation: a value not adjacent to its label (``my password is hunter2`` —
+    "is" sits between) cannot be located by pattern alone; the label and its
+    next token are redacted but a trailing free-form value may remain.
+    honcho_conclude uses :func:`contains_secret` to refuse such content
+    outright; sync_turn accepts the residual risk rather than dropping every
+    turn that merely mentions a credential keyword.
     """
     if not content:
         return content
-
-    out: list[str] = []
-    cursor = 0
-    for match in _SECRET_RE.finditer(content):
-        start, end = match.start(), match.end()
-        # Expand left/right over contiguous non-whitespace so a partial-prefix
-        # match still redacts the whole credential token.
-        while start > 0 and not content[start - 1].isspace():
-            start -= 1
-        while end < len(content) and not content[end].isspace():
-            end += 1
-        if start < cursor:
-            # Overlaps an already-redacted span; skip.
-            continue
-        out.append(content[cursor:start])
-        out.append(placeholder)
-        cursor = end
-    out.append(content[cursor:])
-    return "".join(out)
+    return _SECRET_REDACT_RE.sub(placeholder, content)

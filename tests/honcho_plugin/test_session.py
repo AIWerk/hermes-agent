@@ -673,6 +673,56 @@ class TestConcludeToolDispatch:
         assert session.add_message.call_args_list[0].args == ("user", "what is the weather today")
         assert session.add_message.call_args_list[1].args == ("assistant", "it is sunny in Bern")
 
+    def test_redact_secrets_redacts_the_value_not_just_the_label(self):
+        """Keyed credential forms must redact the VALUE, not only the keyword.
+
+        Regression: redact_secrets reused the detection regex _SECRET_RE, whose
+        keyed alternatives match only the label word, so the credential value
+        leaked through (e.g. "password: hunter2" -> "[REDACTED] hunter2").
+        """
+        from agent.memory_router import redact_secrets
+
+        # (input, the secret value that must NOT survive)
+        cases = [
+            ("password hunter2", "hunter2"),
+            ("password: hunter2", "hunter2"),
+            ("api_key = abcdef1234567890", "abcdef1234567890"),
+            ("token abc.def.ghi", "abc.def.ghi"),
+            ("client_secret=9f8e7d6c5b4a", "9f8e7d6c5b4a"),
+        ]
+        for text, value in cases:
+            out = redact_secrets(text)
+            assert value not in out, f"value leaked: {text!r} -> {out!r}"
+            assert "[REDACTED-SECRET]" in out, f"not redacted: {text!r} -> {out!r}"
+
+        # Value-shaped credentials and benign text behave as before.
+        assert redact_secrets("sk_live_ABCDEFGH12345678") == "[REDACTED-SECRET]"
+        assert redact_secrets("what is the weather today") == "what is the weather today"
+
+    def test_sync_turn_redacts_keyed_credential_value(self):
+        """A label:value credential in a turn must not reach durable add_message."""
+        provider = HonchoMemoryProvider()
+        provider._session_key = "telegram:123"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(message_max_chars=25000)
+
+        session = MagicMock()
+        provider._manager.get_or_create.return_value = session
+
+        provider.sync_turn(
+            "set it up, api_key = abcdef1234567890SECRET",
+            "done, your password: hunter2supersecret is saved",
+        )
+        provider._sync_thread.join(timeout=1.0)
+
+        all_payloads = "".join(
+            call.args[1] for call in session.add_message.call_args_list
+        )
+        assert "abcdef1234567890SECRET" not in all_payloads
+        assert "hunter2supersecret" not in all_payloads
+        assert "[REDACTED-SECRET]" in all_payloads
+
 
 # ---------------------------------------------------------------------------
 # Message chunking
