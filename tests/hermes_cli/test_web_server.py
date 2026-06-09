@@ -214,6 +214,36 @@ class TestSessionTokenInjection:
 
 
 class TestAssistantUserDisplayName:
+    def test_resolves_user_display_name_from_customer_config(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("AIWERK_CUI_USER_DISPLAY_NAME", raising=False)
+        cfg = {
+            "dashboard": {"agent_name": "Customer", "user_name": "Customer Example"},
+        }
+
+        assert ws._assistant_user_display_name_from_config(cfg) == "Customer"
+
+    def test_env_user_display_name_overrides_config(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("AIWERK_CUI_USER_DISPLAY_NAME", "Jordan Example")
+        cfg = {"dashboard": {"user_name": "Customer Example"}}
+
+        assert ws._assistant_user_display_name_from_config(cfg) == "Jordan"
+
+    def test_user_display_name_prefers_config_over_memory_fallback(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        home = tmp_path / "home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text("User's name is Legacy.\n", encoding="utf-8")
+        monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(ws, "load_config", lambda: {"dashboard": {"user_name": "Customer Example"}})
+
+        assert ws._assistant_user_display_name() == "Customer"
+
     def test_prefers_explicit_user_name_over_assistant_identity(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as ws
 
@@ -832,7 +862,7 @@ class TestWebServerEndpoints:
             "/api/assistant/support",
             json={
                 "category": "E-Mail / Kalender / Dateien",
-                "message": "Rocky sieht meine neuen Mails nicht.",
+                "message": "Customer sieht meine neuen Mails nicht.",
                 "include_diagnostics": True,
                 "session_id": "session-123",
                 "session_title": "Mailproblem",
@@ -852,7 +882,7 @@ class TestWebServerEndpoints:
         assert sent
         assert sent[0][0] == ["telegram:-1001234567890"]
         assert "AIWerk Supportmeldung" in sent[0][1]
-        assert "Rocky sieht meine neuen Mails nicht." in sent[0][1]
+        assert "Customer sieht meine neuen Mails nicht." in sent[0][1]
         log_path = get_hermes_home() / "aiwerk-support" / "inbox.jsonl"
         line = log_path.read_text(encoding="utf-8").strip().splitlines()[-1]
         record = json.loads(line)
@@ -1693,6 +1723,29 @@ class TestWebServerEndpoints:
         assert cached_after_update.json()["todos"]["items"][0]["text"] == "Ölwechsel planen"
         assert self.client.post("/api/assistant/todos/update", json={"id": "bad", "done": True}).status_code == 400
 
+    def test_assistant_todo_summary_strips_hermes_metadata_from_items(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        todo_file = tmp_path / "TODO.md"
+        todo_file.write_text(
+            "# TODO\n"
+            "- [ ] Visible customer task\n"
+            "- [ ] Metadata task <!-- hermes:id=1 status=in_progress -->\n"
+            "- [x] Completed metadata task <!-- hermes:id=2 status=completed -->\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+
+        summary = getattr(web_server, "_todo_summary")({})
+
+        assert summary["open_count"] == 2
+        assert summary["done_count"] == 1
+        assert summary["total_count"] == 3
+        assert [item["text"] for item in summary["items"]] == [
+            "Visible customer task",
+            "Metadata task",
+        ]
+
     def test_assistant_todo_add_appends_item_and_invalidates_cache(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
@@ -1790,6 +1843,99 @@ class TestWebServerEndpoints:
         assert children[1]["open_url"] == "https://aiwerkmcp.com/#/catalog/google-workspace"
         assert children[1]["description"] == "Gmail, Kalender und Drive"
         assert all(child["capabilities"] == ["Bridge-Subserver"] for child in children)
+
+    def test_webdav_shared_folder_items_keep_nested_relative_paths(self, monkeypatch):
+        import urllib.parse
+        import hermes_cli.web_server as web_server
+
+        root_href = "/Example%20Customer/Customer-Shared/"
+        folder_href = "/Example%20Customer/Customer-Shared/Bedienungsanleitungen/"
+        file_href = "/Example%20Customer/Customer-Shared/Bedienungsanleitungen/B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf"
+
+        def response_xml(*hrefs: tuple[str, str, bool]) -> bytes:
+            responses = []
+            for href, name, is_folder in hrefs:
+                collection = "<D:collection/>" if is_folder else ""
+                responses.append(
+                    f"<D:response><D:href>{href}</D:href><D:propstat><D:prop>"
+                    f"<D:displayname>{name}</D:displayname><D:getcontentlength>123</D:getcontentlength>"
+                    f"<D:resourcetype>{collection}</D:resourcetype>"
+                    f"</D:prop></D:propstat></D:response>"
+                )
+            return ("<?xml version='1.0'?><D:multistatus xmlns:D='DAV:'>" + "".join(responses) + "</D:multistatus>").encode()
+
+        class FakeResponse:
+            status = 207
+            headers = {}
+            def __init__(self, data: bytes):
+                self.data = data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, *_args):
+                return self.data
+
+        def fake_urlopen(request, timeout=None):
+            path = urllib.parse.urlparse(request.full_url).path
+            if path.rstrip("/") == "/Example%20Customer/Customer-Shared":
+                return FakeResponse(response_xml((root_href, "Customer-Shared", True), (folder_href, "Bedienungsanleitungen", True)))
+            if path.rstrip("/") == "/Example%20Customer/Customer-Shared/Bedienungsanleitungen":
+                return FakeResponse(response_xml((folder_href, "Bedienungsanleitungen", True), (file_href, "B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf", False)))
+            raise AssertionError(path)
+
+        monkeypatch.setattr(web_server, "_pass_first_line", lambda entry: "secret")
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fake_urlopen)
+
+        items = web_server._webdav_cloud_items({
+            "type": "sftpgo_webdav",
+            "base_url": "https://dav.example.test",
+            "username": "customer.example",
+            "password_pass_entry": "pass/entry",
+            "path": "/Example Customer/Customer-Shared",
+            "max_depth": 2,
+        })
+
+        file_item = items[0]["children"][0]
+        assert file_item["name"] == "B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf"
+        parsed = urllib.parse.urlparse(file_item["open_url"])
+        assert urllib.parse.parse_qs(parsed.query)["path"] == ["Bedienungsanleitungen/B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf"]
+
+    def test_webdav_download_uses_file_url_without_trailing_slash(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        requested_urls: list[str] = []
+
+        class FakeResponse:
+            status = 200
+            headers = {"content-type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *_args):
+                return b"%PDF-1.4\n"
+
+        def fake_urlopen(request, timeout=None):
+            requested_urls.append(request.full_url)
+            return FakeResponse()
+
+        monkeypatch.setattr(web_server, "_pass_first_line", lambda entry: "secret")
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", fake_urlopen)
+
+        downloaded = web_server._download_webdav_cloud_file({
+            "type": "sftpgo_webdav",
+            "base_url": "https://dav.example.test",
+            "username": "customer.example",
+            "password_pass_entry": "pass/entry",
+            "path": "/Example Customer/Customer-Shared",
+        }, "Bedienungsanleitungen/manual.pdf")
+
+        assert downloaded is not None
+        assert requested_urls == ["https://dav.example.test/Example%20Customer/Customer-Shared/Bedienungsanleitungen/manual.pdf"]
 
     def test_assistant_resource_attachment_copies_shared_file(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server

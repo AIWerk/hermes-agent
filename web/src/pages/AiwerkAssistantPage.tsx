@@ -1,5 +1,5 @@
 import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
-import { Fragment, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
@@ -16,6 +16,9 @@ interface AttachmentPreview {
   type: string;
   size: number;
   previewUrl?: string;
+  openUrl?: string;
+  downloadUrl?: string;
+  previewKind?: "image" | "pdf" | "text" | "audio" | "video" | "file";
   file?: File;
   uploaded?: AssistantUploadedAttachment;
 }
@@ -269,6 +272,7 @@ interface GatewayHistoryMessage {
   name?: string;
   tool_name?: string;
   context?: string;
+  attachments?: AssistantUploadedAttachment[];
 }
 
 function toolCallsFromGateway(history?: GatewayHistoryMessage[]): ToolCallSummary[] {
@@ -380,6 +384,16 @@ function speechTextFromMarkdown(text: string): string {
     .trim();
 }
 
+function cleanUserDisplayName(value?: string | null): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function resolvedUserDisplayName(modelInfo?: ModelInfoResponse | null): string | null {
+  return cleanUserDisplayName(modelInfo?.user_display_name) ?? getHermesUserDisplayName();
+}
+
 function welcomeMessage(displayName = getHermesUserDisplayName()): ChatMessage {
   const greetingName = displayName ? ` ${displayName}` : "";
   return {
@@ -390,26 +404,27 @@ function welcomeMessage(displayName = getHermesUserDisplayName()): ChatMessage {
   };
 }
 
-function messagesFromGateway(history?: GatewayHistoryMessage[]): ChatMessage[] {
+async function messagesFromGateway(history?: GatewayHistoryMessage[]): Promise<ChatMessage[]> {
   const mapped: ChatMessage[] = [];
   for (const message of history ?? []) {
     const text = message.text?.trim() || message.context?.trim() || message.content?.trim() || "";
-    if (!text) continue;
+    const attachments = await attachmentsFromPayload({ attachments: message.attachments ?? [] });
+    if (!text && attachments.length === 0) continue;
     if (message.role === "user") {
-      mapped.push({ id: newId("resume-user"), role: "user", text, status: "complete" });
+      mapped.push({ id: newId("resume-user"), role: "user", text, status: "complete", attachments });
     } else if (message.role === "assistant") {
-      mapped.push({ id: newId("resume-agent"), role: "agent", text, status: "complete" });
+      mapped.push({ id: newId("resume-agent"), role: "agent", text, status: "complete", attachments });
     } else if (message.role === "tool") {
       continue;
     } else {
-      mapped.push({ id: newId("resume-system"), role: "system", text, status: "complete" });
+      mapped.push({ id: newId("resume-system"), role: "system", text, status: "complete", attachments });
     }
   }
   return mapped.length > 0 ? mapped : [welcomeMessage()];
 }
 
-function messagesWithInflight(history?: GatewayHistoryMessage[], inflight?: SessionInflightTurn | null): ChatMessage[] {
-  const base = messagesFromGateway(history);
+async function messagesWithInflight(history?: GatewayHistoryMessage[], inflight?: SessionInflightTurn | null): Promise<ChatMessage[]> {
+  const base = await messagesFromGateway(history);
   if (!inflight || !inflight.streaming) return base;
   const user = inflight.user?.trim() || "";
   const assistant = inflight.assistant || "";
@@ -483,6 +498,117 @@ function textFromPayload(payload: unknown): string {
   } catch {
     return "";
   }
+}
+
+function assistantArtifactUrl(openUrl?: string | null): string | undefined {
+  if (!openUrl) return undefined;
+  if (/^https?:\/\//i.test(openUrl) || openUrl.startsWith("blob:")) return openUrl;
+  return `${HERMES_BASE_PATH}${openUrl.startsWith("/") ? openUrl : `/${openUrl}`}`;
+}
+
+function isDashboardRelativeUrl(openUrl?: string | null): boolean {
+  return Boolean(openUrl && !/^https?:\/\//i.test(openUrl) && !openUrl.startsWith("blob:"));
+}
+
+function attachmentPreviewKind(name: string, type: string, explicit?: unknown): AttachmentPreview["previewKind"] {
+  if (typeof explicit === "string") {
+    const normalized = explicit.toLowerCase();
+    if (["image", "pdf", "text", "audio", "video", "file"].includes(normalized)) return normalized as AttachmentPreview["previewKind"];
+  }
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".json")) return "file";
+  if (type.startsWith("image/")) return "image";
+  if (type === "application/pdf" || lower.endsWith(".pdf")) return "pdf";
+  if (type.startsWith("audio/")) return "audio";
+  if (type.startsWith("video/")) return "video";
+  if (type.startsWith("text/") || /\.(txt|md|csv|ya?ml)$/.test(lower)) return "text";
+  return "file";
+}
+
+async function fetchProtectedPreviewUrl(openUrl?: string | null): Promise<string | undefined> {
+  const url = assistantArtifactUrl(openUrl);
+  if (!url) return undefined;
+  if (url.startsWith("blob:") || !isDashboardRelativeUrl(openUrl)) return url;
+  const headers = new Headers();
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) headers.set("X-Hermes-Session-Token", token);
+  try {
+    const response = await fetch(url, { headers, credentials: "include" });
+    if (!response.ok) return url;
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    return objectUrl;
+  } catch {
+    return url;
+  }
+}
+
+async function attachmentsFromPayload(payload: Record<string, unknown>): Promise<AttachmentPreview[]> {
+  const raw = payload.attachments;
+  if (!Array.isArray(raw)) return [];
+  const previews: Array<AttachmentPreview | null> = await Promise.all(raw.map(async (item, index) => {
+    if (!item || typeof item !== "object") return null;
+    const data = item as Record<string, unknown>;
+    const name = typeof data.name === "string" && data.name.trim() ? data.name.trim() : `Anhang ${index + 1}`;
+    const type = typeof data.type === "string" && data.type.trim() ? data.type.trim() : "application/octet-stream";
+    const size = typeof data.size === "number" && Number.isFinite(data.size) ? data.size : 0;
+    const previewKind = attachmentPreviewKind(name, type, data.preview_kind);
+    const isImage = previewKind === "image" || data.is_image === true;
+    const rawOpenUrl = typeof data.open_url === "string" ? data.open_url : typeof data.preview_url === "string" ? data.preview_url : undefined;
+    const rawDownloadUrl = typeof data.download_url === "string" ? data.download_url : rawOpenUrl;
+    const canPreview = ["image", "pdf", "text", "audio", "video"].includes(previewKind || "") && data.safe_renderable !== false && type.toLowerCase() !== "text/html";
+    const rawPreviewUrl = canPreview && typeof data.preview_url === "string" ? data.preview_url : canPreview ? rawOpenUrl : undefined;
+    const resolvedOpenUrl = assistantArtifactUrl(rawOpenUrl);
+    const protectedPreviewUrl = canPreview
+      ? rawPreviewUrl === rawOpenUrl
+        ? await fetchProtectedPreviewUrl(rawOpenUrl)
+        : await fetchProtectedPreviewUrl(rawPreviewUrl)
+      : undefined;
+    return {
+      id: newId("agent-attachment"),
+      name,
+      type,
+      size,
+      previewUrl: protectedPreviewUrl,
+      openUrl: resolvedOpenUrl || rawOpenUrl,
+      downloadUrl: assistantArtifactUrl(rawDownloadUrl),
+      previewKind: isImage ? "image" : previewKind,
+    };
+  }));
+  return previews.filter((item): item is AttachmentPreview => Boolean(item));
+}
+
+function stripAssistantArtifactReferences(text: string, attachments: AttachmentPreview[] = []): string {
+  if (!text || attachments.length === 0) return text;
+  const artifactUrls = attachments
+    .flatMap((attachment) => [attachment.openUrl, attachment.downloadUrl, attachment.previewUrl])
+    .filter((url): url is string => Boolean(url));
+  const shouldStripUrl = (url: string) => url.startsWith("MEDIA:") || artifactUrls.some((artifactUrl) => url === artifactUrl || url === artifactUrl.replace(/^blob:/, ""));
+  return text
+    .replace(/!\[[^\]]*\]\(([^)]+)\)/g, (match, url: string) => shouldStripUrl(url.trim()) ? "" : match)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label: string, url: string) => shouldStripUrl(url.trim()) ? label : match)
+    .replace(/(?:^|\s)MEDIA:\S+/g, "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line, index, lines) => line.trim() || (index > 0 && index < lines.length - 1))
+    .join("\n")
+    .trim();
+}
+
+function stripUserAttachmentContext(text: string, attachments: AttachmentPreview[] = []): string {
+  if (!text || attachments.length === 0) return text;
+  return text
+    .replace(/\[The user attached an image:[\s\S]*?\]\s*/g, "")
+    .replace(/\[You can examine it with vision_analyze using image_url:[^\]]+\]\s*/g, "")
+    .replace(/^Anhänge:\s*.*$/gim, "")
+    .trim();
+}
+
+function displayTextForMessage(message: ChatMessage): string {
+  const raw = message.text || (message.status === "streaming" ? "…" : "");
+  if (message.role === "agent") return stripAssistantArtifactReferences(raw, message.attachments);
+  if (message.role === "user") return stripUserAttachmentContext(raw, message.attachments);
+  return raw;
 }
 
 function newId(prefix: string): string {
@@ -653,15 +779,16 @@ function completeAssistant(
   messages: ChatMessage[],
   text: string,
   status: ChatMessage["status"],
+  attachments: AttachmentPreview[] = [],
 ): ChatMessage[] {
   const next = [...messages];
   const lastStreamingIndex = next.findLastIndex((message) => message.role === "agent" && message.status === "streaming");
   if (lastStreamingIndex >= 0) {
     const current = next[lastStreamingIndex];
-    next[lastStreamingIndex] = { ...current, text: text || current.text, status };
+    next[lastStreamingIndex] = { ...current, text: text || current.text, status, attachments };
     return next;
   }
-  next.push({ id: newId("agent"), role: "agent", text, status });
+  next.push({ id: newId("agent"), role: "agent", text, status, attachments });
   return next;
 }
 
@@ -755,6 +882,7 @@ export default function AiwerkAssistantPage() {
   const [isCompressing, setIsCompressing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<AttachmentPreview[]>([]);
+  const [selectedAttachment, setSelectedAttachment] = useState<AttachmentPreview | null>(null);
   const [draggingAttachment, setDraggingAttachment] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceInputState>("idle");
   const [voiceSeconds, setVoiceSeconds] = useState(0);
@@ -1007,15 +1135,18 @@ export default function AiwerkAssistantPage() {
   const addAttachedFiles = useCallback((files: File[], source: "file" | "paste" | "drop" = "file") => {
     if (files.length === 0) return;
     const previews = files.map((file) => {
-      const isImage = file.type.startsWith("image/");
-      const previewUrl = isImage ? URL.createObjectURL(file) : undefined;
+      const type = file.type || "application/octet-stream";
+      const previewKind = attachmentPreviewKind(file.name, type);
+      const canLocalPreview = Boolean(previewKind && ["image", "audio", "video", "text", "pdf"].includes(previewKind));
+      const previewUrl = canLocalPreview ? URL.createObjectURL(file) : undefined;
       if (previewUrl) attachmentUrlsRef.current.add(previewUrl);
       return {
         id: newId("attachment"),
-        name: file.name || (isImage ? "Eingefügtes Bild" : "Anhang"),
-        type: file.type || "application/octet-stream",
+        name: file.name || (previewKind === "image" ? "Eingefügtes Bild" : "Anhang"),
+        type,
         size: file.size,
         previewUrl,
+        previewKind,
         file,
       };
     });
@@ -1474,6 +1605,15 @@ export default function AiwerkAssistantPage() {
   }, []);
 
   useEffect(() => {
+    if (!selectedAttachment) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelectedAttachment(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedAttachment]);
+
+  useEffect(() => {
     return () => {
       if (voiceTimerRef.current !== null) window.clearInterval(voiceTimerRef.current);
       voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -1501,30 +1641,37 @@ export default function AiwerkAssistantPage() {
       }
     });
     const offComplete = gateway.on("message.complete", (ev) => {
-      const payload = (ev.payload ?? {}) as Record<string, unknown>;
-      const text = textFromPayload(payload);
-      const status = payload.status === "error" ? "error" : "complete";
-      const target = activeTurnModeRef.current || conversationModeRef.current;
-      const currentMessages = target === "side" ? sideMessagesRef.current : messagesRef.current;
-      const latestAssistantText = currentMessages[currentMessages.length - 1]?.role === "agent"
-        ? currentMessages[currentMessages.length - 1].text
-        : "";
-      const completedText = text || latestAssistantText;
-      if (target === "side") {
-        setSideMessages((prev) => completeAssistant(prev, text, status));
-      } else {
-        setMessages((prev) => completeAssistant(prev, text, status));
-      }
-      if (status === "complete") speakAssistantText(completedText);
-      setBusy(false);
-      const sid = ev.session_id;
-      if (sid) {
-        const usage = contextUsageFromPayload(payload);
-        if (usage) setContextUsage(usage);
-        window.setTimeout(() => void refreshSessionMeta(gateway, sid), 400);
-        window.setTimeout(() => void refreshContextUsage(gateway, sid), 500);
-        window.setTimeout(() => void refreshSessionMeta(gateway, sid), 2400);
-      }
+      void (async () => {
+        const payload = (ev.payload ?? {}) as Record<string, unknown>;
+        const text = textFromPayload(payload);
+        const status = payload.status === "error" ? "error" : "complete";
+        const attachments = await attachmentsFromPayload(payload);
+        const displayText = stripAssistantArtifactReferences(text, attachments);
+        attachments.forEach((attachment) => {
+          if (attachment.previewUrl?.startsWith("blob:")) attachmentUrlsRef.current.add(attachment.previewUrl);
+        });
+        const target = activeTurnModeRef.current || conversationModeRef.current;
+        const currentMessages = target === "side" ? sideMessagesRef.current : messagesRef.current;
+        const latestAssistantText = currentMessages[currentMessages.length - 1]?.role === "agent"
+          ? currentMessages[currentMessages.length - 1].text
+          : "";
+        const completedText = displayText || latestAssistantText;
+        if (target === "side") {
+          setSideMessages((prev) => completeAssistant(prev, displayText, status, attachments));
+        } else {
+          setMessages((prev) => completeAssistant(prev, displayText, status, attachments));
+        }
+        if (status === "complete") speakAssistantText(completedText);
+        setBusy(false);
+        const sid = ev.session_id;
+        if (sid) {
+          const usage = contextUsageFromPayload(payload);
+          if (usage) setContextUsage(usage);
+          window.setTimeout(() => void refreshSessionMeta(gateway, sid), 400);
+          window.setTimeout(() => void refreshContextUsage(gateway, sid), 500);
+          window.setTimeout(() => void refreshSessionMeta(gateway, sid), 2400);
+        }
+      })();
     });
     const offError = gateway.on("error", (ev) => {
       const message = textFromPayload(ev.payload) || "Hermes-Gateway-Fehler";
@@ -1598,7 +1745,7 @@ export default function AiwerkAssistantPage() {
           setSideMessages([]);
           setSideToolCalls([]);
           setToolCalls(result.resumed ? toolCallsFromGateway(result.messages) : []);
-          setMessages(result.resumed ? messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()]);
+          setMessages(result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()]);
           setBusy(Boolean(result.running || result.status === "working" || result.status === "waiting" || result.inflight?.streaming));
           if (result.inflight?.streaming) activeTurnModeRef.current = "main";
           void refreshSessionMeta(gateway, result.session_id);
@@ -1623,7 +1770,15 @@ export default function AiwerkAssistantPage() {
     api
       .getModelInfo()
       .then((info) => {
-        if (!cancelled) setModelInfo(info);
+        if (!cancelled) {
+          setModelInfo(info);
+          const displayName = resolvedUserDisplayName(info);
+          setMessages((current) => (
+            current.length === 1 && current[0]?.id === "welcome"
+              ? [welcomeMessage(displayName)]
+              : current
+          ));
+        }
       })
       .catch(() => {
         if (!cancelled) setModelInfo(null);
@@ -1696,7 +1851,7 @@ export default function AiwerkAssistantPage() {
       setSideMessages([]);
       setSideToolCalls([]);
       setToolCalls(toolCallsFromGateway(history));
-      setMessages(messagesWithInflight(history, inflight));
+      setMessages(await messagesWithInflight(history, inflight));
       setBusy(resumedRunning);
       if (inflight?.streaming) activeTurnModeRef.current = "main";
       if (gateway) {
@@ -1727,7 +1882,7 @@ export default function AiwerkAssistantPage() {
       sessionIdRef.current = nextSessionId;
       setActiveSessionKey(activeId);
       storeActiveSessionId(activeId);
-      setMessages([welcomeMessage()]);
+      setMessages([welcomeMessage(resolvedUserDisplayName(modelInfo))]);
       setSessionTitle("Neue Unterhaltung");
       setLiveNotes(null);
       setContextUsage(null);
@@ -1761,7 +1916,7 @@ export default function AiwerkAssistantPage() {
       setError(e instanceof Error ? e.message : String(e));
       showToast("Neue Unterhaltung konnte nicht gestartet werden");
     }
-  }, [refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, showToast, stopReadAloud]);
+  }, [modelInfo, refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, showToast, stopReadAloud]);
 
   const submit = async (target: ConversationMode = conversationModeRef.current) => {
     const text = (target === "side" ? sideInput : input).trim();
@@ -2519,7 +2674,7 @@ export default function AiwerkAssistantPage() {
                             }
                           >
                             {msg.attachments && msg.attachments.length > 0 && (
-                              <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} />
+                              <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} onOpenImage={setSelectedAttachment} />
                             )}
                             <MessageText message={msg} className={msg.attachments?.length ? "mt-[10px]" : undefined} />
                           </div>
@@ -2643,7 +2798,7 @@ export default function AiwerkAssistantPage() {
                         Alle entfernen
                       </button>
                     </div>
-                    <AttachmentPreviewGrid attachments={attachedFiles} onRemove={removeAttachedFile} />
+                    <AttachmentPreviewGrid attachments={attachedFiles} onRemove={removeAttachedFile} onOpenImage={setSelectedAttachment} />
                   </div>
                 )}
                 </div>
@@ -2702,7 +2857,7 @@ export default function AiwerkAssistantPage() {
                             }
                           >
                             {msg.attachments && msg.attachments.length > 0 && (
-                              <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} />
+                              <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} onOpenImage={setSelectedAttachment} />
                             )}
                             <MessageText message={msg} className={msg.attachments?.length ? "mt-[8px]" : undefined} compact />
                           </div>
@@ -2817,6 +2972,67 @@ export default function AiwerkAssistantPage() {
         </div>
       )}
 
+      {selectedAttachment?.previewUrl && (
+        <div
+          className="fixed inset-0 z-[70] grid place-items-center bg-[#0f0d09]/86 p-[18px] backdrop-blur-[4px]"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="image-lightbox-title"
+          onClick={() => setSelectedAttachment(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setSelectedAttachment(null)}
+            className="absolute right-[20px] top-[18px] z-[72] grid h-[40px] w-[40px] cursor-pointer place-items-center rounded-full border border-white/18 bg-black/35 text-white shadow-[0_12px_34px_rgba(0,0,0,.35)] transition hover:bg-black/55 focus:outline-none focus:ring-2 focus:ring-white/45"
+            aria-label="Lightbox schließen"
+          >
+            <X className="h-[18px] w-[18px]" />
+          </button>
+          <figure
+            className="m-0 grid max-h-[92vh] max-w-[96vw] place-items-center gap-[12px]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {selectedAttachment.previewKind === "image" && (
+              <img
+                src={selectedAttachment.previewUrl}
+                alt={selectedAttachment.name}
+                className="max-h-[84vh] max-w-[96vw] rounded-[10px] object-contain shadow-[0_24px_90px_rgba(0,0,0,.65)]"
+              />
+            )}
+            {selectedAttachment.previewKind === "pdf" && (
+              <iframe
+                src={selectedAttachment.previewUrl}
+                title={selectedAttachment.name}
+                sandbox=""
+                className="h-[84vh] w-[92vw] max-w-[1100px] rounded-[10px] border border-white/10 bg-white shadow-[0_24px_90px_rgba(0,0,0,.65)]"
+              />
+            )}
+            {selectedAttachment.previewKind === "text" && (
+              <iframe
+                src={selectedAttachment.previewUrl}
+                title={selectedAttachment.name}
+                sandbox=""
+                className="h-[78vh] w-[92vw] max-w-[980px] rounded-[10px] border border-white/10 bg-white shadow-[0_24px_90px_rgba(0,0,0,.65)]"
+              />
+            )}
+            {selectedAttachment.previewKind === "audio" && (
+              <div className="w-[min(720px,92vw)] rounded-[18px] border border-white/12 bg-[#fffaf2] p-[18px] shadow-[0_24px_90px_rgba(0,0,0,.65)]">
+                <audio src={selectedAttachment.previewUrl} controls className="w-full" />
+              </div>
+            )}
+            {selectedAttachment.previewKind === "video" && (
+              <video src={selectedAttachment.previewUrl} controls className="max-h-[84vh] max-w-[96vw] rounded-[10px] shadow-[0_24px_90px_rgba(0,0,0,.65)]" />
+            )}
+            <figcaption
+              id="image-lightbox-title"
+              className="max-w-[90vw] truncate rounded-full border border-white/12 bg-black/32 px-[14px] py-[7px] text-center text-[12px] text-white/82 shadow-[0_10px_30px_rgba(0,0,0,.25)]"
+            >
+              {selectedAttachment.name}
+            </figcaption>
+          </figure>
+        </div>
+      )}
+
       {toast && (
         <div className="fixed bottom-[24px] right-[24px] z-50 rounded-[14px] bg-[#292720] px-[16px] py-[13px] text-white shadow-[0_16px_40px_rgba(0,0,0,.18)]">
           {toast}
@@ -2835,7 +3051,7 @@ function MessageText({
   className?: string;
   compact?: boolean;
 }) {
-  const text = message.text || (message.status === "streaming" ? "…" : "");
+  const text = displayTextForMessage(message);
   const spacing = className ? `${className} block` : "block";
 
   if (message.role !== "agent") {
@@ -4024,6 +4240,7 @@ function ResourcesRail({
         </div>
       )}
 
+
       {contactModalOpen && (
         <div className="fixed inset-0 z-40 grid place-items-center bg-[#181611]/35 p-[20px]" role="dialog" aria-modal="true" aria-labelledby="new-contact-title">
           <form
@@ -4576,11 +4793,13 @@ function AttachmentPreviewGrid({
   compact,
   tone = "light",
   onRemove,
+  onOpenImage,
 }: {
   attachments: AttachmentPreview[];
   compact?: boolean;
   tone?: "light" | "dark";
   onRemove?: (id: string) => void;
+  onOpenImage?: (attachment: AttachmentPreview) => void;
 }) {
   return (
     <div className={compact ? "grid gap-[8px]" : "grid grid-cols-1 gap-[8px] sm:grid-cols-2"}>
@@ -4590,6 +4809,7 @@ function AttachmentPreviewGrid({
           attachment={attachment}
           compact={compact}
           tone={tone}
+          onOpenImage={onOpenImage}
           onRemove={onRemove ? () => onRemove(attachment.id) : undefined}
         />
       ))}
@@ -4602,23 +4822,49 @@ function AttachmentPreviewCard({
   compact,
   tone = "light",
   onRemove,
+  onOpenImage,
 }: {
   attachment: AttachmentPreview;
   compact?: boolean;
   tone?: "light" | "dark";
   onRemove?: () => void;
+  onOpenImage?: (attachment: AttachmentPreview) => void;
 }) {
-  const isImage = Boolean(attachment.previewUrl);
+  const previewKind = attachment.previewKind || attachmentPreviewKind(attachment.name, attachment.type);
+  const isImage = previewKind === "image";
+  const canInlinePreview = Boolean(attachment.previewUrl && ["image", "pdf", "text", "audio", "video"].includes(previewKind ?? ""));
   const baseClass =
     tone === "dark"
       ? "border-white/20 bg-white/10 text-white"
       : "border-[#dfd3c2] bg-[#fffaf2] text-[#3b352c]";
   const metaClass = tone === "dark" ? "text-white/75" : "text-[#746855]";
   const thumbClass = tone === "dark" ? "border-white/15 bg-white/10" : "border-[#e0d4c4] bg-[#efe6d6]";
+  const openTarget = attachment.previewUrl || attachment.openUrl;
+  const canOpen = Boolean(openTarget);
+  const openAttachment = () => {
+    if (!openTarget) return;
+    if (canInlinePreview) {
+      onOpenImage?.({ ...attachment, previewKind });
+      return;
+    }
+    window.open(openTarget, "_blank", "noopener,noreferrer");
+  };
+  const openOnKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!canOpen) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openAttachment();
+    }
+  };
 
   return (
     <div
-      className={`relative flex max-w-full items-center gap-[12px] rounded-[14px] border p-[10px] ${baseClass} ${compact ? "mb-[2px]" : ""}`}
+      role={canOpen ? "button" : undefined}
+      tabIndex={canOpen ? 0 : undefined}
+      title={canOpen ? (canInlinePreview ? "Vorschau öffnen" : "Datei öffnen") : undefined}
+      onClick={canOpen ? openAttachment : undefined}
+      onKeyDown={openOnKeyboard}
+      className={`relative flex max-w-full items-center gap-[12px] rounded-[14px] border p-[10px] ${baseClass} ${compact ? "mb-[2px]" : ""} ${canOpen ? "cursor-pointer transition hover:border-[#c6b69f] hover:bg-[#fff4e3] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#b8aa8f]" : ""}`}
     >
       <div className={`grid h-[58px] w-[58px] shrink-0 place-items-center overflow-hidden rounded-[12px] border ${thumbClass}`}>
         {isImage ? (
@@ -4631,7 +4877,7 @@ function AttachmentPreviewCard({
         <div className="truncate text-[14px] font-bold">{attachment.name}</div>
         <div className={`mt-[3px] flex items-center gap-[6px] text-[12px] ${metaClass}`}>
           {isImage ? <ImageIcon className="h-[13px] w-[13px]" /> : <FileText className="h-[13px] w-[13px]" />}
-          <span>{isImage ? "Bildvorschau" : "Datei"}</span>
+          <span>{canInlinePreview ? "Vorschau öffnen" : (canOpen ? "Datei öffnen" : "Datei")}</span>
           <span>·</span>
           <span>{formatFileSize(attachment.size)}</span>
         </div>
@@ -4639,7 +4885,10 @@ function AttachmentPreviewCard({
       {onRemove && (
         <button
           type="button"
-          onClick={onRemove}
+          onClick={(event) => {
+            event.stopPropagation();
+            onRemove();
+          }}
           aria-label="Anhang entfernen"
           title="Anhang entfernen"
           className="absolute right-[8px] top-[8px] grid h-[24px] w-[24px] cursor-pointer place-items-center rounded-full border border-[#d8cbbb] bg-[#fbf5eb] text-[#5c5142] hover:bg-[#f0e5d6]"

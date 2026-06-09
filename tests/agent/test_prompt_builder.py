@@ -4,6 +4,7 @@ import builtins
 import importlib
 import logging
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -753,6 +754,59 @@ class TestFindGitRoot:
         # If result is not None, it must actually contain .git
         if result is not None:
             assert (result / ".git").exists()
+
+    def test_ignores_inaccessible_git_probe(self, tmp_path, monkeypatch):
+        inaccessible_parent = tmp_path / "tenant-home"
+        child = inaccessible_parent / "workspace"
+        child.mkdir(parents=True)
+        original_exists = Path.exists
+
+        def guarded_exists(path):
+            if str(path) == str(inaccessible_parent / ".git"):
+                raise PermissionError("permission denied")
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+        assert _find_git_root(child) is None
+
+    def test_context_files_ignore_inaccessible_cwd_probes(self, tmp_path, monkeypatch):
+        inaccessible_parent = tmp_path / "tenant-home"
+        child = inaccessible_parent / "workspace"
+        child.mkdir(parents=True)
+        original_exists = Path.exists
+        original_is_file = Path.is_file
+        original_is_dir = Path.is_dir
+
+        def guarded_exists(path):
+            if str(path).startswith(str(inaccessible_parent)) and path.name in {
+                ".git",
+                "AGENTS.md",
+                "agents.md",
+                "CLAUDE.md",
+                "claude.md",
+                ".cursorrules",
+                "rules",
+            }:
+                raise PermissionError("permission denied")
+            return original_exists(path)
+
+        def guarded_is_file(path):
+            if str(path).startswith(str(inaccessible_parent)) and path.name in {
+                ".hermes.md",
+                "HERMES.md",
+            }:
+                raise PermissionError("permission denied")
+            return original_is_file(path)
+
+        def guarded_is_dir(path):
+            if str(path).startswith(str(inaccessible_parent)) and path.name == "rules":
+                raise PermissionError("permission denied")
+            return original_is_dir(path)
+
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+        monkeypatch.setattr(Path, "is_file", guarded_is_file)
+        monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+        assert isinstance(build_context_files_prompt(cwd=str(child)), str)
 
 
 class TestStripYamlFrontmatter:

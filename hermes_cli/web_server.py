@@ -41,6 +41,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -219,6 +220,7 @@ _ASSISTANT_ALLOWED_API_EXACT: frozenset = frozenset({
     "/api/assistant/calendar/view",
     "/api/assistant/shared-folder/open",
     "/api/assistant/shared-folder/open-folder",
+    "/api/assistant/artifacts/open",
     "/api/assistant/attachments",
     "/api/assistant/attachments/resource",
     "/api/assistant/transcribe",
@@ -317,6 +319,8 @@ _ASSISTANT_DOCX_MAX_XML_BYTES = 50 * 1024 * 1024
 _ASSISTANT_UPLOAD_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp",
     ".pdf", ".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".docx",
+    ".mp3", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac",
+    ".mp4", ".mov", ".mkv",
 })
 _ASSISTANT_AUDIO_EXTENSIONS = frozenset({".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
 _ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
@@ -330,7 +334,8 @@ _ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 _SHARED_FOLDER_ACTIVE_CONTENT_MEDIA_TYPES = frozenset({
     "text/html", "application/xhtml+xml", "image/svg+xml",
     "application/xml", "text/xml", "application/xslt+xml",
-    "text/x-component", "message/rfc822",
+    "text/javascript", "application/javascript", "application/ecmascript",
+    "text/ecmascript", "text/x-component", "message/rfc822",
 })
 
 # Extensions kept as a belt-and-suspenders denylist for active-content types
@@ -338,7 +343,7 @@ _SHARED_FOLDER_ACTIVE_CONTENT_MEDIA_TYPES = frozenset({
 _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS = frozenset({
     ".html", ".htm", ".xhtml", ".xht", ".xhtm", ".shtml",
     ".svg", ".svgz", ".xml", ".xsl", ".xslt",
-    ".mhtml", ".mht", ".htc",
+    ".js", ".mjs", ".cjs", ".mhtml", ".mht", ".htc",
 })
 
 
@@ -369,7 +374,28 @@ def _safe_shared_open_disposition(name: str, media_type: str) -> tuple[str, str]
     """
     if _is_active_shared_media_type(name, media_type):
         return "application/octet-stream", "attachment"
+    if Path(name).suffix.lower() == ".json":
+        return media_type, "attachment"
     return media_type, "inline"
+
+
+def _assistant_preview_kind(name: str, media_type: str) -> str:
+    ext = Path(name).suffix.lower()
+    if ext in _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS or _is_active_shared_media_type(name, media_type):
+        return "file"
+    if ext == ".json":
+        return "file"
+    if media_type.startswith("image/"):
+        return "image"
+    if media_type == "application/pdf" or ext == ".pdf":
+        return "pdf"
+    if media_type.startswith("audio/") or ext in {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}:
+        return "audio"
+    if media_type.startswith("video/") or ext in {".mp4", ".mov", ".webm", ".mkv"}:
+        return "video"
+    if media_type.startswith("text/") or ext in {".txt", ".md", ".csv", ".yaml", ".yml"}:
+        return "text"
+    return "file"
 
 
 
@@ -841,6 +867,156 @@ def _sftpgo_pubshare_items(cloud: dict[str, Any]) -> list[dict[str, Any]]:
     return list_path(root_path, max(0, min(max_depth, _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)))
 
 
+def _shared_cloud_uses_webdav(cloud: dict[str, Any] | None) -> bool:
+    if not isinstance(cloud, dict):
+        return False
+    kind = str(cloud.get("type") or cloud.get("kind") or "").strip().lower().replace("-", "_")
+    return kind in {"webdav", "sftpgo_webdav", "webdav_sftpgo"} or bool(cloud.get("webdav_url") or cloud.get("dav_url"))
+
+
+def _webdav_cloud_url(cloud: dict[str, Any]) -> str | None:
+    raw_url = str(cloud.get("webdav_url") or cloud.get("dav_url") or cloud.get("base_url") or "").strip()
+    if not raw_url:
+        return None
+    parsed = urllib.parse.urlparse(raw_url.rstrip("/"))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+
+
+def _webdav_cloud_root_path(cloud: dict[str, Any]) -> str:
+    root_path = str(cloud.get("path") or cloud.get("root_path") or "/").strip() or "/"
+    return _clean_shared_cloud_path(root_path) or "/"
+
+
+def _webdav_auth_header(cloud: dict[str, Any]) -> str | None:
+    username = str(cloud.get("username") or cloud.get("user") or "").strip()
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    if not username or not pass_entry:
+        return None
+    password = _pass_first_line(pass_entry)
+    if not password:
+        return None
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def _webdav_request_url(base_url: str, path: str, *, directory: bool = True) -> str:
+    clean_path = _clean_shared_cloud_path(path) or "/"
+    suffix = "/" if directory and not clean_path.endswith("/") else ""
+    return f"{base_url}{urllib.parse.quote(clean_path, safe='/')}{suffix}"
+
+
+def _webdav_response_prop(response: ET.Element, name: str) -> str | None:
+    value = response.findtext(f".//{{DAV:}}{name}")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _webdav_child_rel_path(root_path: str, href: str) -> str | None:
+    clean_href = _clean_shared_cloud_path(urllib.parse.unquote(urllib.parse.urlparse(href).path))
+    clean_root = _clean_shared_cloud_path(root_path) or "/"
+    if not clean_href or clean_href.rstrip("/") == clean_root.rstrip("/"):
+        return None
+    prefix = clean_root.rstrip("/") + "/"
+    if not clean_href.startswith(prefix):
+        return None
+    return _clean_shared_relative_path(clean_href[len(prefix):])
+
+
+def _webdav_cloud_items(cloud: dict[str, Any]) -> list[dict[str, Any]]:
+    base_url = _webdav_cloud_url(cloud)
+    auth_header = _webdav_auth_header(cloud)
+    root_path = _webdav_cloud_root_path(cloud)
+    max_depth = int(cloud.get("max_depth") or _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
+    if not base_url or not auth_header:
+        return []
+    propfind_body = (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:getcontentlength/>'
+        '<D:getlastmodified/><D:resourcetype/></D:prop></D:propfind>'
+    ).encode("utf-8")
+
+    def child_path(parent: str, name: str) -> str:
+        return _clean_shared_cloud_path((parent.rstrip("/") + "/" + name) if parent != "/" else "/" + name) or "/"
+
+    def list_path(path: str, depth: int) -> list[dict[str, Any]]:
+        request = urllib.request.Request(
+            _webdav_request_url(base_url, path),
+            data=propfind_body,
+            method="PROPFIND",
+            headers={"Authorization": auth_header, "Depth": "1", "Content-Type": "application/xml", "User-Agent": "Hermes-CUI/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw_xml = response.read(512_000)
+        except Exception:
+            return []
+        try:
+            tree = ET.fromstring(raw_xml)
+        except ET.ParseError:
+            return []
+        items: list[dict[str, Any]] = []
+        for raw_response in tree.findall("{DAV:}response"):
+            href = raw_response.findtext("{DAV:}href") or ""
+            current_rel_path = _webdav_child_rel_path(path, href)
+            rel_path = _webdav_child_rel_path(root_path, href)
+            if not current_rel_path or not rel_path:
+                continue
+            name = _webdav_response_prop(raw_response, "displayname") or Path(rel_path).name
+            if not name or "/" in name or name in {".", ".."} or _is_hidden_shared_item(Path(name)):
+                continue
+            is_folder = raw_response.find(".//{DAV:}resourcetype/{DAV:}collection") is not None
+            size_raw = _webdav_response_prop(raw_response, "getcontentlength")
+            item_path = child_path(path, name)
+            item: dict[str, Any] = {
+                "id": _safe_resource_id(rel_path),
+                "name": name,
+                "kind": "folder" if is_folder else "file",
+                "mime": None if is_folder else (mimetypes.guess_type(name)[0] or "application/octet-stream"),
+                "size_bytes": None if is_folder or not size_raw or not size_raw.isdigit() else int(size_raw),
+                "modified_at": _webdav_response_prop(raw_response, "getlastmodified"),
+            }
+            if is_folder:
+                if depth > 0:
+                    children = list_path(item_path, depth - 1)
+                    item["children"] = children
+                    item["child_count"] = len(children)
+            else:
+                item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel_path, safe='')}"
+            items.append(item)
+            if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
+                break
+        return items
+
+    return list_path(root_path, max(0, min(max_depth, _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)))
+
+
+def _download_webdav_cloud_file(cloud: dict[str, Any], rel_path: str) -> tuple[bytes, str, str] | None:
+    clean = _clean_shared_relative_path(rel_path)
+    base_url = _webdav_cloud_url(cloud)
+    auth_header = _webdav_auth_header(cloud)
+    if not clean or not base_url or not auth_header:
+        return None
+    root_path = _webdav_cloud_root_path(cloud)
+    target_path = _clean_shared_cloud_path(root_path.rstrip("/") + "/" + clean)
+    if not target_path:
+        return None
+    filename = Path(clean).name
+    request = urllib.request.Request(
+        _webdav_request_url(base_url, target_path, directory=False),
+        headers={"Authorization": auth_header, "User-Agent": "Hermes-CUI/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = response.headers.get("content-type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+            data = response.read(64 * 1024 * 1024 + 1)
+            if response.status >= 400 or len(data) > 64 * 1024 * 1024:
+                return None
+            return data, content_type, filename
+    except Exception:
+        return None
+
+
 def _download_sftpgo_pubshare_file(cloud: dict[str, Any], rel_path: str) -> tuple[bytes, str, str] | None:
     clean = _clean_shared_relative_path(rel_path)
     if not clean:
@@ -918,7 +1094,7 @@ def _shared_folder_summary(config: dict[str, Any], request: Request | None = Non
         return payload
 
     if isinstance(cloud, dict):
-        items = _sftpgo_pubshare_items(cloud)
+        items = _webdav_cloud_items(cloud) if _shared_cloud_uses_webdav(cloud) else _sftpgo_pubshare_items(cloud)
         root_label = str(cloud.get("root_label") or cloud.get("label") or "cloud.aiwerk.ch")
         if items:
             payload = {
@@ -3022,6 +3198,38 @@ def _todo_summary(config: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _clean_dashboard_display_name(raw: Any, *, max_len: int = 80, first_token_only: bool = False) -> Optional[str]:
+    """Sanitize a short customer-facing display label for browser bootstrap/API use."""
+    if not isinstance(raw, str):
+        return None
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", raw)
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n'\"`<>;{}[]()")
+    if not value or "{{" in value or "}}" in value:
+        return None
+    if "@" in value and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        value = value.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+    if first_token_only:
+        # Keep greetings natural and avoid exposing full names from USER.md.
+        match = re.match(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,40}", value)
+        value = match.group(0) if match else ""
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9 ._'’\-]{2,80}", value):
+        return None
+    return value[:max_len].strip()
+
+
+def _iter_nested_display_candidates(config: dict[str, Any], paths: Iterable[tuple[str, ...]]) -> Iterable[Any]:
+    for path in paths:
+        current: Any = config
+        for part in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(part)
+        yield current
+
+
 def _assistant_display_name_from_config(config: dict[str, Any]) -> str:
     """Resolve the customer-facing assistant name for the AIWerk CUI."""
     candidates: list[Any] = [
@@ -3045,11 +3253,51 @@ def _assistant_display_name_from_config(config: dict[str, Any]) -> str:
             except Exception:
                 pass
     for raw in candidates:
-        if isinstance(raw, str):
-            value = re.sub(r"\s+", " ", raw).strip()
-            if value and "{{" not in value and "}}" not in value:
-                return value[:80]
+        value = _clean_dashboard_display_name(raw)
+        if value:
+            return value
     return "Agent"
+
+
+def _assistant_user_display_name_from_config(config: dict[str, Any]) -> Optional[str]:
+    """Resolve the customer-facing user's short display name from tenant config/env.
+
+    This is the production path for AIWerk customer agents. Do not infer tenant
+    identity from broad memory text when an explicit config value is available.
+    """
+    candidates: list[Any] = [
+        os.environ.get("AIWERK_CUI_USER_DISPLAY_NAME"),
+        os.environ.get("AIWERK_CUI_USER_NAME"),
+        os.environ.get("HERMES_USER_DISPLAY_NAME"),
+    ]
+    candidates.extend(_iter_nested_display_candidates(config, (
+        ("dashboard", "user_display_name"),
+        ("dashboard", "user_name"),
+        ("dashboard", "customer_name"),
+        ("dashboard", "customer", "display_name"),
+        ("dashboard", "customer", "name"),
+        ("assistant", "user_display_name"),
+        ("assistant", "user_name"),
+        ("assistant", "customer_name"),
+        ("aiwerk", "user_display_name"),
+        ("aiwerk", "user_name"),
+        ("aiwerk", "customer_name"),
+        ("aiwerk", "customer", "display_name"),
+        ("aiwerk", "customer", "name"),
+        ("tenant", "user_display_name"),
+        ("tenant", "user_name"),
+        ("tenant", "customer_name"),
+        ("tenant", "customer", "display_name"),
+        ("tenant", "customer", "name"),
+        ("branding", "user_display_name"),
+        ("branding", "user_name"),
+        ("branding", "customer_name"),
+    )))
+    for raw in candidates:
+        value = _clean_dashboard_display_name(raw, first_token_only=True)
+        if value:
+            return value
+    return None
 
 
 def _assistant_support_section(config: dict[str, Any]) -> dict[str, Any]:
@@ -4405,12 +4653,21 @@ def _assistant_uploaded_attachment_payload(path: Path, *, name: str | None = Non
     resolved = path.resolve()
     media_type = content_type or mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
     extracted_text, extraction = _extract_uploaded_text(resolved, media_type)
+    open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(resolved), safe='')}"
+    preview_kind = _assistant_preview_kind(resolved.name, media_type)
+    safe_renderable = preview_kind in {"image", "pdf", "text", "audio", "video"}
     return {
         "name": name or resolved.name,
+        "kind": "file",
         "path": str(resolved),
         "type": media_type,
         "size": resolved.stat().st_size,
-        "is_image": media_type.startswith("image/"),
+        "is_image": preview_kind == "image",
+        "open_url": open_url,
+        "download_url": open_url,
+        "preview_url": open_url if safe_renderable else None,
+        "preview_kind": preview_kind,
+        "safe_renderable": safe_renderable,
         "extracted_text": extracted_text,
         "extraction": extraction,
     }
@@ -4580,7 +4837,10 @@ def _create_shared_file_attachment(config: dict[str, Any], item: dict[str, Any],
         content_type = mimetypes.guess_type(source.name)[0] or str(item.get("mime") or "application/octet-stream")
     else:
         cloud = _shared_cloud_config(config)
-        downloaded = _download_sftpgo_pubshare_file(cloud, rel_path) if isinstance(cloud, dict) else None
+        if isinstance(cloud, dict):
+            downloaded = _download_webdav_cloud_file(cloud, rel_path) if _shared_cloud_uses_webdav(cloud) else _download_sftpgo_pubshare_file(cloud, rel_path)
+        else:
+            downloaded = None
         if not downloaded:
             raise HTTPException(status_code=404, detail="Shared file not found")
         data, content_type, downloaded_name = downloaded
@@ -4745,9 +5005,16 @@ def _assistant_mode_enabled() -> bool:
 def _assistant_user_display_name() -> Optional[str]:
     """Return a sanitized display name for the customer UI bootstrap.
 
-    Never expose the full USER.md/profile content to the browser. The CUI only
-    needs a short first-name style label for local personalization.
+    Production AIWerk/customer deployments should set this explicitly via env or
+    config. USER.md parsing remains a privacy-preserving local fallback only.
     """
+    try:
+        configured = _assistant_user_display_name_from_config(load_config())
+    except Exception:
+        configured = None
+    if configured:
+        return configured
+
     user_path = get_hermes_home() / "memories" / "USER.md"
     try:
         text = user_path.read_text(encoding="utf-8", errors="ignore")[:16_384]
@@ -4767,12 +5034,8 @@ def _assistant_user_display_name() -> Optional[str]:
             match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
             if not match:
                 continue
-            name = match.group(1).strip(" '’-\t\r\n")
-            if (
-                1 < len(name) <= 40
-                and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", name)
-                and (allow_blocked or name.casefold() not in blocked_names)
-            ):
+            name = _clean_dashboard_display_name(match.group(1), max_len=40, first_token_only=True)
+            if name and (allow_blocked or name.casefold() not in blocked_names):
                 return name
     return None
 
@@ -5795,7 +6058,7 @@ async def open_assistant_shared_folder_file(request: Request):
 
     cloud = _shared_cloud_config(config)
     if isinstance(cloud, dict):
-        downloaded = _download_sftpgo_pubshare_file(cloud, rel_path)
+        downloaded = _download_webdav_cloud_file(cloud, rel_path) if _shared_cloud_uses_webdav(cloud) else _download_sftpgo_pubshare_file(cloud, rel_path)
         if not downloaded:
             raise HTTPException(status_code=404, detail="File not found")
         data, media_type, filename = downloaded
@@ -5810,6 +6073,67 @@ async def open_assistant_shared_folder_file(request: Request):
         )
 
     raise HTTPException(status_code=404, detail="Shared folder not configured")
+
+
+_ASSISTANT_ARTIFACT_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+_ASSISTANT_ACTIVE_ARTIFACT_EXTENSIONS = _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS
+_ASSISTANT_ARTIFACT_EXTENSIONS = _ASSISTANT_ARTIFACT_IMAGE_EXTENSIONS | _ASSISTANT_UPLOAD_EXTENSIONS | _ASSISTANT_ACTIVE_ARTIFACT_EXTENSIONS
+_ASSISTANT_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _assistant_artifact_roots() -> tuple[Path, ...]:
+    """Roots that contain files intentionally materialized for the CUI.
+
+    Do not include broad locations such as the whole Hermes home or /tmp here:
+    the artifact endpoint receives a client-controlled path query parameter, so
+    serving must be constrained to files copied/uploaded into the dashboard
+    upload area.
+    """
+    try:
+        return (_assistant_upload_root().expanduser().resolve(),)
+    except Exception:
+        return tuple()
+
+
+def _resolve_assistant_artifact(raw_path: str) -> Path | None:
+    if not raw_path:
+        return None
+    try:
+        target = Path(raw_path.removeprefix("file://")).expanduser().resolve()
+    except Exception:
+        return None
+    if not target.is_file() or target.suffix.lower() not in _ASSISTANT_ARTIFACT_EXTENSIONS:
+        return None
+    try:
+        if target.stat().st_size > _ASSISTANT_ARTIFACT_MAX_BYTES:
+            return None
+    except Exception:
+        return None
+    for root in _assistant_artifact_roots():
+        if target == root or root in target.parents:
+            return target
+    return None
+
+
+@app.get("/api/assistant/artifacts/open")
+async def open_assistant_artifact(request: Request):
+    """Serve local artifacts that the PA agent intentionally returned to the CUI."""
+    _require_token(request)
+    target = _resolve_assistant_artifact(request.query_params.get("path") or "")
+    if not target:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    media_type, disposition = _safe_shared_open_disposition(target.name, media_type)
+    return FileResponse(
+        target,
+        media_type=media_type,
+        filename=target.name,
+        headers={
+            "Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(target.name)}",
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.post("/api/assistant/attachments")
@@ -7104,7 +7428,12 @@ def get_model_info():
             config_ctx = None
 
         if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider, agent_name=_assistant_display_name_from_config(cfg))
+            return dict(
+                _EMPTY_MODEL_INFO,
+                provider=provider,
+                agent_name=_assistant_display_name_from_config(cfg),
+                user_display_name=_assistant_user_display_name_from_config(cfg),
+            )
 
         # Resolve auto-detected context length (pass config_ctx=None to get
         # purely auto-detected value, then separately report the override)
@@ -7151,6 +7480,7 @@ def get_model_info():
             "effective_context_length": effective_ctx,
             "capabilities": caps,
             "agent_name": _assistant_display_name_from_config(cfg),
+            "user_display_name": _assistant_user_display_name_from_config(cfg),
         }
     except Exception:
         _log.exception("GET /api/model/info failed")
