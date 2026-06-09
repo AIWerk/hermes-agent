@@ -1536,6 +1536,11 @@ export interface AssistantUploadedAttachment {
   type: string;
   size: number;
   is_image: boolean;
+  open_url?: string | null;
+  download_url?: string | null;
+  preview_url?: string | null;
+  preview_kind?: "image" | "pdf" | "text" | "audio" | "video" | "file" | string;
+  safe_renderable?: boolean;
   extracted_text: string;
   extraction: string;
 }
@@ -2051,6 +2056,7 @@ export interface ModelInfoResponse {
   config_context_length: number;
   effective_context_length: number;
   agent_name?: string;
+  user_display_name?: string | null;
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;

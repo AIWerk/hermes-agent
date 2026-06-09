@@ -61,6 +61,27 @@ def _scan_context_content(content: str, filename: str) -> str:
     return content
 
 
+def _safe_path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _safe_path_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _safe_path_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _find_git_root(start: Path) -> Optional[Path]:
     """Walk *start* and its parents looking for a ``.git`` directory.
 
@@ -69,7 +90,7 @@ def _find_git_root(start: Path) -> Optional[Path]:
     """
     current = start.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        if _safe_path_exists(parent / ".git"):
             return parent
     return None
 
@@ -90,7 +111,7 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     for directory in [current, *current.parents]:
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
-            if candidate.is_file():
+            if _safe_path_is_file(candidate):
                 return candidate
         # Stop walking at the git root (or filesystem root).
         if stop_at and directory == stop_at:
@@ -1416,7 +1437,7 @@ def load_soul_md() -> Optional[str]:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
     soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
+    if not _safe_path_exists(soul_path):
         return None
     try:
         content = soul_path.read_text(encoding="utf-8").strip()
@@ -1457,7 +1478,7 @@ def _load_agents_md(cwd_path: Path) -> str:
     """AGENTS.md — top-level only (no recursive walk)."""
     for name in ["AGENTS.md", "agents.md"]:
         candidate = cwd_path / name
-        if candidate.exists():
+        if _safe_path_exists(candidate):
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
@@ -1473,7 +1494,7 @@ def _load_claude_md(cwd_path: Path) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
-        if candidate.exists():
+        if _safe_path_exists(candidate):
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
@@ -1489,7 +1510,7 @@ def _load_cursorrules(cwd_path: Path) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
     cursorrules_file = cwd_path / ".cursorrules"
-    if cursorrules_file.exists():
+    if _safe_path_exists(cursorrules_file):
         try:
             content = cursorrules_file.read_text(encoding="utf-8").strip()
             if content:
@@ -1499,7 +1520,7 @@ def _load_cursorrules(cwd_path: Path) -> str:
             logger.debug("Could not read .cursorrules: %s", e)
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
-    if cursor_rules_dir.exists() and cursor_rules_dir.is_dir():
+    if _safe_path_exists(cursor_rules_dir) and _safe_path_is_dir(cursor_rules_dir):
         mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
         for mdc_file in mdc_files:
             try:

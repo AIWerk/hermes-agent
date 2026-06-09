@@ -2,15 +2,21 @@ import atexit
 import concurrent.futures
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import queue
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -2822,6 +2828,41 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
 _DASHBOARD_UPLOAD_ROOT = (_hermes_home / "dashboard_uploads").resolve()
 _ATTACHMENT_CONTEXT_LIMIT = 60_000
 _IMAGE_ATTACHMENT_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+_AUDIO_ATTACHMENT_EXTENSIONS = frozenset({".mp3", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
+_VIDEO_ATTACHMENT_EXTENSIONS = frozenset({".mp4", ".mov", ".webm", ".mkv"})
+_TEXT_ATTACHMENT_EXTENSIONS = frozenset({".txt", ".md", ".csv", ".yaml", ".yml"})
+_ACTIVE_ATTACHMENT_EXTENSIONS = frozenset({
+    ".html", ".htm", ".xhtml", ".xht", ".xhtm", ".shtml",
+    ".svg", ".svgz", ".xml", ".xsl", ".xslt",
+    ".js", ".mjs", ".cjs", ".mhtml", ".mht", ".htc",
+})
+_OUTBOUND_ATTACHMENT_EXTENSIONS = _IMAGE_ATTACHMENT_EXTENSIONS | frozenset({
+    ".pdf", ".docx", ".json",
+}) | _TEXT_ATTACHMENT_EXTENSIONS | _AUDIO_ATTACHMENT_EXTENSIONS | _VIDEO_ATTACHMENT_EXTENSIONS | _ACTIVE_ATTACHMENT_EXTENSIONS
+_OUTBOUND_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+_OUTBOUND_ATTACHMENT_RE = re.compile(
+    r"(?:MEDIA:|file://)?(/[^\s)\]>'\"]+\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))",
+    re.IGNORECASE,
+)
+
+
+def _attachment_preview_kind(path: Path, media_type: str) -> str:
+    ext = path.suffix.lower()
+    if ext in _ACTIVE_ATTACHMENT_EXTENSIONS:
+        return "file"
+    if ext == ".json":
+        return "file"
+    if media_type.startswith("image/") and ext in _IMAGE_ATTACHMENT_EXTENSIONS:
+        return "image"
+    if media_type == "application/pdf" or ext == ".pdf":
+        return "pdf"
+    if media_type.startswith("audio/") or ext in _AUDIO_ATTACHMENT_EXTENSIONS:
+        return "audio"
+    if media_type.startswith("video/") or ext in _VIDEO_ATTACHMENT_EXTENSIONS:
+        return "video"
+    if media_type.startswith("text/") or ext in _TEXT_ATTACHMENT_EXTENSIONS:
+        return "text"
+    return "file"
 
 
 def _attachment_path_allowed(path: Path) -> bool:
@@ -2830,6 +2871,29 @@ def _attachment_path_allowed(path: Path) -> bool:
         return resolved == _DASHBOARD_UPLOAD_ROOT or _DASHBOARD_UPLOAD_ROOT in resolved.parents
     except Exception:
         return False
+
+
+def _materialize_outbound_artifact(path: Path) -> Path | None:
+    """Return a path the CUI artifact endpoint can serve for an outbound file."""
+    try:
+        stat = path.stat()
+        if stat.st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+            return None
+        digest = hashlib.sha256(
+            f"{path}\0{stat.st_mtime_ns}\0{stat.st_size}".encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:16]
+        target_dir = _DASHBOARD_UPLOAD_ROOT / "outbound_artifacts" / digest
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / path.name
+        if not target.exists() or target.stat().st_size != stat.st_size:
+            shutil.copy2(path, target)
+            try:
+                target.chmod(0o600)
+            except Exception:
+                pass
+        return target.resolve()
+    except Exception:
+        return None
 
 
 def _attachment_text_block(name: str, path: Path, text: str, note: str = "") -> str:
@@ -2874,6 +2938,104 @@ def _process_prompt_attachments(attachments: Any) -> tuple[list[str], str]:
                 note = note or "text-read-failed"
         file_blocks.append(_attachment_text_block(name, path, text, note))
     return image_paths, "\n\n".join(file_blocks)
+
+
+def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
+    """Extract local artifacts from assistant text for native CUI attachment cards."""
+    if not isinstance(text, str) or not text:
+        return []
+    attachments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _OUTBOUND_ATTACHMENT_RE.finditer(text):
+        raw_path = match.group(1)
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            continue
+        if str(path) in seen or not path.is_file() or path.suffix.lower() not in _OUTBOUND_ATTACHMENT_EXTENSIONS:
+            continue
+        seen.add(str(path))
+        try:
+            size = path.stat().st_size
+        except Exception:
+            continue
+        if size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+            continue
+        materialized = _materialize_outbound_artifact(path)
+        if not materialized or not materialized.is_file():
+            continue
+        path = materialized
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        try:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
+        preview_kind = _attachment_preview_kind(path, media_type)
+        is_image = preview_kind == "image"
+        safe_renderable = preview_kind in {"image", "pdf", "text", "audio", "video"}
+        attachments.append(
+            {
+                "name": path.name,
+                "kind": "file",
+                "path": str(path),
+                "type": media_type,
+                "size": size,
+                "is_image": is_image,
+                "open_url": open_url,
+                "download_url": open_url,
+                "preview_url": open_url if safe_renderable else None,
+                "preview_kind": preview_kind,
+                "safe_renderable": safe_renderable,
+            }
+        )
+    return attachments
+
+
+_INBOUND_IMAGE_HINT_RE = re.compile(
+    r"vision_analyze\s+using\s+image_url:\s+([^\]\n]+)",
+    re.IGNORECASE,
+)
+
+
+def _inbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
+    """Recover uploaded Customer UI image previews from persisted user history."""
+    if not isinstance(text, str) or not text:
+        return []
+    attachments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _INBOUND_IMAGE_HINT_RE.finditer(text):
+        raw_path = match.group(1).strip()
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            continue
+        if str(path) in seen or not _attachment_path_allowed(path) or not path.is_file():
+            continue
+        if path.suffix.lower() not in _IMAGE_ATTACHMENT_EXTENSIONS:
+            continue
+        seen.add(str(path))
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if not media_type.startswith("image/"):
+            continue
+        try:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
+        attachments.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "type": media_type,
+                "size": size,
+                "is_image": True,
+                "open_url": open_url,
+                "preview_url": open_url,
+                "safe_renderable": True,
+            }
+        )
+    return attachments
 
 
 def _content_display_text(content: Any) -> str:
@@ -3028,7 +3190,14 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if not content_text.strip():
             continue
         msg = {"role": role, "text": content_text}
+        if role == "user":
+            attachments = _inbound_image_attachment_payloads(content_text)
+            if attachments:
+                msg["attachments"] = attachments
         if role == "assistant":
+            attachments = _outbound_image_attachment_payloads(content_text)
+            if attachments:
+                msg["attachments"] = attachments
             for key in (
                 "reasoning",
                 "reasoning_content",
@@ -5106,6 +5275,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            outbound_attachments = _outbound_image_attachment_payloads(raw)
+            if outbound_attachments:
+                payload["attachments"] = outbound_attachments
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
