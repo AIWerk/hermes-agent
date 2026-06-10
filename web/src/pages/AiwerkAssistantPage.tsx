@@ -2273,6 +2273,77 @@ export default function AiwerkAssistantPage() {
         @media (max-width: 900px) {
           .aiwerk-side-drawer { width: min(460px, 92%); }
         }
+        @media (max-width: 640px) {
+          .aiwerk-assistant {
+            height: 100dvh;
+            min-height: 100dvh;
+            overflow: hidden;
+          }
+          .aiwerk-main {
+            height: 100dvh !important;
+            padding: 0 !important;
+            gap: 0 !important;
+            grid-template-rows: minmax(0, 1fr) !important;
+          }
+          .aiwerk-desktop-header { display: none !important; }
+          .aiwerk-content-grid {
+            display: block !important;
+            height: 100% !important;
+            min-height: 0 !important;
+          }
+          .aiwerk-chat-panel {
+            height: 100dvh !important;
+            border: 0 !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+            background: #fffaf2 !important;
+          }
+          .aiwerk-chat-header {
+            padding: 14px 14px 10px !important;
+            border-bottom-color: #eadfce !important;
+            background: rgba(255, 250, 242, .96);
+          }
+          .aiwerk-chat-header strong { font-size: 17px; }
+          .aiwerk-chat-header-subtitle { display: none !important; }
+          .aiwerk-chat-header-actions { gap: 6px !important; }
+          .aiwerk-desktop-only-action { display: none !important; }
+          .aiwerk-messages {
+            padding: 14px 12px 12px !important;
+            background: linear-gradient(180deg, #fffaf2 0%, #f8f1e7 100%);
+          }
+          .aiwerk-message-bubble {
+            max-width: 91% !important;
+            border-radius: 18px !important;
+            padding: 12px 13px !important;
+            font-size: 15px !important;
+            line-height: 1.45 !important;
+          }
+          .aiwerk-system-message { max-width: 92% !important; }
+          .aiwerk-composer {
+            gap: 8px !important;
+            padding: 10px max(10px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)) !important;
+            background: rgba(251,245,235,.98) !important;
+          }
+          .aiwerk-composer textarea {
+            min-height: 48px !important;
+            border-radius: 16px !important;
+            font-size: 16px !important;
+          }
+          .aiwerk-composer button {
+            height: 48px !important;
+            min-width: 48px !important;
+          }
+          .aiwerk-send-label { display: none !important; }
+          .aiwerk-side-drawer, .aiwerk-side-scrim, .aiwerk-right-rail, .aiwerk-rail-resize {
+            display: none !important;
+          }
+          .aiwerk-toast {
+            left: 12px !important;
+            right: 12px !important;
+            bottom: calc(14px + env(safe-area-inset-bottom)) !important;
+            text-align: center;
+          }
+        }
       `}</style>
       {showDashboardLoader && (
         <div className="fixed inset-0 z-[80] grid place-items-center bg-[#f4f1ec]/88 px-[22px] backdrop-blur-[3px]" role="status" aria-live="polite" aria-label="Dashboard wird synchronisiert">
@@ -2395,8 +2466,8 @@ export default function AiwerkAssistantPage() {
         </aside>
 
         {/* Main */}
-        <main className="grid h-dvh min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-[22px] overflow-hidden p-[26px]">
-          <header className="flex flex-col items-start gap-[16px] sm:flex-row sm:items-center sm:justify-between">
+        <main className="aiwerk-main grid h-dvh min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-[22px] overflow-hidden p-[26px]">
+          <header className="aiwerk-desktop-header flex flex-col items-start gap-[16px] sm:flex-row sm:items-center sm:justify-between">
             <div>
               <div className="flex items-center gap-[8px]">
                 <h1 className="m-0 text-[26px] tracking-[-0.03em]">{sessionTitle}</h1>
@@ -2463,7 +2534,7 @@ export default function AiwerkAssistantPage() {
           <section
             ref={contentGridRef}
             className={
-              "grid h-full min-h-0 overflow-hidden grid-cols-1 gap-[12px] xl:grid-cols-[minmax(0,1fr)_10px_var(--right-rail-width)] " +
+              "aiwerk-content-grid grid h-full min-h-0 overflow-hidden grid-cols-1 gap-[12px] xl:grid-cols-[minmax(0,1fr)_10px_var(--right-rail-width)] " +
               (isResizingRightRail ? "cursor-col-resize select-none" : "")
             }
             style={{ "--right-rail-width": `${rightRailWidth}px` } as CSSProperties}
@@ -2507,13 +2578,13 @@ export default function AiwerkAssistantPage() {
                   </div>
                 </div>
               )}
-              <div className="flex items-center justify-between border-b border-[#e3d9c9] px-[20px] py-[18px]">
+              <div className="aiwerk-chat-header flex items-center justify-between border-b border-[#e3d9c9] px-[20px] py-[18px]">
                 <div>
                   <strong>{chatHeader.title}</strong>
                   <br />
-                  <span className="text-[#777063]">{chatHeader.subtitle}</span>
+                  <span className="aiwerk-chat-header-subtitle text-[#777063]">{chatHeader.subtitle}</span>
                 </div>
-                <div className="flex items-center gap-[8px]">
+                <div className="aiwerk-chat-header-actions flex items-center gap-[8px]">
                   <button
                     type="button"
                     onClick={toggleReadAloud}
@@ -2556,7 +2627,7 @@ export default function AiwerkAssistantPage() {
                     aria-label="Laufende Antwort stoppen"
                     disabled={!busy || !sessionId || connection !== "open"}
                     className={
-                      "cursor-pointer rounded-[10px] border px-[13px] py-[8px] text-[12px] font-bold transition disabled:cursor-not-allowed disabled:opacity-45 " +
+                      "aiwerk-desktop-only-action cursor-pointer rounded-[10px] border px-[13px] py-[8px] text-[12px] font-bold transition disabled:cursor-not-allowed disabled:opacity-45 " +
                       (busy
                         ? "border-[#9a6a51] bg-[#8b5d4e] text-white shadow-[0_10px_22px_rgba(91,55,39,.18)]"
                         : "border-[#d9d0c1] bg-[#f6eee3] text-[#7a594d] hover:bg-[#efe2d5]")
@@ -2570,7 +2641,7 @@ export default function AiwerkAssistantPage() {
                     title={foldedTabHelp}
                     aria-label={`${conversationMode === "side" ? "Schliessen" : "Nebenfrage"}. ${foldedTabHelp}`}
                     className={
-                      "cursor-pointer rounded-[10px] border px-[13px] py-[8px] text-[12px] font-bold transition " +
+                      "aiwerk-desktop-only-action cursor-pointer rounded-[10px] border px-[13px] py-[8px] text-[12px] font-bold transition " +
                       (conversationMode === "side"
                         ? "border-[#9a7b51] bg-[#8b724e] text-white shadow-[0_10px_22px_rgba(91,70,39,.18)]"
                         : "border-[#d9d0c1] bg-[#efe6d6] text-[#695a43] hover:bg-[#e6dac8]")
@@ -2656,21 +2727,21 @@ export default function AiwerkAssistantPage() {
               )}
 
               {isChatPanelActive ? (
-                <div ref={messagesScrollRef} className="aiwerk-scrollbar min-h-0 overflow-y-auto overscroll-contain p-[24px]">
+                <div ref={messagesScrollRef} className="aiwerk-messages aiwerk-scrollbar min-h-0 overflow-y-auto overscroll-contain p-[24px]">
                   <div className="flex min-h-full flex-col gap-[16px]">
                     {messages.map((msg, index) => (
                       <Fragment key={msg.id}>
                         {mainToolDisclosureIndex === index && <ToolCallsDisclosure tools={mainUnanchoredToolCalls} />}
                         {msg.role === "system" ? (
-                          <div className="mx-auto max-w-[74%] rounded-[18px] bg-[#f1eadf] px-4 py-3.5 text-center text-[14px] text-[#695a43]">
+                          <div className="aiwerk-system-message mx-auto max-w-[74%] rounded-[18px] bg-[#f1eadf] px-4 py-3.5 text-center text-[14px] text-[#695a43]">
                             {msg.text}
                           </div>
                         ) : (
                           <div
                             className={
                               msg.role === "user"
-                                ? "max-w-[74%] self-end rounded-[18px] rounded-tr-[6px] bg-[#7f6b4d] px-4 py-3.5 text-[15px] leading-[1.45] text-white"
-                                : "max-w-[74%] rounded-[18px] rounded-tl-[6px] bg-[#eee5d7] px-4 py-3.5 text-[15px] leading-[1.45]"
+                                ? "aiwerk-message-bubble max-w-[74%] self-end rounded-[18px] rounded-tr-[6px] bg-[#7f6b4d] px-4 py-3.5 text-[15px] leading-[1.45] text-white"
+                                : "aiwerk-message-bubble max-w-[74%] rounded-[18px] rounded-tl-[6px] bg-[#eee5d7] px-4 py-3.5 text-[15px] leading-[1.45]"
                             }
                           >
                             {msg.attachments && msg.attachments.length > 0 && (
@@ -2697,7 +2768,7 @@ export default function AiwerkAssistantPage() {
 
               {isChatPanelActive && (
                 <div>
-                <div className="flex items-end gap-[10px] border-t border-[#e3d9c9] bg-[#fbf5eb] p-[16px]">
+                <div className="aiwerk-composer flex items-end gap-[10px] border-t border-[#e3d9c9] bg-[#fbf5eb] p-[16px]">
                   <button
                     type="button"
                     onClick={() => void startVoiceInput()}
@@ -2756,7 +2827,7 @@ export default function AiwerkAssistantPage() {
                       e.preventDefault();
                       addAttachedFiles(imageFiles, "paste");
                     }}
-                    placeholder="Nachricht an den Assistenten schreiben…"
+                    placeholder="Nachricht schreiben…"
                     className="aiwerk-scrollbar min-h-[46px] max-h-[160px] min-w-0 flex-1 resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[14px] py-[12px] text-[15px] leading-[1.45] outline-none"
                   />
                   <button
@@ -2765,7 +2836,7 @@ export default function AiwerkAssistantPage() {
                     disabled={(!input.trim() && attachedFiles.length === 0) || !sessionId || connection !== "open" || (busy && !input.trim())}
                     className="h-[46px] shrink-0 cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[10px] font-semibold text-white hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Senden
+                    <span className="aiwerk-send-label">Senden</span><Send className="hidden h-[18px] w-[18px] max-[640px]:block" />
                   </button>
                 </div>
                 {voiceState !== "idle" && (
@@ -2909,12 +2980,13 @@ export default function AiwerkAssistantPage() {
               onPointerDown={startRightRailResize}
               onDoubleClick={resetRightRailWidth}
               data-aiwerk-resize-handle="true"
-              className="group hidden h-full cursor-col-resize items-center justify-center rounded-full focus:outline-none focus:ring-2 focus:ring-[#b89d72]/40 xl:flex"
+              className="aiwerk-rail-resize group hidden h-full cursor-col-resize items-center justify-center rounded-full focus:outline-none focus:ring-2 focus:ring-[#b89d72]/40 xl:flex"
             >
               <span className="h-[72px] w-[3px] rounded-full bg-[#d8cdbd] transition group-hover:bg-[#b89d72] group-focus-visible:bg-[#b89d72]" />
             </button>
 
             {/* Right side panels */}
+            <div className="aiwerk-right-rail min-h-0">
             <ResourcesRail
               resources={resourceSummary}
               loading={resourcesLoading}
@@ -2936,6 +3008,7 @@ export default function AiwerkAssistantPage() {
               onOpenCalendar={openCalendarInPanel}
               onOpenContact={openContactInPanel}
             />
+            </div>
           </section>
         </main>
       </div>
@@ -3034,7 +3107,7 @@ export default function AiwerkAssistantPage() {
       )}
 
       {toast && (
-        <div className="fixed bottom-[24px] right-[24px] z-50 rounded-[14px] bg-[#292720] px-[16px] py-[13px] text-white shadow-[0_16px_40px_rgba(0,0,0,.18)]">
+        <div className="aiwerk-toast fixed bottom-[24px] right-[24px] z-50 rounded-[14px] bg-[#292720] px-[16px] py-[13px] text-white shadow-[0_16px_40px_rgba(0,0,0,.18)]">
           {toast}
         </div>
       )}
