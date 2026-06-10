@@ -995,6 +995,17 @@ DEFAULT_CONFIG = {
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
     },
 
+    "ai_notes": {
+        # Static HTML publishing surface for AIWerk/customer-readable notes.
+        # Disabled by default; tenant/base-agent templates opt in only after
+        # DNS/webroot/proxy activation is verified.
+        "enabled": False,
+        "agent_name": "",
+        "public_base_url": "",
+        "publish_root": "",
+        "visibility": "disabled",
+    },
+
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
