@@ -9515,6 +9515,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                event_message_type=event.message_type,
                 channel_prompt=event.channel_prompt,
             )
 
@@ -12272,6 +12273,21 @@ class GatewayRunner:
         )
 
         await adapter.handle_message(event)
+
+    def _should_suppress_text_streaming_for_voice_reply(
+        self,
+        source: SessionSource,
+        message_type: Optional[MessageType],
+    ) -> bool:
+        """True when this turn should produce a voice reply without a text stream."""
+        if message_type != MessageType.VOICE:
+            return False
+        chat_id = getattr(source, "chat_id", "") or ""
+        platform = getattr(source, "platform", None)
+        if platform is None:
+            return False
+        voice_mode = self._voice_mode.get(self._voice_key(platform, chat_id), "off")
+        return voice_mode == "voice_only"
 
     def _should_send_voice_reply(
         self,
@@ -16731,6 +16747,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        event_message_type: Optional[MessageType] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -16825,6 +16842,11 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if self._should_suppress_text_streaming_for_voice_reply(
+            source,
+            event_message_type,
+        ):
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -17018,6 +17040,7 @@ class GatewayRunner:
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        event_message_type: Optional[MessageType] = None,
         channel_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -17043,6 +17066,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                event_message_type=event_message_type,
             )
 
         from run_agent import AIAgent
@@ -17818,6 +17842,11 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if self._should_suppress_text_streaming_for_voice_reply(
+                source,
+                event_message_type,
+            ):
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -19221,6 +19250,7 @@ class GatewayRunner:
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    event_message_type=(getattr(pending_event, "message_type", None) if pending_event is not None else None),
                     channel_prompt=next_channel_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

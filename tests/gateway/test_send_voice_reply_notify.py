@@ -44,6 +44,7 @@ def _runner_with_adapter(send_voice_mock):
         is_in_voice_channel=lambda *_a, **_k: False,
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
     return runner
 
 
@@ -114,3 +115,27 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
         event.source, runner._reply_anchor_for_event(event)
     )
     assert "notify" not in fresh
+
+
+def test_voice_only_voice_input_suppresses_text_streaming():
+    """Voice-only mode should not stream a text copy before the voice reply."""
+    runner = _runner_with_adapter(AsyncMock())
+    event = _make_event()
+    event.message_type = MessageType.VOICE
+    runner._voice_mode[runner._voice_key(event.source.platform, event.source.chat_id)] = "voice_only"
+
+    assert runner._should_suppress_text_streaming_for_voice_reply(
+        event.source,
+        event.message_type,
+    ) is True
+
+
+def test_voice_only_does_not_suppress_text_streaming_for_text_input():
+    runner = _runner_with_adapter(AsyncMock())
+    event = _make_event()
+    runner._voice_mode[runner._voice_key(event.source.platform, event.source.chat_id)] = "voice_only"
+
+    assert runner._should_suppress_text_streaming_for_voice_reply(
+        event.source,
+        event.message_type,
+    ) is False

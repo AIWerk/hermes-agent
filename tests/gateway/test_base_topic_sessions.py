@@ -274,7 +274,31 @@ class TestTelegramAutoTtsCaptionDelivery:
         return hold
 
     @pytest.mark.asyncio
-    async def test_short_telegram_auto_tts_uses_caption_without_followup_text(self, tmp_path):
+    async def test_telegram_voice_input_defaults_to_text_only(self):
+        adapter = DummyTelegramAdapter()
+        adapter._keep_typing = self._hold_typing()
+        adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="Text reply"))
+
+        with patch("tools.tts_tool.text_to_speech_tool") as text_to_speech:
+            await adapter._process_message_background(
+                self._make_voice_event(),
+                build_session_key(self._make_voice_event().source),
+            )
+
+        text_to_speech.assert_not_called()
+        adapter.play_tts.assert_not_awaited()
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "Text reply",
+                "reply_to": None,
+                "metadata": {"thread_id": "17585", "notify": True},
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_short_telegram_auto_tts_sends_audio_only_without_followup_text(self, tmp_path):
         adapter = DummyTelegramAdapter()
         adapter._keep_typing = self._hold_typing()
         adapter._should_auto_tts_for_chat = lambda _chat_id: True
@@ -292,11 +316,11 @@ class TestTelegramAutoTtsCaptionDelivery:
             await adapter._process_message_background(event, build_session_key(event.source))
 
         adapter.play_tts.assert_awaited_once()
-        assert adapter.play_tts.await_args.kwargs["caption"] == "Short reply"
+        assert adapter.play_tts.await_args.kwargs["caption"] is None
         assert adapter.sent == []
 
     @pytest.mark.asyncio
-    async def test_long_telegram_auto_tts_keeps_followup_text_when_caption_would_truncate(self, tmp_path):
+    async def test_long_telegram_auto_tts_sends_audio_only_without_followup_text(self, tmp_path):
         adapter = DummyTelegramAdapter()
         adapter._keep_typing = self._hold_typing()
         adapter._should_auto_tts_for_chat = lambda _chat_id: True
@@ -316,14 +340,7 @@ class TestTelegramAutoTtsCaptionDelivery:
 
         adapter.play_tts.assert_awaited_once()
         assert adapter.play_tts.await_args.kwargs["caption"] is None
-        assert adapter.sent == [
-            {
-                "chat_id": "-1001",
-                "content": long_reply,
-                "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
-            }
-        ]
+        assert adapter.sent == []
 
     @pytest.mark.asyncio
     async def test_telegram_auto_tts_send_failure_keeps_followup_text(self, tmp_path):
@@ -344,7 +361,7 @@ class TestTelegramAutoTtsCaptionDelivery:
             await adapter._process_message_background(event, build_session_key(event.source))
 
         adapter.play_tts.assert_awaited_once()
-        assert adapter.play_tts.await_args.kwargs["caption"] == "Short reply"
+        assert adapter.play_tts.await_args.kwargs["caption"] is None
         assert adapter.sent == [
             {
                 "chat_id": "-1001",

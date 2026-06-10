@@ -4190,22 +4190,21 @@ class BasePlatformAdapter(ABC):
                 _tts_caption_delivered = False
                 if _tts_path and Path(_tts_path).exists():
                     try:
+                        # Voice replies should not duplicate the same answer as
+                        # a Telegram voice-caption text. Telegram already shows
+                        # its own optional transcription UI for voice messages,
+                        # so keep Hermes voice-only replies audio-only here.
                         telegram_tts_caption = None
-                        if (
-                            self.platform == Platform.TELEGRAM
-                            and text_content
-                            and text_content[:1024] == text_content
-                        ):
-                            telegram_tts_caption = text_content
                         tts_result = await self.play_tts(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
                             metadata=_thread_metadata,
                         )
-                        _tts_caption_delivered = bool(
-                            telegram_tts_caption and getattr(tts_result, "success", False)
-                        )
+                        # If a voice reply was successfully delivered, suppress
+                        # the parallel text message. Otherwise Telegram shows the
+                        # same answer twice: once as text, once as a voice note.
+                        _tts_caption_delivered = bool(getattr(tts_result, "success", False))
                     finally:
                         try:
                             os.remove(_tts_path)
