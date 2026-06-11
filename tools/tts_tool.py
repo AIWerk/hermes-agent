@@ -1841,6 +1841,214 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# TTS text normalization
+# ===========================================================================
+_HU_SMALL_NUMBERS = {
+    0: "nulla",
+    1: "egy",
+    2: "kettő",
+    3: "három",
+    4: "négy",
+    5: "öt",
+    6: "hat",
+    7: "hét",
+    8: "nyolc",
+    9: "kilenc",
+    10: "tíz",
+    11: "tizenegy",
+    12: "tizenkettő",
+    13: "tizenhárom",
+    14: "tizennégy",
+    15: "tizenöt",
+    16: "tizenhat",
+    17: "tizenhét",
+    18: "tizennyolc",
+    19: "tizenkilenc",
+    20: "húsz",
+    30: "harminc",
+    40: "negyven",
+    50: "ötven",
+    60: "hatvan",
+    70: "hetven",
+    80: "nyolcvan",
+    90: "kilencven",
+}
+
+_DE_SMALL_NUMBERS = {
+    0: "null",
+    1: "eins",
+    2: "zwei",
+    3: "drei",
+    4: "vier",
+    5: "fünf",
+    6: "sechs",
+    7: "sieben",
+    8: "acht",
+    9: "neun",
+    10: "zehn",
+    11: "elf",
+    12: "zwölf",
+    13: "dreizehn",
+    14: "vierzehn",
+    15: "fünfzehn",
+    16: "sechzehn",
+    17: "siebzehn",
+    18: "achtzehn",
+    19: "neunzehn",
+    20: "zwanzig",
+    30: "dreißig",
+    40: "vierzig",
+    50: "fünfzig",
+    60: "sechzig",
+    70: "siebzig",
+    80: "achtzig",
+    90: "neunzig",
+}
+
+
+def _hungarian_int_to_words(value: int) -> str:
+    """Return a compact Hungarian word form for integers used in TTS."""
+    if value < 0:
+        return "mínusz " + _hungarian_int_to_words(abs(value))
+    if value in _HU_SMALL_NUMBERS:
+        return _HU_SMALL_NUMBERS[value]
+    if value < 100:
+        tens = value // 10 * 10
+        ones = value % 10
+        if tens == 20:
+            return "huszon" + _HU_SMALL_NUMBERS[ones]
+        return _HU_SMALL_NUMBERS[tens] + _HU_SMALL_NUMBERS[ones]
+    if value < 1000:
+        hundreds = value // 100
+        rest = value % 100
+        prefix = "száz" if hundreds == 1 else _hungarian_int_to_words(hundreds) + "száz"
+        return prefix if rest == 0 else prefix + _hungarian_int_to_words(rest)
+    if value < 1_000_000:
+        thousands = value // 1000
+        rest = value % 1000
+        prefix = "ezer" if thousands == 1 else _hungarian_int_to_words(thousands) + "ezer"
+        return prefix if rest == 0 else prefix + "-" + _hungarian_int_to_words(rest)
+    return str(value)
+
+
+def _hungarian_number_to_words(raw: str) -> str:
+    sign = ""
+    value = raw.strip()
+    if value.startswith("-"):
+        sign = "mínusz "
+        value = value[1:]
+    value = value.replace(" ", "")
+    if "," in value or "." in value:
+        left, right = re.split(r"[,.]", value, maxsplit=1)
+        left_words = _hungarian_int_to_words(int(left or "0"))
+        right_words = " ".join(_hungarian_int_to_words(int(ch)) for ch in right if ch.isdigit())
+        return f"{sign}{left_words} egész {right_words}".strip()
+    return sign + _hungarian_int_to_words(int(value))
+
+
+def _german_int_to_words(value: int) -> str:
+    """Return a compact German word form for integers used in TTS."""
+    if value < 0:
+        return "minus " + _german_int_to_words(abs(value))
+    if value in _DE_SMALL_NUMBERS:
+        return _DE_SMALL_NUMBERS[value]
+    if value < 100:
+        tens = value // 10 * 10
+        ones = value % 10
+        ones_word = "ein" if ones == 1 else _DE_SMALL_NUMBERS[ones]
+        return ones_word + "und" + _DE_SMALL_NUMBERS[tens]
+    if value < 1000:
+        hundreds = value // 100
+        rest = value % 100
+        prefix = "einhundert" if hundreds == 1 else _german_int_to_words(hundreds) + "hundert"
+        return prefix if rest == 0 else prefix + _german_int_to_words(rest)
+    if value < 1_000_000:
+        thousands = value // 1000
+        rest = value % 1000
+        prefix = "eintausend" if thousands == 1 else _german_int_to_words(thousands) + "tausend"
+        return prefix if rest == 0 else prefix + _german_int_to_words(rest)
+    return str(value)
+
+
+def _german_number_to_words(raw: str) -> str:
+    sign = ""
+    value = raw.strip()
+    if value.startswith("-"):
+        sign = "minus "
+        value = value[1:]
+    value = value.replace(" ", "")
+    if "," in value or "." in value:
+        left, right = re.split(r"[,.]", value, maxsplit=1)
+        left_words = _german_int_to_words(int(left or "0"))
+        right_words = " ".join(_german_int_to_words(int(ch)) for ch in right if ch.isdigit())
+        return f"{sign}{left_words} Komma {right_words}".strip()
+    return sign + _german_int_to_words(int(value))
+
+
+_TTS_NUMERIC_TOKEN_RE = re.compile(r"(?<![\w/])-?\d+(?:[,.]\d+)?(?![\w/])")
+
+
+def _normalize_text_for_tts(text: str, language: Optional[str] = None) -> str:
+    """Normalize symbols and numerals into more speakable text before TTS.
+
+    The implementation is deliberately conservative and covers the languages we
+    use for customer-facing voice replies first: Hungarian and German.
+    """
+    if not text:
+        return text
+
+    lang = (language or "").strip().lower()
+    normalized = text
+    if lang.startswith("de"):
+        replacements = [
+            (r"\s*°\s*C\b", " Grad Celsius"),
+            (r"\s*℃", " Grad Celsius"),
+            (r"\s*%", " Prozent"),
+            (r"\s*€", " Euro"),
+            (r"\s*\bCHF\b", " Schweizer Franken"),
+        ]
+    else:
+        replacements = [
+            (r"\s*°\s*C\b", " Celsius fok"),
+            (r"\s*℃", " Celsius fok"),
+            (r"\s*%", " százalék"),
+            (r"\s*€", " euró"),
+            (r"\s*\bCHF\b", " svájci frank"),
+            (r"\s*\bFt\b", " forint"),
+        ]
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+
+    if lang.startswith("hu"):
+        normalized = _TTS_NUMERIC_TOKEN_RE.sub(
+            lambda match: _hungarian_number_to_words(match.group(0)),
+            normalized,
+        )
+    elif lang.startswith("de"):
+        normalized = _TTS_NUMERIC_TOKEN_RE.sub(
+            lambda match: _german_number_to_words(match.group(0)),
+            normalized,
+        )
+
+    normalized = re.sub(r"\s{2,}", " ", normalized)
+    return normalized.strip()
+
+
+def _resolve_tts_language(tts_config: Optional[Dict[str, Any]], provider: str) -> Optional[str]:
+    if not isinstance(tts_config, dict):
+        return None
+    direct = tts_config.get("language") or tts_config.get("language_code")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    provider_config = tts_config.get(provider, {})
+    if isinstance(provider_config, dict):
+        provider_lang = provider_config.get("language_code") or provider_config.get("language")
+        if isinstance(provider_lang, str) and provider_lang.strip():
+            return provider_lang.strip()
+    return None
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -1869,6 +2077,9 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    normalize_text = tts_config.get("normalize_text", True)
+    if normalize_text is not False:
+        text = _normalize_text_for_tts(text, _resolve_tts_language(tts_config, provider))
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here

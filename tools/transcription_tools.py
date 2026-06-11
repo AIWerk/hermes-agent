@@ -107,6 +107,15 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
 
+ELEVENLABS_LANGUAGE_CODE_ALIASES = {
+    "en": "eng",
+    "de": "deu",
+    "fr": "fra",
+    "es": "spa",
+    "it": "ita",
+    "hu": "hun",
+}
+
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
@@ -114,6 +123,20 @@ _local_model_name: Optional[str] = None
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
+
+def _normalize_elevenlabs_language_code(language_code: str) -> str:
+    """Return an ElevenLabs Scribe language code.
+
+    Tenant/base-agent configs often store customer language as a short BCP-47
+    code (``hu``, ``de``, ``en``), while ElevenLabs Scribe examples use ISO
+    639-3 style codes (``hun``, ``deu``, ``eng``). Accept both so customer
+    templates can stay simple without falling back to fragile auto-detect.
+    """
+    code = (language_code or "").strip()
+    if not code:
+        return ""
+    base = code.split("-", 1)[0].lower()
+    return ELEVENLABS_LANGUAGE_CODE_ALIASES.get(base, code)
 
 
 
@@ -1539,7 +1562,9 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
         or get_env_value("ELEVENLABS_STT_BASE_URL")
         or ELEVENLABS_STT_BASE_URL
     ).strip().rstrip("/")
-    language_code = str(elevenlabs_config.get("language_code") or "").strip()
+    language_code = _normalize_elevenlabs_language_code(
+        str(elevenlabs_config.get("language_code") or "").strip()
+    )
     tag_audio_events = is_truthy_value(elevenlabs_config.get("tag_audio_events", False))
     diarize = is_truthy_value(elevenlabs_config.get("diarize", False))
 
