@@ -334,7 +334,9 @@ class MemoryStore:
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
                         f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
+                        f"Consolidate now: use 'replace' to merge overlapping entries into "
+                        f"shorter ones or 'remove' stale or less important entries (see "
+                        f"current_entries below), then retry this add — all in this turn."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
@@ -392,12 +394,17 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
+                current = self._char_count(target)
                 return {
                     "success": False,
                     "error": (
                         f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content or remove other entries first."
+                        f"Shorten the new content, or 'remove' other stale or less important "
+                        f"entries to make room (see current_entries below), then retry — all "
+                        f"in this turn."
                     ),
+                    "current_entries": entries,
+                    "usage": f"{current:,}/{limit:,}",
                 }
 
             entries[idx] = new_content
@@ -617,7 +624,7 @@ def _memory_router_enabled() -> bool:
         return False
 
 
-def _router_block_response(content: str, target: str) -> Optional[str]:
+def _router_block_response(content: str, target: str, *, policy_block: bool = True) -> Optional[str]:
     ok, route = should_write_builtin_memory(content, target=target)
     # Credential safety is an unconditional invariant: never let secrets reach
     # prompt-injected memory, even when the curation policy is disabled or its
@@ -628,6 +635,8 @@ def _router_block_response(content: str, target: str) -> Optional[str]:
             "error": "Memory router blocked a credential/secret from prompt-injected memory.",
             "route": route.to_dict(),
         }, ensure_ascii=False)
+    if not policy_block:
+        return None
     if not _memory_router_enabled():
         return None
     if ok:
@@ -637,6 +646,64 @@ def _router_block_response(content: str, target: str) -> Optional[str]:
         "error": "Memory router blocked this write from prompt-injected memory.",
         "route": route.to_dict(),
     }, ensure_ascii=False)
+
+
+def _apply_write_gate(action: str, target: str, content: Optional[str],
+                      old_text: Optional[str]) -> Optional[str]:
+    """Evaluate the memory write gate. Returns a JSON tool-result string when
+    the write should NOT proceed normally (blocked or staged), or None when the
+    caller should perform the real write.
+
+    Only the mutating actions (add/replace/remove) are gated.
+    """
+    if action not in {"add", "replace", "remove"}:
+        return None
+
+    try:
+        from tools import write_approval as wa
+    except Exception:
+        # If the gate module can't load, fail open (current behaviour) rather
+        # than blocking all memory writes.
+        return None
+
+    # Build a small inline summary/detail for the foreground approval prompt.
+    label = "user profile" if target == "user" else "memory"
+    if action == "add":
+        summary = f"add to {label}"
+        detail = content or ""
+    elif action == "replace":
+        summary = f"replace in {label}"
+        detail = f"old: {old_text}\nnew: {content}"
+    else:  # remove
+        summary = f"remove from {label}"
+        detail = old_text or ""
+
+    decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
+
+    if decision.allow:
+        return None
+
+    if decision.blocked:
+        return tool_error(decision.message, success=False)
+
+    # stage
+    payload = {
+        "action": action,
+        "target": target,
+        "content": content,
+        "old_text": old_text,
+    }
+    record = wa.stage_write(
+        wa.MEMORY, payload,
+        summary=f"{summary}: {detail[:120]}",
+        origin=wa.current_origin(),
+    )
+    return json.dumps(
+        {"success": True, "staged": True, "pending_id": record["id"],
+         "message": decision.message},
+        ensure_ascii=False,
+    )
+
 
 
 def memory_tool(
@@ -657,27 +724,51 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
-    if action == "add":
-        if not content:
-            return tool_error("Content is required for 'add' action.", success=False)
-        blocked = _router_block_response(content, target)
+    # Validate required params BEFORE the gate so an invalid write is rejected
+    # immediately instead of being staged and only failing at approve time.
+    if action == "add" and not content:
+        return tool_error("Content is required for 'add' action.", success=False)
+    if action == "replace" and (not old_text or not content):
+        missing = "old_text" if not old_text else "content"
+        return tool_error(f"{missing} is required for 'replace' action.", success=False)
+    if action == "remove" and not old_text:
+        return tool_error("old_text is required for 'remove' action.", success=False)
+
+    # AIWerk memory router runs before write approval only for credential safety
+    # so secrets are blocked instead of staged. Non-credential routing remains
+    # below and is bypassed when explicit write approval is enabled.
+    write_approval_on = False
+    if action in {"add", "replace"}:
+        try:
+            from tools import write_approval as wa
+            write_approval_on = wa.write_approval_enabled(wa.MEMORY)
+        except Exception:
+            write_approval_on = False
+        blocked = _router_block_response(content, target, policy_block=False)
         if blocked is not None:
             return blocked
+
+    # Approval gate: when on, stages the write (background/gateway) or prompts
+    # inline (interactive CLI); when off (default) passes straight through.
+    gate_result = _apply_write_gate(action, target, content, old_text)
+    if gate_result is not None:
+        return gate_result
+
+    if action == "add":
+        if not write_approval_on:
+            blocked = _router_block_response(content, target)
+            if blocked is not None:
+                return blocked
         result = store.add(target, content)
 
     elif action == "replace":
-        if not old_text:
-            return tool_error("old_text is required for 'replace' action.", success=False)
-        if not content:
-            return tool_error("content is required for 'replace' action.", success=False)
-        blocked = _router_block_response(content, target)
-        if blocked is not None:
-            return blocked
+        if not write_approval_on:
+            blocked = _router_block_response(content, target)
+            if blocked is not None:
+                return blocked
         result = store.replace(target, old_text, content)
 
     elif action == "remove":
-        if not old_text:
-            return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
     else:
@@ -691,7 +782,29 @@ def check_memory_requirements() -> bool:
     return True
 
 
-# =============================================================================
+def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
+    """Replay a staged memory write directly against the store, bypassing the
+    write gate. Called by the /memory approve handler.
+
+    Returns the store's result dict.
+    """
+    action = payload.get("action")
+    target = payload.get("target", "memory")
+    content = payload.get("content") or ""
+    old_text = payload.get("old_text") or ""
+    if action == "add":
+        blocked = _router_block_response(content, target)
+        if blocked is not None:
+            return json.loads(blocked)
+        return store.add(target, content)
+    if action == "replace":
+        blocked = _router_block_response(content, target)
+        if blocked is not None:
+            return json.loads(blocked)
+        return store.replace(target, old_text, content)
+    if action == "remove":
+        return store.remove(target, old_text)
+    return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
 # =============================================================================
 

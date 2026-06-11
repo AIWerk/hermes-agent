@@ -177,12 +177,23 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("skills", "Search, install, inspect, or manage skills",
                "Tools & Skills", cli_only=True,
-               subcommands=("search", "browse", "inspect", "install", "audit")),
+               gateway_config_gate="skills.write_approval",
+               subcommands=("search", "browse", "inspect", "install", "audit",
+                            "pending", "approve", "reject", "diff", "approval")),
+    CommandDef("memory", "Review pending memory writes / toggle the approval gate",
+               "Tools & Skills",
+               args_hint="[pending|approve|reject|approval] [id|on|off]",
+               subcommands=("pending", "approve", "reject", "approval")),
     CommandDef("bundles", "List skill bundles (aliases /<name> for multiple skills)",
                "Tools & Skills"),
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
+    CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
+               "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
+               subcommands=("accept", "dismiss", "catalog", "clear")),
+    CommandDef("blueprint", "Set up an automation from a blueprint template",
+               "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
     CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
@@ -489,6 +500,14 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     return entries
 
 
+
+_TELEGRAM_MENU_EXCLUDE = {
+    # Keep Telegram's advertised command set within Slack native-slash parity.
+    # These remain reachable when typed manually or via /hermes on Slack.
+    "insights",
+    "reload_skills",
+}
+
 def telegram_bot_commands() -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
@@ -512,13 +531,13 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         # usage text when invoked without arguments, and hiding them from
         # the menu hurts discoverability (issue #24312).
         tg_name = _sanitize_telegram_name(cmd.name)
-        if tg_name:
+        if tg_name and tg_name not in _TELEGRAM_MENU_EXCLUDE:
             result.append((tg_name, cmd.description))
     for name, description, args_hint in _iter_plugin_command_entries():
         if _requires_argument(args_hint):
             continue
         tg_name = _sanitize_telegram_name(name)
-        if tg_name:
+        if tg_name and tg_name not in _TELEGRAM_MENU_EXCLUDE:
             result.append((tg_name, description))
     return result
 
@@ -1030,6 +1049,19 @@ _SLACK_RESERVED_COMMANDS = frozenset({
     "topic", "mute", "pro", "shortcuts",
 })
 
+# High-value aliases that must survive Slack's 50-slash cap even when the
+# registry fills up. Without this, adding a new canonical command silently
+# clamps off low-priority aliases (they're added in the second pass), so a
+# long-standing native slash like /btw could disappear just because an
+# unrelated command landed. These claim their slots right after /hermes,
+# ahead of both canonical names and the rest of the aliases. Anything not
+# listed here still degrades gracefully (reachable via /hermes <command>).
+# Keep this list TIGHT: every pinned alias takes a slot a canonical command
+# would otherwise get, and the Telegram-parity test fails when a canonical
+# gets clamped ("reset" was unpinned for exactly that — /new keeps its
+# native slot, the alias spelling stays reachable via /hermes reset).
+_SLACK_PRIORITY_ALIASES = ("btw", "bg")
+
 
 def _sanitize_slack_name(raw: str) -> str:
     """Convert a command name to a valid Slack slash command name.
@@ -1084,27 +1116,45 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
+    # Priority pass: pin high-value Slack aliases ahead of the 50-command clamp.
+    # Use the upstream curated list so /reset is not reintroduced as a pinned
+    # Slack slash, while keeping AIWerk Telegram-visible canonical commands.
+    _alias_to_cmd = {
+        alias: cmd
+        for cmd in COMMAND_REGISTRY
+        if _is_gateway_available(cmd, overrides)
+        for alias in cmd.aliases
+    }
+    for alias in _SLACK_PRIORITY_ALIASES:
+        cmd = _alias_to_cmd.get(alias)
+        if cmd is not None:
+            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
     # Reserve Telegram-visible canonical commands before the 50-command clamp so
     # cross-platform operational parity survives registry growth.
     priority_names = {
         _sanitize_telegram_name(name)
         for name, _description in telegram_bot_commands()
     } | {_sanitize_telegram_name(name) for name in _TELEGRAM_MENU_PRIORITY}
+
+    # First add the curated Telegram menu priority order. This keeps critical
+    # operational commands such as /debug and /version from being clamped after
+    # the registry grows near Slack's 50-command limit.
+    _cmd_by_sanitized_name = {
+        _sanitize_telegram_name(cmd.name): cmd
+        for cmd in COMMAND_REGISTRY
+        if _is_gateway_available(cmd, overrides)
+    }
+    for name in _TELEGRAM_MENU_PRIORITY:
+        cmd = _cmd_by_sanitized_name.get(_sanitize_telegram_name(name))
+        if cmd is not None:
+            _add(cmd.name, cmd.description, cmd.args_hint or "")
+
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         if _sanitize_telegram_name(cmd.name) in priority_names:
             _add(cmd.name, cmd.description, cmd.args_hint or "")
-
-    # Reserve common short aliases before the 50-command clamp so documented
-    # gateway muscle-memory commands stay first-class Slack slashes.
-    priority_aliases = {"btw", "bg", "reset", "q"}
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
-        for alias in cmd.aliases:
-            if alias in priority_aliases:
-                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
@@ -1572,11 +1622,139 @@ class SlashCommandCompleter(Completer):
             pass
 
     @staticmethod
+    def _tools_completions(sub_text: str, sub_lower: str):
+        """Yield completions for /tools — subcommand + toolset/MCP-server name.
+
+        Handles both ``/tools <tab>`` (suggesting ``list|disable|enable``) and
+        ``/tools enable <tab>`` / ``/tools disable <tab>`` (suggesting toolset
+        keys and MCP server prefixes, filtered by current enable state so the
+        user only sees actionable options).
+        """
+        SUBS = ("list", "disable", "enable")
+        parts = sub_text.split()
+        trailing_space = sub_text.endswith(" ")
+
+        # Subcommand stage: zero words typed, or completing the first word.
+        if len(parts) == 0 or (len(parts) == 1 and not trailing_space):
+            partial = sub_text if not trailing_space else ""
+            for sub in SUBS:
+                if sub.startswith(partial.lower()) and sub != partial.lower():
+                    yield Completion(sub, start_position=-len(partial), display=sub)
+            return
+
+        subcommand = parts[0].lower()
+        if subcommand not in ("enable", "disable"):
+            return
+
+        partial = "" if trailing_space else parts[-1]
+        partial_lower = partial.lower()
+        already = set(parts[1:] if trailing_space else parts[1:-1])
+
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import (
+                CONFIGURABLE_TOOLSETS,
+                _get_platform_tools,
+                _get_plugin_toolset_keys,
+            )
+
+            config = load_config()
+            enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+            for ts_key, label, _desc in CONFIGURABLE_TOOLSETS:
+                if ts_key in already or not ts_key.startswith(partial_lower):
+                    continue
+                is_on = ts_key in enabled
+                if subcommand == "enable" and is_on:
+                    continue
+                if subcommand == "disable" and not is_on:
+                    continue
+                yield Completion(
+                    ts_key,
+                    start_position=-len(partial),
+                    display=ts_key,
+                    display_meta=label,
+                )
+
+            for ts_key in sorted(_get_plugin_toolset_keys()):
+                if ts_key in already or not ts_key.startswith(partial_lower):
+                    continue
+                is_on = ts_key in enabled
+                if subcommand == "enable" and is_on:
+                    continue
+                if subcommand == "disable" and not is_on:
+                    continue
+                yield Completion(
+                    ts_key,
+                    start_position=-len(partial),
+                    display=ts_key,
+                    display_meta="plugin toolset",
+                )
+
+            mcp_servers = config.get("mcp_servers") or {}
+            if isinstance(mcp_servers, dict):
+                for server in sorted(mcp_servers):
+                    prefix = f"{server}:"
+                    if prefix in already or not prefix.startswith(partial_lower):
+                        continue
+                    yield Completion(
+                        prefix,
+                        start_position=-len(partial),
+                        display=prefix,
+                        display_meta=f"MCP server '{server}'",
+                    )
+        except Exception:
+            return
+
+    @staticmethod
+    def _handoff_completions(sub_text: str, sub_lower: str):
+        """Yield platform completions for /handoff.
+
+        Offers connected (enabled + configured) gateway platforms. A recorded
+        home channel is NOT required to list a platform — it's often learned at
+        runtime — so the meta hints whether one is set yet. Completes only the
+        first arg (the platform); once one is chosen, stop.
+        """
+        parts = sub_text.split()
+        trailing_space = sub_text.endswith(" ")
+        if len(parts) > 1 or (len(parts) == 1 and trailing_space):
+            return
+        partial = "" if (not parts or trailing_space) else parts[-1]
+        partial_lower = partial.lower()
+        try:
+            from gateway.config import load_gateway_config
+
+            gw = load_gateway_config()
+            platforms = gw.get_connected_platforms()
+        except Exception:
+            return
+        for platform in platforms:
+            name = platform.value
+            if not name.startswith(partial_lower):
+                continue
+            try:
+                home = gw.get_home_channel(platform)
+            except Exception:
+                home = None
+            meta = f"→ {home.name}" if home and getattr(home, "name", None) else "send this session here"
+            yield Completion(
+                name,
+                start_position=-len(partial),
+                display=name,
+                display_meta=meta,
+            )
+
+    @staticmethod
     def _personality_completions(sub_text: str, sub_lower: str):
         """Yield completions for /personality from configured personalities."""
         try:
-            from hermes_cli.config import load_config
-            personalities = load_config().get("agent", {}).get("personalities", {})
+            # Resolve from the same source the runtime applies personalities —
+            # agent.personalities via the CLI config (which ships the built-ins).
+            # load_config()'s schema has no agent.personalities, so the completer
+            # used to come back empty even with personalities available.
+            from cli import load_cli_config
+
+            personalities = (load_cli_config().get("agent") or {}).get("personalities", {}) or {}
             if "none".startswith(sub_lower) and "none" != sub_lower:
                 yield Completion(
                     "none",
@@ -1628,6 +1806,17 @@ class SlashCommandCompleter(Completer):
                 if base_cmd == "/personality":
                     yield from self._personality_completions(sub_text, sub_lower)
                     return
+
+            # /tools needs multi-word completion (subcommand + toolset name)
+            # so it handles both stages itself, bypassing the single-word
+            # SUBCOMMANDS branch below.
+            if base_cmd == "/tools":
+                yield from self._tools_completions(sub_text, sub_lower)
+                return
+
+            if base_cmd == "/handoff":
+                yield from self._handoff_completions(sub_text, sub_lower)
+                return
 
             # Static subcommand completions
             if " " not in sub_text and base_cmd in SUBCOMMANDS and self._command_allowed(base_cmd):
