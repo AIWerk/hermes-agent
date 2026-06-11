@@ -7668,24 +7668,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     audio_paths,
                 )
-                # Echo each successful transcript back to the user immediately,
-                # before the agent loop runs. Lets the user verify STT quality
-                # in real-time and see the raw whisper output verbatim.
-                if _successful_transcripts:
-                    _echo_adapter = self.adapters.get(source.platform)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                # Keep STT output internal to the agent turn. Echoing the raw
+                # transcript back into the chat exposes private dictation and
+                # duplicates what the user just said; platforms such as Telegram
+                # may also show their own voice transcription UI.
                 _stt_fail_markers = (
                     "No STT provider",
                     "STT is disabled",

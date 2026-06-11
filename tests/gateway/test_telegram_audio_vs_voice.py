@@ -79,6 +79,37 @@ async def test_voice_message_still_transcribed():
     assert "voice message" in result.lower()
 
 
+@pytest.mark.asyncio
+async def test_voice_transcript_is_not_echoed_back_to_chat():
+    """STT should enrich the agent turn without sending the raw transcript to Telegram."""
+
+    class FakeAdapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, content, **kwargs):
+            self.sent.append((chat_id, content, kwargs))
+
+    runner = _make_runner(stt_enabled=True)
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+    event = _voice_event("/tmp/voice.ogg")
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "private dictation", "provider": "whisper"},
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert "private dictation" in result
+    assert adapter.sent == []
+
+
 # ---------------------------------------------------------------------------
 # 2. AUDIO file attachment bypasses STT
 # ---------------------------------------------------------------------------
