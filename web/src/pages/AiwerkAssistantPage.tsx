@@ -1,4 +1,4 @@
-import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
+import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, LogOut, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
 import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
@@ -59,6 +59,13 @@ interface RecentSession {
   id: string;
   title?: string | null;
   preview?: string | null;
+}
+
+interface DashboardAuthSession {
+  user_id?: string;
+  display_name?: string;
+  tenant_id?: string;
+  role?: string;
 }
 
 function recentSessionDisplayTitle(session: RecentSession): string {
@@ -891,6 +898,8 @@ export default function AiwerkAssistantPage() {
   const [isResizingRightRail, setIsResizingRightRail] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [authSession, setAuthSession] = useState<DashboardAuthSession | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [sessionTitleBubble, setSessionTitleBubble] = useState<SessionTitleBubble | null>(null);
   const [activeTurnMode, setActiveTurnMode] = useState<ConversationMode>("main");
   const [documentTabs, setDocumentTabs] = useState<DocumentTab[]>([]);
@@ -903,6 +912,34 @@ export default function AiwerkAssistantPage() {
   const showToast = useCallback((text: string) => {
     setToast(text);
     window.setTimeout(() => setToast(null), 1800);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${HERMES_BASE_PATH}/api/auth/me`, { credentials: "include" })
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((data: DashboardAuthSession | null) => {
+        if (!cancelled) setAuthSession(data);
+      })
+      .catch(() => {
+        if (!cancelled) setAuthSession(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
+    try {
+      await fetch(`${HERMES_BASE_PATH}/auth/logout`, {
+        method: "POST",
+        credentials: "include",
+        redirect: "manual",
+      });
+    } finally {
+      window.location.assign(`${HERMES_BASE_PATH}/login`);
+    }
   }, []);
 
   const activeDocumentTab = useMemo(
@@ -2505,29 +2542,49 @@ export default function AiwerkAssistantPage() {
                 ))}
               </div>
             </div>
-            <div className="flex gap-[10px]">
-              <button
-                type="button"
-                onClick={() => void sendSlash("/compress", "Kontext komprimieren")}
-                disabled={!canCompress}
-                title={compressHelp}
-                aria-label={compressHelp}
-                className={
-                  "rounded-[12px] border px-[14px] py-[10px] font-semibold transition " +
-                  (canCompress
-                    ? "cursor-pointer border-[#d9d0c1] bg-[#fffaf2] text-[#3a362d] hover:bg-[#f2eadf]"
-                    : "cursor-not-allowed border-[#e4dacd] bg-[#f4eee5] text-[#9f9383] opacity-60")
-                }
-              >
-                {isCompressing ? "Komprimiert…" : "Komprimieren"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void sendSlash("/new", "Neue Unterhaltung gestartet")}
-                className="cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[10px] font-semibold text-white hover:bg-[#7a6342]"
-              >
-                Neue Unterhaltung
-              </button>
+            <div className="flex min-w-[260px] flex-col items-end gap-[12px]">
+              {authSession && (
+                <div className="flex items-center gap-[10px] rounded-[12px] border border-[#d9d0c1] bg-[#fffaf2] px-[12px] py-[8px] text-[13px] text-[#5f5547] shadow-[0_10px_28px_rgba(56,42,20,.05)]">
+                  <span className="max-w-[170px] truncate" title={authSession.display_name || authSession.user_id || "Angemeldet"}>
+                    {authSession.display_name || authSession.user_id || "Angemeldet"}
+                  </span>
+                  <span className="h-[18px] w-px bg-[#d8cdbd]" aria-hidden="true" />
+                  <button
+                    type="button"
+                    onClick={() => void handleLogout()}
+                    disabled={loggingOut}
+                    className="inline-flex cursor-pointer items-center gap-[6px] rounded-[8px] px-[7px] py-[4px] font-semibold text-[#6a5942] transition hover:bg-[#efe2d3] disabled:cursor-wait disabled:opacity-60"
+                    title="Abmelden"
+                  >
+                    <LogOut className="h-[13px] w-[13px]" />
+                    {loggingOut ? "Abmelden…" : "Abmelden"}
+                  </button>
+                </div>
+              )}
+              <div className="flex flex-wrap justify-end gap-[10px]">
+                <button
+                  type="button"
+                  onClick={() => void sendSlash("/compress", "Kontext komprimieren")}
+                  disabled={!canCompress}
+                  title={compressHelp}
+                  aria-label={compressHelp}
+                  className={
+                    "rounded-[12px] border px-[14px] py-[10px] font-semibold transition " +
+                    (canCompress
+                      ? "cursor-pointer border-[#d9d0c1] bg-[#fffaf2] text-[#3a362d] hover:bg-[#f2eadf]"
+                      : "cursor-not-allowed border-[#e4dacd] bg-[#f4eee5] text-[#9f9383] opacity-60")
+                  }
+                >
+                  {isCompressing ? "Komprimiert…" : "Komprimieren"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void sendSlash("/new", "Neue Unterhaltung gestartet")}
+                  className="cursor-pointer rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[14px] py-[10px] font-semibold text-white hover:bg-[#7a6342]"
+                >
+                  Neue Unterhaltung
+                </button>
+              </div>
             </div>
           </header>
 
