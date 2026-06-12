@@ -4,15 +4,11 @@ No React, no JavaScript dependency. Listed providers come from the
 registry; clicking a provider sends a GET to
 ``/auth/login?provider=<name>``.
 
-Visual styling mirrors the Nous Research design system (the
-``@nous-research/ui`` package the React dashboard uses): the same
-``Collapse`` / ``Rules Compressed`` typeface, amber-on-dark colour
-tokens (``#170d02`` / ``#ffac02`` / ``#fff``), uppercase + wide-tracking
-brand chrome, and the inset-bevel button shadow. Fonts are served
-out of the SPA's ``/fonts/`` directory which the dashboard-auth gate
-already allowlists pre-auth (see ``_GATE_PUBLIC_PREFIXES`` in
-``middleware.py``), so the page renders without needing the React
-bundle loaded.
+Visual styling mirrors the AIWerk Customer UI assistant surface:
+soft warm neutrals, muted borders, modest radius, and professional
+login copy. The page stays server-rendered and independent from the
+React bundle so the auth gate remains fail-closed before any SPA code
+or session token exists.
 
 Test-stable class names: the existing test suite extracts the
 ``class="provider-btn"`` anchor href to walk the OAuth flow. That
@@ -38,9 +34,9 @@ _LOGIN_HTML_TEMPLATE = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in — Hermes Agent</title>
+<title>Anmelden — AIWerk</title>
 <style>
-  /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
+  /* Server-rendered fallback: keep dependency-free, use system fonts. */
   @font-face {{
     font-family: 'Collapse';
     font-style: normal;
@@ -71,12 +67,14 @@ _LOGIN_HTML_TEMPLATE = """\
   }}
 
   :root {{
-    --background-base: #170d02;
-    --background: #170d02;
-    --midground: #ffac02;
-    --foreground: #ffffff;
-    --hairline: color-mix(in srgb, #ffac02 18%, transparent);
-    --hairline-strong: color-mix(in srgb, #ffac02 35%, transparent);
+    --background-base: #f4f1ec;
+    --background: #fffaf2;
+    --midground: #8a6842;
+    --foreground: #292720;
+    --muted: #756a5b;
+    --soft: #f8f0e3;
+    --hairline: #dccfbd;
+    --hairline-strong: #cdbda8;
   }}
 
   *, *::before, *::after {{ box-sizing: border-box; }}
@@ -87,26 +85,17 @@ _LOGIN_HTML_TEMPLATE = """\
     min-height: 100%;
     background: var(--background-base);
     color: var(--foreground);
-    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }}
 
-  /* Subtle dot-grid backdrop — DS idiom (see `.dither` in globals.css). */
   body {{
     background-image:
-      radial-gradient(
-        ellipse at top,
-        color-mix(in srgb, var(--midground) 6%, transparent) 0%,
-        transparent 55%
-      ),
-      repeating-conic-gradient(
-        color-mix(in srgb, var(--midground) 4%, transparent) 0% 25%,
-        transparent 0% 50%
-      );
-    background-size: auto, 3px 3px;
+      radial-gradient(ellipse at top left, rgba(215, 185, 142, .22) 0%, transparent 42%),
+      linear-gradient(180deg, #f7f3ed 0%, #ede6db 100%);
     background-attachment: fixed;
   }}
 
@@ -119,7 +108,7 @@ _LOGIN_HTML_TEMPLATE = """\
 
   main {{
     width: 100%;
-    max-width: 26rem;
+    max-width: 27rem;
     position: relative;
     animation: slide-up 0.6s ease-out both;
   }}
@@ -138,49 +127,42 @@ _LOGIN_HTML_TEMPLATE = """\
   .brand {{
     text-align: center;
     margin-bottom: 1.75rem;
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600;
-    font-size: 1.05rem;
-    letter-spacing: 0.32em;
+    font-weight: 800;
+    font-size: 1rem;
+    letter-spacing: 0.18em;
     text-transform: uppercase;
-    color: var(--midground);
+    color: var(--foreground);
   }}
   .brand .dot {{
     display: inline-block;
     width: 6px;
     height: 6px;
-    background: var(--midground);
+    background: #d7b98e;
     margin: 0 0.55em 0.18em;
     vertical-align: middle;
-    border-radius: 1px;
+    border-radius: 999px;
   }}
 
   .card {{
     position: relative;
-    padding: 2.25rem 2rem 2rem;
-    background: color-mix(in srgb, #ffffff 2%, var(--background-base));
+    padding: 2.2rem 2rem 2rem;
+    background: rgba(255, 250, 242, .96);
     border: 1px solid var(--hairline);
-    /* Hairline highlight + bevel shadow — matches DS Button SHADOW_DEFAULT
-       (`inset -1px -1px 0 #00000080, inset 1px 1px 0 #ffffff80`) at panel scale. */
-    box-shadow:
-      inset 1px 1px 0 0 color-mix(in srgb, #ffffff 5%, transparent),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.4),
-      0 24px 60px -20px rgba(0, 0, 0, 0.6);
+    border-radius: 26px;
+    box-shadow: 0 28px 90px rgba(48, 38, 22, .18);
   }}
 
   h1 {{
     margin: 0 0 0.4rem;
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600;
-    font-size: 1.85rem;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+    font-weight: 800;
+    font-size: 1.8rem;
+    letter-spacing: -0.03em;
     color: var(--foreground);
   }}
 
   .subtitle {{
     margin: 0 0 1.75rem;
-    color: color-mix(in srgb, var(--foreground) 65%, transparent);
+    color: var(--muted);
     font-size: 0.95rem;
   }}
 
@@ -189,36 +171,31 @@ _LOGIN_HTML_TEMPLATE = """\
     gap: 0.75rem;
   }}
 
-  /* Provider button — mirrors DS Button (default variant):
-     amber surface, dark text, uppercase + wide tracking, inset bevel. */
+  /* Provider button — mirrors AIWerk CUI rounded warm controls. */
   .provider-btn {{
     display: block;
     width: 100%;
     box-sizing: border-box;
     padding: 0.95rem 1rem;
     text-align: center;
-    background: var(--midground);
-    color: var(--background-base);
-    font-family: 'Collapse', sans-serif;
-    font-weight: 700;
-    font-size: 0.78rem;
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
+    background: #292720;
+    color: #fffaf2;
+    font-family: inherit;
+    font-weight: 800;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
     text-decoration: none;
     border: 0;
-    border-radius: 0;  /* DS Button is squared — no rounded corners. */
+    border-radius: 14px;
     cursor: pointer;
-    box-shadow:
-      inset 1px 1px 0 0 rgba(255, 255, 255, 0.5),
-      inset -1px -1px 0 0 rgba(0, 0, 0, 0.5);
+    box-shadow: 0 14px 34px rgba(41, 39, 32, .18);
     transition: filter 0.12s ease-out;
   }}
   .provider-btn:hover {{
     filter: brightness(1.08);
   }}
   .provider-btn:active {{
-    /* DS Button uses `active:invert` on the default surface. */
-    filter: invert(1);
+    transform: translateY(1px);
   }}
   .provider-btn:focus-visible {{
     outline: 2px solid var(--midground);
@@ -254,11 +231,11 @@ _LOGIN_HTML_TEMPLATE = """\
     width: 100%;
     box-sizing: border-box;
     padding: 0.7rem 0.8rem;
-    background: color-mix(in srgb, #000000 25%, var(--background-base));
+    background: #fffaf2;
     color: var(--foreground);
     border: 1px solid var(--hairline-strong);
-    border-radius: 0;
-    font-family: 'Collapse', sans-serif;
+    border-radius: 12px;
+    font-family: inherit;
     font-size: 0.95rem;
   }}
   .field-input:focus-visible {{
@@ -267,7 +244,7 @@ _LOGIN_HTML_TEMPLATE = """\
     box-shadow: 0 0 0 1px var(--midground);
   }}
   .form-error {{
-    color: #ff6b6b;
+    color: #9b4f43;
     font-size: 0.82rem;
     letter-spacing: 0.02em;
   }}
@@ -278,7 +255,7 @@ _LOGIN_HTML_TEMPLATE = """\
   footer {{
     margin-top: 1.75rem;
     text-align: center;
-    color: color-mix(in srgb, var(--foreground) 45%, transparent);
+    color: #8b7d6c;
     font-size: 0.75rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
@@ -293,25 +270,25 @@ _LOGIN_HTML_TEMPLATE = """\
     margin: 0 0.6em 0.2em;
   }}
 
-  /* Selection — DS uses midground bg + background text. */
+  /* Selection */
   ::selection {{
-    background: var(--midground);
+    background: #d7b98e;
     color: var(--background-base);
   }}
 </style>
 </head>
 <body>
 <main>
-  <div class="brand">Nous<span class="dot"></span>Research</div>
+  <div class="brand">AIWerk<span class="dot"></span>Assistant</div>
   <div class="card">
-    <h1>Sign in</h1>
-    <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
+    <h1>Anmelden</h1>
+    <p class="subtitle">Melde dich an, um mit deinem AIWerk Assistenten weiterzuarbeiten.</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
   </div>
   <footer>
-    <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
+    <span class="sep"></span>Geschützter Kundenbereich<span class="sep"></span>
   </footer>
 </main>
 {password_script}
@@ -325,7 +302,7 @@ _EMPTY_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign-in unavailable — Hermes Agent</title>
+<title>Anmeldung nicht verfügbar — AIWerk</title>
 <style>
   @font-face {
     font-family: 'Collapse';
@@ -352,7 +329,7 @@ _EMPTY_HTML = """\
     margin: 0; padding: 0; min-height: 100%;
     background: var(--background-base);
     color: var(--foreground);
-    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px; line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
@@ -379,7 +356,7 @@ _EMPTY_HTML = """\
   }
   p { margin: 0 0 1rem; }
   code {
-    background: var(--midground);
+    background: #d7b98e;
     color: var(--background-base);
     padding: 0.1em 0.35em;
     font-family: 'Courier New', monospace;
@@ -389,12 +366,9 @@ _EMPTY_HTML = """\
 </head>
 <body>
 <main>
-<h1>Sign-in unavailable</h1>
-<p>This dashboard is bound to a non-loopback host but no authentication
-providers are installed.</p>
-<p>Install <code>plugins/dashboard-auth-nous</code> (default) or another
-auth provider, or restart with <code>--insecure</code> to bypass the
-auth gate (not recommended on untrusted networks).</p>
+<h1>Anmeldung nicht verfügbar</h1>
+<p>Dieser AIWerk Kundenbereich ist geschützt, aber es ist kein Authentifizierungsanbieter konfiguriert.</p>
+<p>Bitte AIWerk Support kontaktieren. Der Zugriff bleibt bis zur Korrektur geschlossen.</p>
 </main>
 </body>
 </html>
@@ -437,13 +411,13 @@ _PASSWORD_FORM_SCRIPT = """\
           });
         }
         var msg = resp.status === 429
-          ? 'Too many attempts. Please wait and try again.'
-          : (resp.status === 401 ? 'Invalid username or password.'
-                                 : 'Sign-in failed. Please try again.');
+          ? 'Zu viele Versuche. Bitte kurz warten.'
+          : (resp.status === 401 ? 'Benutzername oder Passwort stimmt nicht.'
+                                 : 'Anmeldung fehlgeschlagen. Bitte erneut versuchen.');
         if (err) { err.textContent = msg; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       }).catch(function () {
-        if (err) { err.textContent = 'Network error. Please try again.'; err.hidden = false; }
+        if (err) { err.textContent = 'Netzwerkfehler. Bitte erneut versuchen.'; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       });
     });
@@ -489,7 +463,7 @@ def render_login_html(*, next_path: str = "") -> str:
             buttons.append(
                 f'      <a class="provider-btn" '
                 f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
-                f'Sign in with {html.escape(p.display_name)}</a>'
+                f'Mit {html.escape(p.display_name)} anmelden</a>'
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
     return _LOGIN_HTML_TEMPLATE.format(
@@ -515,20 +489,20 @@ def _render_password_form(provider, next_path: str) -> str:
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
         f'autocomplete="on">\n'
-        f'        <div class="form-title">Sign in with {plabel}</div>\n'
+        f'        <div class="form-title">Anmelden mit {plabel}</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Username</span>\n'
+        f'          <span class="field-label">Benutzer</span>\n'
         f'          <input class="field-input" type="text" name="username" '
         f'autocomplete="username" autocapitalize="none" '
         f'autocorrect="off" spellcheck="false" required>\n'
         f'        </label>\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Password</span>\n'
+        f'          <span class="field-label">Passwort</span>\n'
         f'          <input class="field-input" type="password" name="password" '
         f'autocomplete="current-password" required>\n'
         f'        </label>\n'
         f'        <div class="form-error" role="alert" hidden></div>\n'
-        f'        <button class="provider-btn" type="submit">Sign in</button>\n'
+        f'        <button class="provider-btn" type="submit">Anmelden</button>\n'
         f'      </form>'
     )
