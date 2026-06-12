@@ -575,6 +575,9 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    tenant_id = getattr(sess, "tenant_id", "") or sess.org_id
+    actor_id = getattr(sess, "actor_id", "") or sess.user_id
+    role = getattr(sess, "role", "") or "user"
     return {
         "user_id": sess.user_id,
         "email": sess.email,
@@ -582,6 +585,16 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "tenant_id": tenant_id,
+        "actor_id": actor_id,
+        "role": role,
+        "actor_context": {
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "role": role,
+            "display_name": sess.display_name,
+            "provider": sess.provider,
+        },
     }
 
 
@@ -611,7 +624,16 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    ticket = mint_ticket(
+        user_id=sess.user_id,
+        provider=sess.provider,
+        tenant_id=getattr(sess, "tenant_id", "") or sess.org_id,
+        actor_id=getattr(sess, "actor_id", "") or sess.user_id,
+        role=getattr(sess, "role", "") or "user",
+        display_name=sess.display_name,
+        email=sess.email,
+        org_id=sess.org_id,
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

@@ -248,6 +248,8 @@ from hermes_cli.dashboard_auth.public_paths import (
 
 _ASSISTANT_ALLOWED_API_EXACT: frozenset = frozenset({
     "/api/status",
+    "/api/auth/me",
+    "/api/auth/ws-ticket",
     "/api/sessions",
     "/api/model/info",
     "/api/dashboard/themes",
@@ -5146,18 +5148,23 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 
 
 def should_require_auth(host: str, allow_public: bool) -> bool:
-    """Return True iff the dashboard OAuth auth gate must be active.
+    """Return True iff the dashboard auth gate must be active.
 
-    Truth table:
-      host == loopback                              → False (no auth)
-      host != loopback AND allow_public (--insecure)→ False (legacy escape hatch)
-      host != loopback AND NOT allow_public         → True  (gate engages)
-
-    "Loopback" matches the same set used by ``--insecure`` enforcement in
-    ``start_server``: 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local
-    are deliberately treated as PUBLIC — a hostile device on the same LAN is
-    exactly the threat model the gate is designed for.
+    Public binds engage the gate by default. Reverse-proxy deployments often
+    bind the dashboard to loopback and expose it through Caddy/nginx; those
+    can force the same gate with dashboard.force_auth or env flags.
     """
+    def _truthy(value: object) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    if _truthy(os.environ.get("HERMES_DASHBOARD_FORCE_AUTH")) or _truthy(os.environ.get("AIWERK_CUI_FORCE_AUTH")):
+        return True
+    try:
+        cfg = load_config()
+        if _truthy(cfg_get(cfg, "dashboard", "force_auth", default=False)):
+            return True
+    except Exception:
+        pass
     return (host not in _LOOPBACK_HOST_VALUES) and (not allow_public)
 
 
@@ -15312,7 +15319,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
+                info = consume_internal_credential(internal)
+                try:
+                    ws.state.auth_info = info
+                except Exception:
+                    pass
                 return None, "internal"
             except TicketInvalid as exc:
                 audit_log(
@@ -15328,7 +15339,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            try:
+                ws.state.auth_info = info
+            except Exception:
+                pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -15362,6 +15377,7 @@ def _resolve_chat_argv(
     resume: Optional[str] = None,
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
+    actor_context: Optional[dict[str, Any]] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -15415,6 +15431,20 @@ def _resolve_chat_argv(
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
     env.setdefault("HERMES_TUI_INLINE", "1")
+    if actor_context:
+        import json as _json
+        clean_actor_context = {
+            str(k): str(v)
+            for k, v in actor_context.items()
+            if k in {"tenant_id", "actor_id", "role", "display_name", "user_id", "provider"} and v is not None
+        }
+        env["AIWERK_CUI_ACTOR_CONTEXT"] = _json.dumps(clean_actor_context, separators=(",", ":"))
+        if clean_actor_context.get("tenant_id"):
+            env["AIWERK_CUI_TENANT_ID"] = clean_actor_context["tenant_id"]
+        if clean_actor_context.get("actor_id"):
+            env["AIWERK_CUI_ACTOR_ID"] = clean_actor_context["actor_id"]
+        if clean_actor_context.get("role"):
+            env["AIWERK_CUI_ACTOR_ROLE"] = clean_actor_context["role"]
 
     if profile_dir is not None:
         env["HERMES_HOME"] = str(profile_dir)
@@ -15613,8 +15643,9 @@ async def pty_ws(ws: WebSocket) -> None:
     sidecar_url = _build_sidecar_url(channel) if channel else None
 
     try:
+        auth_info = getattr(ws.state, "auth_info", {}) or {}
         argv, cwd, env = _resolve_chat_argv(
-            resume=resume, sidecar_url=sidecar_url, profile=profile
+            resume=resume, sidecar_url=sidecar_url, profile=profile, actor_context=auth_info
         )
     except HTTPException as exc:
         # Unknown/invalid profile from _resolve_profile_dir.

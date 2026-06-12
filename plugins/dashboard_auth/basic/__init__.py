@@ -208,19 +208,35 @@ class BasicAuthProvider(DashboardAuthProvider):
     def __init__(
         self,
         *,
-        username: str,
-        password_hash: str,
+        username: str = "",
+        password_hash: str = "",
         secret: bytes,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+        users: Optional[dict[str, dict[str, str]]] = None,
     ) -> None:
-        if not username:
-            raise ValueError("username must be non-empty")
-        if not password_hash:
-            raise ValueError("password_hash must be non-empty")
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
-        self._username = username
-        self._password_hash = password_hash
+        self._users = users or {}
+        if self._users:
+            for uname, rec in self._users.items():
+                if not uname or not rec.get("password_hash"):
+                    raise ValueError("each user must have username and password_hash")
+        else:
+            if not username:
+                raise ValueError("username must be non-empty")
+            if not password_hash:
+                raise ValueError("password_hash must be non-empty")
+            self._users = {
+                username: {
+                    "password_hash": password_hash,
+                    "display_name": username,
+                    "actor_id": username,
+                    "role": "admin",
+                    "tenant_id": "",
+                }
+            }
+        self._username = username or next(iter(self._users))
+        self._password_hash = password_hash or self._users[self._username].get("password_hash", "")
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
 
@@ -249,14 +265,13 @@ class BasicAuthProvider(DashboardAuthProvider):
         # username and a wrong password take comparable time. Compare the
         # username with compare_digest too, to avoid a length/byte timing
         # leak on the username itself.
-        username_ok = hmac.compare_digest(
-            username.encode("utf-8"), self._username.encode("utf-8")
-        )
-        target_hash = self._password_hash if username_ok else _DUMMY_HASH
+        record = self._users.get(username)
+        username_ok = record is not None
+        target_hash = (record or {}).get("password_hash", _DUMMY_HASH)
         password_ok = _verify_password(password, target_hash)
         if not (username_ok and password_ok):
             raise InvalidCredentialsError("invalid username or password")
-        return self._mint_session(self._username)
+        return self._mint_session(username, record or {})
 
     # ---- session lifecycle -------------------------------------------------
 
@@ -280,7 +295,8 @@ class BasicAuthProvider(DashboardAuthProvider):
             or payload.get("exp", 0) <= int(time.time())
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
-        return self._mint_session(str(payload.get("sub", self._username)))
+        sub = str(payload.get("sub", self._username))
+        return self._mint_session(sub, self._users.get(sub, {}))
 
     def revoke_session(self, *, refresh_token: str) -> None:
         # Stateless tokens — nothing to revoke server-side. The session
@@ -290,40 +306,65 @@ class BasicAuthProvider(DashboardAuthProvider):
 
     # ---- internals ---------------------------------------------------------
 
-    def _mint_session(self, user_id: str) -> Session:
+    def _mint_session(self, user_id: str, record: Optional[dict[str, str]] = None) -> Session:
+        record = record or {}
         now = int(time.time())
         exp = now + self._ttl
+        tenant_id = str(record.get("tenant_id", "") or "")
+        actor_id = str(record.get("actor_id", "") or user_id)
+        role = str(record.get("role", "user") or "user")
+        display_name = str(record.get("display_name", "") or user_id)
+        email = str(record.get("email", "") or "")
+        payload_base = {
+            "sub": user_id,
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "role": role,
+            "display_name": display_name,
+            "email": email,
+        }
         access_token = _sign(
-            {"sub": user_id, "kind": "access", "exp": exp}, self._secret
+            {**payload_base, "kind": "access", "exp": exp}, self._secret
         )
         refresh_token = _sign(
-            {"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
+            {**payload_base, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
             self._secret,
         )
         return Session(
             user_id=user_id,
-            email="",
-            display_name=user_id,
-            org_id="",
+            email=email,
+            display_name=display_name,
+            org_id=tenant_id,
             provider=self.name,
             expires_at=exp,
             access_token=access_token,
             refresh_token=refresh_token,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            role=role,
         )
 
     def _session_from_payload(
         self, access_token: str, refresh_token: str, payload: dict
     ) -> Session:
         user_id = str(payload.get("sub", ""))
+        tenant_id = str(payload.get("tenant_id", "") or "")
+        actor_id = str(payload.get("actor_id", "") or user_id)
+        role = str(payload.get("role", "user") or "user")
+        display_name = str(payload.get("display_name", "") or user_id)
+        email = str(payload.get("email", "") or "")
         return Session(
             user_id=user_id,
-            email="",
-            display_name=user_id,
-            org_id="",
+            email=email,
+            display_name=display_name,
+            org_id=tenant_id,
             provider=self.name,
             expires_at=int(payload["exp"]),
             access_token=access_token,
             refresh_token=refresh_token,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            role=role,
         )
 
 
@@ -360,6 +401,31 @@ def _resolve(env_name: str, cfg_section: dict, cfg_key: str) -> str:
         return env
     return str(cfg_section.get(cfg_key, "") or "").strip()
 
+
+def _load_users_from_config(section: dict) -> dict[str, dict[str, str]]:
+    """Return optional multi-actor password users from dashboard.basic_auth.users."""
+    raw = section.get("users") or []
+    if isinstance(raw, dict):
+        raw = [{"username": k, **(v if isinstance(v, dict) else {})} for k, v in raw.items()]
+    users: dict[str, dict[str, str]] = {}
+    if not isinstance(raw, list):
+        return users
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username", "") or "").strip()
+        password_hash = str(item.get("password_hash", "") or "").strip()
+        if not username or not password_hash:
+            continue
+        users[username] = {
+            "password_hash": password_hash,
+            "tenant_id": str(item.get("tenant_id", "") or "").strip(),
+            "actor_id": str(item.get("actor_id", "") or username).strip(),
+            "role": str(item.get("role", "user") or "user").strip().lower(),
+            "display_name": str(item.get("display_name", "") or username).strip(),
+            "email": str(item.get("email", "") or "").strip(),
+        }
+    return users
 
 def _resolve_secret(cfg_section: dict) -> bytes:
     """Resolve the token-signing secret.
@@ -417,18 +483,18 @@ def register(ctx) -> None:
         "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS", section, "session_ttl_seconds"
     )
 
-    if not username:
+    users = _load_users_from_config(section)
+
+    if not users and not username:
         LAST_SKIP_REASON = (
-            "dashboard.basic_auth.username is not set (and "
-            "HERMES_DASHBOARD_BASIC_AUTH_USERNAME is empty). Set a username "
-            "and a password (or password_hash) under dashboard.basic_auth in "
-            "config.yaml to enable username/password dashboard login, or use "
-            "the OAuth provider, or pass --insecure to skip the auth gate."
+            "dashboard.basic_auth.username is not set and dashboard.basic_auth.users is empty "
+            "(and HERMES_DASHBOARD_BASIC_AUTH_USERNAME is empty). Set a username/password "
+            "or configure users under dashboard.basic_auth in config.yaml."
         )
         logger.debug("dashboard-auth-basic: %s", LAST_SKIP_REASON)
         return
 
-    if not password_hash and not plaintext:
+    if not users and not password_hash and not plaintext:
         LAST_SKIP_REASON = (
             "dashboard.basic_auth.username is set but neither password_hash "
             "nor password is configured. Provide one of them (password_hash "
@@ -478,6 +544,7 @@ def register(ctx) -> None:
             password_hash=password_hash,
             secret=secret,
             ttl_seconds=ttl,
+            users=users or None,
         )
     except ValueError as exc:
         LAST_SKIP_REASON = f"BasicAuthProvider construction failed: {exc}"
@@ -486,6 +553,6 @@ def register(ctx) -> None:
 
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
-        "dashboard-auth-basic: registered password provider (username=%s)",
-        username,
+        "dashboard-auth-basic: registered password provider (users=%s)",
+        len(users) if users else 1,
     )
