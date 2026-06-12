@@ -31,6 +31,43 @@ export interface VoicePlaybackOptions {
   source: VoicePlaybackSource
 }
 
+function waitForAudioReadiness(audio: HTMLAudioElement): Promise<void> {
+  if (audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    return Promise.resolve()
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      audio.removeEventListener('canplay', onReady)
+      audio.removeEventListener('canplaythrough', onReady)
+      audio.removeEventListener('loadeddata', onReady)
+      audio.removeEventListener('error', onError)
+      currentStop = null
+    }
+
+    const onReady = () => {
+      cleanup()
+      resolve()
+    }
+
+    const onError = () => {
+      cleanup()
+      reject(new Error('Playback failed'))
+    }
+
+    currentStop = () => {
+      cleanup()
+      resolve()
+    }
+
+    audio.addEventListener('loadeddata', onReady, { once: true })
+    audio.addEventListener('canplay', onReady, { once: true })
+    audio.addEventListener('canplaythrough', onReady, { once: true })
+    audio.addEventListener('error', onError, { once: true })
+    audio.load()
+  })
+}
+
 export function stopVoicePlayback() {
   sequence += 1
   currentStop?.()
@@ -76,6 +113,12 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
     const audio = new Audio(response.data_url)
     currentAudio = audio
     setVoicePlaybackState(currentState('speaking', options, audio))
+
+    await waitForAudioReadiness(audio)
+
+    if (!isCurrent()) {
+      return false
+    }
 
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
