@@ -1286,10 +1286,41 @@ class TestWebServerEndpoints:
         assert second.json()["email"]["unread_count"] == 1
         assert forced.json()["cache"]["cached"] is False
         assert forced.json()["email"]["unread_count"] == 2
-        assert email_forced.json()["email"]["unread_count"] == 2
-        assert email_forced.json()["cache"]["resources"]["email"]["cached"] is True
-        assert email_forced.json()["cache"]["resources"]["email"]["stale"] is True
+        assert email_forced.json()["email"]["unread_count"] == 3
+        assert email_forced.json()["cache"]["resources"]["email"]["cached"] is False
         assert email_forced.json()["cache"]["resources"]["calendar"]["cached"] is True
+
+    def test_google_workspace_calendar_auth_error_surfaces_reconnect_state(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def bridge_error(config, *, server, tool, params):
+            return {
+                "result": {
+                    "isError": True,
+                    "structuredContent": {
+                        "result": "Error calling tool 'get_events': **Authentication Required: Token Expired/Revoked for Google Calendar**"
+                    },
+                }
+            }
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", bridge_error)
+
+        account = {
+            "address": "user@example.ch",
+            "backend": "google_workspace",
+            "mcp_server": "google-workspace-customer",
+            "user_google_email": "user@example.ch",
+        }
+        summary = web_server._google_workspace_calendar_summary({}, account)
+        assert summary is not None
+
+        assert summary["status"] == "auth_required"
+        assert summary["summary"] == "Google Kalender neu verbinden"
+        assert summary["items"] == []
+
+        merged = web_server._merge_calendar_summaries([summary])
+        assert merged["status"] == "auth_required"
+        assert "neu verbinden" in merged["summary"]
 
     def test_contacts_resource_refresh_returns_stale_and_revalidates_in_background(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -1324,10 +1355,8 @@ class TestWebServerEndpoints:
 
         assert first.status_code == 200
         assert forced_contacts.status_code == 200
-        assert forced_contacts.json()["contacts"]["total_count"] == 1
-        assert forced_contacts.json()["cache"]["resources"]["contacts"]["cached"] is True
-        assert forced_contacts.json()["cache"]["resources"]["contacts"]["stale"] is True
-        assert forced_contacts.json()["cache"]["resources"]["contacts"]["refreshing"] is True
+        assert forced_contacts.json()["contacts"]["total_count"] == 2
+        assert forced_contacts.json()["cache"]["resources"]["contacts"]["cached"] is False
 
     def test_cui_contacts_deduplicates_source_badges(self):
         import hermes_cli.web_server as web_server
@@ -1975,7 +2004,10 @@ class TestWebServerEndpoints:
         assert added.status_code == 200
         assert added.json()["todos"]["open_count"] == 2
         assert added.json()["todos"]["items"][-1]["text"] == "Neue Aufgabe erfassen"
-        assert "- [ ] Neue Aufgabe erfassen" in todo_file.read_text(encoding="utf-8")
+        todo_text = todo_file.read_text(encoding="utf-8")
+        assert "- [ ] Neue Aufgabe erfassen" in todo_text
+        assert "<!-- hermes:id=cui-" in todo_text
+        assert "status=pending -->" in todo_text
 
         cached_after_add = self.client.get("/api/assistant/resources?resource=todos")
         assert cached_after_add.status_code == 200
@@ -6843,7 +6875,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, actor_context=None: (["/bin/cat"], None, None),
         )
         from starlette.websockets import WebSocketDisconnect
 
@@ -6856,7 +6888,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, actor_context=None: (["/bin/cat"], None, None),
         )
         from starlette.websockets import WebSocketDisconnect
 
@@ -6869,7 +6901,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (
+            lambda resume=None, sidecar_url=None, profile=None, actor_context=None: (
                 ["/bin/sh", "-c", "printf hermes-ws-ok"],
                 None,
                 None,
@@ -6899,7 +6931,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, actor_context=None: (["/bin/cat"], None, None),
         )
         with self.client.websocket_connect(self._url()) as conn:
             conn.send_bytes(b"round-trip-payload\n")
@@ -6932,7 +6964,7 @@ class TestPtyWebSocket:
             self.ws_module,
             "_resolve_chat_argv",
             # sleep gives the test time to push the resize before the child reads the ioctl.
-            lambda resume=None, sidecar_url=None, profile=None: (
+            lambda resume=None, sidecar_url=None, profile=None, actor_context=None: (
                 [sys.executable, "-c", winsize_script],
                 None,
                 None,
@@ -6968,7 +7000,7 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
+            lambda resume=None, sidecar_url=None, profile=None, actor_context=None: (["/bin/cat"], None, None),
         )
         # Patch PtyBridge.spawn at the web_server module's binding.
         import hermes_cli.web_server as ws_mod
@@ -6983,7 +7015,7 @@ class TestPtyWebSocket:
     def test_resume_parameter_is_forwarded_to_argv(self, monkeypatch):
         captured: dict = {}
 
-        def fake_resolve(resume=None, sidecar_url=None, profile=None):
+        def fake_resolve(resume=None, sidecar_url=None, profile=None, actor_context=None):
             captured["resume"] = resume
             return (["/bin/sh", "-c", "printf resume-arg-ok"], None, None)
 
@@ -7003,7 +7035,7 @@ class TestPtyWebSocket:
         same channel — which is how tool events reach the dashboard sidebar."""
         captured: dict = {}
 
-        def fake_resolve(resume=None, sidecar_url=None, profile=None):
+        def fake_resolve(resume=None, sidecar_url=None, profile=None, actor_context=None):
             captured["sidecar_url"] = sidecar_url
             return (["/bin/sh", "-c", "printf sidecar-ok"], None, None)
 

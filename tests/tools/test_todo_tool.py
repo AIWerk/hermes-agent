@@ -166,6 +166,41 @@ class TestMarkdownSync:
         text = path.read_text(encoding="utf-8")
         assert "- [ ] Added from CUI" in text
 
+    def test_replace_write_preserves_loaded_cui_markdown_items(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        path.write_text("# Agent TODO\n\n- [ ] Added from CUI before agent start\n", encoding="utf-8")
+        store = TodoStore(markdown_path=path)
+
+        result = store.write([
+            {"id": "next", "content": "Next agent plan", "status": "in_progress"},
+        ])
+
+        assert result == [
+            {"id": "next", "content": "Next agent plan", "status": "in_progress"},
+            {"id": "todo-3", "content": "Added from CUI before agent start", "status": "pending"},
+        ]
+        text = path.read_text(encoding="utf-8")
+        assert "- [ ] Added from CUI before agent start" in text
+
+    def test_replace_write_preserves_loaded_cui_metadata_items(self, tmp_path):
+        path = tmp_path / "TODO.md"
+        path.write_text(
+            "# Agent TODO\n\n- [ ] Added through CUI <!-- hermes:id=cui-abc123 status=pending -->\n",
+            encoding="utf-8",
+        )
+        store = TodoStore(markdown_path=path)
+
+        result = store.write([
+            {"id": "next", "content": "Next agent plan", "status": "in_progress"},
+        ])
+
+        assert result == [
+            {"id": "next", "content": "Next agent plan", "status": "in_progress"},
+            {"id": "cui-abc123", "content": "Added through CUI", "status": "pending"},
+        ]
+        text = path.read_text(encoding="utf-8")
+        assert "hermes:id=cui-abc123 status=pending" in text
+
 
 class TestTodoToolFunction:
     def test_read_mode(self):

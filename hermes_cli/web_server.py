@@ -2045,6 +2045,22 @@ def _bridge_result_text(result: dict[str, Any]) -> str:
     return ""
 
 
+def _bridge_result_is_error(result: dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("isError") is True:
+        return True
+    nested = result.get("result")
+    return isinstance(nested, dict) and nested.get("isError") is True
+
+
+def _bridge_error_status(text: str) -> tuple[str, str]:
+    normalized = (text or "").lower()
+    if any(marker in normalized for marker in ("authentication required", "token expired", "token expired/revoked", "revoked")):
+        return "auth_required", "Google Kalender neu verbinden"
+    return "error", "Kalender konnte nicht geprüft werden"
+
+
 def _gmail_search_message_ids(text: str) -> list[str]:
     return re.findall(r"Message ID:\s*([A-Za-z0-9_-]+)", text or "")
 
@@ -2520,7 +2536,20 @@ def _google_workspace_calendar_summary(config: dict[str, Any] | None, account_cf
             "event_types": event_types or ["default"],
         },
     )
-    items = _parse_google_workspace_event_items(_bridge_result_text(result), account_label=account_label, account_address=account_address)[:max_results]
+    result_text = _bridge_result_text(result)
+    if _bridge_result_is_error(result):
+        status, summary = _bridge_error_status(result_text)
+        return {
+            "label": account_label,
+            "address": account_address,
+            "calendar_id": calendar_id,
+            "source": "google_calendar",
+            "status": status,
+            "summary": summary,
+            "items": [],
+            "last_error": summary,
+        }
+    items = _parse_google_workspace_event_items(result_text, account_label=account_label, account_address=account_address)[:max_results]
     return {
         "label": account_label,
         "address": account_address,
@@ -2534,6 +2563,7 @@ def _google_workspace_calendar_summary(config: dict[str, Any] | None, account_cf
 
 def _merge_calendar_summaries(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     connected = [account for account in accounts if account.get("status") == "connected"]
+    auth_required = [account for account in accounts if account.get("status") == "auth_required"]
     items: list[dict[str, Any]] = []
     for account in accounts:
         normalized_account_items: list[dict[str, Any]] = []
@@ -2550,11 +2580,14 @@ def _merge_calendar_summaries(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     account_count = len(accounts)
     if total:
         summary = f"{total} kommende Termine" + (f" in {account_count} Kalendern" if account_count > 1 else "")
+    elif auth_required:
+        suffix = f" in {len(auth_required)} Konto" if len(auth_required) == 1 else f" in {len(auth_required)} Konten"
+        summary = "Kalender neu verbinden" + suffix
     elif connected:
         summary = f"Keine kommenden Termine" + (f" in {account_count} Kalendern" if account_count > 1 else "")
     else:
         summary = "Kalender konnte nicht geprüft werden" if accounts else "Nicht eingerichtet"
-    status = "connected" if connected else ("error" if accounts else "not_configured")
+    status = "partial" if connected and auth_required else ("connected" if connected else ("auth_required" if auth_required else ("error" if accounts else "not_configured")))
     return {"status": status, "summary": summary, "items": items[:5], "accounts": accounts}
 
 
@@ -3593,7 +3626,9 @@ def _add_todo_item(config: dict[str, Any], text: str) -> dict[str, Any]:
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
         separator = "" if not existing or existing.endswith("\n") else "\n"
-        path.write_text(f"{existing}{separator}- [ ] {text}\n", encoding="utf-8")
+        item_id = _safe_resource_id(f"cui-{secrets.token_hex(6)}", "cui-todo")
+        meta = f"<!-- hermes:id={item_id} status=pending -->"
+        path.write_text(f"{existing}{separator}- [ ] {text} {meta}\n", encoding="utf-8")
     except Exception:
         raise HTTPException(status_code=500, detail="TODO.md could not be updated")
     _assistant_invalidate_resource_cache("todos")
@@ -4590,7 +4625,7 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _email_summary(config),
         force_refresh=should_refresh("email"),
-        stale_while_revalidate=bool(refresh_resource == "email" or (refresh_resource is None and not force_refresh)),
+        stale_while_revalidate=bool((not force_refresh) and (refresh_resource == "email" or refresh_resource is None)),
         initial_payload=_email_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     calendar, calendar_cache = _assistant_cached_resource(
@@ -4599,7 +4634,7 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _calendar_summary(config),
         force_refresh=should_refresh("calendar"),
-        stale_while_revalidate=bool(refresh_resource == "calendar" or (refresh_resource is None and not force_refresh)),
+        stale_while_revalidate=bool((not force_refresh) and (refresh_resource == "calendar" or refresh_resource is None)),
         initial_payload=_calendar_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     shared_folder, shared_cache = _assistant_cached_resource(
@@ -4608,7 +4643,7 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _shared_folder_summary(config, request),
         force_refresh=should_refresh("shared_folder"),
-        stale_while_revalidate=bool(refresh_resource == "shared_folder" or (refresh_resource is None and not force_refresh)),
+        stale_while_revalidate=bool((not force_refresh) and (refresh_resource == "shared_folder" or refresh_resource is None)),
         initial_payload=_shared_folder_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     vault, vault_cache = _assistant_cached_resource(
@@ -4617,7 +4652,7 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _vaultwarden_summary(config),
         force_refresh=should_refresh("vault"),
-        stale_while_revalidate=bool(refresh_resource == "vault" or (refresh_resource is None and not force_refresh)),
+        stale_while_revalidate=bool((not force_refresh) and (refresh_resource == "vault" or refresh_resource is None)),
         initial_payload=_vault_refreshing_placeholder(config) if refresh_resource is None and not force_refresh else None,
     )
     todos, todos_cache = _assistant_cached_resource(
@@ -4633,7 +4668,7 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _contacts_summary(config, email, calendar),
         force_refresh=should_refresh("contacts"),
-        stale_while_revalidate=bool(refresh_resource == "contacts" or (refresh_resource is None and not force_refresh)),
+        stale_while_revalidate=bool((not force_refresh) and (refresh_resource == "contacts" or refresh_resource is None)),
         initial_payload=_contacts_refreshing_placeholder() if refresh_resource is None and not force_refresh else None,
     )
     contacts = _filter_contacts_payload(
@@ -4646,7 +4681,7 @@ def _assistant_resources_payload(
         cache_key,
         lambda: _connector_summary(config, shared_folder, email, calendar),
         force_refresh=should_refresh("connectors"),
-        stale_while_revalidate=bool(refresh_resource == "connectors" or (refresh_resource is None and not force_refresh)),
+        stale_while_revalidate=bool((not force_refresh) and (refresh_resource == "connectors" or refresh_resource is None)),
         initial_payload=[] if refresh_resource is None and not force_refresh else None,
     )
     warnings = []

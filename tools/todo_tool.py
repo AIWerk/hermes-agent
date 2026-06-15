@@ -77,16 +77,29 @@ class TodoStore:
         """
         external_changed = self._refresh_from_markdown_if_changed()
         external_items = [item.copy() for item in self._items] if external_changed else []
+        # CUI/manual Markdown tasks must survive replace-mode agent writes. Older
+        # CUI/manual checkboxes have no Hermes metadata and hydrate as synthetic
+        # todo-<line> ids; newer CUI tasks carry stable cui-* metadata ids. If an
+        # agent starts after a customer added one, there is no "external_changed"
+        # edge left to see: the item is already loaded into this store. Preserve
+        # those open items so a fresh agent plan cannot silently erase the user's
+        # right-rail task.
+        loaded_unmanaged_items = [] if external_changed else [
+            item.copy()
+            for item in self._items
+            if self._is_unmanaged_markdown_item(item)
+        ]
 
         if not merge:
             # Replace mode: new list entirely. If TODO.md was edited by the
             # CUI since this store last synced, keep external-only tasks so a
             # stale agent plan cannot clobber freshly added right-rail tasks.
             self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
-            if external_items:
+            preserved_items = external_items or loaded_unmanaged_items
+            if preserved_items:
                 seen_ids = {item["id"] for item in self._items}
                 seen_content = {self._content_key(item["content"]) for item in self._items}
-                for item in external_items:
+                for item in preserved_items:
                     content_key = self._content_key(item["content"])
                     if item["id"] not in seen_ids and content_key not in seen_content:
                         self._items.append(item.copy())
@@ -256,6 +269,15 @@ class TodoStore:
     def _content_key(content: str) -> str:
         """Normalize task text for duplicate detection across file/tool ids."""
         return re.sub(r"\s+", " ", str(content or "")).strip().casefold()
+
+    @staticmethod
+    def _is_unmanaged_markdown_item(item: Dict[str, str]) -> bool:
+        """Return True for open CUI/manual Markdown tasks to preserve."""
+        item_id = str(item.get("id") or "")
+        status = str(item.get("status") or "")
+        if status not in {"pending", "in_progress"}:
+            return False
+        return bool(re.fullmatch(r"todo-\d+", item_id) or item_id.startswith("cui-"))
 
     @staticmethod
     def _normalize_id(item_id: str) -> str:
