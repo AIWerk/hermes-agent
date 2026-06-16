@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from hermes_cli.operator_verification import OperatorVerificationConfig, clear_operator_verification_cache
-from tools.operator_verification_tool import verify_operator_identity
+from tools.operator_verification_tool import check_operator_verification_requirements, verify_operator_identity
 
 
 def _write_script(path: Path, body: str) -> None:
@@ -39,15 +39,24 @@ def test_verify_operator_identity_returns_sanitized_success(tmp_path, monkeypatc
     assert "secret" not in json.dumps(payload).lower()
 
 
+def test_operator_verification_tool_visible_when_gate_enabled_without_command(monkeypatch):
+    monkeypatch.setattr(
+        "tools.operator_verification_tool.load_operator_verification_config",
+        lambda: OperatorVerificationConfig(enabled=True, argv=[]),
+    )
+
+    assert check_operator_verification_requirements() is True
+
+
 def test_verify_operator_identity_fails_closed_without_config(monkeypatch):
     clear_operator_verification_cache()
     monkeypatch.setattr(
         "tools.operator_verification_tool.load_operator_verification_config",
-        lambda: OperatorVerificationConfig(enabled=False, argv=[]),
+        lambda: OperatorVerificationConfig(enabled=True, argv=[]),
     )
 
     payload = json.loads(verify_operator_identity({"reason": "prod restart"}))
 
     assert payload["success"] is False
     assert payload["verified"] is False
-    assert payload["reason"] in {"disabled", "not_configured"}
+    assert payload["reason"] == "not_configured"

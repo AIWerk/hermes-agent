@@ -73,7 +73,7 @@ _OPERATOR_VERIFY_SCHEMA = {
 
 def check_operator_verification_requirements() -> bool:
     cfg = load_operator_verification_config()
-    return bool(cfg.enabled and cfg.argv)
+    return bool(cfg.enabled)
 
 
 registry.register(

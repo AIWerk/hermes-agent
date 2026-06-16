@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.operator_verification import (
     OperatorVerificationConfig,
     OperatorVerificationResult,
@@ -13,6 +14,14 @@ from hermes_cli.operator_verification import (
     operator_verification_block_reason_for_command,
     run_operator_verifier,
 )
+
+
+def test_default_config_enables_operator_verification_gate():
+    section = DEFAULT_CONFIG["security"]["operator_verification"]
+
+    assert section["enabled"] is True
+    assert section["require_for_cli_admin"] is True
+    assert section["command"]["argv"] == []
 
 
 def test_operator_verification_result_valid_until_expiry():

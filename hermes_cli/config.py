@@ -2139,7 +2139,7 @@ DEFAULT_CONFIG = {
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
         "operator_verification": {
-            "enabled": False,
+            "enabled": True,
             "ttl_seconds": 900,
             "require_for_cli_admin": True,
             "require_for_trusted_platform_critical": False,
