@@ -59,15 +59,18 @@ export function getManagementProfile(): string {
 }
 
 // Endpoint families that honor ?profile= on the backend (web_server.py
-// _profile_scope). Anything else — sessions, analytics, ops, pairing,
-// channels, cron (which has its own per-job profile params), profiles
-// themselves — is machine-global or self-scoped and must NOT be rewritten.
+// _profile_scope or explicit per-profile DB opens). Anything else — ops,
+// pairing, telegram onboarding, cron (which has its own per-job profile
+// params), profiles themselves — is machine-global or self-scoped and must
+// NOT be rewritten.
 const PROFILE_SCOPED_PREFIXES = [
+  "/api/analytics",
   "/api/skills",
   "/api/tools/toolsets",
   "/api/config",
   "/api/env",
   "/api/mcp",
+  "/api/messaging/platforms",
   "/api/model/info",
   "/api/model/set",
   "/api/model/auxiliary",
@@ -318,6 +321,11 @@ function profileQuery(profile?: string): string {
   return profile ? `?profile=${encodeURIComponent(profile)}` : "";
 }
 
+function appendProfileParam(url: string, profile?: string): string {
+  if (!profile || url.includes("profile=")) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
+}
+
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   /**
@@ -352,12 +360,13 @@ export const api = {
       window.location.assign("/login");
       return r;
     }),
-  getSessions: (limit = 20, offset = 0, options?: { excludeSources?: string[] }) => {
+getSessions: (limit = 20, offset = 0, options?: { excludeSources?: string[]; profile?: string } | string) => {
+    const profile = typeof options === "string" ? options : options?.profile ?? getManagementProfile();
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-    if (options?.excludeSources?.length) {
+    if (typeof options !== "string" && options?.excludeSources?.length) {
       params.set("exclude_sources", options.excludeSources.join(","));
     }
-    return fetchJSON<PaginatedSessions>(`/api/sessions?${params.toString()}`);
+    return fetchJSON<PaginatedSessions>(appendProfileParam(`/api/sessions?${params.toString()}`, profile));
   },
   uploadAssistantAttachments: async (files: File[], sessionId?: string) => {
     const form = new FormData();
@@ -433,45 +442,60 @@ export const api = {
       body: JSON.stringify(body),
     }),
   openAssistantSharedFolder: () => fetchJSON<{ ok: boolean }>("/api/assistant/shared-folder/open-folder", { method: "POST" }),
-  getSessionMessages: (id: string) =>
-    fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
+  getSessionMessages: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionMessagesResponse>(
+      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/messages`, profile),
+    ),
   getSessionLatestDescendant: (id: string) =>
     fetchJSON<SessionLatestDescendantResponse>(
       `/api/sessions/${encodeURIComponent(id)}/latest-descendant`,
     ),
-  deleteSession: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    }),
-  getEmptySessionsCount: () =>
-    fetchJSON<{ count: number }>("/api/sessions/empty/count"),
-  deleteEmptySessions: () =>
-    fetchJSON<{ ok: boolean; deleted: number }>("/api/sessions/empty", {
-      method: "DELETE",
-    }),
-  bulkDeleteSessions: (ids: string[]) =>
+  deleteSession: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean }>(
+      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
+      {
+        method: "DELETE",
+      },
+    ),
+  getEmptySessionsCount: (profile = getManagementProfile()) =>
+    fetchJSON<{ count: number }>(
+      appendProfileParam("/api/sessions/empty/count", profile),
+    ),
+  deleteEmptySessions: (profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; deleted: number }>(
+      appendProfileParam("/api/sessions/empty", profile),
+      {
+        method: "DELETE",
+      },
+    ),
+  bulkDeleteSessions: (ids: string[], profile = getManagementProfile()) =>
     fetchJSON<{ ok: boolean; deleted: number }>("/api/sessions/bulk-delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify({ ids, profile: profile || undefined }),
     }),
-  renameSession: (id: string, title: string) =>
+  renameSession: (id: string, title: string, profile = getManagementProfile()) =>
     fetchJSON<{ ok: boolean; title: string }>(
       `/api/sessions/${encodeURIComponent(id)}`,
       {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify({ title, profile: profile || undefined }),
       },
     ),
-  getSessionStats: () => fetchJSON<SessionStoreStats>("/api/sessions/stats"),
-  exportSessionUrl: (id: string) =>
-    `/api/sessions/${encodeURIComponent(id)}/export`,
-  pruneSessions: (older_than_days: number, source?: string) =>
+  getSessionStats: (profile = getManagementProfile()) =>
+    fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
+  exportSessionUrl: (id: string, profile = getManagementProfile()) =>
+    appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
+  pruneSessions: (
+    older_than_days: number,
+    source?: string,
+    profile = getManagementProfile(),
+  ) =>
     fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ older_than_days, source }),
+      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
     }),
   listFiles: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
@@ -507,10 +531,14 @@ export const api = {
     if (params.component && params.component !== "all") qs.set("component", params.component);
     return fetchJSON<LogsResponse>(`/api/logs?${qs.toString()}`);
   },
-  getAnalytics: (days: number) =>
-    fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
-  getModelsAnalytics: (days: number) =>
-    fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
+  getAnalytics: (days: number, profile = getManagementProfile()) =>
+    fetchJSON<AnalyticsResponse>(
+      appendProfileParam(`/api/analytics/usage?days=${days}`, profile),
+    ),
+  getModelsAnalytics: (days: number, profile = getManagementProfile()) =>
+    fetchJSON<ModelsAnalyticsResponse>(
+      appendProfileParam(`/api/analytics/models?days=${days}`, profile),
+    ),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
@@ -594,7 +622,7 @@ export const api = {
   deleteCronJob: (id: string, profile = "default") =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
-  // Automation Blueprints — parameterized automation templates
+  // Automation Blueprints — parameterized automation blueprints
   getAutomationBlueprints: () =>
     fetchJSON<{ blueprints: AutomationBlueprint[] }>("/api/cron/blueprints"),
   instantiateAutomationBlueprint: (
@@ -620,7 +648,8 @@ export const api = {
     }),
   createProfile: (body: {
     name: string;
-    clone_from_default: boolean;
+    clone_from?: string | null;
+    clone_from_default?: boolean;
     clone_all?: boolean;
     no_skills?: boolean;
     description?: string;
@@ -775,8 +804,10 @@ export const api = {
     ),
 
   // Session search (FTS5)
-  searchSessions: (q: string) =>
-    fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
+  searchSessions: (q: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionSearchResponse>(
+      appendProfileParam(`/api/sessions/search?q=${encodeURIComponent(q)}`, profile),
+    ),
 
   // OAuth provider management
   getOAuthProviders: () =>
