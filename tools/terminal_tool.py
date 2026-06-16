@@ -2096,6 +2096,20 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
+            try:
+                from hermes_cli.operator_verification import operator_verification_block_reason_for_command
+                operator_block = operator_verification_block_reason_for_command(command)
+            except Exception:
+                operator_block = None
+            if operator_block:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": operator_block,
+                    "status": "blocked",
+                    "requires_operator_verification": True,
+                }, ensure_ascii=False)
+
         # Validate workdir against shell injection
         if workdir:
             workdir_error = _validate_workdir(workdir)

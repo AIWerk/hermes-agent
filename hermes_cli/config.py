@@ -2138,6 +2138,18 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+        "operator_verification": {
+            "enabled": False,
+            "ttl_seconds": 900,
+            "require_for_cli_admin": True,
+            "require_for_trusted_platform_critical": False,
+            "verifier": "command",
+            "command": {
+                "argv": [],
+                "timeout_seconds": 60,
+            },
+            "trusted_actor_ids": [],
+        },
     },
 
     "cron": {

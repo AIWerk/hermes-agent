@@ -40,6 +40,7 @@ from agent.prompt_builder import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    OPERATOR_VERIFICATION_GUIDANCE,
 )
 from agent.runtime_cwd import resolve_context_cwd
 
@@ -119,6 +120,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    if "verify_operator_identity" in agent.valid_tool_names:
+        tool_guidance.append(OPERATOR_VERIFICATION_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

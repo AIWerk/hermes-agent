@@ -73,6 +73,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
+    # Security / local operator verification (schema appears only when configured)
+    "verify_operator_identity",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -157,6 +159,12 @@ TOOLSETS = {
     "terminal": {
         "description": "Terminal/command execution and process management tools",
         "tools": ["terminal", "process"],
+        "includes": []
+    },
+
+    "security": {
+        "description": "Security and local operator verification tools",
+        "tools": ["verify_operator_identity"],
         "includes": []
     },
     
