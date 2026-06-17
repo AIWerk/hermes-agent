@@ -7168,6 +7168,86 @@ class TestPtyWebSocket:
         assert env["HERMES_TUI_INLINE"] == "1"
         assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
 
+    def test_resolve_chat_argv_injects_managed_autonomy_for_authenticated_assistant(self, monkeypatch):
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+        monkeypatch.setattr(self.ws_module, "_DASHBOARD_MODE", "assistant")
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv(
+            actor_context={
+                "tenant_id": "rocky",
+                "actor_id": "rocky:user",
+                "role": "user",
+                "display_name": "Rocky User",
+            }
+        )
+
+        assert env is not None
+        assert env["AIWERK_CUI_TENANT_ID"] == "rocky"
+        assert env["AIWERK_CUI_ACTOR_ID"] == "rocky:user"
+        assert env["AIWERK_CUI_ACTOR_ROLE"] == "user"
+        assert env["AIWERK_CUI_MANAGED_AUTONOMY"] == "1"
+
+    def test_resolve_chat_argv_does_not_inject_managed_autonomy_in_admin_dashboard(self, monkeypatch):
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+        monkeypatch.setattr(self.ws_module, "_DASHBOARD_MODE", "admin")
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv(
+            actor_context={"tenant_id": "rocky", "actor_id": "attila:admin", "role": "admin"}
+        )
+
+        assert env is not None
+        assert env["AIWERK_CUI_ACTOR_ROLE"] == "admin"
+        assert "AIWERK_CUI_MANAGED_AUTONOMY" not in env
+
+    def test_resolve_chat_argv_requires_actor_id_for_managed_autonomy(self, monkeypatch):
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+        monkeypatch.setattr(self.ws_module, "_DASHBOARD_MODE", "assistant")
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv(
+            actor_context={"tenant_id": "rocky", "role": "user"}
+        )
+
+        assert env is not None
+        assert env["AIWERK_CUI_TENANT_ID"] == "rocky"
+        assert env["AIWERK_CUI_ACTOR_ROLE"] == "user"
+        assert "AIWERK_CUI_MANAGED_AUTONOMY" not in env
+
+    def test_resolve_chat_argv_strips_inherited_cui_trust_env(self, monkeypatch):
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_CONTEXT", '{"tenant_id":"leaked"}')
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert env is not None
+        assert "AIWERK_CUI_MANAGED_AUTONOMY" not in env
+        assert "AIWERK_CUI_ACTOR_CONTEXT" not in env
+
     def test_resolve_chat_argv_applies_terminal_backend_config(
         self, monkeypatch, _isolate_hermes_home
     ):
@@ -7920,6 +8000,16 @@ class TestAssistantWsGate:
             assert gate(
                 {"method": "config.set", "params": {"key": key, "value": "x"}}
             ) is not None, key
+
+    def test_config_set_yolo_global_scope_is_refused(self):
+        gate = self._gate()
+        assert gate(
+            {"method": "config.set", "params": {"key": "yolo", "scope": "session", "value": "1"}}
+        ) is None
+        reason = gate(
+            {"method": "config.set", "params": {"key": "yolo", "scope": "global", "value": "1"}}
+        )
+        assert reason is not None and "global yolo" in reason
 
     def test_config_get_full_dump_is_refused(self):
         # config.get key="full" returns the entire config.yaml incl. API keys.

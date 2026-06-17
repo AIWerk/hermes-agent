@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import json
 import logging
 import os
 import re
@@ -149,6 +150,55 @@ def _is_gateway_approval_context() -> bool:
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
     return bool(_get_session_platform())
+
+
+def _cui_actor_context() -> dict:
+    """Return sanitized actor context injected by the authenticated CUI.
+
+    The dashboard only injects this into the spawned assistant-mode chat child
+    after app-level auth has established tenant/user/admin identity. Treat it
+    as a deployment-time trust boundary, not as user prompt content.
+    """
+    raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
+    data = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+    for env_key, out_key in (
+        ("AIWERK_CUI_TENANT_ID", "tenant_id"),
+        ("AIWERK_CUI_ACTOR_ID", "actor_id"),
+        ("AIWERK_CUI_ACTOR_ROLE", "role"),
+    ):
+        value = os.getenv(env_key, "")
+        if value and not data.get(out_key):
+            data[out_key] = value
+    return {str(k): str(v) for k, v in data.items() if v is not None}
+
+
+def _is_cui_managed_autonomy_enabled() -> bool:
+    """True when authenticated assistant-mode CUI should avoid raw prompts.
+
+    This is deliberately narrower than process/global YOLO: it requires a flag
+    set by the dashboard child environment AND trusted tenant actor metadata.
+    Hardline and sudo-stdin guards still run before this check.
+    """
+    if not env_var_enabled("AIWERK_CUI_MANAGED_AUTONOMY"):
+        return False
+    actor = _cui_actor_context()
+    tenant_id = (actor.get("tenant_id") or "").strip()
+    actor_id = (actor.get("actor_id") or actor.get("user_id") or "").strip()
+    role = (actor.get("role") or "").strip().lower()
+    if not tenant_id or not actor_id:
+        return False
+    allowed_roles = {
+        "user", "admin", "owner", "operator",
+        "tenant_user", "tenant_admin", "aiwerk_admin",
+    }
+    return role in allowed_roles
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
@@ -1363,6 +1413,17 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
+
+    # Authenticated AIWerk CUI managed autonomy: avoid raw low-level approval
+    # prompts for lay users while preserving the hardline floor above.  This is
+    # narrower than global YOLO because the dashboard must inject both the flag
+    # and trusted tenant actor context into the assistant-mode chat child.
+    if _is_cui_managed_autonomy_enabled():
+        return {
+            "approved": True,
+            "message": None,
+            "policy_scoped_autonomy": True,
+        }
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.

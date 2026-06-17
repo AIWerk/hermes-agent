@@ -12,8 +12,11 @@ import tools.approval as approval_module
 from hermes_constants import get_hermes_home
 from tools.approval import (
     _get_approval_mode,
+    _is_cui_managed_autonomy_enabled,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
+    check_execute_code_guard,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -44,6 +47,54 @@ class TestSmartApproval:
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
         assert mock_call.call_args.kwargs["max_tokens"] == 16
+
+
+class TestCuiManagedAutonomy:
+    def test_requires_flag_and_authenticated_actor_context(self, monkeypatch):
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+        monkeypatch.setenv(
+            "AIWERK_CUI_ACTOR_CONTEXT",
+            '{"tenant_id":"rocky","actor_id":"rocky:user","role":"user"}',
+        )
+        assert _is_cui_managed_autonomy_enabled() is True
+
+        monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "user")
+        assert _is_cui_managed_autonomy_enabled() is True
+
+        monkeypatch.delenv("AIWERK_CUI_ACTOR_ID")
+        assert _is_cui_managed_autonomy_enabled() is False
+
+    def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "true")
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+        monkeypatch.setenv(
+            "AIWERK_CUI_ACTOR_CONTEXT",
+            '{"tenant_id":"rocky","actor_id":"rocky:user","role":"user"}',
+        )
+
+        approved = check_all_command_guards("rm -rf /tmp/hermes-demo", "local")
+        assert approved["approved"] is True
+        assert approved["policy_scoped_autonomy"] is True
+
+        blocked = check_all_command_guards("rm -rf /", "local")
+        assert blocked["approved"] is False
+        assert blocked.get("hardline") is True
+
+    def test_execute_code_still_uses_normal_guard_in_cui_autonomy(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "true")
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "user")
+
+        with mock_patch("tools.approval._get_approval_mode", return_value="manual"), \
+            mock_patch.object(approval_module, "_permanent_approved", set()):
+            result = check_execute_code_guard("print('ok')", "local")
+        assert result["approved"] is False
+        assert result["status"] == "pending_approval"
 
 
 class TestDetectDangerousRm:
@@ -765,11 +816,12 @@ class TestPatternKeyUniqueness:
         _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
         session = "test_find_collision"
         _clear_session(session)
-        approve_session(session, key_exec)
-        assert is_approved(session, key_exec) is True
-        assert is_approved(session, key_delete) is False, (
-            "approving find -exec rm should not auto-approve find -delete"
-        )
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            approve_session(session, key_exec)
+            assert is_approved(session, key_exec) is True
+            assert is_approved(session, key_delete) is False, (
+                "approving find -exec rm should not auto-approve find -delete"
+            )
         _clear_session(session)
 
     def test_legacy_find_key_still_approves_find_exec(self):

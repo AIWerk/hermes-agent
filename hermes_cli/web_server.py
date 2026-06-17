@@ -345,6 +345,10 @@ def _assistant_ws_request_gate(req: Any) -> Optional[str]:
         key = str(params.get("key", "")).strip().lower()
         if key not in _ASSISTANT_ALLOWED_CONFIG_KEYS:
             return f"config key not available in assistant mode: {key or '(none)'}"
+        if method == "config.set" and key == "yolo":
+            scope = str(params.get("scope", "session") or "session").strip().lower()
+            if scope not in {"", "session"}:
+                return "global yolo is not available in assistant mode"
     elif method == "slash.exec":
         raw_cmd = str(params.get("command", "")).strip()
         base = raw_cmd.lstrip("/").split(maxsplit=1)[0].lower() if raw_cmd else ""
@@ -15895,6 +15899,18 @@ def _resolve_chat_argv(
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
     env.setdefault("HERMES_TUI_INLINE", "1")
+    # Avoid leaking a parent process's CUI trust context into non-assistant or
+    # unauthenticated chat children.  Only the authenticated actor_context below
+    # may opt the spawned child into managed autonomy.
+    for key in (
+        "AIWERK_CUI_ACTOR_CONTEXT",
+        "AIWERK_CUI_TENANT_ID",
+        "AIWERK_CUI_ACTOR_ID",
+        "AIWERK_CUI_ACTOR_ROLE",
+        "AIWERK_CUI_MANAGED_AUTONOMY",
+    ):
+        env.pop(key, None)
+
     if actor_context:
         import json as _json
         clean_actor_context = {
@@ -15909,6 +15925,13 @@ def _resolve_chat_argv(
             env["AIWERK_CUI_ACTOR_ID"] = clean_actor_context["actor_id"]
         if clean_actor_context.get("role"):
             env["AIWERK_CUI_ACTOR_ROLE"] = clean_actor_context["role"]
+        actor_id = clean_actor_context.get("actor_id") or clean_actor_context.get("user_id")
+        if _assistant_mode_enabled() and clean_actor_context.get("tenant_id") and actor_id and clean_actor_context.get("role"):
+            # Authenticated customer/admin CUI sessions run in managed-autonomy
+            # mode: low-level tool approvals are handled by tenant policy and
+            # the broker, not raw technical prompts to lay users.  Hardline
+            # approval guards still apply inside tools.approval.
+            env["AIWERK_CUI_MANAGED_AUTONOMY"] = "1"
 
     if profile_dir is not None:
         env["HERMES_HOME"] = str(profile_dir)
