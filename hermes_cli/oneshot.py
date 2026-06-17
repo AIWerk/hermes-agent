@@ -332,6 +332,13 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    operator_session_context = None
+    try:
+        from hermes_cli.operator_session import get_current_operator_session_context
+        operator_session_context = get_current_operator_session_context()
+    except Exception:
+        operator_session_context = None
+
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -344,6 +351,7 @@ def _run_agent(
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
+        operator_session_context=operator_session_context,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction

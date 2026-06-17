@@ -381,6 +381,7 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
+                operator_session_context=getattr(self, "operator_session_context", None),
                 skip_context_files=self.ignore_rules,
                 skip_memory=self.ignore_rules,
                 tool_progress_callback=self._on_tool_progress,

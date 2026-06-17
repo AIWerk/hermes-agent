@@ -296,8 +296,8 @@ def init_agent(
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
     if operator_session_context is None:
         try:
-            from hermes_cli.operator_session import load_operator_session_context_from_env
-            operator_session_context = load_operator_session_context_from_env()
+            from hermes_cli.operator_session import get_current_operator_session_context
+            operator_session_context = get_current_operator_session_context()
         except Exception:
             operator_session_context = None
     agent.operator_session_context = operator_session_context if isinstance(operator_session_context, dict) else None
@@ -1134,6 +1134,7 @@ def init_agent(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                 )
+                agent._memory_store.operator_session_context = agent.operator_session_context
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init

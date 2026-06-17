@@ -130,6 +130,7 @@ class MemoryStore:
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self.operator_session_context: Dict[str, Any] | None = None
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
@@ -706,6 +707,16 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
 
 
 
+def _operator_session_memory_block(store: Optional[MemoryStore]) -> str | None:
+    if store is not None and getattr(store, "operator_session_context", None):
+        return tool_error(
+            "Operator sessions cannot write to built-in prompt-injected user/memory stores. "
+            "Route durable AIWerk/operator knowledge to the sanitized wiki or an explicit operator memory store.",
+            success=False,
+        )
+    return None
+
+
 def memory_tool(
     action: str,
     target: str = "memory",
@@ -733,6 +744,10 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return tool_error("old_text is required for 'remove' action.", success=False)
+
+    blocked = _operator_session_memory_block(store)
+    if blocked is not None:
+        return blocked
 
     # AIWerk memory router runs before write approval only for credential safety
     # so secrets are blocked instead of staged. Non-credential routing remains
@@ -793,16 +808,25 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "add":
+        blocked_operator = _operator_session_memory_block(store)
+        if blocked_operator is not None:
+            return json.loads(blocked_operator)
         blocked = _router_block_response(content, target)
         if blocked is not None:
             return json.loads(blocked)
         return store.add(target, content)
     if action == "replace":
+        blocked_operator = _operator_session_memory_block(store)
+        if blocked_operator is not None:
+            return json.loads(blocked_operator)
         blocked = _router_block_response(content, target)
         if blocked is not None:
             return json.loads(blocked)
         return store.replace(target, old_text, content)
     if action == "remove":
+        blocked_operator = _operator_session_memory_block(store)
+        if blocked_operator is not None:
+            return json.loads(blocked_operator)
         return store.remove(target, old_text)
     return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema

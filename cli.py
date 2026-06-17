@@ -3214,6 +3214,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        operator_session_context: dict[str, Any] | None = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -3417,6 +3418,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # pass skip_context_files=True and skip_memory=True to AIAgent so
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        self.operator_session_context = operator_session_context if isinstance(operator_session_context, dict) else None
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -14823,6 +14825,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    operator_session_context: dict[str, Any] | None = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -14954,6 +14957,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        operator_session_context=operator_session_context,
     )
 
     if parsed_skills:

@@ -71,13 +71,15 @@ def get_cached_operator_verification(
     *, session_id: str | None = None, now: int | None = None
 ) -> OperatorVerificationResult | None:
     key = _cache_key(session_id)
+    cache_key = key
     result = _cache.get(key)
     if result is None and session_id is not None:
-        result = _cache.get(_cache_key(None))
+        cache_key = _cache_key(None)
+        result = _cache.get(cache_key)
     if result is None:
         return None
     if not result.is_valid(now=now):
-        _cache.pop(key, None)
+        _cache.pop(cache_key, None)
         return None
     return result
 

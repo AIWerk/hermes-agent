@@ -2278,9 +2278,10 @@ def cmd_chat(args):
 
     # --operator: verify local operator before the first turn and pass a
     # sanitized operator context into the session prompt/memory routing.
+    operator_session_context = None
     if getattr(args, "operator", False):
         from hermes_cli.operator_session import bootstrap_operator_session
-        bootstrap_operator_session(quiet=getattr(args, "quiet", False))
+        operator_session_context = bootstrap_operator_session(quiet=getattr(args, "quiet", False))
 
     _pin_kanban_board_env()
 
@@ -2324,6 +2325,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "operator_session_context": operator_session_context,
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
