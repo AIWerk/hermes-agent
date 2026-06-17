@@ -844,6 +844,9 @@ function upsertToolCall(
 
 export default function AiwerkAssistantPage() {
   const gatewayRef = useRef<GatewayClient | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectingRef = useRef(false);
+  const reconnectAttemptRef = useRef(0);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const contentGridRef = useRef<HTMLElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -866,6 +869,7 @@ export default function AiwerkAssistantPage() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const [activeSessionKey, setActiveSessionKey] = useState<string | null>(null);
+  const activeSessionKeyRef = useRef<string | null>(null);
   const [input, setInput] = useState("");
   const [sideInput, setSideInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>(() => [welcomeMessage()]);
@@ -886,6 +890,7 @@ export default function AiwerkAssistantPage() {
   const [activeStatusModal, setActiveStatusModal] = useState<RuntimeBadgeId | null>(null);
   const [conversationMode, setConversationMode] = useState<ConversationMode>("main");
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [isCompressing, setIsCompressing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<AttachmentPreview[]>([]);
@@ -1607,6 +1612,14 @@ export default function AiwerkAssistantPage() {
   }, [sessionId]);
 
   useEffect(() => {
+    activeSessionKeyRef.current = activeSessionKey;
+  }, [activeSessionKey]);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
     readAloudEnabledRef.current = readAloudEnabled;
     storeReadAloudEnabled(readAloudEnabled);
   }, [readAloudEnabled]);
@@ -1664,8 +1677,21 @@ export default function AiwerkAssistantPage() {
     const gateway = new GatewayClient();
     gatewayRef.current = gateway;
 
+    const scheduleReconnect = (delayMs = 1200) => {
+      if (cancelled || reconnectingRef.current) return;
+      if (reconnectTimerRef.current !== null) return;
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        void recoverConnection();
+      }, delayMs);
+    };
+
     const offState = gateway.onState((state) => {
-      if (!cancelled) setConnection(state as ConnectionState);
+      if (cancelled) return;
+      setConnection(state as ConnectionState);
+      if (state === "closed" || state === "error") {
+        scheduleReconnect(busyRef.current ? 600 : 1500);
+      }
     });
     const offDelta = gateway.on("message.delta", (ev) => {
       const delta = textFromPayload(ev.payload);
@@ -1752,6 +1778,30 @@ export default function AiwerkAssistantPage() {
       }
     });
 
+    async function applySessionOpenResult(result: SessionOpenResult, options: { recovered?: boolean } = {}) {
+      const persistentSessionId = persistentSessionIdFromOpenResult(result);
+      const activeId = persistentSessionId || result.session_id;
+      const recoveredRunning = Boolean(result.running || result.status === "working" || result.status === "waiting" || result.inflight?.streaming);
+      setSessionId(result.session_id);
+      setActiveSessionKey(activeId);
+      storeActiveSessionId(activeId);
+      setSessionTitle((current) => (options.recovered && current ? current : "Neue Unterhaltung"));
+      setLiveNotes(null);
+      setConversationMode("main");
+      conversationModeRef.current = "main";
+      activeTurnModeRef.current = "main";
+      setActiveTurnMode("main");
+      setSideMessages([]);
+      setSideToolCalls([]);
+      setToolCalls(result.resumed ? toolCallsFromGateway(result.messages) : []);
+      setMessages(result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()]);
+      setBusy(recoveredRunning);
+      if (result.inflight?.streaming) activeTurnModeRef.current = "main";
+      void refreshSessionMeta(gateway, result.session_id);
+      void refreshRuntimeStatus(gateway, result.session_id);
+      void refreshContextUsage(gateway, result.session_id);
+    }
+
     async function connect() {
       try {
         setConnection("connecting");
@@ -1769,31 +1819,47 @@ export default function AiwerkAssistantPage() {
           result = await gateway.request<SessionOpenResult>("session.create", { cols: 100 });
         }
         if (!cancelled) {
-          const persistentSessionId = persistentSessionIdFromOpenResult(result);
-          setSessionId(result.session_id);
-          setActiveSessionKey(persistentSessionId || result.session_id);
-          storeActiveSessionId(persistentSessionId);
-          setSessionTitle("Neue Unterhaltung");
-          setLiveNotes(null);
-          setConversationMode("main");
-          conversationModeRef.current = "main";
-          activeTurnModeRef.current = "main";
-          setActiveTurnMode("main");
-          setSideMessages([]);
-          setSideToolCalls([]);
-          setToolCalls(result.resumed ? toolCallsFromGateway(result.messages) : []);
-          setMessages(result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()]);
-          setBusy(Boolean(result.running || result.status === "working" || result.status === "waiting" || result.inflight?.streaming));
-          if (result.inflight?.streaming) activeTurnModeRef.current = "main";
-          void refreshSessionMeta(gateway, result.session_id);
-          void refreshRuntimeStatus(gateway, result.session_id);
-          void refreshContextUsage(gateway, result.session_id);
+          reconnectAttemptRef.current = 0;
+          setError(null);
+          await applySessionOpenResult(result);
         }
       } catch (e) {
         if (!cancelled) {
           setConnection("error");
           setError(e instanceof Error ? e.message : String(e));
         }
+      }
+    }
+
+    async function recoverConnection() {
+      if (cancelled || reconnectingRef.current) return;
+      reconnectingRef.current = true;
+      try {
+        setConnection("connecting");
+        await gateway.connect();
+        const storedSessionId = readStoredSessionId() || activeSessionKeyRef.current || sessionIdRef.current || "";
+        if (storedSessionId) {
+          const result = await gateway.request<SessionOpenResult>("session.resume", { session_id: storedSessionId, cols: 100 }, 30_000);
+          if (!cancelled) {
+            reconnectAttemptRef.current = 0;
+            setError(null);
+            await applySessionOpenResult(result, { recovered: true });
+            showToast("Verbindung wiederhergestellt");
+          }
+        } else if (!cancelled) {
+          reconnectAttemptRef.current = 0;
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          reconnectAttemptRef.current += 1;
+          setConnection("error");
+          setError(e instanceof Error ? e.message : String(e));
+          const delay = Math.min(10_000, 1200 * Math.max(1, reconnectAttemptRef.current));
+          scheduleReconnect(delay);
+        }
+      } finally {
+        reconnectingRef.current = false;
       }
     }
 
@@ -1823,6 +1889,10 @@ export default function AiwerkAssistantPage() {
 
     return () => {
       cancelled = true;
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       offState();
       offDelta();
       offComplete();
@@ -1835,7 +1905,7 @@ export default function AiwerkAssistantPage() {
       offSessionInfo();
       gateway.close();
     };
-  }, [refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, speakAssistantText]);
+  }, [refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, showToast, speakAssistantText]);
 
   const loadRecentSession = useCallback(async (session: RecentSession) => {
     const gateway = gatewayRef.current;
