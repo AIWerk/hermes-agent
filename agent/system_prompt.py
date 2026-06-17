@@ -122,6 +122,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SKILLS_GUIDANCE)
     if "verify_operator_identity" in agent.valid_tool_names:
         tool_guidance.append(OPERATOR_VERIFICATION_GUIDANCE)
+    _operator_ctx = getattr(agent, "operator_session_context", None)
+    if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator":
+        stable_parts.append(
+            "Operator session context: the local human was verified before the first turn. "
+            f"Treat the human as actor_id={_operator_ctx.get('actor_id', '')!r}, "
+            f"role={_operator_ctx.get('role', '')!r}, acting_for={_operator_ctx.get('acting_for', 'aiwerk')!r}. "
+            "Route durable notes from this session to operator memory/sanitized AIWerk wiki as appropriate, "
+            "not to customer/end-user memory. Do not ask for or record operator secrets."
+        )
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

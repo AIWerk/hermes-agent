@@ -222,6 +222,16 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--operator",
+        action="store_true",
+        default=False,
+        help=(
+            "Verify the local human before the first turn and run this CLI/TUI "
+            "session as an operator session rather than an end-user/customer session."
+        ),
+    )
+    _inherited_flag(
+        parser,
         "--tui",
         action="store_true",
         default=False,
@@ -384,6 +394,16 @@ def build_top_level_parser():
         "--source",
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--operator",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Verify the local human before the first turn and run this CLI/TUI "
+            "session as an operator session rather than an end-user/customer session."
+        ),
     )
     _inherited_flag(
         chat_parser,

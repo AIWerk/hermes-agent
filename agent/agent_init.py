@@ -222,6 +222,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    operator_session_context: Dict[str, Any] | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -293,6 +294,13 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    if operator_session_context is None:
+        try:
+            from hermes_cli.operator_session import load_operator_session_context_from_env
+            operator_session_context = load_operator_session_context_from_env()
+        except Exception:
+            operator_session_context = None
+    agent.operator_session_context = operator_session_context if isinstance(operator_session_context, dict) else None
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy

@@ -2276,6 +2276,12 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    # --operator: verify local operator before the first turn and pass a
+    # sanitized operator context into the session prompt/memory routing.
+    if getattr(args, "operator", False):
+        from hermes_cli.operator_session import bootstrap_operator_session
+        bootstrap_operator_session(quiet=getattr(args, "quiet", False))
+
     _pin_kanban_board_env()
 
     if use_tui:
@@ -11206,6 +11212,9 @@ def _try_termux_fast_cli_launch() -> bool:
 
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
+        if getattr(args, "operator", False):
+            from hermes_cli.operator_session import bootstrap_operator_session
+            bootstrap_operator_session(quiet=True)
         from hermes_cli.oneshot import run_oneshot
 
         sys.exit(
@@ -12438,6 +12447,9 @@ def main():
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
     if getattr(args, "oneshot", None):
+        if getattr(args, "operator", False):
+            from hermes_cli.operator_session import bootstrap_operator_session
+            bootstrap_operator_session(quiet=True)
         from hermes_cli.oneshot import run_oneshot
 
         sys.exit(

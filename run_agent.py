@@ -411,6 +411,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        operator_session_context: Dict[str, Any] | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -485,6 +486,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            operator_session_context=operator_session_context,
         )
 
     def _get_session_db_for_recall(self):
@@ -512,13 +514,17 @@ class AIAgent:
             return
         source = self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli")
         try:
+            _operator_ctx = getattr(self, "operator_session_context", None)
+            _session_user_id = None
+            if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator":
+                _session_user_id = str(_operator_ctx.get("actor_id") or "") or None
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
                 model=self.model,
                 model_config=self._session_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                user_id=_session_user_id,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
             )
