@@ -352,19 +352,38 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
+    try:
+        from agent.cui_actor_context import (
+            cui_actor_system_prompt,
+            current_cui_actor_context,
+            is_aiwerk_admin_actor,
+        )
+        _cui_actor = current_cui_actor_context()
+        _cui_admin_actor = is_aiwerk_admin_actor(_cui_actor)
+        _cui_actor_block = cui_actor_system_prompt(_cui_actor)
+    except Exception:
+        _cui_actor = {}
+        _cui_admin_actor = False
+        _cui_actor_block = ""
+    if _cui_actor_block:
+        volatile_parts.append(_cui_actor_block)
+
     if agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
-        if agent._user_profile_enabled:
+        # USER.md describes the primary customer. In CUI admin/operator
+        # sessions, omit it so the assistant cannot confuse the admin with the
+        # customer or leak customer user-memory into support chat.
+        if agent._user_profile_enabled and not _cui_admin_actor:
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
+    # External memory provider system prompt block (additive to built-in).
+    # Admin/operator sessions do not receive customer external-memory context.
+    if agent._memory_manager and not _cui_admin_actor:
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()
             if _ext_mem_block:

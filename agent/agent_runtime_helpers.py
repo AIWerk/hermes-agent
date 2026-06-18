@@ -1838,6 +1838,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "memory":
         def _execute(next_args: dict) -> Any:
+            try:
+                from agent.cui_actor_context import (
+                    cui_admin_memory_block_result,
+                    memory_write_blocked_for_cui_admin,
+                )
+                if memory_write_blocked_for_cui_admin(function_name, next_args):
+                    return _finish_agent_tool(cui_admin_memory_block_result(function_name), next_args)
+            except Exception:
+                pass
             target = next_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
             result = _memory_tool(
@@ -1868,6 +1877,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(result, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
+            try:
+                from agent.cui_actor_context import (
+                    cui_admin_memory_block_result,
+                    memory_write_blocked_for_cui_admin,
+                )
+                if memory_write_blocked_for_cui_admin(function_name, next_args):
+                    return _finish_agent_tool(cui_admin_memory_block_result(function_name), next_args)
+            except Exception:
+                pass
             return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:

@@ -2992,11 +2992,18 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        _cui_admin_actor = False
+        try:
+            from agent.cui_actor_context import is_aiwerk_admin_actor
+            _cui_admin_actor = is_aiwerk_admin_actor()
+        except Exception:
+            _cui_admin_actor = False
         if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception:
-                pass
+            if not _cui_admin_actor:
+                try:
+                    self._memory_manager.on_session_end(messages or [])
+                except Exception:
+                    pass
             try:
                 self._memory_manager.shutdown_all()
             except Exception:
@@ -3016,7 +3023,13 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if self._memory_manager:
+        _cui_admin_actor = False
+        try:
+            from agent.cui_actor_context import is_aiwerk_admin_actor
+            _cui_admin_actor = is_aiwerk_admin_actor()
+        except Exception:
+            _cui_admin_actor = False
+        if self._memory_manager and not _cui_admin_actor:
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
@@ -3072,6 +3085,12 @@ class AIAgent:
         """
         if interrupted:
             return
+        try:
+            from agent.cui_actor_context import is_aiwerk_admin_actor
+            if is_aiwerk_admin_actor():
+                return
+        except Exception:
+            pass
         if not (self._memory_manager and final_response and original_user_message):
             return
         # Multimodal turns carry content as a list of typed parts; providers
