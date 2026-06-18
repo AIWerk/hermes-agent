@@ -100,6 +100,7 @@ import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import {
+  getHermesAgentDisplayName,
   isAssistantDashboardMode,
   isDashboardEmbeddedChatEnabled,
 } from "@/lib/dashboard-flags";
@@ -351,7 +352,18 @@ function buildRoutes(
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
 export default function App() {
-  return isAssistantDashboardMode() ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
+  const isAssistantMode = isAssistantDashboardMode();
+
+  useEffect(() => {
+    if (isAssistantMode) {
+      const agentName = getHermesAgentDisplayName();
+      document.title = agentName ? `${agentName} AI Assistant` : "AI Assistant";
+      return;
+    }
+    document.title = "Assistant Dashboard";
+  }, [isAssistantMode]);
+
+  return isAssistantMode ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
 }
 
 function AdminDashboardApp() {

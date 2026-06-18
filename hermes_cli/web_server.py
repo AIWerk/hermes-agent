@@ -16386,12 +16386,14 @@ def mount_spa(application: FastAPI):
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
         user_display_name_js = json.dumps(_assistant_user_display_name() if mode == "assistant" else None)
+        agent_display_name_js = json.dumps(_assistant_display_name_from_config(load_config()) if mode == "assistant" else None)
         common_bootstrap = (
             f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
             f'window.__HERMES_DASHBOARD_MODE__="{mode}";'
             f'window.__HERMES_BASE_PATH__="{prefix}";'
             f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
             f"window.__HERMES_USER_DISPLAY_NAME__={user_display_name_js};"
+            f"window.__HERMES_AGENT_DISPLAY_NAME__={agent_display_name_js};"
         )
         if gated:
             bootstrap_script = f"<script>{common_bootstrap}</script>"
