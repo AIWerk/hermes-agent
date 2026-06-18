@@ -11,6 +11,8 @@ declare global {
     __HERMES_DASHBOARD_MODE__?: "admin" | "assistant" | string;
     /** Sanitized first-name style display label injected by the backend for customer UI personalization. */
     __HERMES_USER_DISPLAY_NAME__?: string | null;
+    /** Sanitized customer-facing agent label injected by the backend for browser/title branding. */
+    __HERMES_AGENT_DISPLAY_NAME__?: string | null;
     /** @deprecated Older injected name; treated as on when true. */
     __HERMES_DASHBOARD_TUI__?: boolean;
   }
@@ -38,6 +40,14 @@ export function isAssistantDashboardMode(): boolean {
 export function getHermesUserDisplayName(): string | null {
   if (typeof window === "undefined") return null;
   const value = window.__HERMES_USER_DISPLAY_NAME__;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function getHermesAgentDisplayName(): string | null {
+  if (typeof window === "undefined") return null;
+  const value = window.__HERMES_AGENT_DISPLAY_NAME__;
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
