@@ -249,6 +249,8 @@ def test_honcho_system_prompt_advertises_active_while_background_init_runs(monke
         prompt = provider.system_prompt_block()
         assert "Honcho Memory" in prompt
         assert "hybrid mode" in prompt
+        assert "not new user input" in prompt
+        assert "current user message takes precedence" in prompt
     finally:
         release.set()
         init_thread = getattr(provider, "_init_thread", None)
