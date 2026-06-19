@@ -8143,8 +8143,74 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+def _cui_actor_context_from_request(request: Request | None) -> dict[str, str]:
+    """Return authenticated CUI actor context for assistant-mode requests."""
+    if request is None or not _assistant_mode_enabled():
+        return {}
+    sess = getattr(getattr(request, "state", None), "session", None)
+    if sess is None:
+        return {}
+    tenant_id = str(getattr(sess, "tenant_id", "") or getattr(sess, "org_id", "") or "").strip()
+    actor_id = str(getattr(sess, "actor_id", "") or getattr(sess, "user_id", "") or "").strip()
+    role = str(getattr(sess, "role", "") or "user").strip().lower()
+    if not (tenant_id and actor_id and role):
+        return {}
+    return {"tenant_id": tenant_id, "actor_id": actor_id, "role": role}
+
+
+def _session_cui_metadata(session: dict | None) -> dict[str, str]:
+    if not isinstance(session, dict):
+        return {}
+    raw = session.get("model_config")
+    if not raw:
+        return {}
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    actor = cfg.get("_cui_actor_context") if isinstance(cfg.get("_cui_actor_context"), dict) else {}
+    result = {
+        "visibility_scope": str(cfg.get("_cui_visibility_scope") or "").strip().lower(),
+        "actor_role": str(cfg.get("_cui_actor_role") or actor.get("role") or "").strip().lower(),
+        "actor_id": str(cfg.get("_cui_actor_id") or actor.get("actor_id") or "").strip(),
+        "tenant_id": str(cfg.get("_cui_tenant_id") or actor.get("tenant_id") or "").strip(),
+    }
+    return {k: v for k, v in result.items() if v}
+
+
+def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | None) -> bool:
+    """Fail closed for tagged admin/internal CUI sessions in customer views."""
+    actor = actor or {}
+    if not actor:
+        return True
+    role = (actor.get("role") or "").strip().lower()
+    if role in {"admin", "owner", "operator"}:
+        return True
+    meta = _session_cui_metadata(session)
+    if not meta:
+        # Legacy untagged sessions stay visible; new CUI sessions are tagged at creation time.
+        return True
+    if meta.get("tenant_id") and actor.get("tenant_id") and meta["tenant_id"] != actor["tenant_id"]:
+        return False
+    if meta.get("visibility_scope") in {"admin", "internal", "operator"}:
+        return False
+    if meta.get("actor_role") in {"admin", "owner", "operator"}:
+        return False
+    if meta.get("actor_id") and actor.get("actor_id") and meta["actor_id"] != actor["actor_id"]:
+        return False
+    return True
+
+
+def _enforce_cui_session_visible(session: dict | None, actor: dict[str, str] | None) -> None:
+    if not _session_visible_to_cui_actor(session, actor):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+
 @app.get("/api/sessions")
 async def get_sessions(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -8179,24 +8245,42 @@ async def get_sessions(
             # uses these to split recents (exclude=cron) from the cron-jobs
             # section (source=cron) into two independent lists.
             exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                limit=limit,
-                offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-            )
-            total = db.session_count(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
+            actor = _cui_actor_context_from_request(request)
+            if actor:
+                # Apply visibility before pagination/counting so customer views
+                # cannot infer admin/internal sessions from empty slots or totals.
+                visible_all = db.list_sessions_rich(
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    limit=10000,
+                    offset=0,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    order_by_last_active=order == "recent",
+                )
+                visible_all = [s for s in visible_all if _session_visible_to_cui_actor(s, actor)]
+                total = len(visible_all)
+                sessions = visible_all[offset:offset + limit]
+            else:
+                sessions = db.list_sessions_rich(
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    limit=limit,
+                    offset=offset,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    order_by_last_active=order == "recent",
+                )
+                total = db.session_count(
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    exclude_children=True,
+                )
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
@@ -8338,7 +8422,7 @@ async def get_profiles_sessions(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+async def search_sessions(request: Request, q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -8355,6 +8439,8 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
         db = _open_session_db_for_profile(profile)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
+
+            actor = _cui_actor_context_from_request(request)
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -8436,6 +8522,13 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                 if not raw_sid:
                     return
                 root = compression_root(raw_sid)
+                if actor:
+                    try:
+                        visible_session = db.get_session(lineage_tip(root)) or db.get_session(root)
+                    except Exception:
+                        visible_session = None
+                    if not _session_visible_to_cui_actor(visible_session, actor):
+                        return
                 if root in seen or len(seen) >= safe_limit:
                     return
                 payload = dict(payload)
@@ -12153,13 +12246,15 @@ def _open_session_db_for_profile(profile: Optional[str]):
 
 
 @app.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str, profile: Optional[str] = None):
+async def get_session_detail(session_id: str, request: Request, profile: Optional[str] = None):
+    actor = _cui_actor_context_from_request(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        _enforce_cui_session_visible(session, actor)
         if profile:
             session["profile"] = _cron_profile_home(profile)[0]
         return session
@@ -12169,7 +12264,15 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
-async def get_session_latest_descendant(session_id: str):
+async def get_session_latest_descendant(session_id: str, request: Request):
+    actor = _cui_actor_context_from_request(request)
+    if actor:
+        db = _open_session_db_for_profile(None)
+        try:
+            sid = db.resolve_session_id(session_id)
+            _enforce_cui_session_visible(db.get_session(sid) if sid else None, actor)
+        finally:
+            db.close()
     latest, path = _session_latest_descendant(session_id)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -12181,13 +12284,16 @@ async def get_session_latest_descendant(session_id: str):
     }
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, profile: Optional[str] = None):
+async def get_session_messages(session_id: str, request: Request, profile: Optional[str] = None):
+    actor = _cui_actor_context_from_request(request)
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
+        _enforce_cui_session_visible(db.get_session(sid), actor)
         sid = db.resolve_resume_session_id(sid)
+        _enforce_cui_session_visible(db.get_session(sid), actor)
         messages = db.get_messages(sid)
         return {"session_id": sid, "messages": messages}
     finally:

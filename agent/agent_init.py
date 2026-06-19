@@ -1090,6 +1090,22 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    try:
+        from agent.cui_actor_context import current_cui_actor_context, is_aiwerk_admin_actor
+        _cui_actor_context = current_cui_actor_context()
+        if _cui_actor_context:
+            _cui_role = str(_cui_actor_context.get("role") or "").strip().lower()
+            agent._session_init_model_config["_cui_actor_context"] = _cui_actor_context
+            agent._session_init_model_config["_cui_visibility_scope"] = (
+                "admin" if is_aiwerk_admin_actor(_cui_actor_context) else "customer"
+            )
+            agent._session_init_model_config["_cui_actor_role"] = _cui_role
+            if _cui_actor_context.get("actor_id"):
+                agent._session_init_model_config["_cui_actor_id"] = str(_cui_actor_context.get("actor_id"))
+            if _cui_actor_context.get("tenant_id"):
+                agent._session_init_model_config["_cui_tenant_id"] = str(_cui_actor_context.get("tenant_id"))
+    except Exception:
+        pass
     
     # Shared todo list for task planning; persisted to TODO.md when available so
     # the CUI Aufgaben panel can show the same active agent tasks.
