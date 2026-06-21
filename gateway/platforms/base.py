@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -1633,8 +1634,17 @@ def merge_pending_message_event(
     if existing:
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
+        incoming_is_audio = event.message_type in {MessageType.AUDIO, MessageType.VOICE}
         existing_has_media = bool(existing.media_urls)
         incoming_has_media = bool(event.media_urls)
+
+        # Voice/audio follow-ups are user turns, not album-style attachments.
+        # If several Telegram voice notes arrive while an agent turn is active,
+        # keep only the latest pending note instead of concatenating all cached
+        # audio paths and replaying/transcribing stale messages later.
+        if incoming_is_audio:
+            pending_messages[session_key] = event
+            return
 
         if existing_is_photo and incoming_is_photo:
             existing.media_urls.extend(event.media_urls)
@@ -4297,8 +4307,20 @@ class BasePlatformAdapter(ABC):
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
+                            tts_kwargs = {"text": speech_text}
+                            # Telegram voice bubbles auto-play as a continuous
+                            # playlist in some clients.  For automatic Hermes
+                            # replies use sendAudio/MP3 so tapping the newest
+                            # reply does not continue into older voice notes.
+                            if _platform_name(self.platform) == "telegram":
+                                out_dir = os.path.join(tempfile.gettempdir(), "hermes_voice")
+                                os.makedirs(out_dir, exist_ok=True)
+                                tts_kwargs["output_path"] = os.path.join(
+                                    out_dir,
+                                    f"auto_tts_{uuid.uuid4().hex[:12]}.mp3",
+                                )
                             tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                                text_to_speech_tool, **tts_kwargs
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")
