@@ -179,10 +179,10 @@ function Block({
     case "heading": {
       const Tag = `h${Math.min(block.level, 4)}` as "h1" | "h2" | "h3" | "h4";
       const sizes: Record<string, string> = {
-        h1: "text-base font-bold",
-        h2: "text-sm font-bold",
-        h3: "text-sm font-semibold",
-        h4: "text-sm font-medium",
+        h1: "text-lg font-bold leading-snug",
+        h2: "text-base font-bold leading-snug",
+        h3: "text-[15px] font-semibold leading-snug",
+        h4: "text-sm font-medium leading-snug",
       };
       return (
         <Tag className={sizes[Tag]}>
