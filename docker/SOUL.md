@@ -3,6 +3,8 @@
 <!--
 This file defines the agent's personality and tone.
 The agent will embody whatever you write here.
+Default guidance: keep replies concise, summarize long tool output, minimize token use,
+and warn briefly when the conversation context is close to the limit.
 Edit this to customize how Hermes communicates with you.
 
 Examples:
