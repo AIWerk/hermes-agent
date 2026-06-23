@@ -8384,7 +8384,15 @@ def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | 
         return True
     meta = _session_cui_metadata(session)
     if not meta:
-        # Legacy untagged sessions stay visible; new CUI sessions are tagged at creation time.
+        # Legacy CLI/TUI/internal sessions from tenant setup predate CUI actor
+        # metadata. In customer views they must fail closed; otherwise admin
+        # onboarding chats leak into future customer agents. Admin/operator
+        # actors already returned True above.
+        source = ""
+        if isinstance(session, dict):
+            source = str(session.get("source") or "").strip().lower()
+        if source in {"cli", "tui", "cron", "classifier", "reflection", "system", "internal"}:
+            return False
         return True
     if meta.get("tenant_id") and actor.get("tenant_id") and meta["tenant_id"] != actor["tenant_id"]:
         return False
