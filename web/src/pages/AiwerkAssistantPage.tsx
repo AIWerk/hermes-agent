@@ -2554,7 +2554,7 @@ export default function AiwerkAssistantPage() {
 
           <section className="grid min-w-0 min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-[10px]">
             <div className="text-xs font-bold uppercase tracking-[0.12em] text-[#bfb7aa]">LETZTE SITZUNGEN</div>
-            <div className="aiwerk-scrollbar min-w-0 min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain pb-[8px] pr-[18px]">
+            <div className="aiwerk-scrollbar min-w-0 min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain pb-[8px]">
               <div className="grid min-w-0 content-start gap-[10px] overflow-hidden rounded-[18px] border border-white/10 bg-white/[0.065] p-[14px]">
               {recentSessions.length === 0 ? (
                 <p className="text-[13px] text-[#bfb7aa]">Noch keine Historie geladen.</p>
