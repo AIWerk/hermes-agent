@@ -29,6 +29,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
+    INFORMATION_RETRIEVAL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
@@ -54,6 +55,18 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_information_retrieval_guidance_orders_lookup_layers(self):
+        text = INFORMATION_RETRIEVAL_GUIDANCE.lower()
+        assert "current user message" in text
+        assert "session_search" in text
+        assert "skills" in text
+        assert "files" in text
+        assert "git" in text
+        assert "terminal" in text
+        assert "web" in text
+        assert "ask the user only" in text
+        assert len(INFORMATION_RETRIEVAL_GUIDANCE) < 600
 
 
 # =========================================================================
