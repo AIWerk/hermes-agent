@@ -32,6 +32,7 @@ TitleCallback = Callable[[str], None]
 _TITLE_PROMPT = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
+    "Write the title in the same language the user is writing in. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
@@ -39,6 +40,28 @@ _RETITLE_PROMPT = (
     "Generate a concise updated session title (3-8 words). Capture the overall current topic, "
     "not just the first exchange. Return ONLY the title text, no quotes, no punctuation, no prefix."
 )
+
+_TITLE_PROMPT_PINNED_LANGUAGE = (
+    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
+    "following exchange. The title should capture the main topic or intent. "
+    "Write the title in {language}. "
+    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+)
+
+
+def _title_language() -> str:
+    """Return configured title language, or empty string to match the user."""
+    try:
+        from hermes_cli.config import load_config
+
+        return str(
+            ((load_config() or {}).get("auxiliary") or {})
+            .get("title_generation", {})
+            .get("language", "")
+        ).strip()
+    except Exception:
+        return ""
+
 
 _FINAL_TITLE_PROMPT = (
     "Generate the final concise session title (3-8 words) from this compact session summary. "
@@ -159,8 +182,10 @@ def generate_title(
     """Generate a session title from the first exchange."""
     user_snippet = redact_sensitive_text(user_message[:500] if user_message else "")
     assistant_snippet = redact_sensitive_text(assistant_response[:500] if assistant_response else "")
+    language = _title_language()
+    prompt = _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language) if language else _TITLE_PROMPT
     return _call_title_llm(
-        system_prompt=_TITLE_PROMPT,
+        system_prompt=prompt,
         user_prompt=f"User: {user_snippet}\n\nAssistant: {assistant_snippet}",
         timeout=timeout,
         failure_callback=failure_callback,

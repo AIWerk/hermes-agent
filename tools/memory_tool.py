@@ -742,19 +742,13 @@ def _memory_router_enabled() -> bool:
             cfg_get(cfg, "memory", "router", "block_non_inject_writes", default=True)
         )
     except Exception:
-        # The curation policy can't be read (transient/corrupt config). Fail
-        # OPEN for curation so a config glitch doesn't silently reject the
-        # agent's legitimate writes. The credential gate in
-        # _router_block_response stays active regardless, so this never relaxes
-        # the secret-leak protection.
+        # Fail open for curation so a config glitch doesn't silently reject
+        # legitimate writes. Credential protection remains unconditional.
         return False
 
 
 def _router_block_response(content: str, target: str, *, policy_block: bool = True) -> Optional[str]:
     ok, route = should_write_builtin_memory(content, target=target)
-    # Credential safety is an unconditional invariant: never let secrets reach
-    # prompt-injected memory, even when the curation policy is disabled or its
-    # config can't be read.
     if route.sensitivity == MemorySensitivity.CREDENTIAL:
         return json.dumps({
             "success": False,
@@ -772,6 +766,26 @@ def _router_block_response(content: str, target: str, *, policy_block: bool = Tr
         "error": "Memory router blocked this write from prompt-injected memory.",
         "route": route.to_dict(),
     }, ensure_ascii=False)
+
+
+def load_on_disk_store() -> "MemoryStore":
+    """Build a fresh on-disk MemoryStore, honoring configured char limits."""
+    memory_char_limit = 2200
+    user_char_limit = 1375
+    try:
+        from hermes_cli import config as hermes_config
+
+        mem_cfg = (hermes_config.load_config() or {}).get("memory", {}) or {}
+        memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
+        user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
+    except Exception:
+        pass
+    store = MemoryStore(
+        memory_char_limit=memory_char_limit,
+        user_char_limit=user_char_limit,
+    )
+    store.load_from_disk()
+    return store
 
 
 def _apply_write_gate(action: str, target: str, content: Optional[str],
@@ -889,6 +903,38 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     )
 
 
+def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> str:
+    """Build a recoverable error for a replace/remove call that arrived without
+    ``old_text``.
+
+    ``replace``/``remove`` are inherently targeted -- without ``old_text`` there
+    is no entry to act on, so we cannot fulfil the call. But returning a bare
+    "old_text is required" is a dead-end: some structured-output clients omit the
+    optional ``old_text`` field (it isn't, and can't be, schema-required without
+    a top-level combinator the Codex backend rejects -- see
+    tests/tools/test_memory_tool_schema.py). So instead we return the current
+    entry inventory plus an explicit retry instruction, letting the model reissue
+    the call with ``old_text`` set to a unique substring of the entry it means.
+    Mirrors the batch path's ``_batch_error`` shape. (issues #43412, #49466)
+    """
+    entries = store._entries_for(target)
+    current = store._char_count(target)
+    limit = store._char_limit(target)
+    return json.dumps(
+        {
+            "success": False,
+            "error": (
+                f"'{action}' needs old_text -- a short unique substring of the entry "
+                f"to {action}. None was provided. Reissue the {action} with old_text "
+                f"set to part of one of the current_entries below."
+            ),
+            "current_entries": entries,
+            "usage": f"{current:,}/{limit:,}",
+        },
+        ensure_ascii=False,
+    )
+
+
 def memory_tool(
     action: str = None,
     target: str = "memory",
@@ -947,9 +993,15 @@ def memory_tool(
         return tool_error("Content is required for 'add' action.", success=False)
     if action == "replace" and (not old_text or not content):
         missing = "old_text" if not old_text else "content"
+        if not old_text:
+            # The client/model omitted old_text. Replace is inherently targeted
+            # -- we can't guess which entry. Return the current inventory plus a
+            # retry instruction so the model can reissue with old_text set,
+            # instead of hitting a dead-end error. (issues #43412, #49466)
+            return _missing_old_text_error(store, target, "replace")
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
-        return tool_error("old_text is required for 'remove' action.", success=False)
+        return _missing_old_text_error(store, target, "remove")
 
     blocked = _operator_session_memory_block(store)
     if blocked is not None:
@@ -1022,7 +1074,7 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
             return {"success": False, "error": "operations must be a list."}
         for op in operations:
             if isinstance(op, dict) and op.get("action") in {"add", "replace"}:
-                blocked = _router_block_response(op.get("content"), target)
+                blocked = _router_block_response(op.get("content"), target, policy_block=False)
                 if blocked is not None:
                     return json.loads(blocked)
         return store.apply_batch(target, operations)
@@ -1030,7 +1082,7 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
         blocked_operator = _operator_session_memory_block(store)
         if blocked_operator is not None:
             return json.loads(blocked_operator)
-        blocked = _router_block_response(content, target)
+        blocked = _router_block_response(content, target, policy_block=False)
         if blocked is not None:
             return json.loads(blocked)
         return store.add(target, content)
@@ -1038,7 +1090,7 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
         blocked_operator = _operator_session_memory_block(store)
         if blocked_operator is not None:
             return json.loads(blocked_operator)
-        blocked = _router_block_response(content, target)
+        blocked = _router_block_response(content, target, policy_block=False)
         if blocked is not None:
             return json.loads(blocked)
         return store.replace(target, old_text, content)
@@ -1090,7 +1142,7 @@ MEMORY_SCHEMA = {
             },
             "old_text": {
                 "type": "string",
-                "description": "Short unique substring identifying the entry to replace or remove (single-op shape)."
+                "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
             },
             "operations": {
                 "type": "array",

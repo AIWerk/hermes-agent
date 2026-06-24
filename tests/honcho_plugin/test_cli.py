@@ -710,6 +710,7 @@ class TestSetupWizardDeploymentShape:
     def test_just_me_pins_and_clears_aliases(self, monkeypatch, tmp_path):
         answers = [
             "cloud",           # deployment
+            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -732,6 +733,7 @@ class TestSetupWizardDeploymentShape:
     def test_only_others_leaves_pin_false_and_accepts_prefix(self, monkeypatch, tmp_path):
         answers = [
             "cloud",           # deployment
+            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -750,6 +752,7 @@ class TestSetupWizardDeploymentShape:
     def test_pooled_aliases_operator_runtime_ids_to_peer_name(self, monkeypatch, tmp_path):
         answers = [
             "cloud",           # deployment
+            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -782,7 +785,7 @@ class TestSetupWizardDeploymentShape:
             }},
         }
         answers = [
-            "cloud", "", "eri", "hermetika", "hermes", "s",
+            "cloud", "apikey", "", "eri", "hermetika", "hermes", "s",
         ]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         assert host["pinUserPeer"] is True
@@ -801,6 +804,7 @@ class TestSetupWizardDeploymentShape:
         }
         answers = [
             "cloud",           # deployment
+            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -825,7 +829,7 @@ class TestSetupWizardDeploymentShape:
             "hosts": {"hermes": {"pinPeerName": True, "peerName": "eri"}},
         }
         answers = [
-            "cloud", "", "eri", "hermetika", "hermes",
+            "cloud", "apikey", "", "eri", "hermetika", "hermes",
             "3",               # tree: only others — triggers the orphan guard
             "n",               # decline pooling, accept orphaning
             "telegram_",       # runtime peer prefix
@@ -851,7 +855,7 @@ class TestSetupWizardDeploymentShape:
         # mock falls through to the prompt's default (the detected shape →
         # choice "1").  Scripting an explicit "" would NOT exercise that
         # fallthrough — the mock returns it literally.
-        answers = ["cloud", "", "eri", "hermetika", "hermes"]
+        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes"]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         # Scrub-then-write normalises onto the canonical pinUserPeer.
         assert host["pinUserPeer"] is True
@@ -873,7 +877,7 @@ class TestSetupWizardDeploymentShape:
                 "peerName": "eri",
             }},
         }
-        answers = ["cloud", "", "eri", "hermetika", "hermes"]
+        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes"]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         assert host["pinUserPeer"] is False
         assert "pinPeerName" not in host
@@ -887,7 +891,7 @@ class TestSetupWizardDeploymentShape:
             "userPeerAliases": {"7654321": "eri"},
             "hosts": {"hermes": {"peerName": "eri"}},
         }
-        answers = ["cloud", "", "eri", "hermetika", "hermes"]
+        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes"]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         assert host["pinUserPeer"] is False
         # Hybrid materialises the root aliases into the host so subsequent
@@ -912,7 +916,7 @@ class TestSetupWizardDeploymentShape:
             "hosts": {"hermes": {"peerName": "eri"}},
         }
         answers = [
-            "cloud", "", "eri", "hermetika", "hermes",
+            "cloud", "apikey", "", "eri", "hermetika", "hermes",
             "3",               # explicit per-user override of detected hybrid
         ]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
@@ -931,7 +935,7 @@ class TestSetupWizardDeploymentShape:
             }},
         }
         answers = [
-            "cloud", "", "eri", "hermetika", "hermes",
+            "cloud", "apikey", "", "eri", "hermetika", "hermes",
             "1",
         ]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
@@ -944,7 +948,7 @@ class TestSetupWizardDeploymentShape:
             "apiKey": "***",
             "hosts": {"hermes": {"peerName": "eri"}},
         }
-        answers = ["cloud", "", "eri", "hermetika", "hermes", "n"]
+        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes", "n"]
         host = self._run_setup(
             monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg,
             gateway_platforms=[],
@@ -960,7 +964,7 @@ class TestSetupWizardDeploymentShape:
             "apiKey": "***",
             "hosts": {"hermes": {"peerName": "eri"}},
         }
-        answers = ["cloud", "", "eri", "hermetika", "hermes", "n"]
+        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes", "n"]
         host = self._run_setup(
             monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg,
             gateway_platforms=None,
@@ -971,7 +975,7 @@ class TestSetupWizardDeploymentShape:
         """The [e] escape hatch lets a power user set pinUserPeer + an alias +
         prefix directly, bypassing the intent tree."""
         answers = [
-            "cloud", "", "eri", "hermetika", "hermes",
+            "cloud", "apikey", "", "eri", "hermetika", "hermes",
             "e",               # tree: edit raw keys
             "false",           # pinUserPeer
             "99887766=eri",    # one alias pair
