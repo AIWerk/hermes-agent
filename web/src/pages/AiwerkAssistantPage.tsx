@@ -480,6 +480,15 @@ function contextUsageFromPayload(payload: unknown): ContextUsage | null {
   };
 }
 
+function sameContextUsage(a: ContextUsage | null, b: ContextUsage | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.used === b.used
+    && a.max === b.max
+    && a.percent === b.percent
+    && a.compressions === b.compressions;
+}
+
 function compactNumber(value?: number): string {
   if (!Number.isFinite(value)) return "–";
   if ((value ?? 0) >= 1_000_000) return `${Math.round((value ?? 0) / 100_000) / 10}M`;
@@ -1456,9 +1465,15 @@ export default function AiwerkAssistantPage() {
   const refreshContextUsage = useCallback(async (gateway: GatewayClient, sid: string) => {
     try {
       const usage = await gateway.request<Record<string, unknown>>("session.usage", { session_id: sid }, 15_000);
-      setContextUsage(contextUsageFromPayload(usage));
+      if (sessionIdRef.current && sid !== sessionIdRef.current) return;
+      const nextUsage = contextUsageFromPayload(usage);
+      if (nextUsage) {
+        setContextUsage((current) => sameContextUsage(current, nextUsage) ? current : nextUsage);
+      }
     } catch {
-      setContextUsage(null);
+      // Keep the last stable value. Clearing on transient polling failures made
+      // the left sidebar context text flip between "Kontext" and the measured
+      // state during reconnect/sync bursts.
     }
   }, []);
 
@@ -1467,6 +1482,7 @@ export default function AiwerkAssistantPage() {
       gateway.request<{ title?: string }>("session.title", { session_id: sid }, 15_000),
       gateway.request<SessionNotesSnapshot>("session.notes", { session_id: sid, limit: 12 }, 15_000),
     ]);
+    if (sessionIdRef.current && sid !== sessionIdRef.current) return;
     if (titleResult.status === "fulfilled" && titleResult.value.title?.trim()) {
       setSessionTitle(titleResult.value.title.trim());
     }
@@ -1729,7 +1745,7 @@ export default function AiwerkAssistantPage() {
         const sid = ev.session_id;
         if (sid) {
           const usage = contextUsageFromPayload(payload);
-          if (usage) setContextUsage(usage);
+          if (usage) setContextUsage((current) => sameContextUsage(current, usage) ? current : usage);
           window.setTimeout(() => void refreshSessionMeta(gateway, sid), 400);
           window.setTimeout(() => void refreshContextUsage(gateway, sid), 500);
           window.setTimeout(() => void refreshSessionMeta(gateway, sid), 2400);
@@ -1758,23 +1774,17 @@ export default function AiwerkAssistantPage() {
     const offApproval = gateway.on("approval.request", pushApproval);
     const offClarify = gateway.on("clarify.request", pushApproval);
     const offTitle = gateway.on<{ title?: string }>("session.title", (ev) => {
+      if (ev.session_id && sessionIdRef.current && ev.session_id !== sessionIdRef.current) return;
       const title = ev.payload?.title?.trim();
       if (title) setSessionTitle(title);
     });
     const offSessionInfo = gateway.on("session.info", (ev) => {
+      if (ev.session_id && sessionIdRef.current && ev.session_id !== sessionIdRef.current) return;
       const payload = (ev.payload ?? {}) as Record<string, unknown>;
-      const usage = contextUsageFromPayload(payload);
-      if (usage) setContextUsage(usage);
       const persistentSessionId = typeof payload.session_id === "string" ? payload.session_id.trim() : "";
-      if (persistentSessionId) {
+      if (persistentSessionId && persistentSessionId !== activeSessionKeyRef.current) {
         setActiveSessionKey(persistentSessionId);
         storeActiveSessionId(persistentSessionId);
-      }
-      const sid = ev.session_id;
-      if (sid) {
-        void refreshSessionMeta(gateway, sid);
-        void refreshRuntimeStatus(gateway, sid);
-        void refreshContextUsage(gateway, sid);
       }
     });
 
