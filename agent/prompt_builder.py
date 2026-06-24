@@ -191,6 +191,15 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+INFORMATION_RETRIEVAL_GUIDANCE = (
+    "# Information retrieval routing\n"
+    "Resolve needed information in this order: current user message and active "
+    "context first; session_search for prior conversations; skills for known "
+    "workflows; files, git, terminal, APIs, wiki, Neo4j, or web tools for current "
+    "or verifiable facts. Ask the user only when the missing information cannot "
+    "be retrieved or materially changes the action."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
