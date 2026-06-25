@@ -199,6 +199,15 @@ def test_callback_operator_verifier_fails_closed_without_callback(monkeypatch, t
     assert result.ok is False
     assert result.reason == "callback_not_available"
 
+
+def test_cli_agent_thread_wires_operator_verifier_callback():
+    import inspect
+    import cli
+
+    src = inspect.getsource(cli.HermesCLI.chat)
+    assert "set_operator_verification_callback(self._operator_verification_callback)" in src
+    assert "set_operator_verification_callback(None)" in src
+
 def test_operator_verification_result_valid_until_expiry():
     result = OperatorVerificationResult(
         ok=True,

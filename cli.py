@@ -13001,6 +13001,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     set_secret_capture_callback(self._secret_capture_callback)
                 except Exception:
                     pass
+                try:
+                    set_operator_verification_callback(self._operator_verification_callback)
+                except Exception:
+                    pass
                 # Bind this turn's approval session key into the contextvar so
                 # ``tools.approval.is_current_session_yolo_enabled()`` resolves
                 # against the same key that ``/yolo`` toggles under (see
@@ -13066,6 +13070,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         set_sudo_password_callback(None)
                         set_approval_callback(None)
                         set_secret_capture_callback(None)
+                        set_operator_verification_callback(None)
                     except Exception:
                         pass
                     # Release the per-turn approval session key. ``_session_yolo``
