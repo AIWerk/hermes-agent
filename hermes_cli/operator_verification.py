@@ -151,11 +151,10 @@ def current_operator_interface() -> str:
     explicit = _normalize_interface(os.getenv("HERMES_OPERATOR_INTERFACE", ""))
     if explicit:
         return explicit
-    if (
-        os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "on"}
-        and hasattr(sys.stdin, "isatty")
-        and sys.stdin.isatty()
-    ):
+    if os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        # The interactive Hermes CLI owns the user-facing prompt even when tool
+        # workers themselves have no controlling TTY. Route to the in-process
+        # masked callback, not the desktop GUI verifier.
         return "cli"
     return "local"
 

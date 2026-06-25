@@ -36,13 +36,13 @@ def test_current_operator_interface_prefers_gateway_platform(monkeypatch):
     assert current_operator_interface() == "telegram"
 
 
-def test_current_operator_interface_routes_non_tty_tool_worker_to_local(monkeypatch):
+def test_current_operator_interface_routes_interactive_tool_worker_to_cli(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_OPERATOR_INTERFACE", raising=False)
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
 
-    assert current_operator_interface() == "local"
+    assert current_operator_interface() == "cli"
 
 
 def test_current_operator_interface_detects_cui_actor_context(monkeypatch):
