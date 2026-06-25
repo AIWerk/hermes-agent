@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -36,6 +37,9 @@ class OperatorVerificationConfig:
     ttl_seconds: int = _DEFAULT_TTL_SECONDS
     require_for_cli_admin: bool = True
     interface: str = ""
+    verifier_type: str = "command"
+    missing_interface: bool = False
+    trusted_actor_ids: list[str] | None = None
 
 
 _SENSITIVE_COMMAND_RE = re.compile(
@@ -108,7 +112,14 @@ def _normalize_interface(value: Any) -> str:
 
 
 def current_operator_interface() -> str:
-    """Best-effort UI/channel label for choosing an operator verifier."""
+    """Return the active communication surface for operator verification.
+
+    This is not a fallback preference. Gateway/CUI platform context wins. A
+    local CLI is only ``cli`` when the process has a real controlling terminal;
+    Hermes tool-runner calls from a local desktop session otherwise route to
+    ``local`` so they can use the desktop verifier instead of an invisible
+    /dev/tty prompt.
+    """
     try:
         from gateway.session_context import get_session_env
 
@@ -118,10 +129,16 @@ def current_operator_interface() -> str:
     platform = _normalize_interface(platform)
     if platform:
         return platform
+    if os.getenv("AIWERK_CUI_ACTOR_CONTEXT") or os.getenv("AIWERK_CUI_ACTOR_ROLE"):
+        return "web"
     explicit = _normalize_interface(os.getenv("HERMES_OPERATOR_INTERFACE", ""))
     if explicit:
         return explicit
-    if os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if (
+        os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "on"}
+        and hasattr(sys.stdin, "isatty")
+        and sys.stdin.isatty()
+    ):
         return "cli"
     return "local"
 
@@ -170,13 +187,24 @@ def load_operator_verification_config(interface: str | None = None) -> OperatorV
 
     selected_interface = _normalize_interface(interface) or current_operator_interface()
     command = _command_settings(section.get("command"))
+    verifier_type = str(section.get("verifier") or "command").strip().lower() or "command"
+    trusted_actor_ids = [str(item) for item in (section.get("trusted_actor_ids") or []) if str(item)]
     interfaces = section.get("interfaces", section.get("verifiers", {}))
+    missing_interface = False
     if isinstance(interfaces, dict):
         selected = interfaces.get(selected_interface)
         if isinstance(selected, dict):
             selected_command = _command_settings(selected)
-            if selected_command:
-                command = {**command, **selected_command}
+            verifier_type = str(selected.get("verifier") or selected_command.get("verifier") or verifier_type).strip().lower() or "command"
+            if isinstance(selected.get("trusted_actor_ids"), list):
+                trusted_actor_ids = [str(item) for item in selected.get("trusted_actor_ids", []) if str(item)]
+            command = selected_command
+        elif interfaces:
+            # If interface-specific verifiers are configured, never fall back to
+            # the generic command for a different channel. Invisible verifier
+            # prompts are worse than failing closed.
+            command = {}
+            missing_interface = True
     argv = _argv_from_command(command, section.get("argv", []))
 
     return OperatorVerificationConfig(
@@ -194,6 +222,9 @@ def load_operator_verification_config(interface: str | None = None) -> OperatorV
         ),
         require_for_cli_admin=bool(section.get("require_for_cli_admin", True)),
         interface=selected_interface,
+        verifier_type=verifier_type,
+        missing_interface=missing_interface,
+        trusted_actor_ids=trusted_actor_ids,
     )
 
 
@@ -204,6 +235,71 @@ def _failure(reason: str, *, now: int | None = None) -> OperatorVerificationResu
         verified_at=current,
         expires_at=current,
         reason=reason,
+    )
+
+
+def _cui_actor_verification(config: OperatorVerificationConfig, *, now: int) -> OperatorVerificationResult:
+    """Trust an authenticated AIWerk CUI admin/operator actor as verifier.
+
+    The CUI auth layer is the channel verifier: if the child process has actor
+    metadata for an admin/operator role, no second approval prompt is needed.
+    Missing or customer-only actor context fails closed.
+    """
+    raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
+    data: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+    actor_id = str(
+        data.get("actor_id")
+        or data.get("user_id")
+        or os.getenv("AIWERK_CUI_ACTOR_ID", "")
+        or ""
+    ).strip()
+    role = str(data.get("role") or os.getenv("AIWERK_CUI_ACTOR_ROLE", "") or "").strip().lower()
+    allowed_roles = {"aiwerk_admin", "admin", "operator", "owner", "tenant_admin"}
+    if not actor_id or role not in allowed_roles:
+        return _failure("cui_actor_not_authorized", now=now)
+    return OperatorVerificationResult(
+        ok=True,
+        actor_id=actor_id,
+        role=role,
+        verified_at=now,
+        expires_at=now + config.ttl_seconds,
+    )
+
+
+def _trusted_platform_actor_verification(config: OperatorVerificationConfig, *, now: int) -> OperatorVerificationResult:
+    """Trust the current gateway platform actor only when explicitly allowlisted."""
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "") or os.getenv("HERMES_SESSION_PLATFORM", "") or ""
+        actor_id = (
+            get_session_env("HERMES_SESSION_USER_ID", "")
+            or get_session_env("HERMES_SESSION_CHAT_ID", "")
+            or os.getenv("HERMES_SESSION_USER_ID", "")
+            or os.getenv("HERMES_SESSION_CHAT_ID", "")
+            or ""
+        )
+        actor_name = get_session_env("HERMES_SESSION_USER_NAME", "") or os.getenv("HERMES_SESSION_USER_NAME", "") or ""
+    except Exception:
+        platform = os.getenv("HERMES_SESSION_PLATFORM", "") or ""
+        actor_id = os.getenv("HERMES_SESSION_USER_ID", "") or os.getenv("HERMES_SESSION_CHAT_ID", "") or ""
+        actor_name = os.getenv("HERMES_SESSION_USER_NAME", "") or ""
+    trusted = set(config.trusted_actor_ids or [])
+    candidates = {str(actor_id), str(actor_name)} - {""}
+    if not platform or not candidates or not (trusted & candidates):
+        return _failure("platform_actor_not_authorized", now=now)
+    return OperatorVerificationResult(
+        ok=True,
+        actor_id=str(actor_id or actor_name),
+        role="operator",
+        verified_at=now,
+        expires_at=now + config.ttl_seconds,
     )
 
 
@@ -238,6 +334,12 @@ def run_operator_verifier(
 
     if not cfg.enabled:
         return _failure("disabled", now=current)
+    if cfg.missing_interface:
+        return _failure("not_configured_for_interface", now=current)
+    if cfg.verifier_type in {"cui_actor", "cui-actor", "cui_admin", "cui-admin", "cui_actor_context", "cui-actor-context"}:
+        return _cui_actor_verification(cfg, now=current)
+    if cfg.verifier_type in {"trusted_platform_actor", "trusted-platform-actor", "platform_actor", "platform-actor"}:
+        return _trusted_platform_actor_verification(cfg, now=current)
     if not cfg.argv:
         return _failure("not_configured", now=current)
 

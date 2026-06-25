@@ -34,6 +34,23 @@ def test_current_operator_interface_prefers_gateway_platform(monkeypatch):
     assert current_operator_interface() == "telegram"
 
 
+def test_current_operator_interface_routes_non_tty_tool_worker_to_local(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_OPERATOR_INTERFACE", raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    assert current_operator_interface() == "local"
+
+
+def test_current_operator_interface_detects_cui_actor_context(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_OPERATOR_INTERFACE", raising=False)
+    monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "aiwerk_admin")
+
+    assert current_operator_interface() == "web"
+
+
 def test_operator_verification_config_selects_interface_specific_command(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
@@ -45,8 +62,10 @@ def test_operator_verification_config_selects_interface_specific_command(monkeyp
                     "require_for_cli_admin": True,
                     "command": {"argv": ["local-gui"], "timeout_seconds": 60},
                     "interfaces": {
+                        "local": {"argv": ["local-gui"], "timeout_seconds": 60},
                         "cli": {"argv": ["tty-prompt"], "timeout_seconds": 30},
                         "telegram": {"command": {"argv": ["telegram-approve"], "timeout_seconds": 120}},
+                        "web": {"verifier": "cui_actor"},
                     },
                 }
             }
@@ -56,14 +75,83 @@ def test_operator_verification_config_selects_interface_specific_command(monkeyp
     cli_cfg = load_operator_verification_config(interface="cli")
     telegram_cfg = load_operator_verification_config(interface="telegram")
     web_cfg = load_operator_verification_config(interface="web")
+    missing_cfg = load_operator_verification_config(interface="discord")
 
     assert cli_cfg.argv == ["tty-prompt"]
     assert cli_cfg.timeout_seconds == 30
     assert cli_cfg.interface == "cli"
     assert telegram_cfg.argv == ["telegram-approve"]
     assert telegram_cfg.timeout_seconds == 120
-    assert web_cfg.argv == ["local-gui"]
-    assert web_cfg.timeout_seconds == 60
+    assert web_cfg.verifier_type == "cui_actor"
+    assert web_cfg.argv == []
+    assert missing_cfg.argv == []
+    assert missing_cfg.missing_interface is True
+
+
+def test_cui_admin_actor_context_verifies_without_prompt(monkeypatch):
+    monkeypatch.setenv("AIWERK_CUI_ACTOR_CONTEXT", json.dumps({"actor_id": "attila", "role": "aiwerk_admin"}))
+
+    result = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
+        now=100,
+    )
+
+    assert result.ok is True
+    assert result.actor_id == "attila"
+    assert result.role == "aiwerk_admin"
+    assert result.expires_at == 160
+
+
+def test_cui_customer_actor_context_does_not_self_upgrade(monkeypatch):
+    monkeypatch.setenv("AIWERK_CUI_ACTOR_CONTEXT", json.dumps({"actor_id": "customer", "role": "tenant_user"}))
+
+    result = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
+        now=100,
+    )
+
+    assert result.ok is False
+    assert result.reason == "cui_actor_not_authorized"
+
+
+def test_missing_interface_fails_closed_before_generic_command():
+    result = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, argv=["wrong-gui"], missing_interface=True),
+        now=100,
+    )
+
+    assert result.ok is False
+    assert result.reason == "not_configured_for_interface"
+
+
+def test_trusted_platform_actor_verifies_only_allowlisted_actor(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "12345")
+
+    valid = run_operator_verifier(
+        OperatorVerificationConfig(
+            enabled=True,
+            verifier_type="trusted_platform_actor",
+            trusted_actor_ids=["12345"],
+            ttl_seconds=60,
+        ),
+        now=100,
+    )
+    invalid = run_operator_verifier(
+        OperatorVerificationConfig(
+            enabled=True,
+            verifier_type="trusted_platform_actor",
+            trusted_actor_ids=["999"],
+            ttl_seconds=60,
+        ),
+        now=100,
+    )
+
+    assert valid.ok is True
+    assert valid.actor_id == "12345"
+    assert valid.role == "operator"
+    assert invalid.ok is False
+    assert invalid.reason == "platform_actor_not_authorized"
 
 def test_operator_verification_result_valid_until_expiry():
     result = OperatorVerificationResult(
