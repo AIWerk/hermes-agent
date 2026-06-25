@@ -53,11 +53,17 @@ def _callback_api():
         set_approval_callback,
         set_sudo_password_callback,
     )
+    from hermes_cli.operator_verification import (
+        _get_operator_verification_callback,
+        set_operator_verification_callback,
+    )
     return (
         _get_approval_callback,
         _get_sudo_password_callback,
         set_approval_callback,
         set_sudo_password_callback,
+        _get_operator_verification_callback,
+        set_operator_verification_callback,
     )
 
 
@@ -76,25 +82,28 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     absent.
     """
     ctx = contextvars.copy_context()
-    parent_approval_cb = parent_sudo_cb = None
+    parent_approval_cb = parent_sudo_cb = parent_operator_cb = None
     setters = None
     try:
-        get_approval, get_sudo, set_approval, set_sudo = _callback_api()
+        get_approval, get_sudo, set_approval, set_sudo, get_operator, set_operator = _callback_api()
         parent_approval_cb = get_approval()
         parent_sudo_cb = get_sudo()
-        setters = (set_approval, set_sudo)
+        parent_operator_cb = get_operator()
+        setters = (set_approval, set_sudo, set_operator)
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
 
     def _runner(*args, **kwargs):
         def _inner():
             if setters is not None:
-                set_approval, set_sudo = setters
+                set_approval, set_sudo, set_operator = setters
                 try:
                     if parent_approval_cb is not None:
                         set_approval(parent_approval_cb)
                     if parent_sudo_cb is not None:
                         set_sudo(parent_sudo_cb)
+                    if parent_operator_cb is not None:
+                        set_operator(parent_operator_cb)
                 except Exception:
                     logger.debug(
                         "Failed to install propagated approval/sudo callbacks; "
@@ -105,10 +114,11 @@ def propagate_context_to_thread(target: Callable) -> Callable:
                 return target(*args, **kwargs)
             finally:
                 if setters is not None:
-                    set_approval, set_sudo = setters
+                    set_approval, set_sudo, set_operator = setters
                     try:
                         set_approval(None)
                         set_sudo(None)
+                        set_operator(None)
                     except Exception:
                         logger.debug(
                             "Failed to clear propagated approval/sudo callbacks",

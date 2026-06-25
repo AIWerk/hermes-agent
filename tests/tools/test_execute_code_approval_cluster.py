@@ -42,17 +42,24 @@ def test_helper_propagates_contextvar_and_approval_callback():
         seen: dict = {}
 
         def worker():
+            from hermes_cli import operator_verification as OV
             seen["probe"] = probe.get()
             seen["cb"] = TT._get_approval_callback()
+            seen["operator_cb"] = OV._get_operator_verification_callback()
 
+        from hermes_cli import operator_verification as OV
+        OV.set_operator_verification_callback(sentinel)
         t = threading.Thread(target=propagate_context_to_thread(worker))
         t.start()
         t.join(timeout=5)
 
         assert seen["probe"] == "parent-value"  # ContextVar propagated
         assert seen["cb"] is sentinel            # thread-local callback propagated
+        assert seen["operator_cb"] is sentinel   # operator verifier callback propagated
     finally:
         TT.set_approval_callback(None)
+        from hermes_cli import operator_verification as OV
+        OV.set_operator_verification_callback(None)
 
 
 def test_helper_clears_callbacks_on_teardown():
@@ -62,23 +69,30 @@ def test_helper_clears_callbacks_on_teardown():
 
     sentinel = object()
     TT.set_approval_callback(sentinel)
+    from hermes_cli import operator_verification as OV
+    OV.set_operator_verification_callback(sentinel)
     try:
         seen: dict = {}
 
         def first():
             seen["during"] = TT._get_approval_callback()
+            seen["operator_during"] = OV._get_operator_verification_callback()
 
         def second():  # NOT wrapped — runs on the same recycled worker thread
             seen["after"] = TT._get_approval_callback()
+            seen["operator_after"] = OV._get_operator_verification_callback()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             ex.submit(propagate_context_to_thread(first)).result(timeout=5)
             ex.submit(second).result(timeout=5)
 
         assert seen["during"] is sentinel  # installed for the wrapped target
+        assert seen["operator_during"] is sentinel
         assert seen["after"] is None       # cleared on teardown
+        assert seen["operator_after"] is None
     finally:
         TT.set_approval_callback(None)
+        OV.set_operator_verification_callback(None)
 
 
 def test_both_rpc_threads_use_propagation_helper():

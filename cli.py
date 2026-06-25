@@ -904,6 +904,12 @@ def set_secret_capture_callback(*args, **kwargs):
     return _set_secret_capture_callback(*args, **kwargs)
 
 
+def set_operator_verification_callback(*args, **kwargs):
+    from hermes_cli.operator_verification import set_operator_verification_callback as _set_operator_verification_callback
+
+    return _set_operator_verification_callback(*args, **kwargs)
+
+
 def _cleanup_all_browsers(*args, **kwargs):
     from tools.browser_tool import _emergency_cleanup_all_sessions
 
@@ -5729,6 +5735,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)
         set_secret_capture_callback(self._secret_capture_callback)
+        set_operator_verification_callback(self._operator_verification_callback)
         try:
             from tools.computer_use_tool import set_approval_callback as _set_cu_cb
 
@@ -12369,6 +12376,49 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._restore_modal_input_snapshot()
         self._paint_now()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
+        return ""
+
+    def _operator_verification_callback(self) -> str:
+        """Prompt for the operator verifier secret through the prompt_toolkit UI."""
+        import time as _time
+
+        timeout = 90
+        response_queue = queue.Queue()
+        self._capture_modal_input_snapshot()
+        self._secret_state = {
+            "var_name": "HERMES_OPERATOR_VERIFICATION",
+            "prompt": "Hermes operator verification",
+            "metadata": {"purpose": "operator_verification"},
+            "response_queue": response_queue,
+        }
+        self._secret_deadline = _time.monotonic() + timeout
+        if hasattr(self, "_clear_secret_input_buffer"):
+            self._clear_secret_input_buffer()
+        self._paint_now()
+
+        while True:
+            try:
+                value = response_queue.get(timeout=1)
+                self._secret_state = None
+                self._secret_deadline = 0
+                self._restore_modal_input_snapshot()
+                self._paint_now()
+                if value:
+                    _cprint(f"\n{_DIM}  ✓ Operator verification secret received{_RST}")
+                else:
+                    _cprint(f"\n{_DIM}  ⏭ Operator verification skipped{_RST}")
+                return value
+            except queue.Empty:
+                remaining = self._secret_deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                self._paint_now()
+
+        self._secret_state = None
+        self._secret_deadline = 0
+        self._restore_modal_input_snapshot()
+        self._paint_now()
+        _cprint(f"\n{_DIM}  ⏱ Operator verification timed out{_RST}")
         return ""
 
     def _approval_callback(self, command: str, description: str,

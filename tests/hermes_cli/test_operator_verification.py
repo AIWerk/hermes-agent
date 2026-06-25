@@ -8,6 +8,7 @@ from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.operator_verification import (
     OperatorVerificationConfig,
     OperatorVerificationResult,
+    _derive_operator_secret,
     cache_operator_verification,
     clear_operator_verification_cache,
     current_operator_interface,
@@ -15,6 +16,7 @@ from hermes_cli.operator_verification import (
     load_operator_verification_config,
     operator_verification_block_reason_for_command,
     run_operator_verifier,
+    set_operator_verification_callback,
 )
 
 
@@ -152,6 +154,50 @@ def test_trusted_platform_actor_verifies_only_allowlisted_actor(monkeypatch):
     assert valid.role == "operator"
     assert invalid.ok is False
     assert invalid.reason == "platform_actor_not_authorized"
+
+
+def test_callback_operator_verifier_uses_masked_callback_and_store(monkeypatch, tmp_path):
+    store = tmp_path / "operator-verifier.json"
+    salt = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY="
+    store.write_text(json.dumps({
+        "version": 1,
+        "actor_id": "attila",
+        "role": "operator",
+        "salt": salt,
+        "hash": _derive_operator_secret("secret", salt),
+    }), encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.operator_verification._STORE", store)
+    set_operator_verification_callback(lambda: "secret")
+
+    result = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, verifier_type="callback", ttl_seconds=60),
+        now=100,
+    )
+
+    assert result.ok is True
+    assert result.actor_id == "attila"
+    assert result.role == "operator"
+    assert result.expires_at == 160
+    set_operator_verification_callback(None)
+
+
+def test_callback_operator_verifier_fails_closed_without_callback(monkeypatch, tmp_path):
+    store = tmp_path / "operator-verifier.json"
+    store.write_text(json.dumps({
+        "version": 1,
+        "salt": "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY=",
+        "hash": "unused",
+    }), encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.operator_verification._STORE", store)
+    set_operator_verification_callback(None)
+
+    result = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, verifier_type="callback"),
+        now=100,
+    )
+
+    assert result.ok is False
+    assert result.reason == "callback_not_available"
 
 def test_operator_verification_result_valid_until_expiry():
     result = OperatorVerificationResult(

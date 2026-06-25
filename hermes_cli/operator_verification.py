@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 
 MAX_VERIFIER_STDOUT_CHARS = 4096
 _DEFAULT_TTL_SECONDS = 900
 _DEFAULT_TIMEOUT_SECONDS = 60
+_STORE = Path.home() / ".hermes" / "operator-verifier.json"
+_ITERATIONS = 260_000
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,16 @@ _SENSITIVE_COMMAND_RE = re.compile(
 
 
 _cache: dict[str, OperatorVerificationResult] = {}
+_callback_tls = threading.local()
+
+
+def _get_operator_verification_callback():
+    return getattr(_callback_tls, "operator_verification", None)
+
+
+def set_operator_verification_callback(cb) -> None:
+    """Register a masked in-process operator verifier prompt callback."""
+    _callback_tls.operator_verification = cb
 
 
 def _cache_key(session_id: str | None = None) -> str:
@@ -238,6 +255,61 @@ def _failure(reason: str, *, now: int | None = None) -> OperatorVerificationResu
     )
 
 
+def _load_operator_store() -> dict | None:
+    try:
+        data = json.loads(_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    if not data.get("salt") or not data.get("hash"):
+        return None
+    return data
+
+
+def _derive_operator_secret(secret: str, salt_b64: str) -> str:
+    salt = base64.b64decode(salt_b64.encode("ascii"))
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, _ITERATIONS)
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _verify_operator_secret(secret: str, data: dict | None = None) -> bool:
+    if not secret:
+        return False
+    data = data or _load_operator_store()
+    if not data:
+        return False
+    try:
+        actual = _derive_operator_secret(secret, str(data.get("salt") or ""))
+    except Exception:
+        return False
+    return hmac.compare_digest(actual, str(data.get("hash") or ""))
+
+
+def _callback_operator_verification(config: OperatorVerificationConfig, *, now: int) -> OperatorVerificationResult:
+    data = _load_operator_store()
+    if not data:
+        return _failure("not_configured", now=now)
+    callback = _get_operator_verification_callback()
+    if callback is None:
+        return _failure("callback_not_available", now=now)
+    try:
+        secret = callback() or ""
+    except Exception:
+        return _failure("invalid_or_cancelled", now=now)
+    if not secret:
+        return _failure("invalid_or_cancelled", now=now)
+    if not _verify_operator_secret(secret, data):
+        return _failure("verification_failed", now=now)
+    return OperatorVerificationResult(
+        ok=True,
+        actor_id=str(data.get("actor_id") or "attila"),
+        role=str(data.get("role") or "operator"),
+        verified_at=now,
+        expires_at=now + config.ttl_seconds,
+    )
+
+
 def _cui_actor_verification(config: OperatorVerificationConfig, *, now: int) -> OperatorVerificationResult:
     """Trust an authenticated AIWerk CUI admin/operator actor as verifier.
 
@@ -340,6 +412,8 @@ def run_operator_verifier(
         return _cui_actor_verification(cfg, now=current)
     if cfg.verifier_type in {"trusted_platform_actor", "trusted-platform-actor", "platform_actor", "platform-actor"}:
         return _trusted_platform_actor_verification(cfg, now=current)
+    if cfg.verifier_type in {"callback", "operator_callback", "operator-callback", "prompt", "modal"}:
+        return _callback_operator_verification(cfg, now=current)
     if not cfg.argv:
         return _failure("not_configured", now=current)
 
