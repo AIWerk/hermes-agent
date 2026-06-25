@@ -2044,6 +2044,18 @@ def _mcp_bridge_forget_session(session_key: str) -> None:
         _MCP_BRIDGE_SESSIONS.pop(session_key, None)
 
 
+def _mcp_bridge_forget_all_sessions() -> None:
+    """Drop cached MCP bridge sessions so the next resource probe reconnects.
+
+    Google Workspace re-auth can make an already-open bridge/router session keep
+    returning stale auth or generic calendar errors until the dashboard process
+    restarts.  A user-triggered CUI resource refresh is an explicit request to
+    re-check external state, so it should also force a fresh bridge session.
+    """
+    with _MCP_BRIDGE_SESSION_LOCK:
+        _MCP_BRIDGE_SESSIONS.clear()
+
+
 def _mcp_bridge_router_call(config: dict[str, Any] | None, arguments: dict[str, Any]) -> dict[str, Any]:
     session_key, session_id = _mcp_bridge_session(config)
     try:
@@ -4687,6 +4699,10 @@ def _assistant_resources_payload(
 
     def should_refresh(name: str) -> bool:
         return bool(force_refresh and (refresh_resource is None or refresh_resource == name))
+
+    bridge_resource_names = {"email", "calendar", "contacts", "connectors"}
+    if force_refresh and (refresh_resource is None or refresh_resource in bridge_resource_names):
+        _mcp_bridge_forget_all_sessions()
 
     email, email_cache = _assistant_cached_resource(
         "email",

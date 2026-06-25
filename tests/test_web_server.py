@@ -75,3 +75,51 @@ def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
 
     assert captured["ws_ping_interval"] == 20.0
     assert captured["ws_ping_timeout"] == 20.0
+
+
+def _fake_resource_payload(name: str) -> dict:
+    payload = {"status": "connected", "summary": name, "items": []}
+    if name in {"email", "calendar"}:
+        payload["accounts"] = []
+    if name == "email":
+        payload["unread_count"] = 0
+    if name == "shared_folder":
+        payload["can_open_folder"] = False
+    if name == "vault":
+        payload.update({"weak_count": 0, "reused_count": 0, "compromised_count": 0})
+    if name == "todos":
+        payload["open_count"] = 0
+    if name == "contacts":
+        payload.update({"relevant": [], "frequent": [], "total_count": 0})
+    return payload
+
+
+def _stub_assistant_cached_resource(monkeypatch):
+    def fake_cached_resource(name, ttl_seconds, cache_key, builder, **kwargs):
+        meta = {"cached": False, "updated_at": "now", "expires_at": "later", "ttl_seconds": ttl_seconds}
+        return _fake_resource_payload(name), meta
+
+    monkeypatch.setattr(web_server, "_assistant_cached_resource", fake_cached_resource)
+
+
+def test_assistant_resource_force_refresh_drops_mcp_bridge_sessions(monkeypatch):
+    """A CUI resource refresh must recover after Google Workspace re-auth."""
+    web_server._MCP_BRIDGE_SESSIONS.clear()
+    web_server._MCP_BRIDGE_SESSIONS["stale"] = "session-id"
+    monkeypatch.setattr(web_server, "load_config", lambda: {})
+    _stub_assistant_cached_resource(monkeypatch)
+
+    web_server._assistant_resources_payload(force_refresh=True, refresh_resource="calendar")
+
+    assert web_server._MCP_BRIDGE_SESSIONS == {}
+
+
+def test_assistant_non_bridge_resource_refresh_keeps_mcp_bridge_sessions(monkeypatch):
+    web_server._MCP_BRIDGE_SESSIONS.clear()
+    web_server._MCP_BRIDGE_SESSIONS["active"] = "session-id"
+    monkeypatch.setattr(web_server, "load_config", lambda: {})
+    _stub_assistant_cached_resource(monkeypatch)
+
+    web_server._assistant_resources_payload(force_refresh=True, refresh_resource="shared_folder")
+
+    assert web_server._MCP_BRIDGE_SESSIONS == {"active": "session-id"}
