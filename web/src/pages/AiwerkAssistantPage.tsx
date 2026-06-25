@@ -2329,6 +2329,14 @@ export default function AiwerkAssistantPage() {
           position: relative;
           isolation: isolate;
         }
+        .aiwerk-message-markdown > div,
+        .aiwerk-message-markdown p,
+        .aiwerk-message-markdown ul,
+        .aiwerk-message-markdown ol,
+        .aiwerk-message-markdown li {
+          font-size: inherit !important;
+          line-height: inherit !important;
+        }
         .aiwerk-side-drawer {
           position: absolute;
           inset: 0 0 0 auto;
