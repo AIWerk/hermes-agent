@@ -10,7 +10,9 @@ from hermes_cli.operator_verification import (
     OperatorVerificationResult,
     cache_operator_verification,
     clear_operator_verification_cache,
+    current_operator_interface,
     get_cached_operator_verification,
+    load_operator_verification_config,
     operator_verification_block_reason_for_command,
     run_operator_verifier,
 )
@@ -22,7 +24,46 @@ def test_default_config_enables_operator_verification_gate():
     assert section["enabled"] is True
     assert section["require_for_cli_admin"] is True
     assert section["command"]["argv"] == []
+    assert section["interfaces"] == {}
 
+
+def test_current_operator_interface_prefers_gateway_platform(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_OPERATOR_INTERFACE", "cli")
+
+    assert current_operator_interface() == "telegram"
+
+
+def test_operator_verification_config_selects_interface_specific_command(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "security": {
+                "operator_verification": {
+                    "enabled": True,
+                    "ttl_seconds": 900,
+                    "require_for_cli_admin": True,
+                    "command": {"argv": ["local-gui"], "timeout_seconds": 60},
+                    "interfaces": {
+                        "cli": {"argv": ["tty-prompt"], "timeout_seconds": 30},
+                        "telegram": {"command": {"argv": ["telegram-approve"], "timeout_seconds": 120}},
+                    },
+                }
+            }
+        },
+    )
+
+    cli_cfg = load_operator_verification_config(interface="cli")
+    telegram_cfg = load_operator_verification_config(interface="telegram")
+    web_cfg = load_operator_verification_config(interface="web")
+
+    assert cli_cfg.argv == ["tty-prompt"]
+    assert cli_cfg.timeout_seconds == 30
+    assert cli_cfg.interface == "cli"
+    assert telegram_cfg.argv == ["telegram-approve"]
+    assert telegram_cfg.timeout_seconds == 120
+    assert web_cfg.argv == ["local-gui"]
+    assert web_cfg.timeout_seconds == 60
 
 def test_operator_verification_result_valid_until_expiry():
     result = OperatorVerificationResult(

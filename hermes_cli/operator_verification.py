@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 import subprocess
 import time
@@ -34,6 +35,7 @@ class OperatorVerificationConfig:
     timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS
     ttl_seconds: int = _DEFAULT_TTL_SECONDS
     require_for_cli_admin: bool = True
+    interface: str = ""
 
 
 _SENSITIVE_COMMAND_RE = re.compile(
@@ -92,7 +94,59 @@ def _coerce_positive_int(value: Any, default: int, *, minimum: int = 1, maximum:
     return max(minimum, min(maximum, parsed))
 
 
-def load_operator_verification_config() -> OperatorVerificationConfig:
+def _normalize_interface(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "terminal": "cli",
+        "shell": "cli",
+        "cui": "web",
+        "web-cui": "web",
+        "desktop": "local",
+        "gui": "local",
+    }
+    return aliases.get(raw, raw)
+
+
+def current_operator_interface() -> str:
+    """Best-effort UI/channel label for choosing an operator verifier."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    except Exception:
+        platform = os.getenv("HERMES_SESSION_PLATFORM", "")
+    platform = _normalize_interface(platform)
+    if platform:
+        return platform
+    explicit = _normalize_interface(os.getenv("HERMES_OPERATOR_INTERFACE", ""))
+    if explicit:
+        return explicit
+    if os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "cli"
+    return "local"
+
+
+def _command_settings(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    nested = raw.get("command")
+    if isinstance(nested, dict):
+        merged = dict(raw)
+        merged.update(nested)
+        return merged
+    return raw
+
+
+def _argv_from_command(command: dict[str, Any], fallback: Any = None) -> list[str]:
+    argv = command.get("argv", fallback if fallback is not None else [])
+    if isinstance(argv, str):
+        return [argv] if argv else []
+    if isinstance(argv, (list, tuple)):
+        return [str(part) for part in argv if str(part)]
+    return []
+
+
+def load_operator_verification_config(interface: str | None = None) -> OperatorVerificationConfig:
     """Load operator verification settings from config.yaml.
 
     The verifier command may request secrets from the human, but the command
@@ -114,15 +168,16 @@ def load_operator_verification_config() -> OperatorVerificationConfig:
     if not isinstance(section, dict):
         section = {}
 
-    raw_command = section.get("command")
-    command = raw_command if isinstance(raw_command, dict) else {}
-    argv = command.get("argv", section.get("argv", []))
-    if isinstance(argv, str):
-        argv = [argv]
-    elif isinstance(argv, (list, tuple)):
-        argv = [str(part) for part in argv if str(part)]
-    else:
-        argv = []
+    selected_interface = _normalize_interface(interface) or current_operator_interface()
+    command = _command_settings(section.get("command"))
+    interfaces = section.get("interfaces", section.get("verifiers", {}))
+    if isinstance(interfaces, dict):
+        selected = interfaces.get(selected_interface)
+        if isinstance(selected, dict):
+            selected_command = _command_settings(selected)
+            if selected_command:
+                command = {**command, **selected_command}
+    argv = _argv_from_command(command, section.get("argv", []))
 
     return OperatorVerificationConfig(
         enabled=bool(section.get("enabled", False)),
@@ -138,6 +193,7 @@ def load_operator_verification_config() -> OperatorVerificationConfig:
             maximum=86400,
         ),
         require_for_cli_admin=bool(section.get("require_for_cli_admin", True)),
+        interface=selected_interface,
     )
 
 

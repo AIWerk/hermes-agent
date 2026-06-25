@@ -27,7 +27,8 @@ def verify_operator_identity(args: dict[str, Any] | None = None, **kwargs: Any) 
             cached=True,
         )
 
-    result = run_operator_verifier(load_operator_verification_config())
+    cfg = load_operator_verification_config()
+    result = run_operator_verifier(cfg)
     if result.is_valid():
         cache_operator_verification(result, session_id=session_id)
         return tool_result(
@@ -37,6 +38,7 @@ def verify_operator_identity(args: dict[str, Any] | None = None, **kwargs: Any) 
             role=result.role,
             expires_at=result.expires_at,
             cached=False,
+            interface=cfg.interface,
         )
 
     return tool_result(

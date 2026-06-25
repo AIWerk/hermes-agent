@@ -2390,6 +2390,7 @@ DEFAULT_CONFIG = {
                 "argv": [],
                 "timeout_seconds": 60,
             },
+            "interfaces": {},
             "trusted_actor_ids": [],
         },
     },
