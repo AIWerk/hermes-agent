@@ -302,7 +302,8 @@ async def handle_ws(
                     continue
 
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                actor_context = getattr(getattr(ws, "state", None), "auth_info", None)
+                resp = await asyncio.to_thread(server.dispatch, req, transport, actor_context)
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

@@ -242,6 +242,59 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+_cui_actor_context_var: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "cui_actor_context", default=None
+)
+
+
+def bind_cui_actor_context(actor_context: dict | None):
+    clean = {
+        str(k): str(v)
+        for k, v in (actor_context or {}).items()
+        if k in {"tenant_id", "actor_id", "role", "display_name", "user_id", "provider"} and v is not None
+    }
+    return _cui_actor_context_var.set(clean or None)
+
+
+def reset_cui_actor_context(token) -> None:
+    _cui_actor_context_var.reset(token)
+
+
+def current_cui_actor_context() -> dict[str, str] | None:
+    actor = _cui_actor_context_var.get()
+    return dict(actor) if isinstance(actor, dict) and actor else None
+
+
+def _apply_cui_actor_env(actor_context: dict | None) -> list[tuple[str, str | None]]:
+    actor = {
+        str(k): str(v)
+        for k, v in (actor_context or {}).items()
+        if k in {"tenant_id", "actor_id", "role", "display_name", "user_id", "provider"} and v is not None
+    }
+    if not actor:
+        return []
+    updates = {
+        "AIWERK_CUI_ACTOR_CONTEXT": json.dumps(actor, separators=(",", ":")),
+    }
+    if actor.get("tenant_id"):
+        updates["AIWERK_CUI_TENANT_ID"] = actor["tenant_id"]
+    if actor.get("actor_id"):
+        updates["AIWERK_CUI_ACTOR_ID"] = actor["actor_id"]
+    if actor.get("role"):
+        updates["AIWERK_CUI_ACTOR_ROLE"] = actor["role"]
+    if actor.get("tenant_id") and (actor.get("actor_id") or actor.get("user_id")) and actor.get("role"):
+        updates["AIWERK_CUI_MANAGED_AUTONOMY"] = "1"
+    tokens = [(key, os.environ.get(key)) for key in updates]
+    os.environ.update(updates)
+    return tokens
+
+
+def _clear_cui_actor_env(tokens: list[tuple[str, str | None]]) -> None:
+    for key, old in reversed(tokens):
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
 
 
 class _SlashWorker:
@@ -1003,7 +1056,7 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
-def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
+def dispatch(req: dict, transport: Optional[Transport] = None, actor_context: dict | None = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
     Returns a response dict when handled inline. Returns None when the
@@ -1017,6 +1070,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """
     t = transport or _stdio_transport
     token = bind_transport(t)
+    actor_token = bind_cui_actor_context(actor_context)
     try:
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
@@ -1041,6 +1095,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         return None
     finally:
+        reset_cui_actor_context(actor_token)
         reset_transport(token)
 
 
@@ -1095,6 +1150,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         home_token = None
         profile_home = current.get("profile_home")
         try:
+            actor_env_tokens = _apply_cui_actor_env(current.get("cui_actor_context"))
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
@@ -1187,6 +1243,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
+            _clear_cui_actor_env(locals().get("actor_env_tokens", []))
             # _attach_worker already closed the worker if this session was
             # reaped mid-build; only the late notify registration can still
             # leak (session.close unregistered before _build registered it).
@@ -4067,6 +4124,7 @@ def _init_session(
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
+            "cui_actor_context": current_cui_actor_context(),
         }
     db = session_db if session_db is not None else _get_db()
     if db is not None:
@@ -4081,6 +4139,7 @@ def _init_session(
             except Exception:
                 logger.debug("failed to persist resumed session cwd", exc_info=True)
     _register_session_cwd(_sessions[sid])
+    actor_env_tokens = _apply_cui_actor_env((_sessions.get(sid) or {}).get("cui_actor_context"))
     try:
         _attach_worker(
             sid,
@@ -4090,6 +4149,8 @@ def _init_session(
     except Exception:
         # Defer hard-failure to slash.exec; chat still works without slash worker.
         _sessions[sid]["slash_worker"] = None
+    finally:
+        _clear_cui_actor_env(actor_env_tokens)
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
@@ -4765,6 +4826,7 @@ def _(rid, params: dict) -> dict:
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
+            "cui_actor_context": current_cui_actor_context(),
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
@@ -5161,6 +5223,7 @@ def _(rid, params: dict) -> dict:
             : max(0, len(display_history) - len(history))
         ]
         messages = _history_to_messages(display_history)
+        actor_env_tokens = _apply_cui_actor_env(current_cui_actor_context())
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -5178,6 +5241,7 @@ def _(rid, params: dict) -> dict:
             )
         finally:
             _clear_session_context(tokens)
+            _clear_cui_actor_env(locals().get("actor_env_tokens", []))
     except Exception as e:
         if lease is not None:
             lease.release()
@@ -7340,6 +7404,8 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    if (actor := current_cui_actor_context()):
+        session["cui_actor_context"] = actor
     with session["history_lock"]:
         if session.get("running"):
             return _err(rid, 4009, "session busy")
@@ -7609,6 +7675,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     def run():
         approval_token = None
         session_tokens = []
+        actor_env_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
         pending_steer_followup = None
@@ -7619,6 +7686,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
 
             approval_token = set_current_session_key(session["session_key"])
+            actor_env_tokens = _apply_cui_actor_env(session.get("cui_actor_context"))
             session_tokens = _set_session_context(session["session_key"])
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
@@ -7974,6 +8042,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 pass
             if home_token is not None:
                 reset_hermes_home_override(home_token)
+            _clear_cui_actor_env(actor_env_tokens)
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
