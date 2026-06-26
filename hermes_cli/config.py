@@ -2472,6 +2472,7 @@ DEFAULT_CONFIG = {
             },
             "interfaces": {},
             "trusted_actor_ids": [],
+            "allowed_secret_read_patterns": [],
         },
     },
 

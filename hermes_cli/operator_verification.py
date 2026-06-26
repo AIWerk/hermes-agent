@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -47,6 +48,125 @@ class OperatorVerificationConfig:
     verifier_type: str = "command"
     missing_interface: bool = False
     trusted_actor_ids: list[str] | None = None
+    allowed_secret_read_patterns: list[str] | None = None
+
+
+_ADMIN_MUTATING_SUBCOMMANDS = {
+    "systemctl": {"start", "stop", "restart", "reload", "enable", "disable", "mask", "unmask", "poweroff", "reboot", "halt", "kexec"},
+    "service": {"start", "stop", "restart", "reload", "enable", "disable", "mask", "unmask"},
+    "kubectl": {"apply", "delete", "exec", "patch", "replace", "scale", "cordon", "uncordon", "drain", "taint", "create", "edit", "rollout"},
+    "helm": {"install", "upgrade", "rollback", "uninstall", "delete"},
+    "terraform": {"apply", "destroy", "import", "taint", "untaint", "state", "force-unlock"},
+}
+_ADMIN_READONLY_SUBCOMMANDS = {
+    "systemctl": {"status", "is-active", "is-enabled", "list-units", "list-unit-files", "cat", "show"},
+    "service": {"status"},
+    "kubectl": {"get", "describe", "logs", "top", "explain", "diff", "version", "config"},
+    "helm": {"list", "status", "history", "template", "show", "get", "repo", "search", "version", "lint"},
+    "terraform": {"fmt", "validate", "plan", "output", "show", "version", "providers", "workspace"},
+}
+
+
+def _split_command(command: str) -> list[str]:
+    try:
+        return shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return []
+
+
+def _base_command(tokens: list[str]) -> tuple[str, list[str]]:
+    while tokens and tokens[0] in {"sudo", "env", "command", "builtin", "exec", "time"}:
+        head = tokens.pop(0)
+        if head == "env":
+            while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+                tokens.pop(0)
+    return (tokens[0].lower(), tokens[1:]) if tokens else ("", [])
+
+
+def _first_non_option(args: list[str]) -> str:
+    for arg in args:
+        if not arg.startswith("-"):
+            return arg.lower()
+    return ""
+
+
+def _is_remote_path(arg: str) -> bool:
+    return bool(re.match(r"^[^/@\s:]+@?[^\s:]+:.+", arg))
+
+
+def _copy_args(args: list[str]) -> list[str]:
+    return [arg for arg in args if not arg.startswith("-")]
+
+
+def _matches_allowed_secret_read(command: str, patterns: list[str] | None) -> bool:
+    normalized = " ".join(_split_command(command)) or command.strip()
+    for pattern in patterns or []:
+        try:
+            if re.fullmatch(pattern, normalized):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _requires_operator_verification(command: str, config: OperatorVerificationConfig) -> bool:
+    tokens = _split_command(command)
+    if not tokens:
+        return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
+    cmd, args = _base_command(tokens)
+    verb = _first_non_option(args)
+
+    if cmd == "pass" and verb == "show":
+        return not _matches_allowed_secret_read(command, config.allowed_secret_read_patterns)
+    if cmd == "bw" and verb == "get":
+        return not _matches_allowed_secret_read(command, config.allowed_secret_read_patterns)
+    if cmd in {"vault", "get-secret"}:
+        return True
+    if cmd == "gh" and verb == "secret":
+        return True
+
+    if cmd in _ADMIN_MUTATING_SUBCOMMANDS:
+        if cmd == "service" and len(args) >= 2:
+            verb = args[1].lower()
+        if verb in _ADMIN_READONLY_SUBCOMMANDS.get(cmd, set()):
+            return False
+        if cmd == "kubectl" and verb == "rollout":
+            return any(arg.lower() == "restart" for arg in args)
+        return verb in _ADMIN_MUTATING_SUBCOMMANDS[cmd]
+
+    if cmd == "docker":
+        if args[:1] == ["compose"]:
+            compose_verb = _first_non_option(args[1:])
+            return compose_verb in {"restart", "stop", "kill", "down", "rm", "rmi"}
+        return verb in {"restart", "stop", "kill", "rm", "rmi"}
+
+    if cmd in {"scp", "rsync"}:
+        paths = _copy_args(args)
+        if len(paths) >= 2:
+            src, dest = paths[-2], paths[-1]
+            return not (_is_remote_path(src) and not _is_remote_path(dest))
+        return True
+
+    if cmd == "ansible-playbook":
+        return True
+    if cmd == "chmod":
+        arg_text = " ".join(args).lower()
+        return bool(re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text) or re.search(r"(^|\s)(777|666)($|\s)", arg_text))
+    if cmd == "chown":
+        arg_text = " ".join(args).lower()
+        return "root" in args or bool(re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text))
+    if cmd == "rm":
+        return any("r" in arg and "f" in arg for arg in args if arg.startswith("-"))
+    if cmd in {"dd", "mkfs"}:
+        return True
+    if cmd == "git" and verb == "push":
+        lowered = {arg.lower() for arg in args}
+        return "--force" in lowered or "-f" in lowered or any(arg.startswith(":") or ":" in arg for arg in args[1:])
+    if cmd == "hermes" and len(args) >= 2:
+        area, action = args[0].lower(), args[1].lower()
+        return (area == "gateway" and action in {"restart", "stop", "start"}) or (area == "profile" and action in {"delete", "use", "rename"}) or (area == "cron" and action in {"remove", "create", "edit"})
+
+    return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
 
 
 _SENSITIVE_COMMAND_RE = re.compile(
@@ -205,6 +325,11 @@ def load_operator_verification_config(interface: str | None = None) -> OperatorV
     command = _command_settings(section.get("command"))
     verifier_type = str(section.get("verifier") or "command").strip().lower() or "command"
     trusted_actor_ids = [str(item) for item in (section.get("trusted_actor_ids") or []) if str(item)]
+    allowed_secret_read_patterns = [
+        str(item)
+        for item in (section.get("allowed_secret_read_patterns") or [])
+        if str(item)
+    ]
     interfaces = section.get("interfaces", section.get("verifiers", {}))
     missing_interface = False
     if isinstance(interfaces, dict):
@@ -241,6 +366,7 @@ def load_operator_verification_config(interface: str | None = None) -> OperatorV
         verifier_type=verifier_type,
         missing_interface=missing_interface,
         trusted_actor_ids=trusted_actor_ids,
+        allowed_secret_read_patterns=allowed_secret_read_patterns,
     )
 
 
@@ -384,7 +510,7 @@ def operator_verification_block_reason_for_command(
     cfg = config or load_operator_verification_config()
     if not cfg.enabled or not cfg.require_for_cli_admin:
         return None
-    if not _SENSITIVE_COMMAND_RE.search(command or ""):
+    if not _requires_operator_verification(command or "", cfg):
         return None
     if get_cached_operator_verification(session_id=session_id, now=now) is not None:
         return None

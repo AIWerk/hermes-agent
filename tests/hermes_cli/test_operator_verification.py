@@ -27,6 +27,7 @@ def test_default_config_enables_operator_verification_gate():
     assert section["require_for_cli_admin"] is True
     assert section["command"]["argv"] == []
     assert section["interfaces"] == {}
+    assert section["allowed_secret_read_patterns"] == []
 
 
 def test_current_operator_interface_prefers_gateway_platform(monkeypatch):
@@ -305,3 +306,113 @@ def test_admin_sensitive_command_is_blocked_until_operator_verified():
     verified = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200)
     cache_operator_verification(verified)
     assert operator_verification_block_reason_for_command("systemctl restart hermes", config=config, now=150) is None
+
+
+def test_operator_verification_allows_read_only_admin_tool_subcommands():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+    allowed = [
+        "systemctl status ssh",
+        "service ssh status",
+        "kubectl get pods",
+        "kubectl describe pod web-1",
+        "kubectl logs deploy/web",
+        "helm list",
+        "helm status my-release",
+        "terraform plan",
+        "terraform validate",
+        "terraform output",
+    ]
+
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_operator_verification_still_blocks_mutating_admin_tool_subcommands():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+    blocked = [
+        "systemctl restart ssh",
+        "service ssh restart",
+        "kubectl apply -f deploy.yaml",
+        "kubectl delete pod web-1",
+        "kubectl exec -it web-1 -- sh",
+        "helm upgrade my-release ./chart",
+        "helm uninstall my-release",
+        "terraform apply",
+        "terraform destroy",
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_allows_normal_user_file_and_git_operations():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+    allowed = [
+        "chmod 644 README.md",
+        "chmod 755 scripts/run.sh",
+        "chown attila notes.txt",
+        "git push origin main",
+        "docker compose up -d",
+    ]
+
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_operator_verification_still_blocks_broad_or_privileged_file_and_git_operations():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+    blocked = [
+        "chmod -R 777 /srv/app",
+        "chmod 777 /tmp/shared",
+        "chown -R root /srv/app",
+        "rm -rf /tmp/testdir",
+        "git push --force origin main",
+        "git push origin :main",
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_allows_configured_pass_show_entries_only():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(
+        enabled=True,
+        argv=["verify"],
+        require_for_cli_admin=True,
+        allowed_secret_read_patterns=[r"^pass show homeassistant-hermes-local-token$"],
+    )
+
+    assert operator_verification_block_reason_for_command(
+        "pass show homeassistant-hermes-local-token", config=config, now=100
+    ) is None
+    assert operator_verification_block_reason_for_command(
+        "pass show email/imap", config=config, now=100
+    ) is not None
+
+
+def test_operator_verification_allows_read_only_remote_copy_downloads_only():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+    allowed = [
+        "scp server:/tmp/report.txt ./report.txt",
+        "rsync -av server:/tmp/reports/ ./reports/",
+    ]
+    blocked = [
+        "scp ./secret.txt server:/tmp/secret.txt",
+        "rsync -av ./reports/ server:/tmp/reports/",
+    ]
+
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
