@@ -2035,6 +2035,24 @@ class TestWebServerEndpoints:
         # Exact-match entries remain allowed for their (non-GET) methods.
         assert allowed("/api/assistant/todos/add", "POST") is True
 
+    def test_assistant_ui_locale_resolves_hidden_customer_setting(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        resolve_locale = getattr(web_server, "_assistant_ui_locale_from_config")
+        monkeypatch.setenv("AIWERK_CUI_LOCALE", "hu")
+        assert resolve_locale({}) == "hu"
+        monkeypatch.setenv("AIWERK_CUI_LOCALE", "")
+        assert resolve_locale({"dashboard": {"locale": "de_CH"}}) == "de"
+        assert resolve_locale({"assistant": {"language": "Magyar"}}) == "hu"
+        assert resolve_locale({"assistant": {"language": "invalid"}}) == "de"
+
+    def test_assistant_mode_allows_read_only_commands_catalog_rpc(self):
+        import hermes_cli.web_server as web_server
+
+        gate = web_server._assistant_ws_request_gate
+        assert gate({"method": "commands.catalog", "params": {}}) is None
+        assert gate({"method": "cli.exec", "params": {"argv": ["status"]}}) == "method not available in assistant mode: cli.exec"
+
     def test_assistant_mode_blocks_destructive_session_http(self, monkeypatch):
         import hermes_cli.web_server as web_server
 

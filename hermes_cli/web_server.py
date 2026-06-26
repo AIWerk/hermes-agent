@@ -362,6 +362,7 @@ _ASSISTANT_ALLOWED_RPC_METHODS: frozenset = frozenset({
     "approval.respond",
     "config.get",
     "config.set",
+    "commands.catalog",
     "slash.exec",
 })
 # config.get / config.set reach powerful keys (key="model" repoints the model
@@ -3418,6 +3419,68 @@ def _assistant_display_name_from_config(config: dict[str, Any]) -> str:
             return value
     return "Agent"
 
+
+
+_ASSISTANT_UI_LOCALES: frozenset[str] = frozenset({
+    "en", "de", "hu", "fr", "es", "it", "pt", "ru", "zh", "zh-hant", "ja", "ko", "tr", "uk", "af", "ga",
+})
+
+
+def _clean_assistant_ui_locale(raw: Any) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip().lower().replace("_", "-")
+    aliases = {
+        "chinese": "zh",
+        "zh-cn": "zh",
+        "zh-sg": "zh",
+        "zh-tw": "zh-hant",
+        "zh-hk": "zh-hant",
+        "zh-mo": "zh-hant",
+        "magyar": "hu",
+        "hungarian": "hu",
+        "german": "de",
+        "deutsch": "de",
+        "english": "en",
+    }
+    value = aliases.get(value, value.split(".", 1)[0])
+    return value if value in _ASSISTANT_UI_LOCALES else None
+
+
+def _assistant_ui_locale_from_config(config: dict[str, Any]) -> str:
+    """Resolve the hidden customer-facing UI locale for the AIWerk CUI."""
+    candidates: list[Any] = [
+        os.environ.get("AIWERK_CUI_LOCALE"),
+        os.environ.get("AIWERK_CUI_LANGUAGE"),
+        os.environ.get("HERMES_CUI_LOCALE"),
+    ]
+    candidates.extend(_iter_nested_display_candidates(config, (
+        ("dashboard", "cui_locale"),
+        ("dashboard", "ui_locale"),
+        ("dashboard", "locale"),
+        ("dashboard", "language"),
+        ("assistant", "cui_locale"),
+        ("assistant", "ui_locale"),
+        ("assistant", "locale"),
+        ("assistant", "language"),
+        ("aiwerk", "cui_locale"),
+        ("aiwerk", "ui_locale"),
+        ("aiwerk", "locale"),
+        ("aiwerk", "language"),
+        ("tenant", "cui_locale"),
+        ("tenant", "ui_locale"),
+        ("tenant", "locale"),
+        ("tenant", "language"),
+        ("branding", "cui_locale"),
+        ("branding", "ui_locale"),
+        ("branding", "locale"),
+        ("branding", "language"),
+    )))
+    for raw in candidates:
+        locale = _clean_assistant_ui_locale(raw)
+        if locale:
+            return locale
+    return "de"
 
 def _assistant_user_display_name_from_config(config: dict[str, Any]) -> Optional[str]:
     """Resolve the customer-facing user's short display name from tenant config/env.
@@ -17343,7 +17406,25 @@ async def gateway_ws(ws: WebSocket) -> None:
     # the JSON-RPC surface here — otherwise dispatch exposes shell.exec /
     # cli.exec / config.set model=... / reload.env / skills.manage to the
     # customer. Admin mode passes no gate and keeps the full method table.
-    request_gate = _assistant_ws_request_gate if _assistant_mode_enabled() else None
+    request_gate = None
+    if _assistant_mode_enabled():
+        def request_gate(req: Any) -> Optional[str]:
+            try:
+                auth_info = getattr(ws.state, "auth_info", {}) or {}
+                if isinstance(req, dict) and isinstance(auth_info, dict):
+                    params = req.get("params")
+                    if not isinstance(params, dict):
+                        params = {}
+                        req["params"] = params
+                    if auth_info.get("role"):
+                        params.setdefault("_cui_actor_role", str(auth_info.get("role") or ""))
+                    if auth_info.get("actor_id") or auth_info.get("user_id"):
+                        params.setdefault("_cui_actor_id", str(auth_info.get("actor_id") or auth_info.get("user_id") or ""))
+                    if auth_info.get("tenant_id"):
+                        params.setdefault("_cui_tenant_id", str(auth_info.get("tenant_id") or ""))
+            except Exception:
+                pass
+            return _assistant_ws_request_gate(req)
     await handle_ws(ws, request_gate=request_gate)
 
 
@@ -17487,6 +17568,7 @@ def mount_spa(application: FastAPI):
         gated_js = "true" if gated else "false"
         user_display_name_js = json.dumps(_assistant_user_display_name() if mode == "assistant" else None)
         agent_display_name_js = json.dumps(_assistant_display_name_from_config(load_config()) if mode == "assistant" else None)
+        assistant_ui_locale_js = json.dumps(_assistant_ui_locale_from_config(load_config()) if mode == "assistant" else None)
         common_bootstrap = (
             f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
             f'window.__HERMES_DASHBOARD_MODE__="{mode}";'
@@ -17494,6 +17576,7 @@ def mount_spa(application: FastAPI):
             f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
             f"window.__HERMES_USER_DISPLAY_NAME__={user_display_name_js};"
             f"window.__HERMES_AGENT_DISPLAY_NAME__={agent_display_name_js};"
+            f"window.__AIWERK_CUI_LOCALE__={assistant_ui_locale_js};"
         )
         if gated:
             bootstrap_script = f"<script>{common_bootstrap}</script>"

@@ -26,6 +26,35 @@ _skill_commands_platform: Optional[str] = None
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
+
+def _skill_command_visibility(frontmatter: Dict[str, Any]) -> str:
+    """Return optional CUI slash visibility from skill frontmatter.
+
+    Supported shapes:
+      visibility: customer|admin|operator|internal
+      cui_visibility: customer|admin|operator|internal
+      metadata.aiwerk.visibility: ...
+      metadata.hermes.visibility: ...
+    Empty means no explicit customer visibility. Local/admin surfaces still see
+    the skill; customer CUI catalog filtering fails closed.
+    """
+    if not isinstance(frontmatter, dict):
+        return ""
+    for key in ("visibility", "cui_visibility", "slash_visibility"):
+        value = str(frontmatter.get(key) or "").strip().lower()
+        if value:
+            return value
+    metadata = frontmatter.get("metadata")
+    if isinstance(metadata, dict):
+        for namespace in ("aiwerk", "hermes"):
+            scoped = metadata.get(namespace)
+            if isinstance(scoped, dict):
+                for key in ("visibility", "cui_visibility", "slash_visibility"):
+                    value = str(scoped.get(key) or "").strip().lower()
+                    if value:
+                        return value
+    return ""
+
 # ---------------------------------------------------------------------------
 # Skill-scaffolding markers and the canonical extractor.
 #
@@ -407,6 +436,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
+                        "visibility": _skill_command_visibility(frontmatter),
                     }
                 except Exception:
                     continue

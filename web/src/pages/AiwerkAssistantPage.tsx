@@ -5,6 +5,7 @@ import { Markdown } from "@/components/Markdown";
 import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
+import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
 
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -67,6 +68,20 @@ interface DashboardAuthSession {
   tenant_id?: string;
   role?: string;
 }
+
+interface SlashCommandItem {
+  command: string;
+  description: string;
+  category?: string;
+}
+
+interface SlashCommandCatalogResponse {
+  pairs?: Array<[string, string]>;
+  categories?: Array<{ name?: string; pairs?: Array<[string, string]> }>;
+}
+
+type SlashCommandMenuState = { target: ConversationMode; query: string } | null;
+
 
 function recentSessionDisplayTitle(session: RecentSession): string {
   const title = session.title?.trim();
@@ -873,6 +888,8 @@ export default function AiwerkAssistantPage() {
   const readAloudRequestRef = useRef(0);
   const messagesRef = useRef<ChatMessage[]>([]);
   const sideMessagesRef = useRef<ChatMessage[]>([]);
+  const cuiLocale = useMemo(() => readConfiguredCuiLocale(), []);
+  const slashMenuLabel = SLASH_MENU_LABEL[cuiLocale] ?? "Slash commands";
 
   const [connection, setConnection] = useState<ConnectionState>("idle");
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -881,6 +898,11 @@ export default function AiwerkAssistantPage() {
   const activeSessionKeyRef = useRef<string | null>(null);
   const [input, setInput] = useState("");
   const [sideInput, setSideInput] = useState("");
+  const [slashCommands, setSlashCommands] = useState<SlashCommandItem[]>([]);
+  const [slashMenu, setSlashMenu] = useState<SlashCommandMenuState>(null);
+  const [slashSelection, setSlashSelection] = useState(0);
+  const slashBlurTimerRef = useRef<number | null>(null);
+  const slashOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [messages, setMessages] = useState<ChatMessage[]>(() => [welcomeMessage()]);
   const [sideMessages, setSideMessages] = useState<ChatMessage[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCallSummary[]>([]);
@@ -927,6 +949,91 @@ export default function AiwerkAssistantPage() {
     setToast(text);
     window.setTimeout(() => setToast(null), 1800);
   }, []);
+
+  const updateSlashMenu = useCallback((target: ConversationMode, value: string, caret?: number | null) => {
+    const cursor = typeof caret === "number" ? caret : value.length;
+    const prefix = value.slice(0, Math.max(0, cursor));
+    if (!prefix.startsWith("/") || /\s/.test(prefix)) {
+      setSlashMenu((current) => (current?.target === target ? null : current));
+      return;
+    }
+    const query = prefix.slice(1).toLowerCase();
+    setSlashMenu((current) => {
+      if (current?.target === target && current.query === query) return current;
+      setSlashSelection(0);
+      return { target, query };
+    });
+  }, []);
+
+  const closeSlashMenuSoon = useCallback(() => {
+    if (slashBlurTimerRef.current !== null) window.clearTimeout(slashBlurTimerRef.current);
+    slashBlurTimerRef.current = window.setTimeout(() => setSlashMenu(null), 120);
+  }, []);
+
+  const slashSuggestions = useMemo(() => {
+    if (!slashMenu) return [];
+    const q = slashMenu.query;
+    const matches = slashCommands.filter((item) => {
+      const command = item.command.toLowerCase();
+      return !q || command.slice(1).startsWith(q) || command.includes(q);
+    });
+    return matches;
+  }, [slashCommands, slashMenu]);
+
+  useEffect(() => {
+    if (slashSelection >= slashSuggestions.length) setSlashSelection(0);
+  }, [slashSelection, slashSuggestions.length]);
+
+  useEffect(() => {
+    slashOptionRefs.current = slashOptionRefs.current.slice(0, slashSuggestions.length);
+    const selected = slashOptionRefs.current[slashSelection];
+    selected?.scrollIntoView({ block: "nearest" });
+  }, [slashSelection, slashSuggestions.length, slashMenu?.target]);
+
+  const selectSlashCommand = useCallback((item: SlashCommandItem) => {
+    const target = slashMenu?.target ?? "main";
+    const currentValue = target === "side" ? sideInput : input;
+    const nextValue = `${item.command} `;
+    const nextCaret = nextValue.length;
+    const applyFocus = () => {
+      const textarea = target === "side" ? sideInputRef.current : mainInputRef.current;
+      textarea?.focus();
+      textarea?.setSelectionRange(nextCaret, nextCaret);
+    };
+    if (target === "side") {
+      setSideInput(nextValue + currentValue.replace(/^\/\S*/, "").replace(/^\s+/, ""));
+    } else {
+      setInput(nextValue + currentValue.replace(/^\/\S*/, "").replace(/^\s+/, ""));
+    }
+    setSlashMenu(null);
+    window.setTimeout(applyFocus, 0);
+  }, [input, sideInput, slashMenu?.target]);
+
+  const handleSlashKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement>, target: ConversationMode): boolean => {
+    updateSlashMenu(target, e.currentTarget.value, e.currentTarget.selectionStart);
+    if (!slashMenu || slashMenu.target !== target || slashSuggestions.length === 0) return false;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSlashSelection((index) => (index + 1) % slashSuggestions.length);
+      return true;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSlashSelection((index) => (index - 1 + slashSuggestions.length) % slashSuggestions.length);
+      return true;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      selectSlashCommand(slashSuggestions[slashSelection] ?? slashSuggestions[0]);
+      return true;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setSlashMenu(null);
+      return true;
+    }
+    return false;
+  }, [selectSlashCommand, slashMenu, slashSelection, slashSuggestions, updateSlashMenu]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1816,6 +1923,31 @@ export default function AiwerkAssistantPage() {
       try {
         setConnection("connecting");
         await gateway.connect();
+        try {
+          const catalog = await gateway.request<SlashCommandCatalogResponse>("commands.catalog", {}, 15_000);
+          const categoryByCommand = new Map<string, string>();
+          for (const category of catalog.categories ?? []) {
+            const name = category.name || "";
+            for (const pair of category.pairs ?? []) {
+              if (pair[0]) categoryByCommand.set(pair[0], name);
+            }
+          }
+          const deduped = new Map<string, SlashCommandItem>();
+          for (const pair of catalog.pairs ?? []) {
+            const command = String(pair[0] || "").trim();
+            if (!command.startsWith("/")) continue;
+            const rawDescription = String(pair[1] || "").trim();
+            const rawCategory = categoryByCommand.get(command) || "Skills";
+            deduped.set(command.toLowerCase(), {
+              command,
+              description: localizeSlashCommandDescription(command, rawDescription, cuiLocale),
+              category: localizeSlashCategory(rawCategory, cuiLocale),
+            });
+          }
+          setSlashCommands([...deduped.values()].sort((a, b) => a.command.localeCompare(b.command)));
+        } catch {
+          setSlashCommands([]);
+        }
         const storedSessionId = readStoredSessionId();
         let result: SessionOpenResult;
         if (storedSessionId) {
@@ -1903,6 +2035,10 @@ export default function AiwerkAssistantPage() {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      if (slashBlurTimerRef.current !== null) {
+        window.clearTimeout(slashBlurTimerRef.current);
+        slashBlurTimerRef.current = null;
+      }
       offState();
       offDelta();
       offComplete();
@@ -1915,7 +2051,7 @@ export default function AiwerkAssistantPage() {
       offSessionInfo();
       gateway.close();
     };
-  }, [refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, showToast, speakAssistantText]);
+  }, [cuiLocale, refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, showToast, speakAssistantText]);
 
   const loadRecentSession = useCallback(async (session: RecentSession) => {
     const gateway = gatewayRef.current;
@@ -2267,6 +2403,39 @@ export default function AiwerkAssistantPage() {
 
   const showMainThinking = busy && activeTurnMode !== "side" && messages[messages.length - 1]?.status !== "streaming";
   const showSideThinking = busy && activeTurnMode === "side" && sideMessages[sideMessages.length - 1]?.status !== "streaming";
+  const renderSlashCommandMenu = (target: ConversationMode) => {
+    if (!slashMenu || slashMenu.target !== target || slashSuggestions.length === 0) return null;
+    return (
+      <div className="absolute bottom-[calc(100%+8px)] left-0 right-0 z-20 overflow-hidden rounded-[14px] border border-[#d8cdbc] bg-[#fffaf2] shadow-[0_18px_42px_rgba(56,42,20,.18)]">
+        <div className="border-b border-[#eee3d4] px-[12px] py-[8px] text-[11px] font-bold uppercase tracking-[0.08em] text-[#8a7a63]">
+          {slashMenuLabel}
+        </div>
+        <div className="aiwerk-scrollbar max-h-[310px] overflow-y-auto py-[4px]">
+          {slashSuggestions.map((item, index) => (
+            <button
+              key={item.command}
+              ref={(element) => {
+                slashOptionRefs.current[index] = element;
+              }}
+              type="button"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                selectSlashCommand(item);
+              }}
+              className={
+                "grid w-full grid-cols-[minmax(110px,150px)_minmax(0,1fr)_auto] items-start gap-[10px] px-[12px] py-[9px] text-left text-[13px] transition " +
+                (index === slashSelection ? "bg-[#efe5d5]" : "hover:bg-[#f4eadc]")
+              }
+            >
+              <span className="font-mono text-[13px] font-bold text-[#665238]">{item.command}</span>
+              <span className="min-w-0 truncate text-[#4f473a]">{item.description}</span>
+              {item.category && <span className="rounded-full bg-[#efe5d5] px-[7px] py-[2px] text-[10px] font-semibold text-[#7b6a51]">{item.category}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  };
   const mainHasAnchoredToolCalls = toolCalls.some((tool) => tool.anchorMessageId);
   const sideHasAnchoredToolCalls = sideToolCalls.some((tool) => tool.anchorMessageId);
   const mainUnanchoredToolCalls = mainHasAnchoredToolCalls ? [] : unanchoredTools(toolCalls);
@@ -2328,14 +2497,6 @@ export default function AiwerkAssistantPage() {
         .aiwerk-chat-panel {
           position: relative;
           isolation: isolate;
-        }
-        .aiwerk-message-markdown > div,
-        .aiwerk-message-markdown p,
-        .aiwerk-message-markdown ul,
-        .aiwerk-message-markdown ol,
-        .aiwerk-message-markdown li {
-          font-size: inherit !important;
-          line-height: inherit !important;
         }
         .aiwerk-side-drawer {
           position: absolute;
@@ -2949,32 +3110,40 @@ export default function AiwerkAssistantPage() {
                       e.currentTarget.value = "";
                     }}
                   />
-                  <textarea
-                    ref={mainInputRef}
-                    rows={1}
-                    value={input}
-                    onChange={(e) => {
-                      setInput(e.target.value);
-                      resizeComposerTextarea(e.currentTarget);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
+                  <div className="relative min-w-0 flex-1">
+                    {renderSlashCommandMenu("main")}
+                    <textarea
+                      ref={mainInputRef}
+                      rows={1}
+                      value={input}
+                      onChange={(e) => {
+                        setInput(e.target.value);
+                        updateSlashMenu("main", e.target.value, e.currentTarget.selectionStart);
+                        resizeComposerTextarea(e.currentTarget);
+                      }}
+                      onFocus={(e) => updateSlashMenu("main", e.currentTarget.value, e.currentTarget.selectionStart)}
+                      onClick={(e) => updateSlashMenu("main", e.currentTarget.value, e.currentTarget.selectionStart)}
+                      onBlur={closeSlashMenuSoon}
+                      onKeyDown={(e) => {
+                        if (handleSlashKeyDown(e, "main")) return;
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          void submit("main");
+                        }
+                      }}
+                      onPaste={(e) => {
+                        const imageFiles = Array.from(e.clipboardData.items)
+                          .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+                          .map((item) => item.getAsFile())
+                          .filter((file): file is File => Boolean(file));
+                        if (imageFiles.length === 0) return;
                         e.preventDefault();
-                        void submit("main");
-                      }
-                    }}
-                    onPaste={(e) => {
-                      const imageFiles = Array.from(e.clipboardData.items)
-                        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-                        .map((item) => item.getAsFile())
-                        .filter((file): file is File => Boolean(file));
-                      if (imageFiles.length === 0) return;
-                      e.preventDefault();
-                      addAttachedFiles(imageFiles, "paste");
-                    }}
-                    placeholder="Nachricht schreiben…"
-                    className="aiwerk-scrollbar min-h-[46px] max-h-[160px] min-w-0 flex-1 resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[14px] py-[12px] text-[15px] leading-[1.45] outline-none"
-                  />
+                        addAttachedFiles(imageFiles, "paste");
+                      }}
+                      placeholder="Nachricht schreiben…"
+                      className="aiwerk-scrollbar min-h-[46px] max-h-[160px] w-full resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[14px] py-[12px] text-[15px] leading-[1.45] outline-none"
+                    />
+                  </div>
                   <button
                     type="button"
                     onClick={() => void submit("main")}
@@ -3087,23 +3256,31 @@ export default function AiwerkAssistantPage() {
                 </div>
                 <div className="border-t border-[#e3d9c9] bg-[#fbf5eb] p-[14px]">
                   <div className="flex items-end gap-[10px]">
-                    <textarea
-                      ref={sideInputRef}
-                      rows={1}
-                      value={sideInput}
-                      onChange={(e) => {
-                        setSideInput(e.target.value);
-                        resizeComposerTextarea(e.currentTarget);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          void submit("side");
-                        }
-                      }}
-                      placeholder="Nachricht in der Nebenunterhaltung…"
-                      className="aiwerk-scrollbar min-h-[44px] max-h-[160px] min-w-0 flex-1 resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[13px] py-[11px] text-[14px] leading-[1.45] outline-none"
-                    />
+                    <div className="relative min-w-0 flex-1">
+                      {renderSlashCommandMenu("side")}
+                      <textarea
+                        ref={sideInputRef}
+                        rows={1}
+                        value={sideInput}
+                        onChange={(e) => {
+                          setSideInput(e.target.value);
+                          updateSlashMenu("side", e.target.value, e.currentTarget.selectionStart);
+                          resizeComposerTextarea(e.currentTarget);
+                        }}
+                        onFocus={(e) => updateSlashMenu("side", e.currentTarget.value, e.currentTarget.selectionStart)}
+                        onClick={(e) => updateSlashMenu("side", e.currentTarget.value, e.currentTarget.selectionStart)}
+                        onBlur={closeSlashMenuSoon}
+                        onKeyDown={(e) => {
+                          if (handleSlashKeyDown(e, "side")) return;
+                          if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            void submit("side");
+                          }
+                        }}
+                        placeholder="Nachricht in der Nebenunterhaltung…"
+                        className="aiwerk-scrollbar min-h-[44px] max-h-[160px] w-full resize-none overflow-y-hidden rounded-[14px] border border-[#d9d0c1] bg-white px-[13px] py-[11px] text-[14px] leading-[1.45] outline-none"
+                      />
+                    </div>
                     <button
                       type="button"
                       onClick={() => void submit("side")}

@@ -30,6 +30,8 @@ declare global {
      * WS-upgrade path from legacy ``?token=`` to single-use ``?ticket=``
      * fetched via :func:`getWsTicket`. */
     __HERMES_AUTH_REQUIRED__?: boolean;
+    /** Hidden/customer-configured locale for the AIWerk Customer UI. */
+    __AIWERK_CUI_LOCALE__?: string;
   }
 }
 let _sessionToken: string | null = null;

@@ -4113,6 +4113,119 @@ def test_commands_catalog_includes_tui_mouse_command():
     assert "/mouse" in tui_pairs
 
 
+def test_commands_catalog_filters_admin_skills_for_customer_actor(monkeypatch):
+    import agent.skill_commands as skill_commands
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        skill_commands,
+        "scan_skill_commands",
+        lambda: {
+            "/safe-skill": {
+                "name": "safe-skill",
+                "description": "Customer-safe skill",
+                "visibility": "customer",
+            },
+            "/admin-skill": {
+                "name": "admin-skill",
+                "description": "Admin-only skill",
+                "visibility": "admin",
+            },
+            "/unmarked-skill": {
+                "name": "unmarked-skill",
+                "description": "No explicit visibility",
+            },
+        },
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "commands.catalog",
+            "params": {"_cui_actor_role": "customer"},
+        }
+    )
+
+    pairs = dict(resp["result"]["pairs"])
+    assert "/safe-skill" in pairs
+    assert "/admin-skill" not in pairs
+    assert "/unmarked-skill" not in pairs
+    assert resp["result"]["skill_count"] == 1
+
+
+def test_commands_catalog_shows_admin_skills_for_admin_actor(monkeypatch):
+    import agent.skill_commands as skill_commands
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        skill_commands,
+        "scan_skill_commands",
+        lambda: {
+            "/safe-skill": {
+                "name": "safe-skill",
+                "description": "Customer-safe skill",
+                "visibility": "customer",
+            },
+            "/admin-skill": {
+                "name": "admin-skill",
+                "description": "Admin-only skill",
+                "visibility": "admin",
+            },
+            "/unmarked-skill": {
+                "name": "unmarked-skill",
+                "description": "No explicit visibility",
+            },
+        },
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "commands.catalog",
+            "params": {"_cui_actor_role": "admin"},
+        }
+    )
+
+    pairs = dict(resp["result"]["pairs"])
+    assert "/safe-skill" in pairs
+    assert "/admin-skill" in pairs
+    assert "/unmarked-skill" in pairs
+    assert resp["result"]["skill_count"] == 3
+
+
+def test_command_dispatch_denies_admin_skill_for_customer_actor(monkeypatch):
+    import agent.skill_commands as skill_commands
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        skill_commands,
+        "scan_skill_commands",
+        lambda: {
+            "/admin-skill": {
+                "name": "admin-skill",
+                "description": "Admin-only skill",
+                "visibility": "admin",
+            }
+        },
+    )
+    monkeypatch.setattr(skill_commands, "build_skill_invocation_message", lambda *a, **k: "loaded")
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "command.dispatch",
+            "params": {
+                "name": "admin-skill",
+                "arg": "",
+                "_cui_actor_role": "customer",
+            },
+        }
+    )
+
+    assert resp["error"]["code"] == 4031
+    assert "not available" in resp["error"]["message"]
+
+
 def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible():
     resp = server.handle_request(
         {"id": "1", "method": "commands.catalog", "params": {}}

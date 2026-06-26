@@ -9917,6 +9917,56 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
 
+_ADMIN_CUI_ROLES: frozenset[str] = frozenset(
+    {"admin", "owner", "operator", "tenant_admin", "aiwerk_admin"}
+)
+_CUSTOMER_SKILL_VISIBILITIES: frozenset[str] = frozenset(
+    {"customer", "user", "public", "all"}
+)
+
+
+def _cui_actor_role_from_params(params: dict | None) -> str:
+    if isinstance(params, dict):
+        role = str(params.get("_cui_actor_role") or params.get("actor_role") or "").strip().lower()
+        if role:
+            return role
+    try:
+        import json as _json
+
+        raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
+        if raw:
+            data = _json.loads(raw)
+            if isinstance(data, dict):
+                role = str(data.get("role") or "").strip().lower()
+                if role:
+                    return role
+    except Exception:
+        pass
+    return str(os.getenv("AIWERK_CUI_ACTOR_ROLE", "") or "").strip().lower()
+
+
+def _cui_actor_is_admin(params: dict | None) -> bool:
+    return _cui_actor_role_from_params(params) in _ADMIN_CUI_ROLES
+
+
+def _skill_visibility(info: dict | None) -> str:
+    if not isinstance(info, dict):
+        return ""
+    for key in ("visibility", "cui_visibility", "slash_visibility"):
+        value = str(info.get(key) or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _skill_visible_for_actor(info: dict | None, params: dict | None) -> bool:
+    # Local CLI/TUI and admin/operator CUI keep the full skill catalogue.
+    if not _cui_actor_role_from_params(params) or _cui_actor_is_admin(params):
+        return True
+    # Customer CUI fails closed: dynamic skills appear only when explicitly
+    # marked as customer/user/public/all visible.
+    return _skill_visibility(info) in _CUSTOMER_SKILL_VISIBILITIES
+
 
 @method("commands.catalog")
 def _(rid, params: dict) -> dict:
@@ -9992,6 +10042,8 @@ def _(rid, params: dict) -> dict:
             from agent.skill_commands import scan_skill_commands
 
             for k, info in sorted(scan_skill_commands().items()):
+                if not _skill_visible_for_actor(info, params):
+                    continue
                 d = str(info.get("description", "Skill"))
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 skill_count += 1
@@ -10150,6 +10202,12 @@ def _(rid, params: dict) -> dict:
         cmds = scan_skill_commands()
         key = f"/{name}"
         if key in cmds:
+            if not _skill_visible_for_actor(cmds.get(key), params):
+                return _err(
+                    rid,
+                    4031,
+                    f"skill command {key} is not available in this session",
+                )
             msg = build_skill_invocation_message(
                 key, arg, task_id=session.get("session_key", "") if session else ""
             )
