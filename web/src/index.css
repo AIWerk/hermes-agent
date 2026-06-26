@@ -250,10 +250,14 @@ code { font-size: 0.875rem; }
 .aiwerk-message-markdown .text-foreground {
   color: inherit;
 }
-.aiwerk-message-markdown > div {
+.aiwerk-message-markdown > div,
+.aiwerk-message-markdown p,
+.aiwerk-message-markdown ul,
+.aiwerk-message-markdown ol,
+.aiwerk-message-markdown li {
   color: inherit;
-  font-size: inherit;
-  line-height: inherit;
+  font-size: inherit !important;
+  line-height: inherit !important;
 }
 .aiwerk-message-markdown strong {
   font-weight: 700;
