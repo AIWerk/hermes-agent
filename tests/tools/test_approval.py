@@ -83,7 +83,24 @@ class TestCuiManagedAutonomy:
         assert blocked["approved"] is False
         assert blocked.get("hardline") is True
 
-    def test_execute_code_still_uses_normal_guard_in_cui_autonomy(self, monkeypatch):
+    def test_execute_code_auto_approves_low_risk_public_reads_in_cui_autonomy(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "true")
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "user")
+
+        code = """
+from hermes_tools import terminal
+result = terminal("curl -sS 'https://api.open-meteo.com/v1/forecast?latitude=46.95&longitude=7.44'")
+print(result)
+"""
+        result = check_execute_code_guard(code, "local")
+        assert result["approved"] is True
+        assert result["policy_scoped_autonomy"] is True
+        assert result["low_risk_cui_read"] is True
+
+    def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(self, monkeypatch):
         monkeypatch.setenv("HERMES_EXEC_ASK", "true")
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
@@ -92,7 +109,7 @@ class TestCuiManagedAutonomy:
 
         with mock_patch("tools.approval._get_approval_mode", return_value="manual"), \
             mock_patch.object(approval_module, "_permanent_approved", set()):
-            result = check_execute_code_guard("print('ok')", "local")
+            result = check_execute_code_guard("open('/tmp/x', 'w').write('ok')", "local")
         assert result["approved"] is False
         assert result["status"] == "pending_approval"
 

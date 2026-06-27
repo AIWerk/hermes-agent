@@ -54,6 +54,16 @@ interface SessionTitleBubble {
 interface ApprovalCard {
   id: string;
   detail: string;
+  command?: string;
+  description?: string;
+  source?: string;
+}
+
+interface ApprovalSummary {
+  title: string;
+  explanation: string;
+  rows: Array<{ label: string; value: string }>;
+  technicalDetail: string;
 }
 
 interface RecentSession {
@@ -531,6 +541,56 @@ function textFromPayload(payload: unknown): string {
   }
 }
 
+function approvalFromPayload(payload: unknown): Omit<ApprovalCard, "id"> {
+  if (!payload || typeof payload !== "object") return { detail: textFromPayload(payload) || "Eine Aktion braucht Ihre Bestätigung." };
+  const data = payload as Record<string, unknown>;
+  const command = typeof data.command === "string" ? data.command : undefined;
+  const description = typeof data.description === "string" ? data.description : undefined;
+  const detail = textFromPayload(payload) || description || command || "Eine Aktion braucht Ihre Bestätigung.";
+  const source = typeof data.source === "string" ? data.source : undefined;
+  return { detail, command, description, source };
+}
+
+function approvalHostList(text: string): string[] {
+  const hosts = new Set<string>();
+  for (const match of text.matchAll(/https?:\/\/([^\s'"`)>]+)/gi)) {
+    const raw = match[1]?.replace(/[),.;]+$/g, "");
+    if (raw) hosts.add(raw.split("/")[0]);
+  }
+  return [...hosts].slice(0, 3);
+}
+
+function summarizeApproval(approval: ApprovalCard): ApprovalSummary {
+  const raw = approval.command || approval.detail || "";
+  const description = approval.description || approval.detail || "";
+  const combined = `${description}\n${raw}`;
+  const hosts = approvalHostList(combined);
+  const lower = combined.toLowerCase();
+  const isCode = /execute_code|python|script|\b(curl|bash|sh|terminal|command)\b/.test(lower);
+  const isWriteLike = /\b(write|delete|remove|send|email|calendar|create|update|patch|edit|upload|post|put|rm\b|mv\b|cp\b)/i.test(combined);
+  const source = hosts.length ? hosts.join(", ") : "nicht erkennbar";
+  let title = "Soll ich das für Sie erledigen?";
+  let explanation = "Der Assistent möchte kurz etwas außerhalb des Chats ausführen.";
+  if (hosts.length && !isWriteLike) {
+    title = "Ich möchte öffentliche Daten abrufen";
+    explanation = `Ich möchte Informationen von ${source} lesen, um Ihre Frage zu beantworten.`;
+  } else if (isCode) {
+    title = "Ich möchte eine technische Aktion ausführen";
+    explanation = "Ich kann diese Aktion ausführen, zeige aber die technischen Details nur bei Bedarf.";
+  }
+  return {
+    title,
+    explanation,
+    rows: [
+      { label: "Was passiert", value: hosts.length && !isWriteLike ? "Öffentliche Informationen lesen" : "Technische Aktion ausführen" },
+      { label: "Quelle", value: source },
+      { label: "Datenänderung", value: isWriteLike ? "möglich — bitte prüfen" : "keine erkannt" },
+      { label: "Gültigkeit", value: "nur diese eine Anfrage" },
+    ],
+    technicalDetail: raw || description || "Keine technischen Details verfügbar.",
+  };
+}
+
 function assistantArtifactUrl(openUrl?: string | null): string | undefined {
   if (!openUrl) return undefined;
   if (/^https?:\/\//i.test(openUrl) || openUrl.startsWith("blob:")) return openUrl;
@@ -742,8 +802,8 @@ function statusBadges(status: RuntimeStatus, approvalCount: number): RuntimeBadg
         ? "Aktionen: direkt"
         : approvalCount > 0
           ? `Aktionen: ${approvalCount} offen`
-          : "Aktionen: mit Rückfrage",
-      help: "Wählt, ob riskante Aktionen vorher bestätigt werden müssen oder direkt laufen.",
+          : "Aktionen: nachfragen",
+      help: "Legt fest, wann der Assistent vor externen oder verändernden Aktionen kurz nachfragt.",
     },
   ];
 }
@@ -771,10 +831,10 @@ function chatHeaderCopy(
 ): { title: string; subtitle: string } {
   if (approvalCount > 0) {
     return {
-      title: "Freigabe nötig",
+      title: "Bestätigung nötig",
       subtitle: approvalCount === 1
-        ? "Bitte prüfen Sie die wartende Aktion"
-        : `${approvalCount} Aktionen warten auf Ihre Entscheidung`,
+        ? "Bitte prüfen Sie kurz die nächste Aktion"
+        : `${approvalCount} Aktionen warten kurz auf Ihre Entscheidung`,
     };
   }
   if (busy) {
@@ -1874,8 +1934,8 @@ export default function AiwerkAssistantPage() {
     const offToolStart = gateway.on("tool.start", (ev) => updateTools(ev.payload, "running"));
     const offToolComplete = gateway.on("tool.complete", (ev) => updateTools(ev.payload, "done"));
     const pushApproval = (ev: GatewayEvent) => {
-      const detail = textFromPayload(ev.payload) || "Eine Aktion wartet auf Freigabe.";
-      setApprovals((prev) => [{ id: newId("approval"), detail }, ...prev].slice(0, 4));
+      const approval = approvalFromPayload(ev.payload);
+      setApprovals((prev) => [{ id: newId("approval"), ...approval }, ...prev].slice(0, 4));
       setActiveStatusModal("approvals");
     };
     const offApproval = gateway.on("approval.request", pushApproval);
@@ -5055,10 +5115,19 @@ function RuntimeStatusModal({
     busy: "Eingabe während Arbeit",
     reasoning: "Denkmodus",
     fast: "Tempo",
-    approvals: "Freigaben",
+    approvals: "Bestätigungen",
+  };
+  const [expandedApprovalIds, setExpandedApprovalIds] = useState<Set<string>>(() => new Set());
+  const toggleApprovalDetails = (id: string) => {
+    setExpandedApprovalIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
   const hasBlockingApprovals = active === "approvals" && approvals.length > 0;
-  const closeLabel = hasBlockingApprovals ? "Ablehnen und Dialog schließen" : "Dialog schließen";
+  const closeLabel = hasBlockingApprovals ? "Abbrechen und Dialog schließen" : "Dialog schließen";
 
   return (
     <div className="fixed inset-0 z-40 grid place-items-center bg-[#181611]/35 p-[20px]" role="dialog" aria-modal="true" aria-labelledby="runtime-status-title">
@@ -5077,7 +5146,7 @@ function RuntimeStatusModal({
             <X className="h-[16px] w-[16px]" />
             {hasBlockingApprovals && (
               <span className="pointer-events-none absolute right-0 top-[42px] z-10 w-[220px] rounded-[12px] bg-[#292720] px-[11px] py-[9px] text-left text-[12px] leading-[1.35] text-white opacity-0 shadow-[0_14px_36px_rgba(0,0,0,.2)] transition group-hover:opacity-100 group-focus:opacity-100">
-                Schließen wird als Ablehnen gewertet.
+                Schließen bricht diese Anfrage ab.
               </span>
             )}
           </button>
@@ -5122,23 +5191,48 @@ function RuntimeStatusModal({
           <div className="grid gap-[10px]">
             {approvals.length === 0 ? (
               <div className="grid gap-[10px]">
-                <RuntimeChoice label="Mit Rückfrage" active={status.yoloMode !== "on" && status.yoloMode !== "1"} detail="Riskante Aktionen werden vor der Ausführung gestoppt und hier zur Entscheidung angezeigt." onClick={() => onSetConfig("yolo", "off", "Freigabe: mit Rückfrage")} />
-                <RuntimeChoice label="Direkt ausführen" active={status.yoloMode === "on" || status.yoloMode === "1"} detail="Riskante Aktionen laufen ohne Rückfrage. Für Kundennutzung nur bewusst einschalten." onClick={() => onSetConfig("yolo", "on", "Freigabe: direkt")} />
+                <RuntimeChoice label="Nachfragen" active={status.yoloMode !== "on" && status.yoloMode !== "1"} detail="Der Assistent fragt nur bei Aktionen nach, die Daten ändern oder besondere Reichweite haben." onClick={() => onSetConfig("yolo", "off", "Bestätigung: nachfragen")} />
+                <RuntimeChoice label="Direkt ausführen" active={status.yoloMode === "on" || status.yoloMode === "1"} detail="Der Assistent erledigt bestätigungspflichtige Aktionen ohne Rückfrage. Nur bewusst einschalten." onClick={() => onSetConfig("yolo", "on", "Bestätigung: direkt")} />
               </div>
             ) : (
-              approvals.map((approval) => (
-                <div key={approval.id} className="overflow-hidden rounded-[18px] border border-[#d2c0a8] bg-[#fffdf8] text-[14px] leading-[1.45] shadow-[0_18px_46px_rgba(48,38,22,.12)]">
-                  <div className="h-[4px] bg-gradient-to-r from-[#292720] via-[#8a7658] to-[#d8c7ab]" />
-                  <div className="p-[16px]">
-                    <strong className="text-[15px] text-[#292720]">Aktion wartet auf Entscheidung</strong>
-                    <p className="mb-[14px] mt-[7px] text-[#625a4c]">{approval.detail}</p>
-                    <div className="grid grid-cols-2 gap-[8px]">
-                      <button type="button" onClick={() => onResolveApproval(approval.id, true)} className="cursor-pointer rounded-[11px] border border-[#9a7b51] bg-[#8b724e] px-[12px] py-[10px] font-semibold text-white shadow-[0_10px_24px_rgba(91,70,39,.18)] hover:bg-[#7a6342]">Freigeben</button>
-                      <button type="button" onClick={() => onResolveApproval(approval.id, false)} className="cursor-pointer rounded-[11px] border border-[#d7b7ad] bg-[#fffaf2] px-[12px] py-[10px] font-semibold text-[#7b3b2f] hover:bg-[#f4e2dc]">Ablehnen</button>
+              approvals.map((approval) => {
+                const summary = summarizeApproval(approval);
+                const detailsOpen = expandedApprovalIds.has(approval.id);
+                return (
+                  <div key={approval.id} className="overflow-hidden rounded-[18px] border border-[#d2c0a8] bg-[#fffdf8] text-[14px] leading-[1.45] shadow-[0_18px_46px_rgba(48,38,22,.12)]">
+                    <div className="h-[4px] bg-gradient-to-r from-[#bca982] via-[#d7c6a9] to-[#efe5d6]" />
+                    <div className="grid gap-[13px] p-[16px]">
+                      <div>
+                        <strong className="text-[15px] text-[#292720]">{summary.title}</strong>
+                        <p className="mb-0 mt-[7px] text-[#625a4c]">{summary.explanation}</p>
+                      </div>
+                      <div className="grid gap-[7px] rounded-[14px] border border-[#eadfce] bg-[#fbf5eb] p-[11px]">
+                        {summary.rows.map((row) => (
+                          <div key={row.label} className="grid grid-cols-[112px_1fr] gap-[8px] text-[12px]">
+                            <span className="font-bold text-[#8a7a65]">{row.label}</span>
+                            <span className="text-[#3d372f]">{row.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => toggleApprovalDetails(approval.id)}
+                        className="flex cursor-pointer items-center gap-[7px] justify-self-start rounded-[10px] border border-[#e3d6c5] bg-[#fffaf2] px-[10px] py-[7px] text-[12px] font-bold text-[#6d5d46] hover:bg-[#f3eadb]"
+                      >
+                        <FileText className="h-[14px] w-[14px]" />
+                        {detailsOpen ? "Technische Details ausblenden" : "Technische Details anzeigen"}
+                      </button>
+                      {detailsOpen && (
+                        <pre className="max-h-[180px] overflow-auto whitespace-pre-wrap rounded-[13px] border border-[#e1d2bf] bg-[#292720] p-[11px] text-[11px] leading-[1.45] text-[#fff7e8]">{summary.technicalDetail}</pre>
+                      )}
+                      <div className="grid grid-cols-2 gap-[8px]">
+                        <button type="button" onClick={() => onResolveApproval(approval.id, true)} className="cursor-pointer rounded-[11px] border border-[#9a7b51] bg-[#8b724e] px-[12px] py-[10px] font-semibold text-white shadow-[0_10px_24px_rgba(91,70,39,.18)] hover:bg-[#7a6342]">Ja, fortfahren</button>
+                        <button type="button" onClick={() => onResolveApproval(approval.id, false)} className="cursor-pointer rounded-[11px] border border-[#d7b7ad] bg-[#fffaf2] px-[12px] py-[10px] font-semibold text-[#7b3b2f] hover:bg-[#f4e2dc]">Nein, abbrechen</button>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         )}
@@ -5151,7 +5245,7 @@ function runtimeStatusHelp(active: RuntimeBadgeId): string {
   if (active === "busy") return "Diese Einstellung entspricht /busy status und bestimmt das Verhalten bei Eingaben während einer laufenden Antwort.";
   if (active === "reasoning") return "Diese Einstellung entspricht /reasoning und beeinflusst Denkaufwand sowie Sichtbarkeit von Zwischenüberlegungen.";
   if (active === "fast") return "Diese Einstellung entspricht /fast und schaltet die Priorität der Antwortverarbeitung.";
-  return "Legt fest, ob riskante Aktionen vorher abgefragt werden oder direkt ausgeführt werden.";
+  return "Legt fest, wann der Assistent vor externen oder verändernden Aktionen kurz nachfragt.";
 }
 
 function RuntimeChoice({

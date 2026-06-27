@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextvars
 import fnmatch
 import functools
@@ -15,11 +16,13 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
 import unicodedata
 from typing import Optional
+from urllib.parse import urlparse
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -1418,6 +1421,99 @@ def check_dangerous_command(command: str, env_type: str,
     return {"approved": True, "message": None}
 
 
+def _is_public_http_url(url: str) -> bool:
+    """Return True for non-local HTTP(S) URLs suitable for CUI auto-read."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        return False
+    if re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", host):
+        return False
+    return True
+
+
+def _is_safe_curl_read(command: str) -> bool:
+    """Conservative allowlist for read-only public curl commands."""
+    if re.search(r"[;|<>`$]", command):
+        return False
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        return False
+    if not parts or parts[0] != "curl":
+        return False
+    urls = [part for part in parts[1:] if part.startswith(("http://", "https://"))]
+    if not urls or not all(_is_public_http_url(url) for url in urls):
+        return False
+    disallowed = {"-X", "--request", "-d", "--data", "--data-raw", "--data-binary", "-F", "--form", "-T", "--upload-file", "-o", "--output", "-O", "--remote-name"}
+    for idx, part in enumerate(parts[1:]):
+        if part in disallowed:
+            return False
+        if part.startswith("-X") or part.startswith("--request="):
+            method = (part[2:] if part.startswith("-X") else part.split("=", 1)[1]).upper()
+            if not method or method not in {"GET", "HEAD"}:
+                return False
+        if part.upper() in {"POST", "PUT", "PATCH", "DELETE"} and idx > 0 and parts[idx] in {"-X", "--request"}:
+            return False
+    return True
+
+
+def _literal_terminal_calls_are_safe(tree: ast.AST) -> bool:
+    """Permit hermes_tools.terminal only for literal safe curl reads."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = ""
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        if name != "terminal":
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+            return False
+        if not _is_safe_curl_read(node.args[0].value):
+            return False
+    return True
+
+
+def _is_low_risk_cui_execute_code(code: str) -> bool:
+    """Static fast path for authenticated CUI: public read-only data fetches.
+
+    This removes scary raw-code prompts for common user-agent tasks such as
+    weather/news/RSS lookups, while anything that writes, sends, mutates files,
+    shells out dynamically, or touches local/private URLs still falls through to
+    the normal confirmation flow.
+    """
+    lower = code.lower()
+    forbidden = [
+        r"\bsubprocess\b", r"\bos\.system\b", r"\bpopen\b", r"\bctypes\b",
+        r"\bshutil\b", r"\.write_text\b", r"\.write_bytes\b", r"\.unlink\b",
+        r"\brmtree\b", r"\bremove\b", r"\brmdir\b", r"\bmkdir\b",
+        r"\bwrite_file\b", r"\bpatch\b", r"\bdelete\b", r"\bemail\b",
+        r"\bpost\b", r"\bput\b", r"\bpatch\b", r"\bdelete\b", r"\bupload\b",
+        r"\bopen\s*\([^\)]*['\"](?:w|a|x|r\+)"
+    ]
+    if any(re.search(pattern, lower) for pattern in forbidden):
+        return False
+    urls = re.findall(r"https?://[^\s'\"`)>]+", code)
+    if not urls or not all(_is_public_http_url(url.rstrip("),.;")) for url in urls):
+        return False
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    if not _literal_terminal_calls_are_safe(tree):
+        return False
+    return True
+
+
 # =========================================================================
 # Combined pre-exec guard (tirith + dangerous command detection)
 # =========================================================================
@@ -1907,6 +2003,17 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     # in check_all_command_guards / check_dangerous_command.
     if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
         return {"approved": True, "message": None}
+
+    # Authenticated AIWerk user-agent CUI: do not interrupt ordinary public
+    # read-only data fetches with a raw-code permission prompt.  Mutating,
+    # local/private, or dynamic shell/code still falls through to confirmation.
+    if _is_cui_managed_autonomy_enabled() and _is_low_risk_cui_execute_code(code):
+        return {
+            "approved": True,
+            "message": None,
+            "policy_scoped_autonomy": True,
+            "low_risk_cui_read": True,
+        }
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
