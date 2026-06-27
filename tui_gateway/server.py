@@ -5979,7 +5979,11 @@ def _(rid, params: dict) -> dict:
         db.end_session(side_session_id, "side_session_returned")
         db.reopen_session(parent_session_id)
         restored = db.get_messages_as_conversation(parent_session_id)
-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        restored = [
+            {k: v for k, v in m.items() if k != "timestamp"}
+            for m in (restored or [])
+            if m.get("role") != "session_meta"
+        ]
         info = _switch_live_session(sid, session, parent_session_id, restored, reason="back")
         return _ok(
             rid,
