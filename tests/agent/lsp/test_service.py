@@ -8,6 +8,7 @@ on.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -172,5 +173,31 @@ def test_service_status_includes_clients(mock_pyright):
         info = svc.get_status()
         assert info["enabled"] is True
         assert any(c["server_id"] == "pyright" for c in info["clients"])
+    finally:
+        svc.shutdown()
+
+
+def test_service_reaps_idle_clients(mock_pyright):
+    """Idle LSP clients are shut down instead of living for the full Hermes session."""
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=0.01,
+    )
+    try:
+        svc.get_diagnostics_sync(str(f))
+        info = svc.get_status()
+        assert len(info["clients"]) == 1
+        time.sleep(0.02)
+
+        reaped = svc.reap_idle_clients_sync()
+
+        assert reaped == 1
+        assert svc.get_status()["clients"] == []
     finally:
         svc.shutdown()
