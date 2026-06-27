@@ -283,6 +283,10 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
+        monkeypatch.setattr(
+            "hermes_cli.operator_verification.operator_verification_block_reason_for_command",
+            lambda command: None,
+        )
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:

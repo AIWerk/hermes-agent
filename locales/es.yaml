@@ -404,3 +404,4 @@ cli:
     run_to_update: "run [bold]{command}[/bold] to update"
     update_available: "update available"
     run_command: "run [bold]{command}[/bold]"
+    tip: "✦ Tip: {tip}"

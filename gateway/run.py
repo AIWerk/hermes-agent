@@ -11568,10 +11568,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not tts_text:
                 return
 
-            # Telegram voice bubbles auto-play as a playlist in some clients,
-            # which makes a new assistant reply appear concatenated with older
-            # voice notes.  Use sendAudio/MP3 for automatic replies so only the
-            # newly sent audio plays; other platforms keep the existing default.
+            # Use MP3 for automatic replies so Telegram can send them as audio
+            # rather than replay-prone voice notes.
             audio_ext = "mp3"
             audio_path = os.path.join(
                 tempfile.gettempdir(), "hermes_voice",

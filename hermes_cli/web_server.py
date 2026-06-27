@@ -609,7 +609,11 @@ def _resolve_shared_folder_root(config: dict[str, Any]) -> Path | None:
 
 def _discover_dav_shared_folder_root(config: dict[str, Any]) -> Path | None:
     """Best-effort discovery for a desktop WebDAV mount used by the CUI shared folder."""
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_dir and hasattr(os, "getuid"):
+        runtime_dir = f"/run/user/{os.getuid()}"  # windows-footgun: ok
+    if not runtime_dir:
+        return None
     gvfs_root = Path(runtime_dir) / "gvfs"
     if not gvfs_root.is_dir():
         return None
@@ -8998,7 +9002,7 @@ async def get_profiles_sessions(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(request: Request, q: str = "", limit: int = 20, profile: Optional[str] = None):
+async def search_sessions(request=None, q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -9016,7 +9020,7 @@ async def search_sessions(request: Request, q: str = "", limit: int = 20, profil
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
 
-            actor = _cui_actor_context_from_request(request)
+            actor = _cui_actor_context_from_request(request) if request is not None else None
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately

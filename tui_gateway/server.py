@@ -42,7 +42,7 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
-_hermes_home = get_hermes_home()
+_hermes_home = Path(get_hermes_home()).expanduser()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
 )
@@ -4109,7 +4109,7 @@ def _switch_live_session(
 
         register_gateway_notify(
             target_session_id,
-            lambda data: _emit("approval.request", sid, data),
+            lambda data: _emit_approval_request(sid, data),
         )
     except Exception:
         pass
@@ -5979,7 +5979,11 @@ def _(rid, params: dict) -> dict:
         db.end_session(side_session_id, "side_session_returned")
         db.reopen_session(parent_session_id)
         restored = db.get_messages_as_conversation(parent_session_id)
-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        restored = [
+            {k: v for k, v in m.items() if k != "timestamp"}
+            for m in (restored or [])
+            if m.get("role") != "session_meta"
+        ]
         info = _switch_live_session(sid, session, parent_session_id, restored, reason="back")
         return _ok(
             rid,
@@ -11965,7 +11969,11 @@ def _(rid, params: dict) -> dict:
         agent = session.get("agent") if session else None
         can_steer = False
         if session:
-            with session["history_lock"]:
+            lock = session.get("history_lock")
+            if lock is not None:
+                with lock:
+                    can_steer = bool(session.get("running")) and isinstance(session.get("inflight_turn"), dict)
+            else:
                 can_steer = bool(session.get("running")) and isinstance(session.get("inflight_turn"), dict)
         if can_steer and agent and hasattr(agent, "steer"):
             try:
