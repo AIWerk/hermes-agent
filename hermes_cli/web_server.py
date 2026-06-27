@@ -609,7 +609,11 @@ def _resolve_shared_folder_root(config: dict[str, Any]) -> Path | None:
 
 def _discover_dav_shared_folder_root(config: dict[str, Any]) -> Path | None:
     """Best-effort discovery for a desktop WebDAV mount used by the CUI shared folder."""
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_dir and hasattr(os, "getuid"):
+        runtime_dir = f"/run/user/{os.getuid()}"  # windows-footgun: ok
+    if not runtime_dir:
+        return None
     gvfs_root = Path(runtime_dir) / "gvfs"
     if not gvfs_root.is_dir():
         return None

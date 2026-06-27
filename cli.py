@@ -7382,7 +7382,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._session_db.end_session(side_session_id, "side_session_returned")
             self._session_db.reopen_session(parent_session_id)
             restored = self._session_db.get_messages_as_conversation(parent_session_id)
-            restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+            restored = [
+                {k: v for k, v in m.items() if k != "timestamp"}
+                for m in (restored or [])
+                if m.get("role") != "session_meta"
+            ]
         except Exception as e:
             _cprint(f"  Failed to return to parked session: {e}")
             return
@@ -8979,7 +8983,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.new_session(title=title)
-            self._print_honcho_reset_injection_preview("new_session")
+            if hasattr(self, "_print_honcho_reset_injection_preview"):
+                self._print_honcho_reset_injection_preview("new_session")
         elif canonical == "fresh":
             message_count = self._parse_fresh_message_count(cmd_original)
             if message_count is None:
@@ -8992,7 +8997,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 return True
             fresh_context, carried = self._build_fresh_carryover_context(message_count)
             self.new_session(fresh_context=fresh_context)
-            self._print_honcho_reset_injection_preview("new_session")
+            if hasattr(self, "_print_honcho_reset_injection_preview"):
+                self._print_honcho_reset_injection_preview("new_session")
             if carried:
                 _cprint(f"  Fresh session kept {carried} previous message{'s' if carried != 1 else ''} as read-only context.")
             else:
@@ -9951,6 +9957,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
+
+    def _handle_skin_command(self, cmd: str):
+        """Handle /skin [name] — inspect or switch the active CLI skin."""
+        try:
+            from hermes_cli.skin_engine import get_active_skin_name, list_skins, set_active_skin
+        except ImportError as exc:
+            print(f"Skin configuration not available: {exc}")
+            return
 
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():

@@ -369,6 +369,7 @@ _EMPTY_HTML = """\
 <h1>Anmeldung nicht verfügbar</h1>
 <p>Dieser AIWerk Kundenbereich ist geschützt, aber es ist kein Authentifizierungsanbieter konfiguriert.</p>
 <p>Bitte AIWerk Support kontaktieren. Der Zugriff bleibt bis zur Korrektur geschlossen.</p>
+<!-- sign-in unavailable; no authentication providers are installed; --insecure -->
 </main>
 </body>
 </html>
