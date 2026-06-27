@@ -9002,7 +9002,7 @@ async def get_profiles_sessions(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(request: Request, q: str = "", limit: int = 20, profile: Optional[str] = None):
+async def search_sessions(request=None, q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -9020,7 +9020,7 @@ async def search_sessions(request: Request, q: str = "", limit: int = 20, profil
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
 
-            actor = _cui_actor_context_from_request(request)
+            actor = _cui_actor_context_from_request(request) if request is not None else None
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
