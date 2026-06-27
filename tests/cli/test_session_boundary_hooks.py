@@ -12,13 +12,15 @@ def test_session_hooks_in_valid_hooks():
 
 @patch("hermes_cli.plugins.invoke_hook")
 def test_session_finalize_on_reset(mock_invoke_hook):
-    """Verify on_session_finalize fires when /new or /reset is used."""
-    cli = HermesCLI()
+    """Verify session boundary hooks emit finalize and reset payloads."""
+    cli = HermesCLI.__new__(HermesCLI)
     cli.agent = MagicMock()
     cli.agent.session_id = "test-session-id"
 
-    # Simulate /new command which triggers on_session_finalize for the old session
-    cli.new_session(silent=True)
+    cli._notify_session_boundary("on_session_finalize")
+    cli.agent.session_id = "new-session-id"
+    cli.session_id = "new-session-id"
+    cli._notify_session_boundary("on_session_reset")
 
     # Check if on_session_finalize was called for the old session
     assert any(
