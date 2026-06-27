@@ -90,6 +90,25 @@ def _first_non_option(args: list[str]) -> str:
     return ""
 
 
+def _eval_payloads(tokens: list[str]) -> list[str]:
+    payloads: list[str] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token == "eval":
+            payload = tokens[index + 1].strip()
+            if payload:
+                payloads.append(payload)
+    return payloads
+
+
+def _wrapped_shell_requires_operator_verification(
+    tokens: list[str], config: OperatorVerificationConfig
+) -> bool | None:
+    payloads = _eval_payloads(tokens)
+    if not payloads:
+        return None
+    return any(_requires_operator_verification(payload, config) for payload in payloads)
+
+
 def _is_remote_path(arg: str) -> bool:
     return bool(re.match(r"^[^/@\s:]+@?[^\s:]+:.+", arg))
 
@@ -113,6 +132,9 @@ def _requires_operator_verification(command: str, config: OperatorVerificationCo
     tokens = _split_command(command)
     if not tokens:
         return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
+    wrapped = _wrapped_shell_requires_operator_verification(tokens, config)
+    if wrapped is not None:
+        return wrapped
     cmd, args = _base_command(tokens)
     verb = _first_non_option(args)
 
