@@ -365,6 +365,32 @@ def test_operator_verification_allows_normal_user_file_and_git_operations():
         assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
 
 
+def test_operator_verification_allows_safe_git_push_inside_terminal_shell_wrapper():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    command = (
+        "source /tmp/hermes-snap.sh >/dev/null 2>&1 || true "
+        "builtin cd -- /repo || exit 126 "
+        "eval 'git push -u aiwerk aiwerk/fix/lsp-idle-reaper' "
+        "__hermes_ec=$? export -p > /tmp/hermes-snap.sh exit $__hermes_ec"
+    )
+
+    assert operator_verification_block_reason_for_command(command, config=config, now=100) is None
+
+
+def test_operator_verification_blocks_force_git_push_inside_terminal_shell_wrapper():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    command = (
+        "source /tmp/hermes-snap.sh >/dev/null 2>&1 || true "
+        "builtin cd -- /repo || exit 126 "
+        "eval 'git push --force origin main' "
+        "__hermes_ec=$? export -p > /tmp/hermes-snap.sh exit $__hermes_ec"
+    )
+
+    assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None
+
+
 def test_operator_verification_still_blocks_broad_or_privileged_file_and_git_operations():
     clear_operator_verification_cache()
     config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
