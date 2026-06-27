@@ -106,7 +106,13 @@ def redact_sensitive_text(text: str) -> str:
     """
     # Redact whole private-key blocks BEFORE capping: the END marker may sit
     # beyond _MAX_SCAN, where the single-line patterns below would never see it.
-    redacted = _BLOCK_SECRET_RE.sub("[REDACTED]", str(text or ""))[:_MAX_SCAN]
+    # Avoid running the block regex on ordinary large blobs; most note content
+    # has no PEM header, and CI timing can make a linear 60KB scan trip the
+    # ReDoS guard even when no secret shape is present.
+    raw = str(text or "")
+    if "-----BEGIN " in raw and "PRIVATE KEY-----" in raw:
+        raw = _BLOCK_SECRET_RE.sub("[REDACTED]", raw)
+    redacted = raw[:_MAX_SCAN]
     for pattern in _SECRET_PATTERNS:
         def repl(match: re.Match[str]) -> str:
             if match.lastindex:
