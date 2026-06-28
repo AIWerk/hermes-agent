@@ -107,7 +107,13 @@ def test_outbound_attachment_payloads_extracts_pdf_audio_and_video(tmp_path):
     assert all(payload["preview_url"] for payload in payloads)
 
 
-def test_outbound_attachment_payloads_materializes_external_audio(monkeypatch, tmp_path):
+def test_outbound_attachment_payloads_rejects_external_source(monkeypatch, tmp_path):
+    # SECURITY: the materializer must NOT copy a file that lives outside the
+    # safe-output allowlist (dashboard upload root + process temp dir) into the
+    # customer-servable area. The assistant text is customer-influenceable, and
+    # the extension allowlist also matches config/credential files, so an
+    # external source path must be refused before any copy happens. (This test
+    # previously asserted the insecure copy-anything behavior.)
     from tui_gateway import server
 
     source_root = tmp_path / "outside-artifact-roots"
@@ -117,6 +123,28 @@ def test_outbound_attachment_payloads_materializes_external_audio(monkeypatch, t
     upload_root = tmp_path / "dashboard_uploads"
     hermes_root = tmp_path / "hermes-home"
     fake_temp_root = tmp_path / "fake-temp"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(server, "_DASHBOARD_UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(server, "_hermes_home", hermes_root)
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(fake_temp_root))
+
+    assert server._outbound_image_attachment_payloads(f"MEDIA:{source}") == []
+    assert server._materialize_outbound_artifact(source) is None
+    # Nothing was laundered into the served upload root.
+    assert not (upload_root / "outbound_artifacts").exists()
+
+
+def test_outbound_attachment_payloads_materializes_temp_dir_source(monkeypatch, tmp_path):
+    # A file the agent legitimately produced under the process temp dir (e.g.
+    # generated TTS/media) IS materialized into the served upload root.
+    from tui_gateway import server
+
+    fake_temp_root = tmp_path / "fake-temp"
+    fake_temp_root.mkdir()
+    source = fake_temp_root / "Jaro.mp3"
+    source.write_bytes(b"ID3 playable test bytes")
+    upload_root = tmp_path / "dashboard_uploads"
+    hermes_root = tmp_path / "hermes-home"
     monkeypatch.setattr(server, "_DASHBOARD_UPLOAD_ROOT", upload_root)
     monkeypatch.setattr(server, "_hermes_home", hermes_root)
     monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(fake_temp_root))
@@ -135,6 +163,27 @@ def test_outbound_attachment_payloads_materializes_external_audio(monkeypatch, t
     assert payload["path"] == str(materialized)
     assert payload["preview_kind"] == "audio"
     assert payload["safe_renderable"] is True
+
+
+def test_outbound_attachment_payloads_rejects_hermes_home_config(monkeypatch, tmp_path):
+    # The concrete attack from the brief: assistant text references
+    # ~/.hermes/config.yaml (provider API keys). Even though .yaml is in the
+    # extension allowlist, the materializer must refuse a HERMES_HOME source.
+    from tui_gateway import server
+
+    hermes_root = tmp_path / "hermes-home"
+    hermes_root.mkdir()
+    config = hermes_root / "config.yaml"
+    config.write_text("provider_api_key: sk-secret\n", encoding="utf-8")
+    upload_root = tmp_path / "dashboard_uploads"
+    monkeypatch.setattr(server, "_DASHBOARD_UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(server, "_hermes_home", hermes_root)
+    # Even if HERMES_HOME were (mis)configured under the temp allowlist, the
+    # explicit HERMES_HOME / dotfile denylist still rejects it.
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    assert server._outbound_image_attachment_payloads(f"MEDIA:{config}") == []
+    assert server._materialize_outbound_artifact(config) is None
 
 
 def test_assistant_artifact_endpoint_serves_upload_root_image(client_loopback, tmp_path, monkeypatch):

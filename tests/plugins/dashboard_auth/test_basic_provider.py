@@ -159,6 +159,87 @@ class TestProvider:
 
 
 # ---------------------------------------------------------------------------
+# Multi-user table: config is authoritative for role/membership
+# ---------------------------------------------------------------------------
+
+
+class TestMultiUserProvider:
+    def _users(self, basic, **roles):
+        """Build a users table; default two users alice(admin) / bob(user)."""
+        h = basic.hash_password("pw")
+        users = {
+            "alice": {"password_hash": h, "role": roles.get("alice", "admin"),
+                      "tenant_id": "t1", "actor_id": "alice", "display_name": "Alice"},
+            "bob": {"password_hash": h, "role": roles.get("bob", "user"),
+                    "tenant_id": "t1", "actor_id": "bob", "display_name": "Bob"},
+        }
+        return users
+
+    def _provider(self, basic, users, secret=None):
+        return basic.BasicAuthProvider(
+            secret=secret or secrets.token_bytes(32),
+            users=users,
+        )
+
+    def test_role_demotion_takes_effect_on_verify(self, basic):
+        # A user logs in as admin; config later demotes them. The next
+        # verify_session (per-request hot path) must reflect the demotion
+        # without waiting for the access-token TTL.
+        users = self._users(basic)
+        secret = secrets.token_bytes(32)
+        p = self._provider(basic, users, secret)
+        s = p.complete_password_login(username="alice", password="pw")
+        assert s.role == "admin"
+
+        # Demote alice in the live config (admin -> user).
+        users["alice"]["role"] = "user"
+        verified = p.verify_session(access_token=s.access_token)
+        assert verified is not None
+        assert verified.role == "user"  # demotion is live, not TTL-delayed
+        # exp is preserved (verify doesn't extend the session).
+        assert verified.expires_at == s.expires_at
+
+    def test_removed_user_verify_fails(self, basic):
+        users = self._users(basic)
+        p = self._provider(basic, users)
+        s = p.complete_password_login(username="bob", password="pw")
+        assert p.verify_session(access_token=s.access_token) is not None
+        # Remove bob from the config.
+        del users["bob"]
+        assert p.verify_session(access_token=s.access_token) is None
+
+    def test_removed_user_refresh_is_revoked(self, basic):
+        # The key revocation lever: a removed user must NOT be able to mint new
+        # access tokens via the 30-day refresh token.
+        users = self._users(basic)
+        p = self._provider(basic, users)
+        s = p.complete_password_login(username="bob", password="pw")
+        # While present, refresh works.
+        assert p.refresh_session(refresh_token=s.refresh_token).user_id == "bob"
+        # After removal, refresh is refused (treated as revocation).
+        del users["bob"]
+        with pytest.raises(RefreshExpiredError):
+            p.refresh_session(refresh_token=s.refresh_token)
+
+    def test_present_user_refresh_reflects_current_role(self, basic):
+        users = self._users(basic)
+        p = self._provider(basic, users)
+        s = p.complete_password_login(username="alice", password="pw")
+        users["alice"]["role"] = "user"
+        r = p.refresh_session(refresh_token=s.refresh_token)
+        assert r.role == "user"
+
+    def test_single_user_fallback_keeps_token_role(self, basic):
+        # The single-user (no users table) provider has no membership concept —
+        # verify must still round-trip from the token (no users table to consult).
+        h = basic.hash_password("hunter2")
+        p = basic.BasicAuthProvider(username="admin", password_hash=h, secret=secrets.token_bytes(32))
+        s = p.complete_password_login(username="admin", password="hunter2")
+        verified = p.verify_session(access_token=s.access_token)
+        assert verified is not None and verified.role == "admin"
+
+
+# ---------------------------------------------------------------------------
 # register() entry point — config/env resolution + skip reasons
 # ---------------------------------------------------------------------------
 

@@ -90,12 +90,27 @@ def test_cross_tenant_actions_are_admin_only_even_when_action_is_normally_user_o
     assert decision.reason == "cross_tenant"
 
 
-def test_unknown_write_actions_fail_safe_to_confirmation_not_admin_prompt():
+def test_unknown_write_actions_fail_closed_to_admin_for_non_admin():
+    # Security posture: an action the table does not recognise must NOT be
+    # silently permitted to a non-admin. A sensitive action an engineer forgets
+    # to register in _ADMIN_ONLY_ACTIONS would otherwise become non-admin
+    # permitted; we fail closed and require admin instead.
     user = _session("user")
 
     decision = decide_dashboard_permission("custom.low_risk_write", session=user, scope="own_tenant")
 
+    assert decision.allowed is False
+    assert decision.level is PermissionLevel.ADMIN_ONLY
+    assert decision.admin_required is True
+    assert decision.reason == "unknown_denied"
+
+
+def test_unknown_write_actions_allowed_for_admin_session():
+    admin = _session("admin")
+
+    decision = decide_dashboard_permission("custom.low_risk_write", session=admin, scope="own_tenant")
+
     assert decision.allowed is True
-    assert decision.level is PermissionLevel.CONFIRM
-    assert decision.admin_required is False
-    assert decision.reason == "unknown_confirm"
+    assert decision.level is PermissionLevel.ADMIN_ONLY
+    assert decision.admin_required is True
+    assert decision.reason == "unknown_admin"

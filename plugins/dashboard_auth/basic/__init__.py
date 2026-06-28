@@ -217,6 +217,13 @@ class BasicAuthProvider(DashboardAuthProvider):
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
         self._users = users or {}
+        # True when an explicit multi-user table was configured. In that mode the
+        # users dict is the authoritative membership/role source: verify_session
+        # re-resolves role from it (so a demotion takes effect within seconds,
+        # not at access-token TTL) and refresh_session treats removal as
+        # revocation. The single-user fallback below is a fixed admin record with
+        # no membership concept, so those checks are skipped for it.
+        self._has_users_table = bool(self._users)
         if self._users:
             for uname, rec in self._users.items():
                 if not uname or not rec.get("password_hash"):
@@ -283,6 +290,18 @@ class BasicAuthProvider(DashboardAuthProvider):
             or payload.get("exp", 0) <= int(time.time())
         ):
             return None
+        # When an explicit users table is configured it is the authoritative
+        # source for role/tenant/membership. Re-resolve from it on this
+        # per-request hot path so a config demotion (admin -> user) or a tenant
+        # change takes effect within seconds, instead of persisting until the
+        # access-token TTL (default 12h) lapses. A user removed from the table is
+        # no longer authenticated (treat removal as revocation).
+        if self._has_users_table:
+            sub = str(payload.get("sub", ""))
+            record = self._users.get(sub)
+            if record is None:
+                return None
+            return self._session_from_record(access_token, "", sub, record, int(payload["exp"]))
         return self._session_from_payload(access_token, "", payload)
 
     def refresh_session(self, *, refresh_token: str) -> Session:
@@ -296,6 +315,13 @@ class BasicAuthProvider(DashboardAuthProvider):
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
         sub = str(payload.get("sub", self._username))
+        # When a users table is configured, a refresh for a subject no longer in
+        # the table must be refused — otherwise a removed user keeps a valid
+        # 30-day refresh token and the middleware's transparent refresh-on-expiry
+        # would keep minting access tokens for them. Removal == revocation; this
+        # is the only revocation lever a stateless provider has.
+        if self._has_users_table and sub not in self._users:
+            raise RefreshExpiredError("user no longer exists")
         return self._mint_session(sub, self._users.get(sub, {}))
 
     def revoke_session(self, *, refresh_token: str) -> None:
@@ -330,6 +356,39 @@ class BasicAuthProvider(DashboardAuthProvider):
             {**payload_base, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
             self._secret,
         )
+        return Session(
+            user_id=user_id,
+            email=email,
+            display_name=display_name,
+            org_id=tenant_id,
+            provider=self.name,
+            expires_at=exp,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            role=role,
+        )
+
+    def _session_from_record(
+        self,
+        access_token: str,
+        refresh_token: str,
+        user_id: str,
+        record: dict,
+        exp: int,
+    ) -> Session:
+        """Build a Session from the CURRENT config record (authoritative role).
+
+        Keeps the existing token's ``exp`` so verify_session does not extend the
+        session lifetime; it only re-resolves the privilege-bearing fields
+        (role/tenant) from ``self._users`` so config changes take effect now.
+        """
+        tenant_id = str(record.get("tenant_id", "") or "")
+        actor_id = str(record.get("actor_id", "") or user_id)
+        role = str(record.get("role", "user") or "user")
+        display_name = str(record.get("display_name", "") or user_id)
+        email = str(record.get("email", "") or "")
         return Session(
             user_id=user_id,
             email=email,

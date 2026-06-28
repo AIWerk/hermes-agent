@@ -30,6 +30,11 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from agent.cui_actor_context import (
+    bind_cui_actor_context as _canonical_bind_cui_actor_context,
+    current_cui_actor_context as _canonical_current_cui_actor_context,
+    reset_cui_actor_context as _canonical_reset_cui_actor_context,
+)
 from utils import is_truthy_value
 from tui_gateway import git_probe
 from tui_gateway.transport import (
@@ -252,59 +257,166 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
-_cui_actor_context_var: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
-    "cui_actor_context", default=None
-)
+# The per-turn CUI actor identity is transported through the canonical
+# contextvar in ``agent.cui_actor_context`` (race-free across concurrent
+# in-process turns), NOT a server-local copy — keeping two independent
+# ContextVars was the bug that let concurrent turns read a clobbered identity.
+# These thin wrappers delegate to the canonical helpers so existing call sites
+# and tests keep working unchanged.
 
 
 def bind_cui_actor_context(actor_context: dict | None):
-    clean = {
-        str(k): str(v)
-        for k, v in (actor_context or {}).items()
-        if k in {"tenant_id", "actor_id", "role", "display_name", "user_id", "provider"} and v is not None
-    }
-    return _cui_actor_context_var.set(clean or None)
+    return _canonical_bind_cui_actor_context(actor_context)
 
 
 def reset_cui_actor_context(token) -> None:
-    _cui_actor_context_var.reset(token)
+    _canonical_reset_cui_actor_context(token)
 
 
 def current_cui_actor_context() -> dict[str, str] | None:
-    actor = _cui_actor_context_var.get()
-    return dict(actor) if isinstance(actor, dict) and actor else None
+    actor = _canonical_current_cui_actor_context()
+    return actor or None
 
 
-def _apply_cui_actor_env(actor_context: dict | None) -> list[tuple[str, str | None]]:
+def _apply_cui_actor_env(actor_context: dict | None):
+    """Bind the per-turn actor context for in-process turns.
+
+    Previously this MUTATED process-global ``os.environ`` per turn, so concurrent
+    in-process gateway turns clobbered each other's actor identity (cross-customer
+    context bleed). The actor identity now rides the canonical contextvar instead,
+    which is isolated per logical flow. The non-identifying
+    ``AIWERK_CUI_MANAGED_AUTONOMY`` flag is the one signal still bridged through
+    ``os.environ`` so the managed-autonomy gate keeps working for consumers that
+    have not yet migrated off the env bridge; it carries no per-customer identity,
+    so a concurrent set/clear cannot leak one tenant's context into another.
+
+    Returns an opaque token; pass it back to :func:`_clear_cui_actor_env`
+    (try/finally) to restore the previous bindings.
+    """
     actor = {
         str(k): str(v)
         for k, v in (actor_context or {}).items()
         if k in {"tenant_id", "actor_id", "role", "display_name", "user_id", "provider"} and v is not None
     }
     if not actor:
-        return []
-    updates = {
-        "AIWERK_CUI_ACTOR_CONTEXT": json.dumps(actor, separators=(",", ":")),
-    }
-    if actor.get("tenant_id"):
-        updates["AIWERK_CUI_TENANT_ID"] = actor["tenant_id"]
-    if actor.get("actor_id"):
-        updates["AIWERK_CUI_ACTOR_ID"] = actor["actor_id"]
-    if actor.get("role"):
-        updates["AIWERK_CUI_ACTOR_ROLE"] = actor["role"]
+        return None
+    ctx_token = bind_cui_actor_context(actor)
+    env_token = None
     if actor.get("tenant_id") and (actor.get("actor_id") or actor.get("user_id")) and actor.get("role"):
-        updates["AIWERK_CUI_MANAGED_AUTONOMY"] = "1"
-    tokens = [(key, os.environ.get(key)) for key in updates]
-    os.environ.update(updates)
-    return tokens
+        env_token = ("AIWERK_CUI_MANAGED_AUTONOMY", os.environ.get("AIWERK_CUI_MANAGED_AUTONOMY"))
+        os.environ["AIWERK_CUI_MANAGED_AUTONOMY"] = "1"
+    return (ctx_token, env_token)
 
 
-def _clear_cui_actor_env(tokens: list[tuple[str, str | None]]) -> None:
-    for key, old in reversed(tokens):
+def _clear_cui_actor_env(token) -> None:
+    if not token:
+        return
+    ctx_token, env_token = token
+    if env_token is not None:
+        key, old = env_token
         if old is None:
             os.environ.pop(key, None)
         else:
             os.environ[key] = old
+    reset_cui_actor_context(ctx_token)
+
+
+_CUI_ADMIN_ROLES = frozenset({"admin", "owner", "operator"})
+_CUI_INTERNAL_SOURCES = frozenset(
+    {"cli", "tui", "cron", "classifier", "reflection", "system", "internal"}
+)
+
+
+def _row_cui_metadata(row: dict | None) -> dict[str, str]:
+    """Extract persisted CUI actor metadata from a stored session row.
+
+    Mirrors ``hermes_cli.web_server._session_cui_metadata`` so the WebSocket
+    resume path makes the same visibility decision the HTTP session endpoints
+    make. The actor context is persisted into the row's ``model_config`` JSON
+    under ``_cui_actor_context`` (see ``_ensure_session_db_row``).
+    """
+    if not isinstance(row, dict):
+        return {}
+    raw = row.get("model_config")
+    if not raw:
+        return {}
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    actor = cfg.get("_cui_actor_context") if isinstance(cfg.get("_cui_actor_context"), dict) else {}
+    result = {
+        "visibility_scope": str(cfg.get("_cui_visibility_scope") or "").strip().lower(),
+        "actor_role": str(cfg.get("_cui_actor_role") or actor.get("role") or "").strip().lower(),
+        "actor_id": str(cfg.get("_cui_actor_id") or actor.get("actor_id") or "").strip(),
+        "tenant_id": str(cfg.get("_cui_tenant_id") or actor.get("tenant_id") or "").strip(),
+    }
+    return {k: v for k, v in result.items() if v}
+
+
+def _row_visible_to_cui_actor(row: dict | None, actor: dict[str, str] | None) -> bool:
+    """Whether the resuming CUI actor may read/resume the stored session ``row``.
+
+    Mirrors ``hermes_cli.web_server._session_visible_to_cui_actor``. ``actor`` is
+    the dispatch-bound actor context: it is None/empty for the trusted
+    standalone/loopback/admin path (no confinement), and a populated dict for an
+    authenticated CUI customer. A non-admin customer may only see their own
+    actor/tenant sessions; legacy CLI/TUI/internal rows fail closed.
+    """
+    actor = actor or {}
+    if not actor:
+        # Standalone TUI / loopback / admin dispatch — no CUI confinement.
+        return True
+    role = (actor.get("role") or "").strip().lower()
+    if role in _CUI_ADMIN_ROLES:
+        return True
+    meta = _row_cui_metadata(row)
+    if not meta:
+        # No persisted CUI metadata: a customer (non-admin actor) must not be
+        # able to resume admin onboarding / internal sessions by id or title.
+        source = ""
+        if isinstance(row, dict):
+            source = str(row.get("source") or "").strip().lower()
+        if source in _CUI_INTERNAL_SOURCES:
+            return False
+        # Fail closed for a confined customer: without metadata we cannot prove
+        # the row belongs to them, so do not expose it.
+        return False
+    if meta.get("tenant_id") and actor.get("tenant_id") and meta["tenant_id"] != actor["tenant_id"]:
+        return False
+    if meta.get("visibility_scope") in {"admin", "internal", "operator"}:
+        return False
+    if meta.get("actor_role") in _CUI_ADMIN_ROLES:
+        return False
+    if meta.get("actor_id") and actor.get("actor_id") and meta["actor_id"] != actor["actor_id"]:
+        return False
+    return True
+
+
+def _stamp_cui_actor_context(model_config: dict, actor_context: dict | None) -> None:
+    """Persist the authenticated CUI actor identity into a session's model_config.
+
+    Writes the same keys ``_row_cui_metadata`` /
+    ``hermes_cli.web_server._session_cui_metadata`` read back. No-op when there
+    is no actor context (standalone TUI / loopback admin), so non-CUI sessions
+    are unchanged.
+    """
+    actor = {
+        str(k): str(v)
+        for k, v in (actor_context or {}).items()
+        if k in {"tenant_id", "actor_id", "role", "display_name", "user_id", "provider"} and v
+    }
+    if not actor:
+        return
+    model_config["_cui_actor_context"] = actor
+    if actor.get("role"):
+        model_config["_cui_actor_role"] = actor["role"]
+    if actor.get("actor_id") or actor.get("user_id"):
+        model_config["_cui_actor_id"] = actor.get("actor_id") or actor.get("user_id")
+    if actor.get("tenant_id"):
+        model_config["_cui_tenant_id"] = actor["tenant_id"]
 
 
 class _SlashWorker:
@@ -1623,6 +1735,12 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config["reasoning_config"] = reasoning
     if tier := session.get("create_service_tier_override"):
         model_config["service_tier"] = tier
+    # Persist the authenticated CUI actor context so the session's owner/tenant
+    # can be enforced on a later resume (the WS resume visibility check reads
+    # this back via _row_cui_metadata; the HTTP session endpoints read the same
+    # keys). Without this a customer's own resume would fail closed, and a
+    # cross-tenant resume could not be distinguished from a legitimate one.
+    _stamp_cui_actor_context(model_config, session.get("cui_actor_context"))
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -4600,8 +4718,71 @@ def _attachment_path_allowed(path: Path) -> bool:
         return False
 
 
+# Source paths the outbound materializer is allowed to copy into the
+# customer-servable area. An assistant turn's text is customer-influenceable
+# (direct request or prompt injection) and the extension allowlist alone is far
+# too wide: it matches .yaml/.json/.txt/etc, so a path like
+# ~/.hermes/config.yaml (provider API keys) or ~/.aws/credentials.json would
+# otherwise be laundered into the served root. Restrict the SOURCE to files the
+# agent legitimately produces — the dashboard upload root and the process temp
+# dir (where TTS / generated media land) — and reject anything under HERMES_HOME
+# or a sensitive dotfile dir even if it happens to fall under one of those roots.
+def _outbound_source_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    try:
+        roots.append(_DASHBOARD_UPLOAD_ROOT)
+    except Exception:
+        pass
+    try:
+        roots.append(Path(tempfile.gettempdir()).resolve())
+    except Exception:
+        pass
+    return tuple(roots)
+
+
+# Directory names that must never be served even when nested under an allowed
+# root. Anchors a defence-in-depth denylist on top of the allowlist.
+_OUTBOUND_FORBIDDEN_DIR_NAMES: frozenset[str] = frozenset({
+    ".ssh", ".aws", ".gnupg", ".config", ".hermes", ".secrets", ".azure", ".gcloud",
+})
+
+
+def _outbound_source_allowed(path: Path) -> bool:
+    """True only when ``path`` resolves inside a safe-output root and is not a
+    sensitive config/credential location."""
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    # Never serve anything under HERMES_HOME (config.yaml, sessions, skills,
+    # secrets) — that is the agent's own home, not a customer-output area.
+    try:
+        hermes_home = _hermes_home.resolve()
+        if resolved == hermes_home or hermes_home in resolved.parents:
+            return False
+    except Exception:
+        pass
+    # Reject sensitive dotfile / credential directories anywhere in the chain,
+    # and any dot-directory under a real home directory.
+    for part in resolved.parts:
+        if part in _OUTBOUND_FORBIDDEN_DIR_NAMES:
+            return False
+    roots = _outbound_source_roots()
+    if not roots:
+        return False
+    for root in roots:
+        try:
+            if resolved == root or root in resolved.parents:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _materialize_outbound_artifact(path: Path) -> Path | None:
     """Return a path the CUI artifact endpoint can serve for an outbound file."""
+    if not _outbound_source_allowed(path):
+        return None
     try:
         stat = path.stat()
         if stat.st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
@@ -4682,6 +4863,12 @@ def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
         if str(path) in seen or not path.is_file() or path.suffix.lower() not in _OUTBOUND_ATTACHMENT_EXTENSIONS:
             continue
         seen.add(str(path))
+        # Confine the SOURCE to the safe-output allowlist before doing anything
+        # else: the regex extension allowlist matches config/credential files
+        # (.yaml/.json/.txt/...) and the assistant text is customer-influenceable,
+        # so an unrestricted match would launder secrets into the served root.
+        if not _outbound_source_allowed(path):
+            continue
         try:
             size = path.stat().st_size
         except Exception:
@@ -5518,6 +5705,35 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     timer.start()
 
 
+def _live_session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | None) -> bool:
+    """Whether the resuming CUI actor owns the in-memory live ``session``.
+
+    The live-session fast path rebinds the session's event transport to the
+    requesting client (``touch=True``), which would hijack the original owner's
+    stream. Refuse the rebind when a confined (non-admin) customer does not own
+    the live session, using its in-memory ``cui_actor_context``.
+    """
+    actor = actor or {}
+    if not actor:
+        return True
+    role = (actor.get("role") or "").strip().lower()
+    if role in _CUI_ADMIN_ROLES:
+        return True
+    owner = session.get("cui_actor_context") if isinstance(session, dict) else None
+    owner = owner if isinstance(owner, dict) else {}
+    if not owner:
+        # A live session with no actor identity (standalone TUI / internal) must
+        # not be hijacked by a confined customer.
+        return False
+    if owner.get("tenant_id") and actor.get("tenant_id") and owner["tenant_id"] != actor["tenant_id"]:
+        return False
+    if str(owner.get("role") or "").strip().lower() in _CUI_ADMIN_ROLES:
+        return False
+    if owner.get("actor_id") and actor.get("actor_id") and owner["actor_id"] != actor["actor_id"]:
+        return False
+    return True
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
@@ -5527,6 +5743,11 @@ def _(rid, params: dict) -> dict:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
         cols = 80
+    # The authenticated CUI actor (None for standalone TUI / loopback admin).
+    # A confined (non-admin) customer may only resume sessions they own — both
+    # the live fast path below and the stored-row path enforce this. A bare
+    # title lookup is disabled for customers entirely (predictable admin titles).
+    cui_actor = current_cui_actor_context()
     # ``profile`` (app-global remote mode): resume a session that lives in another
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
@@ -5536,6 +5757,8 @@ def _(rid, params: dict) -> dict:
         live = _find_live_session(str(target))
         if live is not None:
             sid, session = live
+            if not _live_session_visible_to_cui_actor(session, cui_actor):
+                return _err(rid, 4007, "session not found")
             payload = _live_session_payload(
                 sid,
                 session,
@@ -5557,9 +5780,15 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
+    # A confined customer may only resume by the SERVER-trusted session id they
+    # own. Resolving a human-readable title to a session id is an admin/TUI
+    # affordance (admin onboarding/tenant-setup chats have predictable titles),
+    # so disable the title-lookup fallback for non-admin CUI actors.
+    _cui_confined = bool(cui_actor) and (cui_actor.get("role") or "").strip().lower() not in _CUI_ADMIN_ROLES
+
     found = db.get_session(target)
     if not found:
-        found = db.get_session_by_title(target)
+        found = None if _cui_confined else db.get_session_by_title(target)
         if found:
             target = found["id"]
         elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
@@ -5597,6 +5826,14 @@ def _(rid, params: dict) -> dict:
         if tip and tip != target:
             target = tip
             found = db.get_session(target) or found
+
+    # Enforce per-actor session visibility on the final stored row. A confined
+    # customer must not read/resume admin/internal or other-tenant/other-actor
+    # sessions (the HTTP session endpoints enforce the same via
+    # _enforce_cui_session_visible). 404 — never leak existence. ``found`` is {}
+    # only on the internal lazy-child race above, which is not a customer vector.
+    if found and not _row_visible_to_cui_actor(found, cui_actor):
+        return _err(rid, 4007, "session not found")
 
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
@@ -8868,7 +9105,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     def run():
         approval_token = None
         session_tokens = []
-        actor_env_tokens = []
+        actor_env_tokens = None
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
         pending_steer_followup = None
@@ -8879,6 +9116,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
 
             approval_token = set_current_session_key(session["session_key"])
+            # Bind the actor context as a THREAD-LOCAL contextvar for this turn.
+            # ``run`` executes on a fresh thread (no contextvar inheritance), so
+            # the dispatch-time binding does not reach here — re-bind from the
+            # session's stored context. ``_apply_cui_actor_env`` binds the canonical
+            # contextvar (race-free across concurrent in-process turns, unlike the
+            # old os.environ bridge) and returns the reset token.
             actor_env_tokens = _apply_cui_actor_env(session.get("cui_actor_context"))
             session_tokens = _set_session_context(session["session_key"])
             _profile_home_str = session.get("profile_home")
@@ -11575,19 +11818,11 @@ def _cui_actor_role_from_params(params: dict | None) -> str:
         role = str(params.get("_cui_actor_role") or params.get("actor_role") or "").strip().lower()
         if role:
             return role
-    try:
-        import json as _json
-
-        raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
-        if raw:
-            data = _json.loads(raw)
-            if isinstance(data, dict):
-                role = str(data.get("role") or "").strip().lower()
-                if role:
-                    return role
-    except Exception:
-        pass
-    return str(os.getenv("AIWERK_CUI_ACTOR_ROLE", "") or "").strip().lower()
+    # Fall through to the canonical helper: it prefers the race-free per-turn
+    # contextvar and only then the os.environ bridge, so concurrent in-process
+    # turns see their own actor role rather than a clobbered global one.
+    actor = _canonical_current_cui_actor_context()
+    return str((actor or {}).get("role") or "").strip().lower()
 
 
 def _cui_actor_is_admin(params: dict | None) -> bool:

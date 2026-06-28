@@ -141,8 +141,12 @@ def decide_dashboard_permission(
     if action in _USER_CONFIRM_ACTIONS:
         return PermissionDecision(True, PermissionLevel.CONFIRM, False, "user_owned_confirm")
 
-    # Unknown own-tenant write surfaces should ask for a visible confirmation,
-    # not immediately punish UX with an admin gate. Callers should promote an
-    # action into _ADMIN_ONLY_ACTIONS only when it crosses one of the big-red-
-    # button criteria above.
-    return PermissionDecision(True, PermissionLevel.CONFIRM, False, "unknown_confirm")
+    # Fail closed on the unknown surface. An action string the table does not
+    # recognise is not implicitly safe: a newly-added or mis-named sensitive
+    # action that an engineer forgets to register here must NOT silently become
+    # a non-admin-permitted operation. Require an admin for anything we cannot
+    # positively classify as user-owned, and let the caller promote it into
+    # _USER_ACTIONS / _USER_CONFIRM_ACTIONS once it is reviewed as safe.
+    if is_admin_role(session.role):
+        return PermissionDecision(True, PermissionLevel.ADMIN_ONLY, True, "unknown_admin")
+    return PermissionDecision(False, PermissionLevel.ADMIN_ONLY, True, "unknown_denied")
