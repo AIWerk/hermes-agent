@@ -309,6 +309,72 @@ class TestRegister:
         with pytest.raises(InvalidCredentialsError):
             provider.complete_password_login(username="admin", password="config-pw")
 
+    def test_top_level_admin_merged_with_users_table(self, basic, monkeypatch, caplog):
+        # Footgun: configuring BOTH a users table AND a top-level
+        # username/password used to silently drop the top-level admin, locking
+        # the operator out. It must instead be merged in as an admin user and a
+        # warning emitted — and the top-level admin must still be able to log in.
+        user_hash = basic.hash_password("user-pw")
+        admin_hash = basic.hash_password("admin-pw")
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {
+                "username": "root",
+                "password_hash": admin_hash,
+                "users": [
+                    {"username": "alice", "password_hash": user_hash, "role": "user"},
+                ],
+            },
+        )
+        ctx = MagicMock()
+        with caplog.at_level("WARNING"):
+            basic.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_called_once()
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+        # The users-table user still works ...
+        assert provider.complete_password_login(
+            username="alice", password="user-pw"
+        ).role == "user"
+        # ... AND the top-level admin is usable (not silently dropped).
+        admin_session = provider.complete_password_login(
+            username="root", password="admin-pw"
+        )
+        assert admin_session.user_id == "root"
+        assert admin_session.role == "admin"
+        assert basic.LAST_SKIP_REASON == ""
+        # A clear warning was emitted rather than a silent drop.
+        assert any("merging the top-level" in rec.message for rec in caplog.records)
+
+    def test_top_level_admin_collision_prefers_users_entry(self, basic, monkeypatch, caplog):
+        # When the top-level username collides with a users-table entry, the
+        # explicit users entry wins (it carries the deliberate role) and we warn
+        # instead of overwriting.
+        users_hash = basic.hash_password("table-pw")
+        top_hash = basic.hash_password("top-pw")
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {
+                "username": "admin",
+                "password_hash": top_hash,
+                "users": [
+                    {"username": "admin", "password_hash": users_hash, "role": "admin"},
+                ],
+            },
+        )
+        ctx = MagicMock()
+        with caplog.at_level("WARNING"):
+            basic.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+        # The explicit users entry password wins; the top-level one is ignored.
+        assert provider.complete_password_login(
+            username="admin", password="table-pw"
+        ).user_id == "admin"
+        with pytest.raises(InvalidCredentialsError):
+            provider.complete_password_login(username="admin", password="top-pw")
+        assert any("also appears" in rec.message for rec in caplog.records)
+
     def test_explicit_secret_makes_sessions_portable(self, basic, monkeypatch):
         # Two providers built from the SAME explicit secret accept each
         # other's tokens (the restart-/multi-worker-survival contract).

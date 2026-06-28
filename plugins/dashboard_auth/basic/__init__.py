@@ -216,7 +216,11 @@ class BasicAuthProvider(DashboardAuthProvider):
     ) -> None:
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
-        self._users = users or {}
+        # Hold the SAME dict the caller passed (no copy): an explicit users table
+        # is a live config view — verify_session/refresh_session re-resolve from
+        # it so an operator's demotion/removal takes effect within seconds. The
+        # top-level-admin merge below mutates this dict in place to preserve that.
+        self._users = users if users is not None else {}
         # True when an explicit multi-user table was configured. In that mode the
         # users dict is the authoritative membership/role source: verify_session
         # re-resolves role from it (so a demotion takes effect within seconds,
@@ -228,6 +232,38 @@ class BasicAuthProvider(DashboardAuthProvider):
             for uname, rec in self._users.items():
                 if not uname or not rec.get("password_hash"):
                     raise ValueError("each user must have username and password_hash")
+            # Footgun guard: when a 'users:' table AND a top-level
+            # username/password_hash are BOTH configured, the top-level admin
+            # credential used to be silently dropped here — an operator who left
+            # their original admin login in place alongside a new users table
+            # could lock themselves out. Merge the top-level admin into the
+            # users set as an admin-role user instead of dropping it. On a
+            # username collision the explicit users entry wins (it is the more
+            # deliberate, role-bearing record) and we warn rather than overwrite.
+            if username and password_hash:
+                if username in self._users:
+                    logger.warning(
+                        "dashboard-auth-basic: top-level username %r also appears "
+                        "in the users table; keeping the explicit users entry and "
+                        "ignoring the top-level credential.",
+                        username,
+                    )
+                else:
+                    logger.warning(
+                        "dashboard-auth-basic: both a users table and a top-level "
+                        "username/password were configured; merging the top-level "
+                        "credential %r into the users set as an admin user so it "
+                        "stays usable. Move it under dashboard.basic_auth.users to "
+                        "silence this warning.",
+                        username,
+                    )
+                    self._users[username] = {
+                        "password_hash": password_hash,
+                        "display_name": username,
+                        "actor_id": username,
+                        "role": "admin",
+                        "tenant_id": "",
+                    }
         else:
             if not username:
                 raise ValueError("username must be non-empty")
@@ -581,8 +617,10 @@ def register(ctx) -> None:
             "dashboard-auth-basic: hashed env-supplied password in-memory "
             "(overrides any config password_hash)."
         )
-    elif not password_hash:
-        # config-only plaintext password.
+    elif not password_hash and plaintext:
+        # config-only plaintext password. (Guarded by ``plaintext`` so a
+        # users-only config — no top-level credential — never hashes an empty
+        # string into a bogus top-level password_hash.)
         password_hash = hash_password(plaintext)
         logger.info(
             "dashboard-auth-basic: hashed plaintext password in-memory. "

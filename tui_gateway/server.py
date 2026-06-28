@@ -4710,12 +4710,33 @@ def _attachment_preview_kind(path: Path, media_type: str) -> str:
     return "file"
 
 
-def _attachment_path_allowed(path: Path) -> bool:
+def _session_upload_component(session_id: Any) -> str:
+    """Mirror web_server._safe_upload_component so a path can be scoped to the
+    subdir the upload endpoints actually write into
+    (``dashboard_uploads/<session_part>/<batch>/...``)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(session_id or "")).strip(".-_")
+    return (safe or "session")[:80]
+
+
+def _attachment_path_allowed(path: Path, session_id: Any = None) -> bool:
+    """True when ``path`` lives under the dashboard upload root.
+
+    When ``session_id`` is supplied, the path is additionally confined to that
+    session's own subdir so one customer/session cannot reference another
+    session's uploaded file by absolute path (the upload root is shared). When
+    no session id is given the check falls back to the upload-root boundary only.
+    """
     try:
         resolved = path.resolve()
-        return resolved == _DASHBOARD_UPLOAD_ROOT or _DASHBOARD_UPLOAD_ROOT in resolved.parents
     except Exception:
         return False
+    if session_id is not None and str(session_id).strip():
+        try:
+            session_root = (_DASHBOARD_UPLOAD_ROOT / _session_upload_component(session_id)).resolve()
+        except Exception:
+            return False
+        return resolved == session_root or session_root in resolved.parents
+    return resolved == _DASHBOARD_UPLOAD_ROOT or _DASHBOARD_UPLOAD_ROOT in resolved.parents
 
 
 # Source paths the outbound materializer is allowed to copy into the
@@ -4816,8 +4837,13 @@ def _attachment_text_block(name: str, path: Path, text: str, note: str = "") -> 
     return f"{header}\nContent was not extracted automatically. The file is available at the path above.]"
 
 
-def _process_prompt_attachments(attachments: Any) -> tuple[list[str], str]:
-    """Validate uploaded Customer UI attachments and build prompt context."""
+def _process_prompt_attachments(attachments: Any, session_id: Any = None) -> tuple[list[str], str]:
+    """Validate uploaded Customer UI attachments and build prompt context.
+
+    ``session_id`` scopes the accepted attachment paths to the requesting
+    session's own upload subdir, so a client cannot reference another session's
+    uploaded file by absolute path on the shared upload root.
+    """
     if not isinstance(attachments, list):
         return [], ""
     image_paths: list[str] = []
@@ -4829,7 +4855,7 @@ def _process_prompt_attachments(attachments: Any) -> tuple[list[str], str]:
         if not raw_path:
             continue
         path = Path(raw_path)
-        if not _attachment_path_allowed(path) or not path.exists() or not path.is_file():
+        if not _attachment_path_allowed(path, session_id) or not path.exists() or not path.is_file():
             continue
         name = str(item.get("name") or path.name)
         mime = str(item.get("type") or "")
@@ -8800,7 +8826,7 @@ def _(rid, params: dict) -> dict:
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
-    uploaded_images, attachment_context = _process_prompt_attachments(params.get("attachments"))
+    uploaded_images, attachment_context = _process_prompt_attachments(params.get("attachments"), sid)
     if attachment_context:
         text = f"{text}\n\n{attachment_context}" if str(text).strip() else attachment_context
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
