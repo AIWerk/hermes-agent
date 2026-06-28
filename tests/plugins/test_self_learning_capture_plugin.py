@@ -177,6 +177,62 @@ def test_sanitize_redacts_jwt():
     assert "[REDACTED]" in out
 
 
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "xai-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD",          # xAI / Grok
+        "SG." + "abcdefghij1234567890." + "ABCDEFGHIJ1234567890abcdefghij",  # SendGrid
+        "hf_" + "abcdefghijklmnopqrstuvwxyz1234",                     # HuggingFace
+        "pplx-" + "abcdefghijklmnopqrstuvwxyz1234",                   # Perplexity
+        "tvly-" + "abcdefghijklmnopqrstuvwxyz",                       # Tavily
+        "bot123456789:" + "AAEabcdefghijklmnopqrstuvwxyz1234567",     # Telegram bot token
+    ],
+)
+def test_sanitize_redacts_vendor_prefix_tokens(secret):
+    # These vendor shapes were previously KEPT verbatim and could be promoted by
+    # the curator into durable memory. They now share the canonical detector.
+    out = _sanitize(f"value {secret} here")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_bare_aws_secret():
+    # A bare 40-char base64 AWS secret with no label was previously missed here
+    # though session_notes caught it.
+    secret = "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert len(secret) == 40
+    out = _sanitize("the value is " + secret + " ok")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_does_not_redact_lowercase_hex_git_sha():
+    sha = "a1b2c3d4e5f6a7b8c9d0" + "e1f2a3b4c5d6e7f8a9b0"
+    assert len(sha) == 40
+    text = "The commit hash is " + sha
+    assert _sanitize(text) == text
+
+
+def test_sanitize_redacts_unquoted_multi_word_value():
+    # An UNQUOTED multi-word value after a label kept only the first token; it
+    # now consumes to the next clear delimiter so the full passphrase is masked.
+    out = _sanitize("password = correct horse battery staple")
+    for word in ["correct", "horse", "battery", "staple"]:
+        assert word not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_url_password_containing_at_sign():
+    # A URL password containing '@' was truncated at the first '@', leaking the
+    # remainder of the password and the host. The matcher now backtracks to the
+    # LAST '@' before the host.
+    out = _sanitize("postgres://u:p@ss@host/db")
+    assert "p@ss" not in out
+    assert "@ss@host" not in out
+    assert "[REDACTED]" in out
+    assert out.endswith("@host/db")
+
+
 def test_register_hooks():
     calls = []
 

@@ -3,6 +3,17 @@
 These helpers intentionally avoid per-turn LLM calls. The runtime records small
 structured events, then this module keeps a compact mutable scratchpad that the
 final session summarizer can consume later.
+
+Secret redaction here feeds only the lower-sensitivity session-summary index
+(title/summary aux-LLM + persisted session note). The value-only/vendor token
+shapes are sourced from ``agent.secret_patterns`` so this redactor stays in sync
+with the durable-memory gate (``memory_router.contains_secret``). One
+intentional difference remains: this index redactor does NOT redact bare 64-char
+lowercase-hex blobs (to avoid false-positiving git SHA-1s and other 64-hex
+identifiers that legitimately appear in transcripts), whereas the durable-memory
+gate treats a 64+ hex run as a secret and blocks it. A raw hex signing secret
+can therefore survive into the session index even though durable memory rejects
+it — an accepted trade-off for this lower-sensitivity store.
 """
 
 from __future__ import annotations
@@ -11,6 +22,8 @@ import copy
 import json
 import re
 from typing import Any, Dict, Optional
+
+from agent.secret_patterns import AWS_BARE_SECRET_RE, VALUE_ONLY_RE
 
 _MAX_ITEMS = 12
 _MAX_TEXT = 500
@@ -24,20 +37,31 @@ _MAX_TEXT = 500
 # which redacts the FULL message before slicing.
 _MAX_SCAN = 4096
 
+# Quote-aware value class: a fully single- or double-quoted string (which may
+# contain whitespace, ``,`` or ``;``), else an UNQUOTED value that runs to the
+# next clear delimiter (newline / quote / ``,`` / ``;``). Matching the closing
+# quote closes the tail-leak where a quoted multi-word value (e.g.
+# ``DB_PASSWORD="my secret pw value"``) used to leak everything after the first
+# space; the unquoted branch consumes intervening whitespace so a bare
+# multi-word passphrase (``password = correct horse battery staple``) is also
+# redacted in full instead of stopping at the first space. Both branches are
+# bounded (no nested unbounded quantifiers), so matching stays linear.
+_VALUE = r"(?:'[^']*'|\"[^\"]*\"|[^\n'\",;]+)"
+
 _SECRET_PATTERNS = [
     # Keyed forms: group(1) is the label and is kept; the value is redacted.
-    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+"),
-    re.compile(r"(?i)(authorization\s*:\s*basic\s+)\S+"),
-    re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)\S+"),
-    re.compile(r"(?i)(password\s*[=:]\s*)\S+"),
-    re.compile(r"(?i)(token\s*[=:]\s*)\S+"),
-    re.compile(r"(?i)(token\s+)\S+"),
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)" + _VALUE),
+    re.compile(r"(?i)(authorization\s*:\s*basic\s+)" + _VALUE),
+    re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)" + _VALUE),
+    re.compile(r"(?i)(password\s*[=:]\s*)" + _VALUE),
+    re.compile(r"(?i)(token\s*[=:]\s*)" + _VALUE),
+    re.compile(r"(?i)(token\s+)" + _VALUE),
     # ENV-style assignments whose name looks secret-bearing:
     #   STRIPE_WEBHOOK_SECRET=...  MY_API_KEY=...  *PASSWORD=...  *TOKEN=...
-    # Keep the "NAME=" label, redact the value.
+    # Keep the "NAME=" label, redact the value (quote-aware).
     re.compile(
         r"(?i)([A-Z0-9_]{0,50}(?:SECRET|API[_-]?KEY|PASSWORD|PASSWD|TOKEN|CREDENTIAL)"
-        r"[A-Z0-9_]{0,50}\s*=\s*)\S+"
+        r"[A-Z0-9_]{0,50}\s*=\s*)" + _VALUE
     ),
     # JSON / structured quoted key:value secrets, incl. nested ones:
     #   "access_token":"...", "refresh_token":"...", "client_secret":"...",
@@ -52,34 +76,16 @@ _SECRET_PATTERNS = [
     # Scheme run is anchored (no preceding alnum) and bounded ({0,30}) so the
     # engine cannot backtrack quadratically on a long no-delimiter blob.
     re.compile(r"(?i)(?<![A-Za-z0-9])([a-z][a-z0-9+.-]{0,30}://[^\s:/@]+:)[^@/\s]+(?=@)"),
-    # Value-only forms: the whole match is the secret and is fully redacted.
-    re.compile(r"sk[-_][A-Za-z0-9][A-Za-z0-9_-]{6,}"),
-    re.compile(r"(?i)(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9_]{12,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
-    re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
-    re.compile(r"(?i)https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"),
-    re.compile(r"AIza[0-9A-Za-z_-]{8,}"),
-    # Vendor key prefixes not covered above.
-    re.compile(r"(?<![A-Za-z0-9_-])xai-[A-Za-z0-9]{20,}"),          # xAI (Grok)
-    re.compile(r"(?<![A-Za-z0-9_-])SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # SendGrid
-    re.compile(r"(?<![A-Za-z0-9_-])hf_[A-Za-z0-9]{10,}"),           # HuggingFace
-    re.compile(r"(?<![A-Za-z0-9_-])pplx-[A-Za-z0-9]{10,}"),         # Perplexity
-    re.compile(r"(?<![A-Za-z0-9_-])tvly-[A-Za-z0-9]{10,}"),         # Tavily
-    # Telegram bot token: bot<digits>:<token> (or bare <digits>:<token>).
-    re.compile(r"(?<![A-Za-z0-9])(?:bot)?\d{8,}:[-A-Za-z0-9_]{30,}"),
     # AWS SECRET access key. Labeled form keeps the label, redacts the value.
-    re.compile(r"(?i)(aws_secret_access_key\s*[=:]\s*)\S+"),
-    # Bare 40-char base64-ish blob. Constrained to exactly 40 [A-Za-z0-9/+]
-    # chars that contain at least one uppercase letter, "/" or "+", so a
-    # lowercase-hex git SHA-1 (40 hex chars) or a lowercase 40-char identifier
-    # is NOT redacted — only the mixed-case base64 shape AWS uses.
-    re.compile(
-        r"(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=]))"
-        r"[A-Za-z0-9/+]*[A-Z/+][A-Za-z0-9/+]*"
-    ),
+    re.compile(r"(?i)(aws_secret_access_key\s*[=:]\s*)" + _VALUE),
+    # Value-only forms: the whole match is the secret and is fully redacted.
+    # Sourced from the canonical agent.secret_patterns module so this index
+    # redactor and the durable-memory gate (memory_router.contains_secret) and
+    # the feedback-inbox sanitizer (self_learning_capture) cannot drift apart.
+    VALUE_ONLY_RE,
+    # Bare 40-char base64-ish AWS *secret* (mixed case w/ upper or / or +; a
+    # lowercase-hex git SHA-1 is intentionally NOT matched).
+    AWS_BARE_SECRET_RE,
 ]
 
 # Block secrets (PEM private keys) can span past _MAX_SCAN. They are redacted on
@@ -128,7 +134,10 @@ def _redact_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_value(item) for item in value[:_MAX_ITEMS]]
     if isinstance(value, dict):
-        return {str(k): _redact_value(v) for k, v in value.items()}
+        # Redact the stringified KEY too: a structured event whose key encodes a
+        # secret (e.g. an args dict keyed by a token) would otherwise retain the
+        # secret in the key while the value is recursively redacted.
+        return {redact_sensitive_text(str(k)): _redact_value(v) for k, v in value.items()}
     return value
 
 
