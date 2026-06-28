@@ -8,6 +8,29 @@ import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantCo
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
 import { safeWindowOpen } from "@/lib/safe-open";
 
+// Object URLs (blob:) this client minted via URL.createObjectURL. Only these may
+// be passed to window.open — a server/agent-supplied "blob:..." (e.g. routed
+// through an attachment open_url) must never be opened directly. Tracked at
+// module scope so both the page component and the standalone attachment card can
+// consult it without prop-drilling.
+const localObjectUrls = new Set<string>();
+
+function createLocalObjectUrl(blob: Blob): string {
+  const url = URL.createObjectURL(blob);
+  localObjectUrls.add(url);
+  return url;
+}
+
+function revokeLocalObjectUrl(url?: string | null): void {
+  if (!url) return;
+  URL.revokeObjectURL(url);
+  localObjectUrls.delete(url);
+}
+
+function isLocalObjectUrl(url: string): boolean {
+  return localObjectUrls.has(url);
+}
+
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 type VoiceInputState = "idle" | "recording" | "transcribing";
@@ -238,9 +261,9 @@ function openSharedFolderFile(item: AssistantSharedFolderItem): void {
       return response.blob();
     })
     .then((blob) => {
-      const objectUrl = URL.createObjectURL(blob);
+      const objectUrl = createLocalObjectUrl(blob);
       opened.location.href = objectUrl;
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+      window.setTimeout(() => revokeLocalObjectUrl(objectUrl), 60_000);
     })
     .catch(() => {
       opened.document.body.textContent = "Datei konnte nicht geöffnet werden.";
@@ -592,7 +615,10 @@ function summarizeApproval(approval: ApprovalCard): ApprovalSummary {
 
 function assistantArtifactUrl(openUrl?: string | null): string | undefined {
   if (!openUrl) return undefined;
-  if (/^https?:\/\//i.test(openUrl) || openUrl.startsWith("blob:")) return openUrl;
+  // A server/agent-supplied open_url must never be a blob: object URL — those
+  // are only ever minted client-side. Drop it so it cannot reach the open path.
+  if (openUrl.startsWith("blob:")) return undefined;
+  if (/^https?:\/\//i.test(openUrl)) return openUrl;
   return `${HERMES_BASE_PATH}${openUrl.startsWith("/") ? openUrl : `/${openUrl}`}`;
 }
 
@@ -618,7 +644,9 @@ function attachmentPreviewKind(name: string, type: string, explicit?: unknown): 
 async function fetchProtectedPreviewUrl(openUrl?: string | null): Promise<string | undefined> {
   const url = assistantArtifactUrl(openUrl);
   if (!url) return undefined;
-  if (url.startsWith("blob:") || !isDashboardRelativeUrl(openUrl)) return url;
+  // assistantArtifactUrl never returns a blob: URL (server blobs are dropped),
+  // so only dashboard-relative artifacts are fetched into a local object URL.
+  if (!isDashboardRelativeUrl(openUrl)) return url;
   const headers = new Headers();
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) headers.set("X-Hermes-Session-Token", token);
@@ -626,8 +654,8 @@ async function fetchProtectedPreviewUrl(openUrl?: string | null): Promise<string
     const response = await fetch(url, { headers, credentials: "include" });
     if (!response.ok) return url;
     const blob = await response.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    return objectUrl;
+    // Mint locally and record it so the attachment open path may open it.
+    return createLocalObjectUrl(blob);
   } catch {
     return url;
   }
@@ -1332,7 +1360,7 @@ export default function AiwerkAssistantPage() {
 
   const revokeAttachmentUrl = useCallback((url?: string) => {
     if (!url || !attachmentUrlsRef.current.has(url)) return;
-    URL.revokeObjectURL(url);
+    revokeLocalObjectUrl(url);
     attachmentUrlsRef.current.delete(url);
   }, []);
 
@@ -1349,7 +1377,7 @@ export default function AiwerkAssistantPage() {
   // Revoke the previous session's history preview blobs before loading another
   // session, reclaiming memory instead of waiting for unmount.
   const revokeHistoryAttachmentUrls = useCallback(() => {
-    historyAttachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    historyAttachmentUrlsRef.current.forEach((url) => revokeLocalObjectUrl(url));
     historyAttachmentUrlsRef.current.clear();
   }, []);
 
@@ -1376,7 +1404,7 @@ export default function AiwerkAssistantPage() {
       const type = file.type || "application/octet-stream";
       const previewKind = attachmentPreviewKind(file.name, type);
       const canLocalPreview = Boolean(previewKind && ["image", "audio", "video", "text", "pdf"].includes(previewKind));
-      const previewUrl = canLocalPreview ? URL.createObjectURL(file) : undefined;
+      const previewUrl = canLocalPreview ? createLocalObjectUrl(file) : undefined;
       if (previewUrl) attachmentUrlsRef.current.add(previewUrl);
       return {
         id: newId("attachment"),
@@ -1853,9 +1881,9 @@ export default function AiwerkAssistantPage() {
     const urls = attachmentUrlsRef.current;
     const historyUrls = historyAttachmentUrlsRef.current;
     return () => {
-      urls.forEach((url) => URL.revokeObjectURL(url));
+      urls.forEach((url) => revokeLocalObjectUrl(url));
       urls.clear();
-      historyUrls.forEach((url) => URL.revokeObjectURL(url));
+      historyUrls.forEach((url) => revokeLocalObjectUrl(url));
       historyUrls.clear();
     };
   }, []);
@@ -1994,6 +2022,11 @@ export default function AiwerkAssistantPage() {
       setSideMessages([]);
       setSideToolCalls([]);
       setToolCalls(result.resumed ? toolCallsFromGateway(result.messages) : []);
+      // Reclaim the previously-minted history preview blobs before re-registering
+      // this open's blobs. On reconnect/recovery the same history is re-fetched
+      // and re-rendered, minting fresh object URLs; without this revoke the prior
+      // ones leak (a bounded re-mint leak that grows with each reconnect).
+      revokeHistoryAttachmentUrls();
       const resumedMessages = result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()];
       registerHistoryAttachmentUrls(resumedMessages);
       setMessages(resumedMessages);
@@ -2136,7 +2169,7 @@ export default function AiwerkAssistantPage() {
       offSessionInfo();
       gateway.close();
     };
-  }, [cuiLocale, refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, registerHistoryAttachmentUrls, showToast, speakAssistantText]);
+  }, [cuiLocale, refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, registerHistoryAttachmentUrls, revokeHistoryAttachmentUrls, showToast, speakAssistantText]);
 
   const loadRecentSession = useCallback(async (session: RecentSession) => {
     const gateway = gatewayRef.current;
@@ -5370,14 +5403,10 @@ function AttachmentPreviewCard({
       onOpenImage?.({ ...attachment, previewKind });
       return;
     }
-    // blob: URLs are object URLs we minted from a protected fetch — safe to open
-    // directly; everything else goes through the shared scheme validator.
-    if (openTarget.startsWith("blob:")) {
-      const opened = window.open(openTarget, "_blank", "noopener,noreferrer");
-      if (opened) opened.opener = null;
-      return;
-    }
-    safeWindowOpen(openTarget);
+    // Route everything (including blob:) through the shared guard. A blob: URL
+    // is only opened when this client minted it (isLocalObjectUrl); a server- or
+    // agent-supplied blob: (e.g. via attachment open_url) is rejected.
+    safeWindowOpen(openTarget, { isLocalBlob: isLocalObjectUrl });
   };
   const openOnKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!canOpen) return;

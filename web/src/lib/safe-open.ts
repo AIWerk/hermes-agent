@@ -8,14 +8,30 @@
 // through safeWindowOpen.
 //
 // Allowed: http:, https:, mailto:, and dashboard-relative paths ("/..." or
-// "./..."). Blocked: javascript:, data:, vbscript:, blob:, file:, and anything
-// that does not resolve to one of the allowed schemes.
+// "./..."). Blocked: javascript:, data:, vbscript:, file:, and anything that
+// does not resolve to one of the allowed schemes. blob: URLs are blocked by
+// default and only allowed when an `isLocalBlob` predicate confirms this client
+// minted the object URL itself — a server/agent-supplied "blob:..." must never
+// be opened directly.
+
+/**
+ * Options for {@link safeExternalUrl} / {@link safeWindowOpen}.
+ */
+export interface SafeOpenOptions {
+  /**
+   * Predicate that returns true only for blob: object URLs this client created
+   * locally (e.g. via URL.createObjectURL on a fetched/protected blob). When
+   * provided, a blob: URL is allowed iff the predicate returns true; otherwise
+   * blob: is always rejected. Server-supplied blob: URLs must never pass.
+   */
+  isLocalBlob?: (url: string) => boolean;
+}
 
 /**
  * Returns the URL when it is safe to pass to window.open, otherwise null.
  * Pure and DOM-free so it can be unit-tested in a node context.
  */
-export function safeExternalUrl(raw?: string | null): string | null {
+export function safeExternalUrl(raw?: string | null, options?: SafeOpenOptions): string | null {
   if (typeof raw !== "string") return null;
   const url = raw.trim();
   if (!url) return null;
@@ -36,6 +52,9 @@ export function safeExternalUrl(raw?: string | null): string | null {
   if (schemeMatch) {
     const scheme = schemeMatch[1].toLowerCase();
     if (scheme === "http" || scheme === "https" || scheme === "mailto") return url;
+    // Only object URLs this client minted are openable; server-supplied blob:
+    // URLs are rejected so the agent cannot smuggle one into the open path.
+    if (scheme === "blob" && options?.isLocalBlob?.(url)) return url;
     return null;
   }
 
@@ -47,8 +66,8 @@ export function safeExternalUrl(raw?: string | null): string | null {
  * Opens a validated external URL in a new tab with noopener/noreferrer and
  * nulls the opener. Returns the opened window (or null when blocked/rejected).
  */
-export function safeWindowOpen(raw?: string | null): Window | null {
-  const url = safeExternalUrl(raw);
+export function safeWindowOpen(raw?: string | null, options?: SafeOpenOptions): Window | null {
+  const url = safeExternalUrl(raw, options);
   if (!url) return null;
   const opened = window.open(url, "_blank", "noopener,noreferrer");
   if (opened) opened.opener = null;

@@ -34,6 +34,26 @@ describe("safeExternalUrl", () => {
     expect(safeExternalUrl("tel:+41000")).toBeNull();
   });
 
+  it("blocks blob: by default and without an isLocalBlob predicate", () => {
+    // A server/agent-supplied blob: must never pass when no local allowlist is
+    // provided.
+    expect(safeExternalUrl("blob:https://app.example/abc")).toBeNull();
+    expect(safeExternalUrl("blob:https://app.example/abc", {})).toBeNull();
+  });
+
+  it("only allows blob: URLs the client minted itself", () => {
+    const localUrl = "blob:https://app.example/local-1234";
+    const serverUrl = "blob:https://app.example/server-evil";
+    const minted = new Set([localUrl]);
+    const isLocalBlob = (url: string) => minted.has(url);
+
+    // Locally minted object URL -> allowed.
+    expect(safeExternalUrl(localUrl, { isLocalBlob })).toBe(localUrl);
+    // Server/agent-supplied blob: (not in the local registry) -> rejected even
+    // though a predicate is present.
+    expect(safeExternalUrl(serverUrl, { isLocalBlob })).toBeNull();
+  });
+
   it("blocks scheme-smuggling via embedded control characters / whitespace", () => {
     expect(safeExternalUrl("java\tscript:alert(1)")).toBeNull();
     expect(safeExternalUrl("java\nscript:alert(1)")).toBeNull();
@@ -90,6 +110,23 @@ describe("safeWindowOpen", () => {
     expect(safeWindowOpen("javascript:alert(1)")).toBeNull();
     expect(safeWindowOpen("data:text/html,<script>")).toBeNull();
     expect(safeWindowOpen(undefined)).toBeNull();
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("opens a locally-minted blob: URL but never a server-supplied one", () => {
+    const opened: { opener: unknown } = { opener: {} };
+    const open = vi.fn().mockReturnValue(opened);
+    (globalThis as { window?: unknown }).window = { open };
+
+    const localUrl = "blob:https://app.example/local-1234";
+    const isLocalBlob = (url: string) => url === localUrl;
+
+    expect(safeWindowOpen(localUrl, { isLocalBlob })).toBe(opened);
+    expect(open).toHaveBeenCalledWith(localUrl, "_blank", "noopener,noreferrer");
+    expect(opened.opener).toBeNull();
+
+    open.mockClear();
+    expect(safeWindowOpen("blob:https://app.example/server-evil", { isLocalBlob })).toBeNull();
     expect(open).not.toHaveBeenCalled();
   });
 });
