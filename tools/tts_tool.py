@@ -49,7 +49,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin
 
 from hermes_constants import display_hermes_home
@@ -2224,6 +2224,25 @@ def _hungarian_int_to_words(value: int) -> str:
     return str(value)
 
 
+def _split_decimal_de_hu(value: str) -> Tuple[str, Optional[str]]:
+    """Split a de/hu-locale numeric string into (integer, fractional) parts.
+
+    In German and Hungarian the comma is the decimal separator and the dot
+    is the thousands separator (e.g. ``1.000`` = one thousand, ``3,14`` =
+    three point one four).  We therefore strip dots that group digits and
+    treat only the comma as the decimal point.  Returns ``(left, None)``
+    when the value has no comma — i.e. it's an integer (any dots are
+    thousands grouping and removed).
+    """
+    # Drop thousands-grouping dots that sit between digits.  Bounded,
+    # ReDoS-safe (single char class on each side, no nested quantifiers).
+    grouped = re.sub(r"(?<=\d)\.(?=\d)", "", value)
+    if "," in grouped:
+        left, right = grouped.split(",", 1)
+        return left, right
+    return grouped, None
+
+
 def _hungarian_number_to_words(raw: str) -> str:
     sign = ""
     value = raw.strip()
@@ -2231,12 +2250,12 @@ def _hungarian_number_to_words(raw: str) -> str:
         sign = "mínusz "
         value = value[1:]
     value = value.replace(" ", "")
-    if "," in value or "." in value:
-        left, right = re.split(r"[,.]", value, maxsplit=1)
+    left, right = _split_decimal_de_hu(value)
+    if right is not None:
         left_words = _hungarian_int_to_words(int(left or "0"))
         right_words = " ".join(_hungarian_int_to_words(int(ch)) for ch in right if ch.isdigit())
         return f"{sign}{left_words} egész {right_words}".strip()
-    return sign + _hungarian_int_to_words(int(value))
+    return sign + _hungarian_int_to_words(int(left or "0"))
 
 
 def _german_int_to_words(value: int) -> str:
@@ -2270,12 +2289,12 @@ def _german_number_to_words(raw: str) -> str:
         sign = "minus "
         value = value[1:]
     value = value.replace(" ", "")
-    if "," in value or "." in value:
-        left, right = re.split(r"[,.]", value, maxsplit=1)
+    left, right = _split_decimal_de_hu(value)
+    if right is not None:
         left_words = _german_int_to_words(int(left or "0"))
         right_words = " ".join(_german_int_to_words(int(ch)) for ch in right if ch.isdigit())
         return f"{sign}{left_words} Komma {right_words}".strip()
-    return sign + _german_int_to_words(int(value))
+    return sign + _german_int_to_words(int(left or "0"))
 
 
 _TTS_NUMERIC_TOKEN_RE = re.compile(r"(?<![\w/])-?\d+(?:[,.]\d+)?(?![\w/])")

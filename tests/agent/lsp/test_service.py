@@ -201,3 +201,50 @@ def test_service_reaps_idle_clients(mock_pyright):
         assert svc.get_status()["clients"] == []
     finally:
         svc.shutdown()
+
+
+def test_service_does_not_reap_inflight_client(mock_pyright):
+    """A client with an in-flight request must survive the idle reaper even
+    when its last-used stamp looks stale.
+
+    Reproduces the race: a slow ``wait_for_diagnostics`` whose duration
+    exceeds ``idle_timeout`` refreshes ``_last_used`` only AFTER the await
+    completes, so without an in-flight guard the reaper would pop+shutdown
+    the client out from under the request.
+    """
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=0.01,
+    )
+    try:
+        # Spawn a real client so there's something for the reaper to find.
+        svc.get_diagnostics_sync(str(f))
+        info = svc.get_status()
+        assert len(info["clients"]) == 1
+        key = (info["clients"][0]["server_id"], info["clients"][0]["workspace_root"])
+
+        # Simulate an in-flight request: mark the key busy and let its
+        # last-used stamp go stale past idle_timeout.
+        svc._mark_inflight(key)
+        with svc._state_lock:
+            svc._last_used[key] = time.time() - 10.0  # well past idle_timeout
+
+        # The reaper must skip the busy client.
+        assert svc.reap_idle_clients_sync() == 0
+        assert len(svc.get_status()["clients"]) == 1
+
+        # Once the request completes (in-flight cleared), the now-idle client
+        # is eligible again.
+        svc._clear_inflight(key)
+        with svc._state_lock:
+            svc._last_used[key] = time.time() - 10.0
+        assert svc.reap_idle_clients_sync() == 1
+        assert svc.get_status()["clients"] == []
+    finally:
+        svc.shutdown()

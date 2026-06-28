@@ -183,6 +183,13 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # In-flight request refcount per (server_id, workspace_root).  A
+        # client with a non-zero count is actively serving an open/wait, so
+        # the idle reaper must never shut it down even if its _last_used
+        # stamp looks stale — the stamp is only refreshed AFTER the wait
+        # completes, and a slow wait_for_diagnostics can outlast a low
+        # idle_timeout.  See _reap_idle_clients_async.
+        self._inflight: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
         self._closed = False
         self._reaper_future = None
@@ -478,23 +485,50 @@ class LSPService:
     # async internals
     # ------------------------------------------------------------------
 
+    def _mark_inflight(self, key: Tuple[str, str]) -> None:
+        """Mark a request in-flight against *key* so the reaper skips it.
+
+        Also refreshes ``_last_used`` up-front (under the lock) so a request
+        whose ``wait_for_diagnostics`` outlasts ``idle_timeout`` doesn't look
+        stale the moment it starts.  Both are done atomically under
+        ``_state_lock``, the same lock the reaper takes.
+        """
+        with self._state_lock:
+            self._inflight[key] = self._inflight.get(key, 0) + 1
+            self._last_used[key] = time.time()
+
+    def _clear_inflight(self, key: Tuple[str, str]) -> None:
+        """Drop one in-flight marker against *key* and refresh ``_last_used``."""
+        with self._state_lock:
+            remaining = self._inflight.get(key, 0) - 1
+            if remaining > 0:
+                self._inflight[key] = remaining
+            else:
+                self._inflight.pop(key, None)
+            self._last_used[key] = time.time()
+
     async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
+        self._mark_inflight(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._clear_inflight(key)
         return list(client.diagnostics_for(file_path))
 
     async def _open_and_wait_async(self, file_path: str) -> List[Dict[str, Any]]:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
+        self._mark_inflight(key)
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             await client.save_file(file_path)
@@ -502,7 +536,8 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._clear_inflight(key)
         return list(client.diagnostics_for(file_path))
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
@@ -532,6 +567,13 @@ class LSPService:
         stale: List[Tuple[Tuple[str, str], LSPClient]] = []
         with self._state_lock:
             for key, client in list(self._clients.items()):
+                # Never reap a client that is actively serving an open/wait
+                # request — its _last_used stamp is only refreshed AFTER the
+                # await completes, so a slow wait_for_diagnostics that
+                # outlasts idle_timeout would otherwise be shut down from
+                # under the in-flight request.
+                if self._inflight.get(key, 0) > 0:
+                    continue
                 last_used = self._last_used.get(key, now)
                 if now - last_used >= self._idle_timeout:
                     stale.append((key, client))
@@ -633,6 +675,7 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._inflight.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,

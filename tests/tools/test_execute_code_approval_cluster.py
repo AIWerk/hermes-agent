@@ -62,6 +62,56 @@ def test_helper_propagates_contextvar_and_approval_callback():
         OV.set_operator_verification_callback(None)
 
 
+def test_helper_propagates_secret_capture_callback():
+    """The skills secret-capture callback (thread-local in tools.skills_tool)
+    must be propagated into the worker thread, so a future parallelized
+    skill-install can still prompt for secrets instead of silently falling
+    through to setup_skipped."""
+    from tools import skills_tool as ST
+
+    sentinel = object()
+    ST.set_secret_capture_callback(sentinel)
+    try:
+        seen: dict = {}
+
+        def worker():
+            seen["secret_cb"] = ST._get_secret_capture_callback()
+
+        t = threading.Thread(target=propagate_context_to_thread(worker))
+        t.start()
+        t.join(timeout=5)
+
+        assert seen["secret_cb"] is sentinel
+    finally:
+        ST.set_secret_capture_callback(None)
+
+
+def test_helper_clears_secret_capture_callback_on_teardown():
+    """A recycled worker thread must not retain the propagated secret-capture
+    callback after the wrapped target finishes."""
+    from tools import skills_tool as ST
+
+    sentinel = object()
+    ST.set_secret_capture_callback(sentinel)
+    try:
+        seen: dict = {}
+
+        def first():
+            seen["during"] = ST._get_secret_capture_callback()
+
+        def second():  # NOT wrapped — runs on the same recycled worker thread
+            seen["after"] = ST._get_secret_capture_callback()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(propagate_context_to_thread(first)).result(timeout=5)
+            ex.submit(second).result(timeout=5)
+
+        assert seen["during"] is sentinel  # installed for the wrapped target
+        assert seen["after"] is None       # cleared on teardown
+    finally:
+        ST.set_secret_capture_callback(None)
+
+
 def test_helper_clears_callbacks_on_teardown():
     """A recycled worker thread must not retain the propagated callback after
     the wrapped target finishes (mirrors the GHSA-qg5c-hvr5-hjgr teardown)."""

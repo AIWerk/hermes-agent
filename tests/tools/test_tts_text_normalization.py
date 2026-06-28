@@ -1,7 +1,12 @@
 from pathlib import Path
 
 from tools import tts_tool
-from tools.tts_tool import _normalize_text_for_tts, text_to_speech_tool
+from tools.tts_tool import (
+    _german_number_to_words,
+    _hungarian_number_to_words,
+    _normalize_text_for_tts,
+    text_to_speech_tool,
+)
 
 
 def test_normalize_text_for_tts_spells_hungarian_celsius_and_percent():
@@ -34,6 +39,34 @@ def test_normalize_text_for_tts_spells_german_negative_decimal():
     normalized = _normalize_text_for_tts(text, language="de-CH")
 
     assert normalized == "Draussen sind minus drei Komma fünf Grad Celsius."
+
+
+def test_hungarian_thousands_separator_is_not_read_as_decimal():
+    # In hu, '.' is the thousands separator: 1.000 is one thousand, NOT a
+    # decimal ('egy egész nulla nulla nulla' would be the bug).
+    assert _hungarian_number_to_words("1.000") == "ezer"
+    assert "egész" not in _hungarian_number_to_words("1.000")
+    assert _hungarian_number_to_words("12.500") == "tizenkettőezer-ötszáz"
+    # Comma stays the decimal separator.
+    assert _hungarian_number_to_words("3,14") == "három egész egy négy"
+
+
+def test_german_thousands_separator_is_not_read_as_decimal():
+    # In de, '.' is the thousands separator: 1.000 == eintausend, NOT a decimal.
+    assert _german_number_to_words("1.000") == "eintausend"
+    assert _german_number_to_words("12.500") == "zwölftausendfünfhundert"
+    # Comma stays the decimal separator.
+    assert _german_number_to_words("3,14") == "drei Komma eins vier"
+
+
+def test_normalize_text_for_tts_speaks_thousands_grouping_de_and_hu():
+    de = _normalize_text_for_tts("Das kostet 1.000 CHF.", language="de")
+    assert "eintausend" in de
+    assert "Komma" not in de
+
+    hu = _normalize_text_for_tts("Ez 2.000 Ft.", language="hu")
+    assert "kettőezer" in hu
+    assert "egész" not in hu
 
 
 def test_normalize_text_for_tts_preserves_non_numeric_text():
