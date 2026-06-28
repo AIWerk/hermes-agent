@@ -18,8 +18,18 @@ Design:
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+from utils import atomic_replace
+
+# fcntl is Unix-only. Hermes runs on Linux, but guard the import so the module
+# still loads on Windows (sync just falls back to a non-locked atomic write).
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
 
 # Valid status values for todo items
@@ -35,6 +45,15 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 MAX_TODO_CONTENT_CHARS = 4000
 MAX_TODO_ITEMS = 256
 _TRUNCATION_MARKER = "… [truncated]"
+
+# The Hermes metadata comment ``_sync_markdown`` appends to persist a task's
+# stable id + precise status. Shared by the persist-side strip (so an embedded
+# metadata-shaped comment can't hijack recovery) and the load-side visible-text
+# extraction (so the trailing metadata is removed while legitimate ``<!-- ... -->``
+# comments in a task description survive the round-trip). ReDoS-safe: the
+# ``\S+`` runs are delimited by the literal ``status=`` and ``-->`` tokens — no
+# nested unbounded quantifiers.
+_HERMES_META_COMMENT_RE = re.compile(r"<!--\s*hermes:id=\S+\s+status=\S+\s*-->")
 
 
 def default_todo_markdown_path() -> Path:
@@ -144,9 +163,39 @@ class TodoStore:
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
-        """Return a copy of the current list."""
+        """Return a copy of the current list.
+
+        When TODO.md sync is enabled, the items are file-backed and an
+        authenticated CUI customer (via /api/assistant/todos/add) can append
+        arbitrary text into the file. ``todo_tool`` serializes this list
+        straight back to the model as a tool result far more often than a
+        compression event fires, so the same threat scan that guards
+        ``format_for_injection`` must also run here — otherwise the documented
+        trust boundary is bypassed on the primary read path. Items the agent
+        authored in-session (no markdown backing) are not customer-controlled,
+        so the scan is gated on markdown sync to avoid neutralizing the agent's
+        own legitimate plan text.
+        """
         self._refresh_from_markdown_if_changed()
-        return [item.copy() for item in self._items]
+        if not self._markdown_path:
+            return [item.copy() for item in self._items]
+        return [self._sanitize_item_for_read(item) for item in self._items]
+
+    @classmethod
+    def _sanitize_item_for_read(cls, item: Dict[str, str]) -> Dict[str, str]:
+        """Return a copy of a file-backed item safe to hand back to the model.
+
+        Both ``content`` and ``id`` are threat-scanned with the same
+        ``scope="strict"`` scanner the compression path uses. ``id`` is also
+        re-normalized to the ``[A-Za-z0-9_-]`` whitelist so an id smuggled
+        through a hand-edited / externally-written TODO.md (bypassing
+        ``_normalize_id`` on the write path) cannot carry invisible/bidi
+        unicode or structural payloads into the tool result.
+        """
+        safe = item.copy()
+        safe["content"] = cls._sanitize_for_injection(safe.get("content", ""))
+        safe["id"] = cls._normalize_id(safe.get("id", "")) or "?"
+        return safe
 
     def markdown_path(self) -> Optional[Path]:
         """Return the backing TODO.md path, if markdown sync is enabled."""
@@ -189,7 +238,12 @@ class TodoStore:
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
             content = self._sanitize_for_injection(item["content"])
-            lines.append(f"- {marker} {item['id']}. {content} ({item['status']})")
+            # The id is emitted verbatim into the prompt, so whitelist it to the
+            # safe charset before injection: a payload smuggled through the id
+            # field (invisible unicode, ``evil].(SYSTEM:…)``) would otherwise
+            # ride into the prompt unscanned (#27 id-bypass).
+            safe_id = self._normalize_id(item["id"]) or "?"
+            lines.append(f"- {marker} {safe_id}. {content} ({item['status']})")
 
         return "\n".join(lines)
 
@@ -288,28 +342,46 @@ class TodoStore:
 
     @staticmethod
     def _normalize_id(item_id: str) -> str:
-        """Collapse any whitespace in an id to a single token.
+        """Normalize an id to a safe single ``[A-Za-z0-9_-]`` token.
 
         The id is persisted into the ``hermes:id=<id> status=<status>``
         metadata comment and recovered with ``(\\S+)``; internal whitespace
         would truncate recovery at the first space and silently mint a
         synthetic ``todo-N`` id (re-introducing duplicate tasks + losing the
-        precise status). Replacing whitespace with ``_`` keeps the id a
-        single ``\\S+`` token so the round-trip stays lossless.
+        precise status). Whitespace collapses to ``_`` so the round-trip stays
+        a single ``\\S+`` token.
+
+        The id is also emitted verbatim into the post-compression injection
+        block (``format_for_injection``), so it is an injection surface in its
+        own right: ``(\\S+)`` matches ANY non-whitespace, including invisible /
+        bidi unicode (U+200B, U+202E, …) and structural payloads
+        (``evil].(SYSTEM:…)``) that the content scanner is meant to catch.
+        We therefore whitelist the id to an ASCII-safe charset, dropping every
+        other character (non-ASCII, invisible, bidi, punctuation), so neither a
+        CUI customer nor a stale TODO.md can smuggle an unscanned payload
+        through the id. An id that reduces to empty falls back to ``?`` /
+        ``todo-N`` upstream, exactly as for a missing id.
         """
-        return re.sub(r"\s+", "_", str(item_id or "").strip())
+        collapsed = re.sub(r"\s+", "_", str(item_id or "").strip())
+        return re.sub(r"[^A-Za-z0-9_-]", "", collapsed)
 
     @staticmethod
     def _strip_meta_comments(content: str) -> str:
-        """Remove any ``<!-- ... -->`` comments embedded in task content.
+        """Strip only Hermes *metadata* comments from task content.
 
         Content is written to TODO.md as ``- [m] {content} <!-- hermes:id=... -->``.
-        An embedded comment in ``content`` (whether agent- or CUI-authored)
-        could otherwise be mistaken for the trailing metadata on recovery
-        (#27 bypass). Stripping it before persisting guarantees the only
-        comment on the line is the one ``_sync_markdown`` appends.
+        An embedded ``<!-- hermes:id=... status=... -->`` comment in ``content``
+        (whether agent- or CUI-authored) could otherwise be mistaken for the
+        trailing metadata on recovery (#27 bypass), so it must not survive into
+        the persisted line. But arbitrary ``<!-- ... -->`` comments in a task
+        description are legitimate content (e.g. ``Document the
+        <!-- TODO: later --> section``) and deleting them silently corrupts the
+        task across the round-trip. We therefore strip ONLY the metadata-shaped
+        comment and leave every other comment untouched; recovery stays
+        unambiguous because the only hermes metadata comment left on the line is
+        the trailing one ``_sync_markdown`` appends.
         """
-        return re.sub(r"<!--.*?-->", "", str(content or "")).strip()
+        return _HERMES_META_COMMENT_RE.sub("", str(content or "")).strip()
 
     def _markdown_mtime(self) -> Optional[int]:
         if not self._markdown_path or not self._markdown_path.exists():
@@ -319,16 +391,15 @@ class TodoStore:
         except Exception:
             return None
 
-    def _load_markdown_if_available(self) -> None:
-        """Hydrate the in-memory list from TODO.md without failing agent startup."""
-        if not self._markdown_path or not self._markdown_path.exists():
-            return
-        try:
-            lines = self._markdown_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return
+    @classmethod
+    def _parse_markdown_text(cls, text: str) -> List[Dict[str, str]]:
+        """Parse TODO.md text into todo items (id, content, status).
+
+        Pure function of the file text so both the in-memory hydrate and the
+        under-lock re-read in ``_sync_markdown`` share one parser.
+        """
         items: List[Dict[str, str]] = []
-        for line_no, line in enumerate(lines, start=1):
+        for line_no, line in enumerate(text.splitlines(), start=1):
             match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$", line)
             if not match:
                 continue
@@ -344,7 +415,13 @@ class TodoStore:
             # persisting, but recovery must stay safe for files written by
             # other tools / older code paths too.
             meta = re.search(r"<!--\s*hermes:id=(\S+)\s+status=(\S+)\s*-->\s*$", raw)
-            content = re.sub(r"<!--.*?-->", "", raw).strip()
+            # Strip ONLY hermes metadata comments from the visible text. A
+            # legitimate ``<!-- ... -->`` in the task description (e.g.
+            # ``Document the <!-- TODO: later --> section``) is real content and
+            # must survive the round-trip; deleting every comment corrupted it
+            # silently. Recovery above already takes the end-anchored metadata,
+            # so a non-metadata comment can't hijack id/status.
+            content = _HERMES_META_COMMENT_RE.sub("", raw).strip()
             if not content:
                 continue
             checked = match.group(1).lower() == "x"
@@ -356,13 +433,32 @@ class TodoStore:
                 status = meta_status if meta_status in {"completed", "cancelled"} else "completed"
             else:
                 status = meta_status if meta_status in {"pending", "in_progress"} else "pending"
-            item_id = meta.group(1) if meta else f"todo-{line_no}"
+            # Normalize the recovered id too: the metadata comment is written by
+            # whoever last touched TODO.md (agent, CUI, or a hand edit), and the
+            # ``(\S+)`` capture matches invisible / bidi unicode and structural
+            # payloads. Without this an attacker bypasses the id whitelist by
+            # smuggling the payload through the persisted ``hermes:id=...`` field
+            # rather than through a tool write. Fall back to the synthetic
+            # ``todo-N`` id if the recovered id reduces to empty.
+            item_id = cls._normalize_id(meta.group(1)) if meta else ""
+            if not item_id:
+                item_id = f"todo-{line_no}"
             items.append({
                 "id": item_id,
-                "content": self._cap_content(content),
+                "content": cls._cap_content(content),
                 "status": status,
             })
-        self._items = items[:MAX_TODO_ITEMS]
+        return items[:MAX_TODO_ITEMS]
+
+    def _load_markdown_if_available(self) -> None:
+        """Hydrate the in-memory list from TODO.md without failing agent startup."""
+        if not self._markdown_path or not self._markdown_path.exists():
+            return
+        try:
+            text = self._markdown_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return
+        self._items = self._parse_markdown_text(text)
         self._markdown_mtime_ns = self._markdown_mtime()
 
     def _refresh_from_markdown_if_changed(self) -> bool:
@@ -373,36 +469,125 @@ class TodoStore:
         self._load_markdown_if_available()
         return True
 
+    def _merge_external_open_items(self, on_disk: List[Dict[str, str]]) -> None:
+        """Fold any open on-disk task not already in memory into ``self._items``.
+
+        Called under the sync lock with the file as it is *right now*, so a CUI
+        append (``/api/assistant/todos/add``) that landed in the window between
+        this store's last refresh and this write is merged instead of clobbered
+        by the truncating rewrite. Only open (pending/in_progress) items are
+        preserved — a completed/cancelled item the agent dropped should stay
+        dropped — and dedup uses the same id + normalized-content keys as the
+        replace-mode preservation in ``write()``.
+        """
+        seen_ids = {item["id"] for item in self._items}
+        seen_content = {self._content_key(item["content"]) for item in self._items}
+        for item in on_disk:
+            if item.get("status") not in {"pending", "in_progress"}:
+                continue
+            content_key = self._content_key(item["content"])
+            if item["id"] in seen_ids or content_key in seen_content:
+                continue
+            self._items.append(item.copy())
+            seen_ids.add(item["id"])
+            seen_content.add(content_key)
+        if len(self._items) > MAX_TODO_ITEMS:
+            self._items = self._items[:MAX_TODO_ITEMS]
+
+    def _render_markdown(self) -> str:
+        """Render the current list to TODO.md text."""
+        lines = [
+            "# Agent TODO",
+            "",
+            "<!-- Managed by Hermes todo tool. The CUI Aufgaben panel reads open Markdown checkboxes from this file. -->",
+            "",
+        ]
+        for item in self._items:
+            marker = "x" if item["status"] in {"completed", "cancelled"} else " "
+            # Strip any *metadata-shaped* comment embedded in the content so the
+            # ONLY hermes metadata comment on the persisted line is the trailing
+            # one — otherwise an embedded "<!-- hermes:id=... -->" could hijack
+            # recovery. Legitimate non-metadata comments are preserved.
+            content = self._strip_meta_comments(item["content"].replace("\n", " "))
+            # Persist id + precise status in an HTML comment (invisible in the
+            # rendered CUI panel, stripped from the loaded text) so the
+            # round-trip preserves agent ids and all four statuses. The id is
+            # already whitelist-normalized in _validate, so it stays a single
+            # \S+ token that recovery can parse.
+            meta = f"<!-- hermes:id={item['id']} status={item['status']} -->"
+            lines.append(f"- [{marker}] {content} {meta}")
+        return "\n".join(lines).rstrip() + "\n"
+
     def _sync_markdown(self) -> None:
-        """Persist the current tool list to TODO.md for the CUI Aufgaben panel."""
+        """Persist the current tool list to TODO.md for the CUI Aufgaben panel.
+
+        The design has two concurrent writers — this agent and the CUI
+        ``/api/assistant/todos/add`` endpoint. To avoid last-writer-wins data
+        loss and partial reads we (1) take an exclusive advisory lock on a
+        sibling ``.lock`` file, (2) re-read the file under the lock and merge any
+        open task that appeared since our last refresh, then (3) write
+        atomically via a temp file + ``os.replace`` so a concurrent CUI reader
+        always sees a whole file, never a truncated one.
+        """
         if not self._markdown_path:
             return
         try:
             self._markdown_path.parent.mkdir(parents=True, exist_ok=True)
-            lines = [
-                "# Agent TODO",
-                "",
-                "<!-- Managed by Hermes todo tool. The CUI Aufgaben panel reads open Markdown checkboxes from this file. -->",
-                "",
-            ]
-            for item in self._items:
-                marker = "x" if item["status"] in {"completed", "cancelled"} else " "
-                # Strip any comment embedded in the content so the ONLY comment
-                # on the persisted line is the trailing metadata one — otherwise
-                # an embedded "<!-- hermes:id=... -->" could hijack recovery.
-                content = self._strip_meta_comments(item["content"].replace("\n", " "))
-                # Persist id + precise status in an HTML comment (invisible in the
-                # rendered CUI panel, stripped from the loaded text) so the
-                # round-trip preserves agent ids and all four statuses. The id is
-                # already whitespace-normalized in _validate, so it stays a single
-                # \S+ token that recovery can parse.
-                meta = f"<!-- hermes:id={item['id']} status={item['status']} -->"
-                lines.append(f"- [{marker}] {content} {meta}")
-            self._markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+            lock_path = self._markdown_path.with_name(self._markdown_path.name + ".lock")
+            lock_fd = None
+            try:
+                if fcntl is not None:
+                    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                # Under the lock, fold in any concurrent CUI append that landed
+                # between our last refresh and now so the truncating rewrite
+                # below does not clobber it.
+                if self._markdown_path.exists():
+                    try:
+                        current_text = self._markdown_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        self._merge_external_open_items(
+                            self._parse_markdown_text(current_text)
+                        )
+                    except Exception:
+                        pass
+                self._atomic_write_text(self._markdown_path, self._render_markdown())
+            finally:
+                if lock_fd is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_fd)
             self._markdown_mtime_ns = self._markdown_mtime()
         except Exception:
             # Todo is a planning aid; disk sync must never break tool execution.
             return
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` atomically (temp file + os.replace).
+
+        A plain ``write_text`` truncates the target first, so a concurrent CUI
+        reader can observe an empty/partial file. Writing to a sibling temp file
+        and renaming it into place means readers always see the old complete
+        file or the new one, never a torn write.
+        """
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".todo_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def todo_tool(
