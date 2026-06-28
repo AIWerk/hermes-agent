@@ -37,8 +37,20 @@ def _pooled_codex_credential() -> dict[str, Any]:
         raise RuntimeError("OpenAI Codex credential pool is not available") from exc
 
     pool = load_pool("openai-codex")
-    entries = list(getattr(pool, "_entries", []) or [])
     now = time.time()
+
+    # Only consider entries the pool itself reports as available. This honors
+    # last_status (STATUS_EXHAUSTED / STATUS_DEAD) and the last_error_reset_at
+    # cooldown window, so we never re-hand a rate-limited (429) or revoked (401)
+    # credential straight back to the upstream just because its JWT has not yet
+    # expired. Falling back to _entries here would resurrect a key the pool's
+    # own rotation just retired.
+    try:
+        entries = list(pool._available_entries())
+    except Exception:
+        # Defensive: if the pool internals change, degrade to peek() rather than
+        # touch the private _entries list (which ignores exhaustion state).
+        entries = []
 
     def _score(entry: Any) -> tuple[int, int]:
         token = str(getattr(entry, "runtime_api_key", "") or "")
@@ -49,6 +61,8 @@ def _pooled_codex_credential() -> dict[str, Any]:
 
     candidates = [e for e in entries if str(getattr(e, "runtime_api_key", "") or "").strip()]
     candidates.sort(key=_score, reverse=True)
+    # peek() also routes through current()/_available_entries(), so the fallback
+    # likewise stays within the pool's availability contract.
     entry = candidates[0] if candidates else pool.peek()
     if entry is None or not entry.runtime_api_key:
         raise RuntimeError("No usable OpenAI Codex pooled credential found")
@@ -331,15 +345,20 @@ class OpenAICodexAdapter(UpstreamAdapter):
         return _ALLOWED_PATHS
 
     def is_authenticated(self) -> bool:
+        # Base contract: this must be cheap with no network calls. Resolving
+        # with refresh_if_expiring=False checks for a stored token without
+        # triggering _refresh_codex_auth_tokens() (network) or taking the
+        # cross-process auth-store lock — so `proxy start` and /health polling
+        # never block on a hanging refresh or lock contention.
         try:
-            creds = self._resolve_credentials()
+            creds = self._resolve_credentials(refresh_if_expiring=False)
             return bool(str(creds.get("api_key") or "").strip())
         except Exception:
             return False
 
-    def _resolve_credentials(self) -> dict[str, Any]:
+    def _resolve_credentials(self, *, refresh_if_expiring: bool = True) -> dict[str, Any]:
         try:
-            return resolve_codex_runtime_credentials()
+            return resolve_codex_runtime_credentials(refresh_if_expiring=refresh_if_expiring)
         except Exception:
             try:
                 return _pooled_codex_credential()
@@ -373,14 +392,24 @@ class OpenAICodexAdapter(UpstreamAdapter):
 
         Without this override the adapter inherited the base no-op and the
         proxy server's retry block could never rotate for Codex, so a single
-        expired/rate-limited pool entry took down every request. We mark the
-        offending entry exhausted (so a stuck/expired key isn't reselected)
-        and hand back the next available pooled credential.
+        expired/rate-limited pool entry took down every request. When the
+        failed bearer is a pool entry we mark it exhausted (so a stuck/expired
+        key isn't reselected) and hand back the next available pooled
+        credential.
 
-        Note: this only covers the generic forward path. The Codex chat shim
-        (``_handle_codex_chat_completion`` in server.py) returns before the
-        server's retry block, so the ``/chat/completions`` shim path does not
-        rotate today — that remains a documented limitation.
+        The failed credential, however, frequently originates from the
+        singleton token store (``resolve_codex_runtime_credentials`` reads the
+        singleton first and only falls back to the pool). That bearer is NOT a
+        pool entry, so marking it exhausted via ``mark_exhausted_and_rotate``'s
+        hint-miss fallthrough would burn an *unrelated* healthy pool entry on a
+        1-hour cooldown (or kill a single-entry pool entirely). We therefore
+        only mark-and-rotate when the failed bearer actually matches a pool
+        entry; for a non-pool failure we offer an available pool credential
+        without exhausting anyone.
+
+        This is also reused by the ``/chat/completions`` shim
+        (``_handle_codex_chat_completion`` in server.py) so the documented
+        Honcho consumer rotates on 401/429 too.
         """
         if status_code not in {401, 429}:
             return None
@@ -399,14 +428,38 @@ class OpenAICodexAdapter(UpstreamAdapter):
         if pool is None:
             return None
 
-        # Mark the failed key exhausted (1-hour cooldown for 429, terminal
-        # handling for 401) and rotate to the next available pool entry. The
-        # api_key_hint pins rotation to the bearer that actually failed even
-        # when this pool was freshly loaded from disk.
-        refreshed = pool.mark_exhausted_and_rotate(
-            status_code=status_code,
-            api_key_hint=failed_credential.bearer or None,
+        failed_bearer = failed_credential.bearer or None
+
+        # Determine whether the failed bearer is actually one of this pool's
+        # entries. If it is not (the common singleton-store case), rotating via
+        # mark_exhausted_and_rotate's hint-miss fallback would exhaust an
+        # innocent healthy entry. Only mark/rotate for a true pool-sourced
+        # failure; otherwise return a still-available pool credential as-is.
+        try:
+            pool_entries = list(getattr(pool, "_entries", []) or [])
+        except Exception:
+            pool_entries = []
+        failed_is_pool_entry = bool(failed_bearer) and any(
+            str(getattr(e, "runtime_api_key", "") or "") == failed_bearer
+            for e in pool_entries
         )
+
+        if failed_is_pool_entry:
+            # Mark the failed key exhausted (1-hour cooldown for 429, terminal
+            # handling for 401) and rotate to the next available pool entry. The
+            # api_key_hint pins rotation to the bearer that actually failed even
+            # when this pool was freshly loaded from disk.
+            refreshed = pool.mark_exhausted_and_rotate(
+                status_code=status_code,
+                api_key_hint=failed_bearer,
+            )
+        else:
+            # Non-pool (e.g. singleton) bearer failed. Do NOT exhaust any pool
+            # entry — just surface an available pool credential to retry with.
+            try:
+                refreshed = pool.peek()
+            except Exception:
+                refreshed = None
         if refreshed is None:
             return None
 

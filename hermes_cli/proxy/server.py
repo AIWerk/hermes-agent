@@ -171,9 +171,10 @@ def _log_proxy_event(
 async def _handle_codex_chat_completion(
     *,
     request: "web.Request",
-    upstream_url: str,
+    adapter: UpstreamAdapter,
+    credential: UpstreamCredential,
+    headers_for_credential,
     body: bytes,
-    headers: dict,
     provider: str,
     start_time: float,
 ) -> "web.Response":
@@ -182,6 +183,13 @@ async def _handle_codex_chat_completion(
     This path exists for OpenAI-compatible clients such as Honcho. It is a
     strict no-tools shim: tools from the caller are intentionally not forwarded
     to the Codex backend.
+
+    On a 401/429 from the upstream the shim performs a single credential
+    rotation via ``adapter.get_retry_credential`` and re-issues the request
+    once. The generic forward path already does this, but this shim returns
+    before that block — so without an explicit rotation here the documented
+    primary consumer (Honcho's memory deriver, wired to /chat/completions)
+    would get an un-rotated 401/429 straight through.
     """
     try:
         incoming: Any = json.loads(body.decode("utf-8") if body else "{}")
@@ -236,56 +244,89 @@ async def _handle_codex_chat_completion(
         return _json_error(400, f"failed to translate chat request: {exc}", code="translation_failed")
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
-    try:
+
+    async def _post_once(active_cred: UpstreamCredential):
+        """Issue one Responses POST; return (status, raw_body, request_id)."""
+        upstream_url = f"{active_cred.base_url.rstrip('/')}/responses"
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 upstream_url,
                 json=responses_payload,
-                headers=headers,
+                headers=headers_for_credential(active_cred),
                 allow_redirects=False,
             ) as upstream_resp:
                 raw = await upstream_resp.read()
-                if upstream_resp.status >= 400:
-                    _log_proxy_event(
-                        method=request.method,
-                        path="/chat/completions",
-                        provider=provider,
-                        status=upstream_resp.status,
-                        start_time=start_time,
-                        model=model,
-                        upstream_request_id=_request_id_from_headers(upstream_resp.headers),
-                        error_code="upstream_error",
-                    )
-                    return web.Response(
-                        status=upstream_resp.status,
-                        body=raw,
-                        headers=_filter_response_headers(upstream_resp.headers),
-                    )
-                try:
-                    content_type = upstream_resp.headers.get("content-type", "")
-                    stripped = raw.lstrip()
-                    if (
-                        "text/event-stream" in content_type.lower()
-                        or stripped.startswith(b"event:")
-                        or stripped.startswith(b"data:")
-                    ):
-                        upstream_json = responses_stream_to_payload(raw)
-                    else:
-                        upstream_json = json.loads(raw.decode("utf-8") if raw else "{}")
-                    if not isinstance(upstream_json, dict):
-                        raise ValueError("response JSON must be an object")
-                except Exception as exc:
-                    _log_proxy_event(
-                        method=request.method,
-                        path="/chat/completions",
-                        provider=provider,
-                        status=502,
-                        start_time=start_time,
-                        model=model,
-                        upstream_request_id=_request_id_from_headers(upstream_resp.headers),
-                        error_code="upstream_invalid_response",
-                    )
-                    return _json_error(502, f"invalid Codex response: {exc}", code="upstream_invalid_response")
+                return (
+                    upstream_resp.status,
+                    raw,
+                    _request_id_from_headers(upstream_resp.headers),
+                    upstream_resp.headers.get("content-type", ""),
+                    _filter_response_headers(upstream_resp.headers),
+                )
+
+    active_cred = credential
+    try:
+        status, raw, request_id, content_type, resp_headers = await _post_once(active_cred)
+
+        # One-shot rotation on auth/rate-limit failures so the documented
+        # /chat/completions consumer is protected just like the generic path.
+        if status in {401, 429}:
+            try:
+                retry_cred = adapter.get_retry_credential(
+                    failed_credential=active_cred,
+                    status_code=status,
+                )
+            except Exception as exc:
+                logger.warning("proxy: Codex chat-shim retry credential resolution failed: %s", exc)
+                retry_cred = None
+            if retry_cred is not None:
+                logger.info(
+                    "proxy: Codex chat shim got %s; retrying once with rotated credential",
+                    status,
+                )
+                active_cred = retry_cred
+                status, raw, request_id, content_type, resp_headers = await _post_once(active_cred)
+
+        if status >= 400:
+            _log_proxy_event(
+                method=request.method,
+                path="/chat/completions",
+                provider=provider,
+                status=status,
+                start_time=start_time,
+                model=model,
+                upstream_request_id=request_id,
+                error_code="upstream_error",
+            )
+            return web.Response(
+                status=status,
+                body=raw,
+                headers=resp_headers,
+            )
+        try:
+            stripped = raw.lstrip()
+            if (
+                "text/event-stream" in content_type.lower()
+                or stripped.startswith(b"event:")
+                or stripped.startswith(b"data:")
+            ):
+                upstream_json = responses_stream_to_payload(raw)
+            else:
+                upstream_json = json.loads(raw.decode("utf-8") if raw else "{}")
+            if not isinstance(upstream_json, dict):
+                raise ValueError("response JSON must be an object")
+        except Exception as exc:
+            _log_proxy_event(
+                method=request.method,
+                path="/chat/completions",
+                provider=provider,
+                status=502,
+                start_time=start_time,
+                model=model,
+                upstream_request_id=request_id,
+                error_code="upstream_invalid_response",
+            )
+            return _json_error(502, f"invalid Codex response: {exc}", code="upstream_invalid_response")
     except aiohttp.ClientError as exc:
         logger.warning("proxy: Codex upstream connection failed: %s", exc)
         _log_proxy_event(
@@ -322,7 +363,7 @@ async def _handle_codex_chat_completion(
         start_time=start_time,
         model=model,
         usage=_usage_from_payload(chat_payload),
-        upstream_request_id=_request_id_from_headers(upstream_resp.headers),
+        upstream_request_id=request_id,
     )
     return web.json_response(chat_payload)
 
@@ -408,9 +449,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         if adapter.name == "openai-codex" and rel_path == "/chat/completions":
             return await _handle_codex_chat_completion(
                 request=request,
-                upstream_url=f"{cred.base_url.rstrip('/')}/responses",
+                adapter=adapter,
+                credential=cred,
+                headers_for_credential=_headers_for_credential,
                 body=body,
-                headers=_headers_for_credential(cred),
                 provider=adapter.name,
                 start_time=start_time,
             )
