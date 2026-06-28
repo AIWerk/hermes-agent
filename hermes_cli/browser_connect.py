@@ -91,6 +91,7 @@ class LocalBrowserLauncherConfig:
     ssh_target: str = ""
     ssh_port: int | None = None
     ssh_identity_file: str = ""
+    launcher_token: str = ""
     browser_profile_dir: str = ""
     browser_binary: str = ""
     start_url: str = "about:blank"
@@ -197,6 +198,7 @@ def load_local_browser_launcher_config(config: dict[str, Any] | None = None) -> 
         ssh_target=str(raw.get("ssh_target") or "").strip(),
         ssh_port=ssh_port,
         ssh_identity_file=str(raw.get("ssh_identity_file") or "").strip(),
+        launcher_token=str(raw.get("launcher_token") or "").strip(),
         browser_profile_dir=str(raw.get("browser_profile_dir") or "").strip(),
         browser_binary=str(raw.get("browser_binary") or "").strip(),
         start_url=str(raw.get("start_url") or "about:blank").strip() or "about:blank",
@@ -233,8 +235,16 @@ def call_local_browser_launcher(
         return False, "local browser launcher is not configured"
 
     url = _launcher_endpoint(config.launcher_url, action)
+    # Present the shared secret so the loopback-bound launcher can reject other
+    # local processes. Omit the header (and keep the bare-URL call) when no token
+    # is configured, preserving backward compatibility with older launchers.
+    request: str | urllib.request.Request = url
+    if config.launcher_token:
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {config.launcher_token}"}
+        )
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             body = resp.read(16384).decode("utf-8", errors="replace")
             status = getattr(resp, "status", 200)
     except urllib.error.URLError as exc:
