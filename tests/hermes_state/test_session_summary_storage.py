@@ -119,3 +119,68 @@ def test_search_session_summaries_clamps_limit(db):
     results = db.search_session_summaries("session-index", limit=-1)
 
     assert len(results) == 1
+
+
+def test_search_session_summaries_treats_underscore_as_literal(db):
+    """'_' in the query must not act as a LIKE single-char wildcard."""
+    session_id = db.create_session(session_id="sess-1", source="cli")
+    db.set_session_summary(
+        session_id,
+        short_summary="Topic about axb internals",
+        outline=["axb step"],
+        topics=["axb"],
+    )
+
+    # 'a_b' would match 'axb' if '_' were a wildcard; it must not.
+    assert db.search_session_summaries("a_b") == []
+
+    # A literal-underscore match still works against real underscore content.
+    db.set_session_summary(
+        session_id,
+        short_summary="Topic about a_b internals",
+        outline=["a_b step"],
+        topics=["a_b"],
+    )
+    results = db.search_session_summaries("a_b")
+    assert len(results) == 1
+    assert results[0]["session_id"] == session_id
+
+
+def test_search_session_summaries_treats_percent_as_literal(db):
+    """'%' in the query must not act as a LIKE match-anything wildcard."""
+    session_id = db.create_session(session_id="sess-1", source="cli")
+    db.set_session_summary(
+        session_id,
+        short_summary="No wildcard characters here",
+        outline=["nothing special"],
+        topics=["plain"],
+    )
+
+    # A bare '%' would match every row if it were a wildcard; it must not.
+    assert db.search_session_summaries("%") == []
+
+    # A literal-percent match still works against real percent content.
+    db.set_session_summary(
+        session_id,
+        short_summary="Battery at 50% capacity",
+        outline=["50% done"],
+        topics=["50%"],
+    )
+    results = db.search_session_summaries("50%")
+    assert len(results) == 1
+    assert results[0]["session_id"] == session_id
+
+
+def test_search_session_summaries_treats_backslash_as_literal(db):
+    """A trailing backslash (the ESCAPE char) must not corrupt the pattern."""
+    session_id = db.create_session(session_id="sess-1", source="cli")
+    db.set_session_summary(
+        session_id,
+        short_summary=r"Path C:\temp\notes",
+        outline=[r"C:\temp"],
+        topics=[r"c:\temp"],
+    )
+
+    results = db.search_session_summaries(r"c:\temp")
+    assert len(results) == 1
+    assert results[0]["session_id"] == session_id

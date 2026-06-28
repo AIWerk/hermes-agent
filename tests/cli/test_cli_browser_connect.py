@@ -230,12 +230,14 @@ class TestChromeDebugLaunch:
              patch("hermes_cli.browser_connect.os.path.isfile", return_value=False):
             assert manual_chrome_debug_command(9222, "Linux") is None
 
-    def test_connect_context_note_allows_expected_browser_use(self, monkeypatch):
-        """`/browser connect` is an instruction to use the CDP browser.
+    def test_connect_context_note_keeps_normal_approval_flow(self, monkeypatch):
+        """`/browser connect` queues an informational note, not a permission grant.
 
-        The queued context note must not tell the model to wait for a second
-        permission step or imply that the attached browser is the user's main
-        everyday Chrome profile.
+        The note must describe that the tools are now CDP-backed against a
+        possibly-session-bearing debug profile, but it must NOT tell the model to
+        skip the normal per-action approval step ("do not wait for separate
+        permission"). The attached browser controls a live profile, so
+        navigational/destructive actions still go through the usual approval flow.
         """
         cli = HermesCLI.__new__(HermesCLI)
         cli._pending_input = Queue()
@@ -248,9 +250,15 @@ class TestChromeDebugLaunch:
             cli._handle_browser_command("/browser connect")
 
         note = cli._pending_input.get_nowait()
+        # Still informational about what was attached.
         assert "Chromium-family" in note
         assert "dev/debug" in note
-        assert "using browser tools for their current browser-related request is expected" in note
+        assert "logged-in sessions" in note or "cookies" in note
+        # The wait-for-permission step must NOT be removed anymore.
+        assert "do not wait for separate permission" not in note
+        assert "is expected" not in note
+        assert "normal approval flow" in note
+        # Still must not misrepresent the profile as the main everyday browser.
         assert "live Chrome browser" not in note
         assert "real browser" not in note
         assert "Please await their instruction" not in note

@@ -1262,34 +1262,76 @@ class SessionDB:
                 return
             if all((str(row[6]) or "").upper() == "CASCADE" for row in session_fks):
                 return
-            cursor.executescript(
-                """
-                DROP TABLE IF EXISTS session_stack_new;
-                CREATE TABLE session_stack_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source TEXT NOT NULL,
-                    parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    title TEXT,
-                    pushed_at REAL NOT NULL,
-                    popped_at REAL,
-                    status TEXT NOT NULL DEFAULT 'active'
-                );
-                INSERT INTO session_stack_new
-                    SELECT id, source, parent_session_id, side_session_id, title,
-                           pushed_at, popped_at, status
-                    FROM session_stack
-                    WHERE parent_session_id IN (SELECT id FROM sessions)
-                      AND side_session_id IN (SELECT id FROM sessions);
-                DROP TABLE session_stack;
-                ALTER TABLE session_stack_new RENAME TO session_stack;
-                CREATE INDEX IF NOT EXISTS idx_session_stack_active
-                    ON session_stack(source, status, id DESC);
-                """
-            )
+            # Wrap the whole rebuild in one transaction so DROP+RENAME is
+            # atomic: a crash can never leave session_stack dropped while the
+            # populated session_stack_new survives (which would orphan the
+            # stack rows permanently — SCHEMA_SQL would recreate an empty
+            # CASCADE table on the next start and this reconcile would
+            # early-return). executescript() would issue an implicit COMMIT at
+            # its start and break our BEGIN, so each statement is executed
+            # individually inside the explicit transaction instead.
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute("DROP TABLE IF EXISTS session_stack_new")
+                cursor.execute(
+                    """
+                    CREATE TABLE session_stack_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        title TEXT,
+                        pushed_at REAL NOT NULL,
+                        popped_at REAL,
+                        status TEXT NOT NULL DEFAULT 'active'
+                    )
+                    """
+                )
+                total = cursor.execute(
+                    "SELECT COUNT(*) FROM session_stack"
+                ).fetchone()[0]
+                cursor.execute(
+                    """
+                    INSERT INTO session_stack_new
+                        SELECT id, source, parent_session_id, side_session_id, title,
+                               pushed_at, popped_at, status
+                        FROM session_stack
+                        WHERE parent_session_id IN (SELECT id FROM sessions)
+                          AND side_session_id IN (SELECT id FROM sessions)
+                    """
+                )
+                kept = cursor.execute(
+                    "SELECT COUNT(*) FROM session_stack_new"
+                ).fetchone()[0]
+                cursor.execute("DROP TABLE session_stack")
+                cursor.execute(
+                    "ALTER TABLE session_stack_new RENAME TO session_stack"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_session_stack_active "
+                    "ON session_stack(source, status, id DESC)"
+                )
+                cursor.execute("COMMIT")
+            except BaseException:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            dropped = int(total) - int(kept)
+            if dropped > 0:
+                logger.warning(
+                    "session_stack rebuild dropped %d orphaned stack row(s) "
+                    "referencing missing sessions", dropped,
+                )
             logger.info("session_stack rebuilt with ON DELETE CASCADE foreign keys")
         except sqlite3.OperationalError as exc:
-            logger.debug("session_stack FK reconcile skipped: %s", exc)
+            # A divergent legacy session_stack (e.g. an unexpected column set
+            # making the column-listed INSERT...SELECT fail) lands here. The
+            # table then keeps its non-CASCADE FKs, so deletes/prunes of
+            # referenced sessions will keep aborting — surface this at WARNING
+            # so the failed migration is operator-visible, not a silent skip.
+            logger.warning("session_stack FK reconcile skipped: %s", exc)
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
@@ -3082,17 +3124,27 @@ class SessionDB:
         if limit is None:
             limit = 20
         limit = max(1, min(int(limit), 100))
-        needle = f"%{str(query or '').lower()}%"
+        # Escape LIKE metacharacters so the query is matched as a literal
+        # substring: \ first (it's the ESCAPE char), then % and _ which would
+        # otherwise act as wildcards (e.g. 'a_b' matching 'axb').
+        escaped = (
+            str(query or "")
+            .lower()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        needle = f"%{escaped}%"
         with self._lock:
             rows = self._conn.execute(
-                """
+                r"""
                 SELECT s.id AS session_id, ss.short_summary, ss.outline_json,
                        ss.topics_json, ss.model, ss.updated_at
                 FROM session_summaries ss
                 JOIN sessions s ON s.id = ss.session_id
-                WHERE lower(ss.short_summary) LIKE ?
-                   OR lower(ss.outline_json) LIKE ?
-                   OR lower(ss.topics_json) LIKE ?
+                WHERE lower(ss.short_summary) LIKE ? ESCAPE '\'
+                   OR lower(ss.outline_json) LIKE ? ESCAPE '\'
+                   OR lower(ss.topics_json) LIKE ? ESCAPE '\'
                 ORDER BY ss.updated_at DESC
                 LIMIT ?
                 """,

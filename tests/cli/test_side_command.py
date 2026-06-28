@@ -154,6 +154,54 @@ class TestSideCommandCLI:
 
         assert cli_instance.session_id == original_id
 
+    def test_back_passes_calling_clients_session_id_to_pop(self, cli_instance, session_db):
+        """/back must scope the pop to THIS client's current session id.
+
+        Without the scope, a shared-source gateway lets one client's /back pop
+        another client's parked entry. The handler passes self.session_id so the
+        DB layer can match only the calling client's own side session.
+        """
+        from cli import HermesCLI
+
+        captured = {}
+        real_pop = session_db.pop_side_session
+
+        def _spy(*args, **kwargs):
+            captured["side_session_id"] = kwargs.get("side_session_id")
+            return real_pop(*args, **kwargs)
+
+        session_db.pop_side_session = _spy
+
+        HermesCLI._handle_side_command(cli_instance, "/side topic")
+        side_id = cli_instance.session_id  # client is now in the side session
+        HermesCLI._handle_back_command(cli_instance, "/back")
+
+        assert captured["side_session_id"] == side_id
+
+    def test_back_only_pops_this_clients_parked_session(self, cli_instance, session_db):
+        """A second client's newer parked entry must survive this client's /back."""
+        from cli import HermesCLI
+
+        parent_a = cli_instance.session_id
+
+        # Client A parks via /side, then a second client (same source) parks too.
+        HermesCLI._handle_side_command(cli_instance, "/side topic A")
+        side_a = cli_instance.session_id
+
+        session_db.create_session(session_id="parent_b", source="cli")
+        session_db.create_session(session_id="side_b", source="cli")
+        session_db.push_side_session("cli", "parent_b", "side_b", title="topic B")
+
+        # Client A returns; it is still positioned in its own side session.
+        cli_instance.session_id = side_a
+        HermesCLI._handle_back_command(cli_instance, "/back")
+
+        # A returned to its own parent, and B's newer entry is untouched.
+        assert cli_instance.session_id == parent_a
+        active = session_db.get_active_side_session(source="cli")
+        assert active is not None
+        assert active["side_session_id"] == "side_b"
+
 
 class TestSideCommandDef:
     def test_side_and_back_are_registered(self):
