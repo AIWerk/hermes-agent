@@ -6,6 +6,7 @@ import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
+import { safeWindowOpen } from "@/lib/safe-open";
 
 type ChatRole = "user" | "agent" | "system" | "tool";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -191,9 +192,7 @@ function formatResourceTime(value?: string | null, options?: { year?: boolean })
 }
 
 function openSharedFolderCloudUrl(url?: string | null): void {
-  if (!url) return;
-  const opened = window.open(url, "_blank", "noopener,noreferrer");
-  if (opened) opened.opener = null;
+  safeWindowOpen(url);
 }
 
 type DocumentTabKind = "email" | "calendar" | "contact";
@@ -942,6 +941,11 @@ export default function AiwerkAssistantPage() {
   const voiceTimerRef = useRef<number | null>(null);
   const voiceCancelledRef = useRef(false);
   const attachmentUrlsRef = useRef<Set<string>>(new Set());
+  // Blob: URLs minted while rendering resumed/history attachments. Tracked
+  // separately from locally-attached files so we can revoke a previous
+  // session's preview blobs when a new session is loaded, without touching the
+  // user's pending upload previews.
+  const historyAttachmentUrlsRef = useRef<Set<string>>(new Set());
   const readAloudEnabledRef = useRef(false);
   const readAloudAudioRef = useRef<HTMLAudioElement | null>(null);
   const readAloudUrlRef = useRef<string | null>(null);
@@ -1144,8 +1148,7 @@ export default function AiwerkAssistantPage() {
   const openDocumentTab = useCallback(async (kind: DocumentTabKind, openUrl: string | null | undefined, title: string, subtitle?: string) => {
     if (!openUrl) return;
     if (/^https?:\/\//i.test(openUrl)) {
-      const opened = window.open(openUrl, "_blank", "noopener,noreferrer");
-      if (opened) opened.opener = null;
+      safeWindowOpen(openUrl);
       return;
     }
     const id = `${kind}:${openUrl}`;
@@ -1331,6 +1334,23 @@ export default function AiwerkAssistantPage() {
     if (!url || !attachmentUrlsRef.current.has(url)) return;
     URL.revokeObjectURL(url);
     attachmentUrlsRef.current.delete(url);
+  }, []);
+
+  // Register every blob: preview URL produced while rendering resumed/history
+  // messages so it can be revoked when the session is replaced or on unmount.
+  const registerHistoryAttachmentUrls = useCallback((messages: ChatMessage[]) => {
+    for (const message of messages) {
+      for (const attachment of message.attachments ?? []) {
+        if (attachment.previewUrl?.startsWith("blob:")) historyAttachmentUrlsRef.current.add(attachment.previewUrl);
+      }
+    }
+  }, []);
+
+  // Revoke the previous session's history preview blobs before loading another
+  // session, reclaiming memory instead of waiting for unmount.
+  const revokeHistoryAttachmentUrls = useCallback(() => {
+    historyAttachmentUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    historyAttachmentUrlsRef.current.clear();
   }, []);
 
   const removeAttachedFile = useCallback((id: string) => {
@@ -1831,9 +1851,12 @@ export default function AiwerkAssistantPage() {
 
   useEffect(() => {
     const urls = attachmentUrlsRef.current;
+    const historyUrls = historyAttachmentUrlsRef.current;
     return () => {
       urls.forEach((url) => URL.revokeObjectURL(url));
       urls.clear();
+      historyUrls.forEach((url) => URL.revokeObjectURL(url));
+      historyUrls.clear();
     };
   }, []);
 
@@ -1971,7 +1994,9 @@ export default function AiwerkAssistantPage() {
       setSideMessages([]);
       setSideToolCalls([]);
       setToolCalls(result.resumed ? toolCallsFromGateway(result.messages) : []);
-      setMessages(result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()]);
+      const resumedMessages = result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()];
+      registerHistoryAttachmentUrls(resumedMessages);
+      setMessages(resumedMessages);
       setBusy(recoveredRunning);
       if (result.inflight?.streaming) activeTurnModeRef.current = "main";
       void refreshSessionMeta(gateway, result.session_id);
@@ -2111,7 +2136,7 @@ export default function AiwerkAssistantPage() {
       offSessionInfo();
       gateway.close();
     };
-  }, [cuiLocale, refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, showToast, speakAssistantText]);
+  }, [cuiLocale, refreshContextUsage, refreshSessionMeta, refreshRuntimeStatus, registerHistoryAttachmentUrls, showToast, speakAssistantText]);
 
   const loadRecentSession = useCallback(async (session: RecentSession) => {
     const gateway = gatewayRef.current;
@@ -2164,7 +2189,11 @@ export default function AiwerkAssistantPage() {
       setSideMessages([]);
       setSideToolCalls([]);
       setToolCalls(toolCallsFromGateway(history));
-      setMessages(await messagesWithInflight(history, inflight));
+      // Reclaim the previous session's preview blobs before swapping messages.
+      revokeHistoryAttachmentUrls();
+      const resumedMessages = await messagesWithInflight(history, inflight);
+      registerHistoryAttachmentUrls(resumedMessages);
+      setMessages(resumedMessages);
       setBusy(resumedRunning);
       if (inflight?.streaming) activeTurnModeRef.current = "main";
       if (gateway) {
@@ -2177,7 +2206,7 @@ export default function AiwerkAssistantPage() {
       setError(e instanceof Error ? e.message : String(e));
       showToast("Session konnte nicht geladen werden");
     }
-  }, [refreshContextUsage, refreshRuntimeStatus, refreshSessionMeta, showToast, stopReadAloud]);
+  }, [refreshContextUsage, refreshRuntimeStatus, refreshSessionMeta, registerHistoryAttachmentUrls, revokeHistoryAttachmentUrls, showToast, stopReadAloud]);
 
   const startNewSession = useCallback(async () => {
     const gateway = gatewayRef.current;
@@ -2195,6 +2224,8 @@ export default function AiwerkAssistantPage() {
       sessionIdRef.current = nextSessionId;
       setActiveSessionKey(activeId);
       storeActiveSessionId(activeId);
+      // Reclaim the previous session's preview blobs when starting fresh.
+      revokeHistoryAttachmentUrls();
       setMessages([welcomeMessage(resolvedUserDisplayName(modelInfo))]);
       setSessionTitle("Neue Unterhaltung");
       setLiveNotes(null);
@@ -2229,7 +2260,7 @@ export default function AiwerkAssistantPage() {
       setError(e instanceof Error ? e.message : String(e));
       showToast("Neue Unterhaltung konnte nicht gestartet werden");
     }
-  }, [modelInfo, refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, showToast, stopReadAloud]);
+  }, [modelInfo, refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, revokeHistoryAttachmentUrls, showToast, stopReadAloud]);
 
   const submit = async (target: ConversationMode = conversationModeRef.current) => {
     const text = (target === "side" ? sideInput : input).trim();
@@ -3899,16 +3930,22 @@ function ResourcesRail({
     if (!message || sendingSupport) return;
     setSendingSupport(true);
     setSupportError(null);
-    const diagnostics = {
-      connection,
-      email: resources?.email ? { status: resources.email.status, summary: resources.email.summary, unread_count: resources.email.unread_count } : undefined,
-      calendar: resources?.calendar ? { status: resources.calendar.status, summary: resources.calendar.summary } : undefined,
-      shared_folder: resources?.shared_folder ? { status: resources.shared_folder.status, summary: resources.shared_folder.summary, source: resources.shared_folder.source } : undefined,
-      vault: resources?.vault ? { status: resources.vault.status, summary: resources.vault.summary, source: resources.vault.source } : undefined,
-      todos: resources?.todos ? { status: resources.todos.status, summary: resources.todos.summary, open_count: resources.todos.open_count } : undefined,
-      contacts: resources?.contacts ? { status: resources.contacts.status, summary: resources.contacts.summary, total_count: resources.contacts.total_count } : undefined,
-      connectors: { count: resources?.connectors.length ?? 0 },
-    };
+    // Honor the opt-out before building the payload: when the user unchecks
+    // diagnostics we must not transmit any resource/session metadata over the
+    // wire (incl. page_url/user_agent), not merely flip include_diagnostics and
+    // rely on the backend to drop it.
+    const diagnostics = supportDiagnostics
+      ? {
+          connection,
+          email: resources?.email ? { status: resources.email.status, summary: resources.email.summary, unread_count: resources.email.unread_count } : undefined,
+          calendar: resources?.calendar ? { status: resources.calendar.status, summary: resources.calendar.summary } : undefined,
+          shared_folder: resources?.shared_folder ? { status: resources.shared_folder.status, summary: resources.shared_folder.summary, source: resources.shared_folder.source } : undefined,
+          vault: resources?.vault ? { status: resources.vault.status, summary: resources.vault.summary, source: resources.vault.source } : undefined,
+          todos: resources?.todos ? { status: resources.todos.status, summary: resources.todos.summary, open_count: resources.todos.open_count } : undefined,
+          contacts: resources?.contacts ? { status: resources.contacts.status, summary: resources.contacts.summary, total_count: resources.contacts.total_count } : undefined,
+          connectors: { count: resources?.connectors.length ?? 0 },
+        }
+      : undefined;
     try {
       await onSendSupport({
         category: supportCategory,
@@ -3917,9 +3954,9 @@ function ResourcesRail({
         include_diagnostics: supportDiagnostics,
         session_id: sessionId,
         session_title: sessionTitle,
-        connection,
-        page_url: window.location.pathname + window.location.search,
-        user_agent: navigator.userAgent,
+        connection: supportDiagnostics ? connection : undefined,
+        page_url: supportDiagnostics ? window.location.pathname + window.location.search : undefined,
+        user_agent: supportDiagnostics ? navigator.userAgent : undefined,
         diagnostics,
       });
       setSupportMessage("");
@@ -4031,8 +4068,7 @@ function ResourcesRail({
   });
   const openVault = () => {
     const url = resources?.vault.vault_url || "https://pass.aiwerk.ch";
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (opened) opened.opener = null;
+    safeWindowOpen(url);
   };
   return (
     <>
@@ -4860,9 +4896,7 @@ function McpConnectorTree({
         const isExpanded = !!expandedItems[connector.id];
         const canOpen = !!connector.open_url;
         const openConnector = () => {
-          if (!connector.open_url) return;
-          const opened = window.open(connector.open_url, "_blank", "noopener,noreferrer");
-          if (opened) opened.opener = null;
+          safeWindowOpen(connector.open_url);
         };
         return (
           <div key={connector.id} className={depth ? "grid min-w-0 gap-[7px] overflow-hidden" : "min-w-0 overflow-hidden"}>
@@ -5336,7 +5370,14 @@ function AttachmentPreviewCard({
       onOpenImage?.({ ...attachment, previewKind });
       return;
     }
-    window.open(openTarget, "_blank", "noopener,noreferrer");
+    // blob: URLs are object URLs we minted from a protected fetch — safe to open
+    // directly; everything else goes through the shared scheme validator.
+    if (openTarget.startsWith("blob:")) {
+      const opened = window.open(openTarget, "_blank", "noopener,noreferrer");
+      if (opened) opened.opener = null;
+      return;
+    }
+    safeWindowOpen(openTarget);
   };
   const openOnKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!canOpen) return;
