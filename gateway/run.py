@@ -13546,6 +13546,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return prefix, successful_transcripts
         return user_text, successful_transcripts
 
+    async def _maybe_echo_transcripts(
+        self,
+        adapter,
+        chat_id: str,
+        transcripts: List[str],
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Echo raw STT transcripts back to the chat as '🎙️ "..."'.
+
+        Centralized privacy gate for every voice-input echo path (fresh
+        message, queued/drain, and interrupt). The raw transcript is only
+        sent when ``voice.echo_transcript`` (config ``echo_transcript``) is
+        explicitly enabled. Default is False: echoing the transcript exposes
+        private dictation and duplicates what the user just said, so STT
+        output stays internal to the agent turn.
+        """
+        if not getattr(self.config, "echo_transcript", False):
+            return
+        if not adapter or not transcripts:
+            return
+        for tx in transcripts:
+            try:
+                await adapter.send(
+                    chat_id,
+                    f'🎙️ "{tx}"',
+                    metadata=metadata,
+                )
+            except Exception as echo_exc:
+                logger.debug(
+                    "Transcript echo failed (non-fatal): %s", echo_exc,
+                )
+
     async def _dequeue_pending_with_transcription(
         self,
         adapter,
@@ -13561,10 +13593,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         time never runs.
 
         This helper fills that gap: when the dequeued event has audio media,
-        we transcribe inline, echo the raw transcript back to the user (same
-        "🎙️" format as the fresh-message path), and return enriched text.
-        Non-audio events fall back to _build_media_placeholder, matching the
-        original _dequeue_pending_text behavior.
+        we transcribe inline, optionally echo the raw transcript back to the
+        user (only when voice.echo_transcript is enabled; see
+        _maybe_echo_transcripts), and return enriched text. Non-audio events
+        fall back to _build_media_placeholder, matching the original
+        _dequeue_pending_text behavior.
         """
         event = adapter.get_pending_message(session_key)
         if not event:
@@ -13588,23 +13621,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
             )
-            # Echo raw transcripts back to the user so voice interrupts
-            # feel identical to fresh voice messages.
-            if successful_transcripts:
-                echo_adapter = self.adapters.get(source.platform)
-                echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                if echo_adapter:
-                    for tx in successful_transcripts:
-                        try:
-                            await echo_adapter.send(
-                                source.chat_id,
-                                f'🎙️ "{tx}"',
-                                metadata=echo_meta,
-                            )
-                        except Exception as echo_exc:
-                            logger.debug(
-                                "Transcript echo failed (non-fatal): %s", echo_exc,
-                            )
+            # Echo raw transcripts back to the user only when explicitly
+            # enabled (voice.echo_transcript); off by default to keep
+            # dictation internal. See _maybe_echo_transcripts.
+            echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+            await self._maybe_echo_transcripts(
+                self.adapters.get(source.platform),
+                source.chat_id,
+                successful_transcripts,
+                echo_meta,
+            )
             return enriched_text or None
 
         # Non-audio fallback: preserve original _dequeue_pending_text semantics.
@@ -17002,9 +17028,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # Transcribe audio media BEFORE signaling the
                                 # agent, so voice messages interrupt with the
                                 # real transcript instead of an empty string
-                                # (or file-path placeholder). Matches the UX
-                                # of fresh voice messages including the
-                                # 🎙️ echo back to the user.
+                                # (or file-path placeholder). The raw transcript
+                                # is only echoed back when voice.echo_transcript
+                                # is enabled (see _maybe_echo_transcripts).
                                 _media_urls = getattr(_peek_event, "media_urls", None) or []
                                 _media_types = getattr(_peek_event, "media_types", None) or []
                                 _audio_paths = []
@@ -17022,20 +17048,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             pending_text, _audio_paths,
                                         )
                                         pending_text = _enriched
-                                        if _transcripts:
-                                            _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                                            for _tx in _transcripts:
-                                                try:
-                                                    await _adapter.send(
-                                                        source.chat_id,
-                                                        f'🎙️ "{_tx}"',
-                                                        metadata=_echo_meta,
-                                                    )
-                                                except Exception as _echo_exc:
-                                                    logger.debug(
-                                                        "Voice-interrupt echo failed (non-fatal): %s",
-                                                        _echo_exc,
-                                                    )
+                                        _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                                        await self._maybe_echo_transcripts(
+                                            _adapter,
+                                            source.chat_id,
+                                            _transcripts,
+                                            _echo_meta,
+                                        )
                                     except Exception as _trans_exc:
                                         logger.warning(
                                             "Voice-interrupt transcription failed: %s", _trans_exc,
@@ -17383,9 +17402,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Transcribe audio media on the dequeued event BEFORE it is
                     # handed back as the next user turn, so queued/interrupting
                     # voice messages drain with the real transcript instead of
-                    # a file-path placeholder. Echo each transcript back to the
-                    # user (same 🎙️ format as fresh voice messages) so voice
-                    # interrupts feel identical to text interrupts.
+                    # a file-path placeholder. The raw transcript is only echoed
+                    # back when voice.echo_transcript is enabled (default off;
+                    # see _maybe_echo_transcripts).
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
                     _media_types = getattr(pending_event, "media_types", None) or []
@@ -17404,19 +17423,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _pending_text, _audio_paths,
                             )
                             pending = _enriched or None
-                            if _transcripts:
-                                _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                                for _tx in _transcripts:
-                                    try:
-                                        await adapter.send(
-                                            source.chat_id,
-                                            f'🎙️ "{_tx}"',
-                                            metadata=_echo_meta,
-                                        )
-                                    except Exception as _echo_exc:
-                                        logger.debug(
-                                            "Voice-drain echo failed (non-fatal): %s", _echo_exc,
-                                        )
+                            _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                            await self._maybe_echo_transcripts(
+                                adapter,
+                                source.chat_id,
+                                _transcripts,
+                                _echo_meta,
+                            )
                         except Exception as _trans_exc:
                             logger.warning(
                                 "Voice-drain transcription failed: %s", _trans_exc,
