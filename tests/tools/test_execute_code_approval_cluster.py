@@ -175,6 +175,11 @@ def gw_session(monkeypatch):
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("AIWERK_CUI_MANAGED_AUTONOMY", raising=False)
+    monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT", raising=False)
+    monkeypatch.delenv("AIWERK_CUI_TENANT_ID", raising=False)
+    monkeypatch.delenv("AIWERK_CUI_ACTOR_ID", raising=False)
+    monkeypatch.delenv("AIWERK_CUI_ACTOR_ROLE", raising=False)
     # Force manual mode regardless of host config.
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
 
@@ -183,6 +188,8 @@ def gw_session(monkeypatch):
     with A._lock:
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
+        A._permanent_approved.discard("execute_code")
+        A._session_approved.pop(session_key, None)
     try:
         yield session_key
     finally:
