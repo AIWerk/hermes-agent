@@ -527,6 +527,12 @@ class GatewayConfig:
 
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
+    # Echo the raw STT transcript back into the chat as '🎙️ "..."'. Default
+    # False keeps dictation internal to the agent turn: echoing the raw
+    # transcript exposes private speech and duplicates what the user just said
+    # (platforms such as Telegram may also show their own transcription UI).
+    # Opt in with voice.echo_transcript / echo_transcript: true.
+    echo_transcript: bool = False
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -650,6 +656,7 @@ class GatewayConfig:
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
+            "echo_transcript": self.echo_transcript,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
@@ -697,6 +704,10 @@ class GatewayConfig:
         if stt_enabled is None:
             stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
 
+        echo_transcript = data.get("echo_transcript")
+        if echo_transcript is None:
+            echo_transcript = data.get("voice", {}).get("echo_transcript") if isinstance(data.get("voice"), dict) else None
+
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
         multiplex_profiles = data.get("multiplex_profiles")
@@ -739,6 +750,7 @@ class GatewayConfig:
                 data.get("filter_silence_narration"), True
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
+            echo_transcript=_coerce_bool(echo_transcript, False),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
@@ -841,6 +853,15 @@ def load_gateway_config() -> GatewayConfig:
             stt_cfg = yaml_cfg.get("stt")
             if isinstance(stt_cfg, dict):
                 gw_data["stt"] = stt_cfg
+
+            # Voice section (echo_transcript privacy gate). Accept the nested
+            # ``voice.echo_transcript`` form and the flat ``echo_transcript``
+            # top-level key; from_dict resolves either.
+            voice_cfg = yaml_cfg.get("voice")
+            if isinstance(voice_cfg, dict):
+                gw_data["voice"] = voice_cfg
+            if "echo_transcript" in yaml_cfg:
+                gw_data["echo_transcript"] = yaml_cfg["echo_transcript"]
 
             if "group_sessions_per_user" in yaml_cfg:
                 gw_data["group_sessions_per_user"] = yaml_cfg["group_sessions_per_user"]
