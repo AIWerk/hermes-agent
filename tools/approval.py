@@ -12,11 +12,13 @@ import ast
 import contextvars
 import fnmatch
 import functools
+import ipaddress
 import json
 import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import threading
 import time
@@ -164,33 +166,39 @@ def _cui_actor_context() -> dict:
     The dashboard only injects this into the spawned assistant-mode chat child
     after app-level auth has established tenant/user/admin identity. Treat it
     as a deployment-time trust boundary, not as user prompt content.
+
+    Delegates to the canonical ``agent.cui_actor_context`` helper so this path
+    transparently picks up the per-turn ContextVar (race-free across concurrent
+    in-process gateway turns) once it is bound, falling back to the os.environ
+    bridge for the CLI/cron/subprocess paths. The returned dict shape is
+    unchanged (sanitized tenant_id/actor_id/role/... keys).
     """
-    raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
-    data = {}
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except Exception:
-            data = {}
-    for env_key, out_key in (
-        ("AIWERK_CUI_TENANT_ID", "tenant_id"),
-        ("AIWERK_CUI_ACTOR_ID", "actor_id"),
-        ("AIWERK_CUI_ACTOR_ROLE", "role"),
-    ):
-        value = os.getenv(env_key, "")
-        if value and not data.get(out_key):
-            data[out_key] = value
-    return {str(k): str(v) for k, v in data.items() if v is not None}
+    from agent.cui_actor_context import current_cui_actor_context
+
+    return dict(current_cui_actor_context())
+
+
+# Roles trusted to skip dangerous-command approval prompts under managed
+# autonomy. Restricted to genuine operators/admins — a lay customer ('user'/
+# 'tenant_user') in a managed CUI session must NOT silently run dangerous
+# (non-hardline) commands like `git push --force`, `chmod -R 777`, or
+# `docker restart`. Mirrors agent.cui_actor_context._ADMIN_ROLES (the canonical
+# operator/admin allowlist); 'tenant_admin'/'aiwerk_admin' are admin aliases
+# the dashboard may inject for the same trust tier.
+_MANAGED_AUTONOMY_OPERATOR_ROLES = {
+    "admin", "operator", "owner", "support",
+    "tenant_admin", "aiwerk_admin",
+}
 
 
 def _is_cui_managed_autonomy_enabled() -> bool:
     """True when authenticated assistant-mode CUI should avoid raw prompts.
 
     This is deliberately narrower than process/global YOLO: it requires a flag
-    set by the dashboard child environment AND trusted tenant actor metadata.
-    Hardline and sudo-stdin guards still run before this check.
+    set by the dashboard child environment AND a trusted operator/admin tenant
+    actor. Lay customer roles ('user'/'tenant_user') are intentionally excluded
+    so dangerous (non-hardline) commands still prompt for them. Hardline and
+    sudo-stdin guards still run before this check regardless of role.
     """
     if not env_var_enabled("AIWERK_CUI_MANAGED_AUTONOMY"):
         return False
@@ -200,11 +208,7 @@ def _is_cui_managed_autonomy_enabled() -> bool:
     role = (actor.get("role") or "").strip().lower()
     if not tenant_id or not actor_id:
         return False
-    allowed_roles = {
-        "user", "admin", "owner", "operator",
-        "tenant_user", "tenant_admin", "aiwerk_admin",
-    }
-    return role in allowed_roles
+    return role in _MANAGED_AUTONOMY_OPERATOR_ROLES
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
@@ -1421,8 +1425,41 @@ def check_dangerous_command(command: str, env_type: str,
     return {"approved": True, "message": None}
 
 
+# A bare IP literal token: only decimal-dotted IPv4 or (bracketed) IPv6 uses
+# these characters. Anything that looks IP-ish (digits/dots/colons/hex) but is
+# NOT a valid ``ipaddress.ip_address`` is an obfuscated literal — octal
+# (0177.0.0.1), 32-bit decimal (2130706433), hex (0x7f.0.0.1), or short form —
+# which the C resolver still interprets as a private/loopback address. We reject
+# those outright rather than hand them to DNS, where they would resolve to an
+# internal host. Bounded character class, no backtracking → ReDoS-safe.
+_IP_LITERAL_SHAPE_RE = re.compile(r"^[0-9a-fx:.]+$", re.IGNORECASE)
+
+
+def _is_global_ip(value: str) -> bool:
+    """True only for a parseable IP address that is globally routable.
+
+    ``ipaddress.is_global`` rejects every IANA special-use range in one shot:
+    loopback (127.0.0.0/8, ::1), link-local incl. cloud metadata
+    (169.254.0.0/16, fe80::/10), RFC1918 (10/8, 172.16/12, 192.168/16),
+    CGNAT (100.64/10), 0.0.0.0/8, unique-local (fc00::/7), and IPv4-mapped
+    forms of all of these (::ffff:127.0.0.1).
+    """
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
 def _is_public_http_url(url: str) -> bool:
-    """Return True for non-local HTTP(S) URLs suitable for CUI auto-read."""
+    """Return True for HTTP(S) URLs that resolve only to public IP addresses.
+
+    SSRF defense for the CUI auto-read fast paths: resolve the hostname and
+    ALLOW only when every resolved address is globally routable
+    (``ipaddress.is_global``). This rejects the cloud-metadata endpoint, the
+    full loopback range, RFC1918/CGNAT, IPv4-mapped loopback, internal-resolving
+    hostnames, and non-decimal-dotted IP literals (octal/decimal/hex), which the
+    previous prefix denylist let through. Fails closed on resolution errors.
+    """
     try:
         parsed = urlparse(url)
     except Exception:
@@ -1430,11 +1467,30 @@ def _is_public_http_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
     host = parsed.hostname.lower()
-    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+
+    # Direct IP literal (decimal-dotted IPv4 or IPv6): check it as-is. No DNS.
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        pass
+
+    # Looks like an IP literal but did not parse → obfuscated encoding
+    # (octal/decimal/hex). Reject; do not let the resolver normalize it to a
+    # private address.
+    if _IP_LITERAL_SHAPE_RE.match(host):
         return False
-    if re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", host):
+
+    # Real hostname: resolve and require EVERY address to be globally routable.
+    # An empty result, a resolution failure, or any non-global address is a
+    # reject (DNS-rebinding / internal-name protection).
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
         return False
-    return True
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        return False
+    return all(_is_global_ip(addr) for addr in addresses)
 
 
 def _is_safe_curl_read(command: str) -> bool:
@@ -1498,6 +1554,11 @@ def _is_low_risk_cui_execute_code(code: str) -> bool:
         r"\brmtree\b", r"\bremove\b", r"\brmdir\b", r"\bmkdir\b",
         r"\bwrite_file\b", r"\bpatch\b", r"\bdelete\b", r"\bemail\b",
         r"\bpost\b", r"\bput\b", r"\bpatch\b", r"\bdelete\b", r"\bupload\b",
+        # urlretrieve downloads a URL straight to a local file path — a
+        # network-driven disk write, not a read-only fetch. The open()-for-write
+        # regex below does not see its implicit file write. urlcleanup is its
+        # companion and equally non-read-only.
+        r"\burlretrieve\b", r"\burlcleanup\b",
         r"\bopen\s*\([^\)]*['\"](?:w|a|x|r\+)"
     ]
     if any(re.search(pattern, lower) for pattern in forbidden):

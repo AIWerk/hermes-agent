@@ -54,25 +54,60 @@ class TestCuiManagedAutonomy:
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv(
             "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"rocky","actor_id":"rocky:user","role":"user"}',
+            '{"tenant_id":"rocky","actor_id":"rocky:op","role":"operator"}',
         )
         assert _is_cui_managed_autonomy_enabled() is True
 
         monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT")
         monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "user")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:op")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
         assert _is_cui_managed_autonomy_enabled() is True
 
         monkeypatch.delenv("AIWERK_CUI_ACTOR_ID")
         assert _is_cui_managed_autonomy_enabled() is False
+
+    def test_actor_context_reads_through_canonical_helper(self, monkeypatch):
+        """approval._cui_actor_context() must source identity from the canonical
+        agent.cui_actor_context helper (env-driven here; ContextVar-backed once
+        PR-2 lands), not re-parse os.environ itself."""
+        monkeypatch.setenv(
+            "AIWERK_CUI_ACTOR_CONTEXT",
+            '{"tenant_id":"rocky","actor_id":"rocky:op","role":"operator"}',
+        )
+        # The helper is the single source of truth for the actor dict.
+        from agent.cui_actor_context import current_cui_actor_context
+
+        assert approval_module._cui_actor_context() == current_cui_actor_context()
+        assert approval_module._cui_actor_context()["actor_id"] == "rocky:op"
+
+        # Delegation, not a private re-parse: stubbing the helper changes what
+        # approval sees, proving it does not read os.environ directly.
+        monkeypatch.setattr(
+            "agent.cui_actor_context.current_cui_actor_context",
+            lambda: {"tenant_id": "t2", "actor_id": "a2", "role": "admin"},
+        )
+        assert approval_module._cui_actor_context() == {
+            "tenant_id": "t2",
+            "actor_id": "a2",
+            "role": "admin",
+        }
+
+    def test_lay_customer_roles_do_not_get_managed_autonomy(self, monkeypatch):
+        """'user'/'tenant_user' are customers, not operators — no bypass."""
+        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
+        for role in ("user", "tenant_user"):
+            monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", role)
+            assert _is_cui_managed_autonomy_enabled() is False
 
     def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(self, monkeypatch):
         monkeypatch.setenv("HERMES_EXEC_ASK", "true")
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv(
             "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"rocky","actor_id":"rocky:user","role":"user"}',
+            '{"tenant_id":"rocky","actor_id":"rocky:op","role":"operator"}',
         )
 
         approved = check_all_command_guards("rm -rf /tmp/hermes-demo", "local")
@@ -87,15 +122,16 @@ class TestCuiManagedAutonomy:
         monkeypatch.setenv("HERMES_EXEC_ASK", "true")
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "user")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:op")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
 
         code = """
 from hermes_tools import terminal
 result = terminal("curl -sS 'https://api.open-meteo.com/v1/forecast?latitude=46.95&longitude=7.44'")
 print(result)
 """
-        result = check_execute_code_guard(code, "local")
+        with mock_patch("tools.approval._is_public_http_url", return_value=True):
+            result = check_execute_code_guard(code, "local")
         assert result["approved"] is True
         assert result["policy_scoped_autonomy"] is True
         assert result["low_risk_cui_read"] is True
@@ -104,8 +140,8 @@ print(result)
         monkeypatch.setenv("HERMES_EXEC_ASK", "true")
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "user")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:op")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
 
         with mock_patch("tools.approval._get_approval_mode", return_value="manual"), \
             mock_patch.object(approval_module, "_permanent_approved", set()):
