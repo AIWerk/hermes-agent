@@ -48,7 +48,7 @@ _MAX_SCAN = 4096
 # bounded (no nested unbounded quantifiers), so matching stays linear.
 _VALUE = r"(?:'[^']*'|\"[^\"]*\"|[^\n'\",;]+)"
 
-_SECRET_PATTERNS = [
+_KEYED_SECRET_PATTERNS = [
     # Keyed forms: group(1) is the label and is kept; the value is redacted.
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)" + _VALUE),
     re.compile(r"(?i)(authorization\s*:\s*basic\s+)" + _VALUE),
@@ -72,21 +72,26 @@ _SECRET_PATTERNS = [
         r"|secret|password|passwd|api[_-]?key|apikey|auth(?:orization)?|token"
         r'|private[_-]?key|key)"\s*:\s*)"[^"]*"'
     ),
-    # scheme://user:password@host — keep "scheme://user:", redact the password.
-    # Scheme run is anchored (no preceding alnum) and bounded ({0,30}) so the
-    # engine cannot backtrack quadratically on a long no-delimiter blob.
-    re.compile(r"(?i)(?<![A-Za-z0-9])([a-z][a-z0-9+.-]{0,30}://[^\s:/@]+:)[^@/\s]+(?=@)"),
     # AWS SECRET access key. Labeled form keeps the label, redacts the value.
     re.compile(r"(?i)(aws_secret_access_key\s*[=:]\s*)" + _VALUE),
-    # Value-only forms: the whole match is the secret and is fully redacted.
-    # Sourced from the canonical agent.secret_patterns module so this index
-    # redactor and the durable-memory gate (memory_router.contains_secret) and
-    # the feedback-inbox sanitizer (self_learning_capture) cannot drift apart.
-    VALUE_ONLY_RE,
-    # Bare 40-char base64-ish AWS *secret* (mixed case w/ upper or / or +; a
-    # lowercase-hex git SHA-1 is intentionally NOT matched).
-    AWS_BARE_SECRET_RE,
 ]
+
+# scheme://user:password@host — keep "scheme://user:", redact the password.
+# Scheme run is anchored (no preceding alnum) and bounded ({0,30}) so the engine
+# cannot backtrack quadratically on a long no-delimiter blob. It is only tried
+# when the cheap literal prefilter sees both a URL delimiter and userinfo marker.
+_URL_PASSWORD_RE = re.compile(r"(?i)(?<![A-Za-z0-9])([a-z][a-z0-9+.-]{0,30}://[^\s:/@]+:)[^@/\s]+(?=@)")
+
+# Value-only forms: the whole match is the secret and is fully redacted.
+# Sourced from the canonical agent.secret_patterns module so this index redactor
+# and the durable-memory gate (memory_router.contains_secret) and the
+# feedback-inbox sanitizer (self_learning_capture) cannot drift apart.
+_VALUE_ONLY_MARKERS = (
+    "sk-", "sk_", "pk_", "rk_", "xox", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+    "github_pat_", "aiza", "akia", "asia", "gocspx-", "npm_", "eyj", "hooks.slack.com/",
+    "xai-", "sg.", "hf_", "pplx-", "tvly-", "bot",
+)
+_KEYED_MARKERS = ("authorization", "api", "password", "passwd", "token", "secret", "credential", "key")
 
 # Block secrets (PEM private keys) can span past _MAX_SCAN. They are redacted on
 # the FULL text BEFORE the scan cap (see redact_sensitive_text), so a key whose
@@ -119,7 +124,19 @@ def redact_sensitive_text(text: str) -> str:
     if "-----BEGIN " in raw and "PRIVATE KEY-----" in raw:
         raw = _BLOCK_SECRET_RE.sub("[REDACTED]", raw)
     redacted = raw[:_MAX_SCAN]
-    for pattern in _SECRET_PATTERNS:
+    redacted_lower = redacted.lower()
+
+    patterns: list[re.Pattern[str]] = []
+    if any(marker in redacted_lower for marker in _KEYED_MARKERS):
+        patterns.extend(_KEYED_SECRET_PATTERNS)
+    if "://" in redacted and "@" in redacted:
+        patterns.append(_URL_PASSWORD_RE)
+    if any(marker in redacted_lower for marker in _VALUE_ONLY_MARKERS):
+        patterns.append(VALUE_ONLY_RE)
+    if len(redacted) >= 40 and any(c.isupper() or c in "/+" for c in redacted):
+        patterns.append(AWS_BARE_SECRET_RE)
+
+    for pattern in patterns:
         def repl(match: re.Match[str]) -> str:
             if match.lastindex:
                 return f"{match.group(1)}[REDACTED]"
