@@ -107,3 +107,46 @@ def test_cui_actor_context_from_authenticated_request(monkeypatch):
         "actor_id": "meerwohnen:susanne:user",
         "role": "user",
     }
+
+
+def test_cui_actor_context_fails_closed_when_metadata_empty(monkeypatch):
+    # A logged-in customer in assistant mode whose auth provider does NOT
+    # populate tenant/actor/role must NOT yield {} (which the visibility filter
+    # reads as the trusted admin/loopback path). It returns the restricted
+    # sentinel so the customer view fails closed.
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server, "_assistant_mode_enabled", lambda: True)
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            session=SimpleNamespace(
+                tenant_id="", org_id="", actor_id="", user_id="", role="",
+            )
+        )
+    )
+    actor = web_server._cui_actor_context_from_request(request)
+    assert actor.get("_restricted") == "1"
+
+
+def test_restricted_actor_sees_no_sessions(monkeypatch):
+    # The restricted sentinel must make every session invisible (fail closed),
+    # including customer-tagged ones with no proven ownership.
+    from hermes_cli import web_server
+
+    restricted = {"role": "user", "_restricted": "1"}
+    tagged_customer = {
+        "id": "cust-session",
+        "model_config": json.dumps(
+            {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": "meerwohnen:susanne:user",
+                "_cui_tenant_id": "meerwohnen",
+            }
+        ),
+    }
+    untagged = {"id": "x", "source": "tui", "model_config": None}
+    assert web_server._session_visible_to_cui_actor(tagged_customer, restricted) is False
+    assert web_server._session_visible_to_cui_actor(untagged, restricted) is False
+    # And the unconfined path (no actor at all) is unchanged.
+    assert web_server._session_visible_to_cui_actor(untagged, {}) is True

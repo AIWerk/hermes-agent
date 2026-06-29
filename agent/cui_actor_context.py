@@ -2,15 +2,62 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 from typing import Any, Dict
 
 _ADMIN_ROLES = {"admin", "operator", "owner", "support"}
 
+_ACTOR_KEYS = ("tenant_id", "actor_id", "role", "display_name", "user_id", "provider")
+
+# Per-turn actor context, bound by in-process gateway turns. ``os.environ`` is
+# process-global, so concurrent in-process turns in the TUI gateway would clobber
+# each other's actor identity (cross-customer context bleed). The contextvar is
+# isolated per logical flow (thread / asyncio task / copied context), so it is
+# race-free across concurrent turns. ``os.environ`` stays as the fallback for the
+# subprocess CLI/cron/test paths, where the child receives the context via its
+# environment rather than an in-process binding.
+_cui_actor_context_var: contextvars.ContextVar[Dict[str, str] | None] = (
+    contextvars.ContextVar("cui_actor_context", default=None)
+)
+
+
+def _sanitize_actor(data: Dict[str, Any] | None) -> Dict[str, str]:
+    clean: Dict[str, str] = {}
+    for key in _ACTOR_KEYS:
+        value = (data or {}).get(key)
+        if value is not None and str(value).strip():
+            clean[key] = str(value).strip()
+    return clean
+
+
+def bind_cui_actor_context(actor: Dict[str, str] | None) -> contextvars.Token:
+    """Bind a sanitized actor context for the current logical flow.
+
+    Returns a token; pass it to :func:`reset_cui_actor_context` (try/finally) to
+    restore the previous binding. An empty/None actor binds ``None`` so reads
+    fall through to the ``os.environ`` path.
+    """
+    clean = _sanitize_actor(actor)
+    return _cui_actor_context_var.set(clean or None)
+
+
+def reset_cui_actor_context(token: contextvars.Token) -> None:
+    """Restore the actor context to the value captured in ``token``."""
+    _cui_actor_context_var.reset(token)
+
 
 def current_cui_actor_context() -> Dict[str, str]:
-    """Return sanitized actor context injected by the authenticated CUI."""
+    """Return sanitized actor context injected by the authenticated CUI.
+
+    Prefers the per-turn contextvar (race-free across concurrent in-process
+    turns); falls back to the ``os.environ`` bridge for CLI/cron/subprocess/test
+    paths where no contextvar is bound.
+    """
+    bound = _cui_actor_context_var.get()
+    if bound:
+        return dict(bound)
     raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
     data: Dict[str, Any] = {}
     if raw:
@@ -28,12 +75,7 @@ def current_cui_actor_context() -> Dict[str, str]:
         value = os.getenv(env_key, "")
         if value and not data.get(out_key):
             data[out_key] = value
-    clean: Dict[str, str] = {}
-    for key in ("tenant_id", "actor_id", "role", "display_name", "user_id", "provider"):
-        value = data.get(key)
-        if value is not None and str(value).strip():
-            clean[key] = str(value).strip()
-    return clean
+    return _sanitize_actor(data)
 
 
 def is_aiwerk_admin_actor(actor: Dict[str, str] | None = None) -> bool:

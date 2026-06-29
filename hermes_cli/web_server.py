@@ -399,6 +399,26 @@ _ASSISTANT_ALLOWED_SLASH_COMMANDS: frozenset = frozenset({
 })
 
 
+def _inject_trusted_cui_actor(params: dict, auth_info: dict) -> None:
+    """Stamp the SERVER-trusted ticket identity onto an inbound WS request.
+
+    The minted ws-ticket identity is authoritative. STRIP any client-supplied
+    actor keys FIRST, then assign the trusted values directly — never
+    ``setdefault``: setdefault keeps a pre-existing client value, so a customer
+    who sends ``_cui_actor_role:"admin"`` in their own params would otherwise be
+    treated as admin for skill visibility (``commands.catalog`` would expose the
+    full admin/internal skill catalogue). Direct assignment restores server-wins.
+    """
+    for key in ("_cui_actor_role", "_cui_actor_id", "_cui_tenant_id", "actor_role"):
+        params.pop(key, None)
+    if auth_info.get("role"):
+        params["_cui_actor_role"] = str(auth_info.get("role") or "")
+    if auth_info.get("actor_id") or auth_info.get("user_id"):
+        params["_cui_actor_id"] = str(auth_info.get("actor_id") or auth_info.get("user_id") or "")
+    if auth_info.get("tenant_id"):
+        params["_cui_tenant_id"] = str(auth_info.get("tenant_id") or "")
+
+
 def _assistant_ws_request_gate(req: Any) -> Optional[str]:
     """Confine an inbound /api/ws JSON-RPC request to the customer chat surface.
 
@@ -433,6 +453,76 @@ def _assistant_ws_request_gate(req: Any) -> Optional[str]:
         if base not in _ASSISTANT_ALLOWED_SLASH_COMMANDS:
             return f"slash command not available in assistant mode: /{base or '(none)'}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Admin-only HTTP enforcement (proportional role policy).
+#
+# The dashboard exposes a set of "big red button" mutating endpoints — the
+# credential pool, MCP/runtime config, gateway lifecycle, security ops — that
+# must be reachable only by an admin/operator session, never by an ordinary
+# authenticated (non-admin) user. ``hermes_cli.dashboard_auth.permissions``
+# defines the policy; this map wires it into the request pipeline so the policy
+# is an enforced control, not advisory documentation. Each entry maps an
+# (HTTP method, path-prefix) to one of the policy's ``_ADMIN_ONLY_ACTIONS``.
+# decide_dashboard_permission default-DENYs anything it cannot classify, so an
+# endpoint added here is fail-closed for non-admins by construction.
+# ---------------------------------------------------------------------------
+_ADMIN_API_ACTIONS: tuple[tuple[str, str, str], ...] = (
+    # (HTTP method, path prefix, policy action)
+    ("POST", "/api/credentials/pool", "security.policy_weaken"),
+    ("DELETE", "/api/credentials/pool", "security.policy_weaken"),
+    ("POST", "/api/mcp/servers", "tool.allowlist.change"),
+    ("DELETE", "/api/mcp/servers", "tool.allowlist.change"),
+    ("PUT", "/api/mcp/servers", "tool.allowlist.change"),
+    ("POST", "/api/mcp/catalog/install", "tool.allowlist.change"),
+    ("POST", "/api/gateway/restart", "runtime.restart_shared_prod"),
+    ("POST", "/api/gateway/start", "runtime.restart_shared_prod"),
+    ("POST", "/api/gateway/stop", "runtime.restart_shared_prod"),
+    ("POST", "/api/gateway/drain", "runtime.restart_shared_prod"),
+    ("POST", "/api/memory/reset", "memory.reset_all"),
+    ("POST", "/api/ops/security-audit", "security.policy_weaken"),
+    ("DELETE", "/api/ops/hooks", "security.policy_weaken"),
+    ("POST", "/api/ops/hooks", "security.policy_weaken"),
+    ("POST", "/api/webhooks", "security.policy_weaken"),
+    ("DELETE", "/api/webhooks", "security.policy_weaken"),
+    ("POST", "/api/pairing/approve", "identity.user_invite"),
+    ("POST", "/api/pairing/revoke", "identity.user_remove"),
+)
+
+
+def _admin_api_action_for(method: str, path: str) -> Optional[str]:
+    """Return the admin-only policy action governing (method, path), or None."""
+    m = (method or "").upper()
+    for entry_method, prefix, action in _ADMIN_API_ACTIONS:
+        if m == entry_method and (path == prefix or path.startswith(prefix + "/")):
+            return action
+    return None
+
+
+def _enforce_admin_api_permission(request: Request) -> Optional[JSONResponse]:
+    """Deny mutating admin endpoints to non-admin sessions (fail closed).
+
+    Returns a 403 JSONResponse when the verified session is not permitted to
+    perform the admin-only action mapped to this request, else None. Only acts
+    when a verified ``request.state.session`` is present (gated/OAuth mode);
+    loopback/token mode has a single trusted operator and no role to enforce.
+    """
+    action = _admin_api_action_for(request.method, request.url.path)
+    if action is None:
+        return None
+    session = getattr(getattr(request, "state", None), "session", None)
+    if session is None:
+        return None
+    from hermes_cli.dashboard_auth.permissions import decide_dashboard_permission
+
+    decision = decide_dashboard_permission(action, session=session, scope="own_tenant")
+    if decision.allowed:
+        return None
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "Admin privileges required for this action."},
+    )
 
 
 # Customer UI attachment upload limits. Files are stored under HERMES_HOME only,
@@ -5428,6 +5518,24 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
 
 
 @app.middleware("http")
+async def _admin_permission_middleware(request: Request, call_next):
+    """Enforce the proportional admin-only policy on mutating admin endpoints.
+
+    Registered FIRST so Starlette runs it INNERMOST — by the time it executes,
+    the OAuth gate (``_dashboard_auth_gate``) and token seam have already
+    attached ``request.state.session``. This is the wiring that turns
+    ``hermes_cli.dashboard_auth.permissions`` from advisory documentation into
+    an enforced control: an authenticated but non-admin session is rejected
+    with 403 for any endpoint mapped in ``_ADMIN_API_ACTIONS`` (and the policy
+    default-DENYs unknown actions, so the map is fail-closed by construction).
+    """
+    denied = _enforce_admin_api_permission(request)
+    if denied is not None:
+        return denied
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def host_header_middleware(request: Request, call_next):
     """Reject requests whose Host header doesn't match the bound interface.
 
@@ -8711,6 +8819,14 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+# Sentinel actor returned in assistant mode for a logged-in customer whose auth
+# provider did not populate tenant/actor/role. It is deliberately the most
+# restrictive non-admin context so session visibility fails CLOSED (lists
+# nothing, blocks every resume) rather than fails open to the whole session
+# table. See _session_visible_to_cui_actor.
+_CUI_RESTRICTED_ACTOR: dict[str, str] = {"role": "user", "_restricted": "1"}
+
+
 def _cui_actor_context_from_request(request: Request | None) -> dict[str, str]:
     """Return authenticated CUI actor context for assistant-mode requests."""
     if request is None or not _assistant_mode_enabled():
@@ -8722,7 +8838,12 @@ def _cui_actor_context_from_request(request: Request | None) -> dict[str, str]:
     actor_id = str(getattr(sess, "actor_id", "") or getattr(sess, "user_id", "") or "").strip()
     role = str(getattr(sess, "role", "") or "user").strip().lower()
     if not (tenant_id and actor_id and role):
-        return {}
+        # Fail closed: a logged-in customer in assistant mode whose provider
+        # yields no tenant/actor/role MUST NOT be treated as "no actor" (which
+        # the visibility filter reads as the trusted admin/loopback path and
+        # lists everything). Return the restricted sentinel so the customer
+        # sees only sessions that positively match — i.e. none.
+        return dict(_CUI_RESTRICTED_ACTOR)
     return {"tenant_id": tenant_id, "actor_id": actor_id, "role": role}
 
 
@@ -8753,6 +8874,11 @@ def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | 
     actor = actor or {}
     if not actor:
         return True
+    if actor.get("_restricted"):
+        # A logged-in assistant-mode customer with no tenant/actor/role from the
+        # auth provider. Cannot prove ownership of any session, so nothing is
+        # visible (fail closed).
+        return False
     role = (actor.get("role") or "").strip().lower()
     if role in {"admin", "owner", "operator"}:
         return True
@@ -17758,12 +17884,7 @@ async def gateway_ws(ws: WebSocket) -> None:
                     if not isinstance(params, dict):
                         params = {}
                         req["params"] = params
-                    if auth_info.get("role"):
-                        params.setdefault("_cui_actor_role", str(auth_info.get("role") or ""))
-                    if auth_info.get("actor_id") or auth_info.get("user_id"):
-                        params.setdefault("_cui_actor_id", str(auth_info.get("actor_id") or auth_info.get("user_id") or ""))
-                    if auth_info.get("tenant_id"):
-                        params.setdefault("_cui_tenant_id", str(auth_info.get("tenant_id") or ""))
+                    _inject_trusted_cui_actor(params, auth_info)
             except Exception:
                 pass
             return _assistant_ws_request_gate(req)

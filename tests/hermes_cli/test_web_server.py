@@ -8655,11 +8655,28 @@ class TestAssistantWsGate:
     def test_allows_chat_methods(self):
         gate = self._gate()
         for method in [
-            "session.create", "session.resume", "session.title", "session.notes",
+            "session.create", "session.title", "session.notes",
             "session.usage", "session.steer", "session.side.start",
             "session.side.back", "prompt.submit", "approval.respond",
         ]:
             assert gate({"id": 1, "method": method, "params": {}}) is None, method
+
+    def test_session_resume_is_method_allowed_but_not_authorization(self):
+        # session.resume is allowed as a METHOD (the chat UI needs it), but the
+        # gate is NOT the authorization boundary for it: a method-level allow no
+        # longer implies a customer may resume an arbitrary session_id. Per-actor
+        # session visibility is enforced inside the gateway session.resume
+        # handler against the dispatch actor_context (see
+        # tests/tui_gateway/test_cui_actor_gateway_context.py). This test pins
+        # that the gate still lets the method through (so the handler can run and
+        # apply its own visibility check) rather than the gate silently being the
+        # only control.
+        gate = self._gate()
+        assert gate({"id": 1, "method": "session.resume", "params": {}}) is None
+        assert gate(
+            {"id": 1, "method": "session.resume",
+             "params": {"session_id": "someone-elses-session"}}
+        ) is None
 
     def test_blocks_admin_methods(self):
         gate = self._gate()
@@ -8724,6 +8741,136 @@ class TestAssistantWsGate:
         assert gate("not-a-dict") is None
         assert gate({"params": {}}) is None
         assert gate({"method": "", "params": {}}) is None
+
+
+class TestTrustedCuiActorInjection:
+    """The server-minted ws-ticket identity must be authoritative; a client
+    cannot spoof _cui_actor_role to escalate skill visibility.
+    """
+
+    def _inject(self):
+        import hermes_cli.web_server as web_server
+
+        return web_server._inject_trusted_cui_actor
+
+    def test_client_supplied_role_is_overwritten_not_kept(self):
+        inject = self._inject()
+        # Customer tries to spoof admin; server ticket says role=user.
+        params = {"_cui_actor_role": "admin", "actor_role": "admin", "method_arg": 1}
+        inject(params, {"role": "user", "actor_id": "cust-1", "tenant_id": "meerwohnen"})
+        assert params["_cui_actor_role"] == "user"  # server wins
+        assert params["_cui_actor_id"] == "cust-1"
+        assert params["_cui_tenant_id"] == "meerwohnen"
+        # The legacy alias key the consumer also reads must be stripped.
+        assert "actor_role" not in params
+        # Unrelated params are preserved.
+        assert params["method_arg"] == 1
+
+    def test_client_supplied_actor_and_tenant_are_overwritten(self):
+        inject = self._inject()
+        params = {"_cui_actor_id": "victim", "_cui_tenant_id": "other-co"}
+        inject(params, {"role": "user", "actor_id": "cust-1", "tenant_id": "meerwohnen"})
+        assert params["_cui_actor_id"] == "cust-1"
+        assert params["_cui_tenant_id"] == "meerwohnen"
+
+    def test_no_trusted_identity_strips_client_keys(self):
+        # If the ticket carries no identity, client-supplied keys must NOT
+        # survive (default-safe: no role => not admin).
+        inject = self._inject()
+        params = {"_cui_actor_role": "admin"}
+        inject(params, {})
+        assert "_cui_actor_role" not in params
+
+    def test_spoofed_admin_does_not_make_actor_admin(self):
+        # End-to-end through the gateway helpers: a spoofed admin role does not
+        # make tui_gateway treat the actor as admin for skill visibility.
+        from tui_gateway import server as gw
+
+        inject = self._inject()
+        params = {"_cui_actor_role": "admin"}
+        inject(params, {"role": "user", "actor_id": "cust-1", "tenant_id": "meerwohnen"})
+        assert gw._cui_actor_role_from_params(params) == "user"
+        assert gw._cui_actor_is_admin(params) is False
+
+
+class TestAdminApiPermissionEnforcement:
+    """decide_dashboard_permission must be WIRED into a real HTTP enforcement
+    point: a non-admin session is rejected for an _ADMIN_ONLY_ACTIONS endpoint.
+    """
+
+    def test_admin_action_map_maps_to_admin_only_actions(self):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth.permissions import is_admin_only_action
+
+        for _method, _prefix, action in web_server._ADMIN_API_ACTIONS:
+            assert is_admin_only_action(action), action
+
+    def test_non_admin_session_is_denied_admin_endpoint(self):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth.base import Session
+
+        def _sess(role):
+            return Session(
+                user_id="u1", email="u@x.test", display_name="U", org_id="t1",
+                provider="basic", expires_at=9999999999, access_token="at",
+                refresh_token="rt", tenant_id="t1", actor_id="a1", role=role,
+            )
+
+        class _State:
+            pass
+
+        class _FakeRequest:
+            def __init__(self, method, path, session):
+                self.method = method
+                self.url = type("U", (), {"path": path})()
+                self.state = _State()
+                self.state.session = session
+
+        # A real admin endpoint from the map.
+        denied = web_server._enforce_admin_api_permission(
+            _FakeRequest("POST", "/api/credentials/pool", _sess("user"))
+        )
+        assert denied is not None and denied.status_code == 403
+
+        # An admin session is allowed through (returns None).
+        allowed = web_server._enforce_admin_api_permission(
+            _FakeRequest("POST", "/api/credentials/pool", _sess("admin"))
+        )
+        assert allowed is None
+
+        # A non-mapped endpoint is never gated here.
+        passthrough = web_server._enforce_admin_api_permission(
+            _FakeRequest("GET", "/api/sessions", _sess("user"))
+        )
+        assert passthrough is None
+
+        # Loopback/token mode (no verified session) is not gated by this layer.
+        no_session = web_server._enforce_admin_api_permission(
+            _FakeRequest("POST", "/api/credentials/pool", None)
+        )
+        assert no_session is None
+
+    def test_subpath_admin_endpoint_is_gated(self):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth.base import Session
+
+        sess = Session(
+            user_id="u1", email="u@x.test", display_name="U", org_id="t1",
+            provider="basic", expires_at=9999999999, access_token="at",
+            refresh_token="rt", tenant_id="t1", actor_id="a1", role="user",
+        )
+
+        class _FakeRequest:
+            def __init__(self, method, path):
+                self.method = method
+                self.url = type("U", (), {"path": path})()
+                self.state = type("S", (), {"session": sess})()
+
+        # DELETE /api/credentials/pool/{provider}/{index} matches the prefix.
+        denied = web_server._enforce_admin_api_permission(
+            _FakeRequest("DELETE", "/api/credentials/pool/openai/0")
+        )
+        assert denied is not None and denied.status_code == 403
 
 
 class TestAssistantWsGateWiring:
