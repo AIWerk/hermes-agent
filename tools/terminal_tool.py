@@ -2267,7 +2267,13 @@ def terminal_tool(
 
             try:
                 from hermes_cli.operator_verification import operator_verification_block_reason_for_command
-                operator_block = operator_verification_block_reason_for_command(command)
+                # Pass session_id so the block-check reads the same cache key
+                # verify_operator_identity writes under (it caches per session_id).
+                # The getter falls back to the process-wide key, so bootstrap
+                # (--operator, session_id=None) keeps working too.
+                operator_block = operator_verification_block_reason_for_command(
+                    command, session_id=session_id
+                )
             except Exception:
                 operator_block = None
             if operator_block:

@@ -117,6 +117,44 @@ def test_cui_customer_actor_context_does_not_self_upgrade(monkeypatch):
     assert result.reason == "cui_actor_not_authorized"
 
 
+def test_cui_actor_verification_sources_context_from_canonical_helper(monkeypatch):
+    """The cui_actor verifier must read identity via the canonical
+    agent.cui_actor_context helper (env-driven here; ContextVar-backed once PR-2
+    lands), not re-parse os.environ itself."""
+    # No AIWERK_CUI_* env at all — drive purely through the helper.
+    for key in (
+        "AIWERK_CUI_ACTOR_CONTEXT",
+        "AIWERK_CUI_ACTOR_ID",
+        "AIWERK_CUI_ACTOR_ROLE",
+        "AIWERK_CUI_TENANT_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "agent.cui_actor_context.current_cui_actor_context",
+        lambda: {"actor_id": "attila", "role": "aiwerk_admin"},
+    )
+
+    result = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
+        now=200,
+    )
+    assert result.ok is True
+    assert result.actor_id == "attila"
+    assert result.role == "aiwerk_admin"
+
+    # An empty helper (no actor) fails closed even with the verifier configured.
+    monkeypatch.setattr(
+        "agent.cui_actor_context.current_cui_actor_context",
+        lambda: {},
+    )
+    blocked = run_operator_verifier(
+        OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
+        now=200,
+    )
+    assert blocked.ok is False
+    assert blocked.reason == "cui_actor_not_authorized"
+
+
 def test_missing_interface_fails_closed_before_generic_command():
     result = run_operator_verifier(
         OperatorVerificationConfig(enabled=True, argv=["wrong-gui"], missing_interface=True),
@@ -442,3 +480,272 @@ def test_operator_verification_allows_read_only_remote_copy_downloads_only():
         assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
     for command in blocked:
         assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def _gate_config():
+    return OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+
+def test_unquoted_eval_does_not_suppress_sensitive_command_fallback():
+    """Regression: `eval <sensitive...>` (unquoted) must NOT disable the gate.
+
+    Previously _eval_payloads captured only the single token after eval, which
+    collapsed `eval git push --force` to the benign payload `git` and — worse —
+    short-circuited before the regex fallback.
+    """
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "eval git push --force origin main",
+        "eval pass show prod/db",
+        "eval systemctl restart hermes",
+        'eval "git push --force origin main"',
+        "eval rm -r -f /etc",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_benign_eval_cannot_mask_a_trailing_admin_command():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "eval 'echo hi' ; systemctl restart hermes",
+        "eval echo ok && docker-compose down",
+        "true ; eval echo ok ; git push --force origin main",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_git_global_options_do_not_hide_force_push():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "git -c protocol.version=2 push --force origin main",
+        "git -C /srv/repo push --force",
+        "git --git-dir=/srv/.git push --force",
+        "git --work-tree=/srv -C /srv/repo push --force",
+        "git --namespace=ns push --force",
+        "git --exec-path=/x push --force",
+    ]
+    allowed = [
+        "git -c user.name=x commit -m hi",
+        "git -C /repo status",
+        "git -c protocol.version=2 push origin main",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_all_force_and_destructive_push_forms_are_gated():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "git push origin +refs/heads/main",
+        "git push --mirror origin",
+        "git push --delete origin main",
+        "git push -d origin main",
+        "git push --force-with-lease origin main",
+        "git push --force-with-lease=main origin main",
+        "git push origin :main",
+    ]
+    allowed = [
+        "git push origin main",
+        "git push -u origin feature/x",
+        "git push --tags origin",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_docker_compose_hyphen_and_podman_destructive_subcommands_are_gated():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "docker-compose down",
+        "docker-compose restart",
+        "docker-compose stop",
+        "docker-compose kill",
+        "docker-compose rm -f",
+        "podman restart web",
+        "podman-compose down",
+    ]
+    allowed = [
+        "docker-compose up -d",
+        "docker-compose ps",
+        "podman ps",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_setuid_and_setgid_chmod_are_gated():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "chmod 4755 /bin/sh",
+        "chmod 2755 /usr/bin/x",
+        "chmod 6755 /usr/bin/y",
+        "chmod u+s /bin/bash",
+        "chmod g+s /usr/bin/x",
+        "chmod 777 /tmp/shared",
+    ]
+    allowed = [
+        "chmod 644 README.md",
+        "chmod 755 scripts/run.sh",
+        "chmod u+x scripts/run.sh",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_split_flag_recursive_force_rm_is_gated():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    blocked = [
+        "rm -r -f /tmp/x",
+        "rm -f -r /tmp/x",
+        "rm -d -r -f /etc",
+        "rm -r --force /etc",
+        "rm --recursive --force /etc",
+        "rm -rf /tmp/x",
+    ]
+    allowed = [
+        "rm file.txt",
+        "rm -r /tmp/onlydir",
+        "rm -f /tmp/onlyfile",
+        "ls -rf",
+    ]
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+
+
+def test_chained_segment_neither_hides_nor_masks_sibling_segments():
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    # Benign leading segment must not let a dangerous one slip through...
+    assert operator_verification_block_reason_for_command(
+        "git push origin main ; systemctl restart hermes", config=config, now=100
+    ) is not None
+    # ...and a benign segment must not be over-blocked by a sibling.
+    assert operator_verification_block_reason_for_command(
+        "git push origin main && echo done", config=config, now=100
+    ) is None
+
+
+def test_sensitive_command_regex_is_redos_bounded():
+    import time
+
+    from hermes_cli.operator_verification import _SENSITIVE_COMMAND_RE
+
+    adversarial = [
+        "git push " + "a " * 6000 + "x",
+        "rm -" + "r" * 9000,
+        "rm -" + "x" * 6000 + " -" + "y" * 6000,
+        "chmod " + "7" * 9000,
+    ]
+    for payload in adversarial:
+        start = time.time()
+        _SENSITIVE_COMMAND_RE.search(payload)
+        assert time.time() - start < 1.0, payload[:40]
+
+
+def test_gate_is_inert_until_a_verifier_is_provisioned(monkeypatch, tmp_path):
+    """Fail-closed-deadlock guard.
+
+    With the default callback verifier but no operator store and no callback,
+    nothing can ever satisfy the gate, so it must NOT block (otherwise the
+    command is permanently un-runnable). Once a store exists, it blocks.
+    """
+    clear_operator_verification_cache()
+    set_operator_verification_callback(None)
+    monkeypatch.setattr(
+        "hermes_cli.operator_verification._STORE", tmp_path / "missing.json"
+    )
+
+    unprovisioned = OperatorVerificationConfig(
+        enabled=True, require_for_cli_admin=True, verifier_type="callback", argv=[]
+    )
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=unprovisioned, now=100
+    ) is None
+
+    # An argv-based verifier is provisioned -> the gate is live again.
+    live = OperatorVerificationConfig(
+        enabled=True, require_for_cli_admin=True, verifier_type="command", argv=["verify"]
+    )
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=live, now=100
+    ) is not None
+
+
+def test_callback_verifier_with_store_is_provisioned(monkeypatch, tmp_path):
+    clear_operator_verification_cache()
+    store = tmp_path / "operator-verifier.json"
+    store.write_text(json.dumps({
+        "version": 1,
+        "actor_id": "attila",
+        "role": "operator",
+        "salt": "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY=",
+        "hash": "unused",
+    }), encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.operator_verification._STORE", store)
+
+    config = OperatorVerificationConfig(
+        enabled=True, require_for_cli_admin=True, verifier_type="callback", argv=[]
+    )
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, now=100
+    ) is not None
+
+
+def test_block_check_honors_session_scoped_verification_cache():
+    """The block-check must read the same cache key verify_operator_identity writes.
+
+    A real (non-None) session_id is used on both sides; with session_id dropped
+    at the enforcement point this would hard re-block forever.
+    """
+    clear_operator_verification_cache()
+    config = _gate_config()
+
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, session_id="s1", now=100
+    ) is not None
+
+    verified = OperatorVerificationResult(
+        ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200
+    )
+    cache_operator_verification(verified, session_id="s1")
+
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, session_id="s1", now=150
+    ) is None
+
+
+def test_terminal_tool_passes_session_id_to_operator_block_check():
+    import inspect
+
+    import tools.terminal_tool as terminal_tool
+
+    src = inspect.getsource(terminal_tool.terminal_tool)
+    assert "operator_verification_block_reason_for_command(" in src
+    assert "session_id=session_id" in src

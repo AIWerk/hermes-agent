@@ -90,11 +90,52 @@ def _first_non_option(args: list[str]) -> str:
     return ""
 
 
+# git global options that consume a following value token; the verb (push, etc.)
+# only appears *after* both the option and its value, so they must be skipped
+# before reading the subcommand. Without this, ``git -C /repo push --force``
+# would read ``/repo`` as the verb and bypass the push force-check entirely.
+_GIT_GLOBAL_VALUE_OPTIONS = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+
+
+def _git_subcommand_and_rest(args: list[str]) -> tuple[str, list[str]]:
+    """Return git's (subcommand, remaining-args), skipping global value options.
+
+    Handles both ``-c key=val``/``-C dir`` (value as separate token) and the
+    ``--git-dir=...`` glued form so an attacker cannot push the verb out of
+    reach of the force-detection logic.
+    """
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if not arg.startswith("-"):
+            return arg.lower(), args[index + 1 :]
+        bare = arg.split("=", 1)[0]
+        if bare in _GIT_GLOBAL_VALUE_OPTIONS and "=" not in arg:
+            # Option and its value are separate tokens; skip both.
+            index += 2
+            continue
+        # Glued ``--git-dir=...``/``-cfoo`` or a valueless flag: skip this token.
+        index += 1
+    return "", []
+
+
 def _eval_payloads(tokens: list[str]) -> list[str]:
+    """Return the full command(s) that follow an ``eval`` token.
+
+    The previous implementation captured only the single token after ``eval``,
+    which let an unquoted ``eval git push --force`` collapse to the payload
+    ``git`` (no force, no match) and — worse — suppressed the regex fallback.
+    We now reconstruct the entire remaining command after each ``eval`` so the
+    real payload is scanned. The quoted form (single token) is unchanged.
+    """
     payloads: list[str] = []
     for index, token in enumerate(tokens[:-1]):
         if token == "eval":
-            payload = tokens[index + 1].strip()
+            rest = tokens[index + 1 :]
+            if len(rest) == 1:
+                payload = rest[0].strip()
+            else:
+                payload = shlex.join(rest).strip()
             if payload:
                 payloads.append(payload)
     return payloads
@@ -102,11 +143,24 @@ def _eval_payloads(tokens: list[str]) -> list[str]:
 
 def _wrapped_shell_requires_operator_verification(
     tokens: list[str], config: OperatorVerificationConfig
-) -> bool | None:
+) -> bool:
+    """True iff any ``eval`` payload requires verification (never suppresses)."""
     payloads = _eval_payloads(tokens)
-    if not payloads:
-        return None
     return any(_requires_operator_verification(payload, config) for payload in payloads)
+
+
+def _normalize_short_flag_chars(args: list[str]) -> set[str]:
+    """Collect bundled short-flag characters across all -prefixed option args.
+
+    ``rm -rf`` and ``rm -r -f`` and ``rm -d -r -f`` all yield ``{'r','f',...}``
+    so recursive+force detection no longer depends on flag spelling. Long
+    options (``--force``) are ignored here and matched separately by callers.
+    """
+    chars: set[str] = set()
+    for arg in args:
+        if arg.startswith("-") and not arg.startswith("--"):
+            chars.update(arg[1:])
+    return chars
 
 
 def _is_remote_path(arg: str) -> bool:
@@ -128,15 +182,91 @@ def _matches_allowed_secret_read(command: str, patterns: list[str] | None) -> bo
     return False
 
 
-def _requires_operator_verification(command: str, config: OperatorVerificationConfig) -> bool:
-    tokens = _split_command(command)
-    if not tokens:
-        return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
-    wrapped = _wrapped_shell_requires_operator_verification(tokens, config)
-    if wrapped is not None:
-        return wrapped
+def _git_push_requires_verification(args: list[str]) -> bool:
+    """True for any history-overwriting / destructive push form.
+
+    Covers ``--force``/``-f``, ``--force-with-lease`` (bare or ``=value``),
+    ``--mirror``, ``--delete``/``-d``, leading-``+`` force refspecs, and
+    ``:branch`` delete refspecs.
+    """
+    subcommand, rest = _git_subcommand_and_rest(args)
+    if subcommand != "push":
+        return False
+    lowered = {arg.lower() for arg in rest}
+    if {"--force", "-f", "--mirror", "--delete", "-d"} & lowered:
+        return True
+    if any(arg.lower().split("=", 1)[0] == "--force-with-lease" for arg in rest):
+        return True
+    # ``+refspec`` force push (no colon) and ``src:dst`` / ``:branch`` deletes.
+    return any(arg.startswith("+") or arg.startswith(":") or ":" in arg for arg in rest)
+
+
+def _chmod_requires_verification(args: list[str]) -> bool:
+    arg_text = " ".join(args).lower()
+    if re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text):
+        return True
+    if re.search(r"(^|\s)(777|666)($|\s)", arg_text):
+        return True
+    # Setuid/setgid grants (privilege escalation): 4-digit octal whose leading
+    # digit sets the suid(4)/sgid(2)/sticky(6+) bit, or symbolic +s.
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        if re.fullmatch(r"[1-7][0-7]{3}", arg):
+            return True
+        if re.search(r"[ugoa]*\+[rwxXst]*s", arg):
+            return True
+    return False
+
+
+def _rm_requires_verification(args: list[str]) -> bool:
+    short_chars = _normalize_short_flag_chars(args)
+    long_flags = {arg.lower() for arg in args if arg.startswith("--")}
+    recursive = "r" in short_chars or "R" in short_chars or {"--recursive", "--recursive=true"} & long_flags
+    force = "f" in short_chars or "--force" in long_flags
+    return bool(recursive and force)
+
+
+# Shell statement / pipeline separators. A compound command is split on these
+# so EACH segment is classified independently — a benign leading segment can no
+# longer hide a dangerous trailing one (and a benign segment is not over-blocked
+# by the coarse regex just because a later segment is sensitive).
+_SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "|&"}
+
+
+def _split_segments(tokens: list[str]) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments or [tokens]
+
+
+def _structured_segment_verdict(
+    command: str, tokens: list[str], config: OperatorVerificationConfig
+) -> bool | None:
+    """Classify ONE command segment.
+
+    Returns True (verification required), False (recognized as safe — the
+    backstop regex must NOT override this for the segment), or None (leading
+    command not recognized — fall through to the regex backstop).
+    """
     cmd, args = _base_command(tokens)
     verb = _first_non_option(args)
+
+    # docker-compose / podman-compose are aliases of "<engine> compose".
+    if cmd in {"docker-compose", "podman-compose"}:
+        cmd, args = ("docker", ["compose", *args])
+        verb = _first_non_option(args)
+    elif cmd == "podman":
+        cmd = "docker"
 
     if cmd == "pass" and verb == "show":
         return not _matches_allowed_secret_read(command, config.allowed_secret_read_patterns)
@@ -172,32 +302,81 @@ def _requires_operator_verification(command: str, config: OperatorVerificationCo
     if cmd == "ansible-playbook":
         return True
     if cmd == "chmod":
-        arg_text = " ".join(args).lower()
-        return bool(re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text) or re.search(r"(^|\s)(777|666)($|\s)", arg_text))
+        return _chmod_requires_verification(args)
     if cmd == "chown":
         arg_text = " ".join(args).lower()
         return "root" in args or bool(re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text))
     if cmd == "rm":
-        return any("r" in arg and "f" in arg for arg in args if arg.startswith("-"))
+        return _rm_requires_verification(args)
     if cmd in {"dd", "mkfs"}:
         return True
-    if cmd == "git" and verb == "push":
-        lowered = {arg.lower() for arg in args}
-        return "--force" in lowered or "-f" in lowered or any(arg.startswith(":") or ":" in arg for arg in args[1:])
+    if cmd == "git":
+        return _git_push_requires_verification(args)
     if cmd == "hermes" and len(args) >= 2:
         area, action = args[0].lower(), args[1].lower()
         return (area == "gateway" and action in {"restart", "stop", "start"}) or (area == "profile" and action in {"delete", "use", "rename"}) or (area == "cron" and action in {"remove", "create", "edit"})
 
-    return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
+    return None
 
 
+def _structured_requires_operator_verification(
+    command: str, tokens: list[str], config: OperatorVerificationConfig
+) -> bool:
+    """True iff ANY segment's leading command is recognized as requiring it."""
+    for segment in _split_segments(tokens):
+        if _structured_segment_verdict(command, segment, config) is True:
+            return True
+    return False
+
+
+def _segment_text(tokens: list[str]) -> str:
+    try:
+        return shlex.join(tokens)
+    except Exception:
+        return " ".join(tokens)
+
+
+def _requires_operator_verification(command: str, config: OperatorVerificationConfig) -> bool:
+    tokens = _split_command(command)
+    if not tokens:
+        return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
+    # OR semantics: structured parse, eval payloads, AND the raw-string regex are
+    # ALL consulted. No branch (especially an eval token) may reduce coverage by
+    # short-circuiting before the fallback. Each compound segment is judged on
+    # its own so a benign one neither hides nor is masked by another.
+    for segment in _split_segments(tokens):
+        verdict = _structured_segment_verdict(command, segment, config)
+        if verdict is True:
+            return True
+        if verdict is None and _SENSITIVE_COMMAND_RE.search(_segment_text(segment)):
+            # Unrecognized leading command: the regex backstop catches sensitive
+            # invocations the structured parser could not resolve.
+            return True
+    if _wrapped_shell_requires_operator_verification(tokens, config):
+        return True
+    return False
+
+
+# Coarse backstop for sensitive commands that appear OUTSIDE the leading token
+# (chained with ;/&&/|/eval etc.) where the structured parser only sees token 0.
+# Conditionally-sensitive commands (git push, docker compose up, benign chmod
+# octals) are matched here ONLY in their dangerous variants so the OR with the
+# structured parse cannot over-block legitimate non-force pushes / benign modes.
 _SENSITIVE_COMMAND_RE = re.compile(
     r"\b("
-    r"systemctl|service|supervisorctl|docker\s+compose\s+(?:up|down|restart)|"
-    r"docker\s+(?:restart|rm|rmi)|kubectl|helm|terraform|ansible-playbook|"
+    r"systemctl|service|supervisorctl|"
+    r"docker\s+compose\s+(?:down|restart|stop|kill|rm|rmi)|"
+    r"docker-compose\s+(?:down|restart|stop|kill|rm|rmi)|"
+    r"podman-compose\s+(?:down|restart|stop|kill|rm|rmi)|"
+    r"docker\s+(?:restart|rm|rmi)|podman\s+(?:restart|rm|rmi)|"
+    r"kubectl|helm|terraform|ansible-playbook|"
     r"rsync|scp|pass\s+show|bw\s+get|vault\s+kv|get-secret|"
-    r"chmod\s+(?:777|[0-7]{3,4})|chown|rm\s+-rf|dd\s+if=|mkfs|"
-    r"git\s+push|gh\s+secret|hermes\s+gateway\s+(?:restart|stop|start)|"
+    r"chmod\s+(?:[1-7][0-7]{3}|777|666)|chmod\s+[ugoa]*\+[rwxXt]*s|chown|"
+    r"rm\s+-[^\sr]*r[^\s]*\s+-[^\sf]*f|rm\s+-[^\sf]*f[^\s]*\s+-[^\sr]*r|rm\s+-rf|"
+    r"dd\s+if=|mkfs|"
+    r"git\s+push\s+(?:[^\n]*\s)?(?:--force|-f|--mirror|--delete|-d|--force-with-lease)\b|"
+    r"git\s+push\s+[^\n]*(?:\s\+|\s:|:[^\s]+\s|[^\s]:[^\s])|"
+    r"gh\s+secret|hermes\s+gateway\s+(?:restart|stop|start)|"
     r"hermes\s+profile\s+(?:delete|use|rename)|hermes\s+cron\s+(?:remove|create|edit)"
     r")\b",
     re.IGNORECASE,
@@ -273,11 +452,14 @@ def _normalize_interface(value: Any) -> str:
 def current_operator_interface() -> str:
     """Return the active communication surface for operator verification.
 
-    This is not a fallback preference. Gateway/CUI platform context wins. A
-    local CLI is only ``cli`` when the process has a real controlling terminal;
-    Hermes tool-runner calls from a local desktop session otherwise route to
-    ``local`` so they can use the desktop verifier instead of an invisible
-    /dev/tty prompt.
+    This is not a fallback preference. Gateway/CUI platform context wins. The
+    ``cli`` surface is selected purely from the deployment-injected
+    ``HERMES_INTERACTIVE`` flag (no controlling-TTY/isatty check): the
+    interactive Hermes CLI owns the user-facing prompt even when its tool
+    workers have no controlling terminal, so they route to the in-process
+    masked callback. Local desktop tool-runner calls without that flag route to
+    ``local`` and use the desktop verifier instead of an invisible /dev/tty
+    prompt.
     """
     try:
         from gateway.session_context import get_session_env
@@ -288,7 +470,9 @@ def current_operator_interface() -> str:
     platform = _normalize_interface(platform)
     if platform:
         return platform
-    if os.getenv("AIWERK_CUI_ACTOR_CONTEXT") or os.getenv("AIWERK_CUI_ACTOR_ROLE"):
+    # An authenticated CUI actor (ContextVar-bound or env-bridged) routes to the
+    # web verifier surface.
+    if _cui_actor_context_data():
         return "web"
     explicit = _normalize_interface(os.getenv("HERMES_OPERATOR_INTERFACE", ""))
     if explicit:
@@ -457,29 +641,41 @@ def _callback_operator_verification(config: OperatorVerificationConfig, *, now: 
     )
 
 
+def _cui_actor_context_data() -> dict[str, Any]:
+    """Sanitized CUI actor context from the canonical helper.
+
+    Delegates to ``agent.cui_actor_context.current_cui_actor_context`` so the
+    verifier path respects the per-turn ContextVar once bound, falling back to
+    the os.environ bridge for CLI/cron/subprocess contexts. Imported lazily to
+    keep this module importable without pulling in the agent package eagerly.
+    """
+    try:
+        from agent.cui_actor_context import current_cui_actor_context
+
+        return dict(current_cui_actor_context())
+    except Exception:
+        return {}
+
+
 def _cui_actor_verification(config: OperatorVerificationConfig, *, now: int) -> OperatorVerificationResult:
     """Trust an authenticated AIWerk CUI admin/operator actor as verifier.
 
     The CUI auth layer is the channel verifier: if the child process has actor
     metadata for an admin/operator role, no second approval prompt is needed.
     Missing or customer-only actor context fails closed.
+
+    Sources the actor identity from the canonical ``agent.cui_actor_context``
+    helper, which prefers the per-turn ContextVar (race-free across concurrent
+    in-process gateway turns) and falls back to the os.environ bridge for the
+    CLI/cron/subprocess paths.
     """
-    raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
-    data: dict[str, Any] = {}
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except Exception:
-            data = {}
+    data = _cui_actor_context_data()
     actor_id = str(
         data.get("actor_id")
         or data.get("user_id")
-        or os.getenv("AIWERK_CUI_ACTOR_ID", "")
         or ""
     ).strip()
-    role = str(data.get("role") or os.getenv("AIWERK_CUI_ACTOR_ROLE", "") or "").strip().lower()
+    role = str(data.get("role") or "").strip().lower()
     allowed_roles = {"aiwerk_admin", "admin", "operator", "owner", "tenant_admin"}
     if not actor_id or role not in allowed_roles:
         return _failure("cui_actor_not_authorized", now=now)
@@ -522,6 +718,34 @@ def _trusted_platform_actor_verification(config: OperatorVerificationConfig, *, 
     )
 
 
+def _verifier_is_provisioned(config: OperatorVerificationConfig) -> bool:
+    """True only when SOME verifier could actually succeed for this config.
+
+    Without this guard the gate ships fail-closed-deadlocked: on a fresh
+    install (default ``command``/``callback`` verifier, no
+    ~/.hermes/operator-verifier.json store, no registered callback, no CUI/
+    platform actor) every admin-sensitive command is blocked but the
+    remediation (verify_operator_identity) can never succeed, so the command is
+    permanently un-runnable. When nothing can verify, the gate is inert until an
+    operator explicitly provisions a verifier.
+    """
+    verifier = (config.verifier_type or "").strip().lower()
+    if verifier in {"cui_actor", "cui-actor", "cui_admin", "cui-admin", "cui_actor_context", "cui-actor-context"}:
+        return bool(_cui_actor_context_data())
+    if verifier in {"trusted_platform_actor", "trusted-platform-actor", "platform_actor", "platform-actor"}:
+        return bool(config.trusted_actor_ids)
+    if verifier in {"callback", "operator_callback", "operator-callback", "prompt", "modal"}:
+        return _load_operator_store() is not None
+    # Generic "command" verifier: usable when an argv is configured, or when the
+    # callback store + callback are wired (the CLI resolves "command" to the
+    # masked callback verifier interactively).
+    if config.argv:
+        return True
+    if config.missing_interface:
+        return False
+    return _load_operator_store() is not None and _get_operator_verification_callback() is not None
+
+
 def operator_verification_block_reason_for_command(
     command: str,
     *,
@@ -535,6 +759,8 @@ def operator_verification_block_reason_for_command(
     if not _requires_operator_verification(command or "", cfg):
         return None
     if get_cached_operator_verification(session_id=session_id, now=now) is not None:
+        return None
+    if not _verifier_is_provisioned(cfg):
         return None
     return (
         "Operator verification required before running this admin-sensitive "
