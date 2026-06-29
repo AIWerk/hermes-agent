@@ -7,6 +7,7 @@ export type CuiLocale = "en" | "de" | "hu" | "fr" | "es" | "it" | "pt" | "ru" | 
 const CUI_LOCALES: readonly CuiLocale[] = ["en", "de", "hu", "fr", "es", "it", "pt", "ru", "zh", "zh-hant", "ja", "ko", "tr", "uk", "af", "ga"];
 
 export function readConfiguredCuiLocale(): CuiLocale {
+  if (typeof window === "undefined") return "de";
   const raw = window.__AIWERK_CUI_LOCALE__?.trim().toLowerCase().replace("_", "-") ?? "";
   const aliases: Record<string, CuiLocale> = {
     "zh-cn": "zh",
