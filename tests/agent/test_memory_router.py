@@ -9,6 +9,7 @@ from agent.memory_router import (
     MemorySensitivity,
     _SECRET_RE,
     classify_memory_route,
+    contains_secret,
     should_mirror_to_honcho,
     should_write_builtin_memory,
 )
@@ -316,3 +317,117 @@ def test_profile_metadata_does_not_create_specialist_memory_route():
     assert ok is True
     assert route.has(MemoryDestination.INJECT)
     assert route.target_hint == "user"
+
+
+# --- Unified secret detection: the durable-memory gate must catch every bare
+# value-only vendor token the session-notes index redactor catches, so the gate
+# protecting the MOST durable destination is never weaker than the index. ------
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "xai-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD",          # xAI / Grok
+        "SG." + "abcdefghij1234567890." + "ABCDEFGHIJ1234567890abcdefghij",  # SendGrid
+        "hf_" + "abcdefghijklmnopqrstuvwxyz1234",                     # HuggingFace
+        "pplx-" + "abcdefghijklmnopqrstuvwxyz1234",                   # Perplexity
+        "tvly-" + "abcdefghijklmnopqrstuvwxyz",                       # Tavily
+        "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCYEXAMPLEKEY",             # bare AWS secret (40 chars, base64)
+        "bot123456789:" + "AAEabcdefghijklmnopqrstuvwxyz1234567",     # Telegram bot token
+        "123456789:" + "AAEabcdefghijklmnopqrstuvwxyz1234567",        # bare Telegram token
+        "Authorization: Basic " + "dXNlcjpwYXNz" + "d29yZA==",       # Authorization: Basic header
+    ],
+)
+def test_contains_secret_catches_bare_vendor_tokens(secret):
+    # These value-only shapes have no adjacent keyword. Before unifying detection
+    # the router missed every one of them, so a pasted/echoed token routed to
+    # inject + durable Honcho memory.
+    assert contains_secret(secret) is True, f"contains_secret missed {secret!r}"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "xai-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+        "SG." + "abcdefghij1234567890." + "ABCDEFGHIJ1234567890abcdefghij",
+        "hf_" + "abcdefghijklmnopqrstuvwxyz1234",
+        "pplx-" + "abcdefghijklmnopqrstuvwxyz1234",
+        "tvly-" + "abcdefghijklmnopqrstuvwxyz",
+        "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "bot123456789:" + "AAEabcdefghijklmnopqrstuvwxyz1234567",
+        "Authorization: Basic " + "dXNlcjpwYXNz" + "d29yZA==",
+    ],
+)
+def test_bare_vendor_tokens_are_discarded_not_mirrored(secret):
+    # A turn carrying only the bare token (no keyword) must be withheld from
+    # both built-in injection and durable Honcho mirroring.
+    ok, route = should_mirror_to_honcho(secret, target="user")
+    assert ok is False, f"vendor token mirrored to Honcho: {secret!r}"
+    assert route.has(MemoryDestination.DISCARD)
+    assert route.sensitivity == MemorySensitivity.CREDENTIAL
+    assert route.honcho_store_allowed is False
+    assert route.inject_allowed is False
+
+
+def test_contains_secret_does_not_flag_lowercase_hex_git_sha():
+    # A 40-char lowercase-hex git SHA-1 must not trip the bare-AWS-secret matcher
+    # (which requires an uppercase / '/' / '+' char to qualify).
+    sha = "a1b2c3d4e5f6a7b8c9d0" + "e1f2a3b4c5d6e7f8a9b0"
+    assert len(sha) == 40
+    assert contains_secret("The commit hash is " + sha) is False
+
+
+def test_tenant_metadata_with_preference_verb_routes_to_tenant_private():
+    # Explicit customer_id metadata is the strongest tenant signal and is
+    # authoritative: a preference verb ("prefers") must NOT flip a customer PII
+    # fact onto the INJECT + STORE_HONCHO branch.
+    route = classify_memory_route(
+        "Customer ACME prefers we keep their phone 079 123 45 67 on file.",
+        target="user",
+        metadata={"customer_id": "acme"},
+    )
+
+    assert route.has(MemoryDestination.TENANT_PRIVATE)
+    assert route.tenant_private_required is True
+    assert route.sensitivity == MemorySensitivity.CUSTOMER
+    assert not route.has(MemoryDestination.INJECT)
+    assert not route.has(MemoryDestination.STORE_HONCHO)
+    assert route.inject_allowed is False
+    assert route.honcho_store_allowed is False
+
+    ok, _ = should_mirror_to_honcho(
+        "Customer ACME prefers we keep their phone 079 123 45 67 on file.",
+        target="user",
+        metadata={"customer_id": "acme"},
+    )
+    assert ok is False
+
+
+def test_tenant_metadata_with_product_keyword_still_routes_tenant_private():
+    # Even when the customer fact mentions an AIWerk product keyword, explicit
+    # tenant metadata keeps it tenant-private (not WIKI_CANDIDATE).
+    route = classify_memory_route(
+        "Customer ACME wants their Smart Website onboarding kept on file.",
+        target="user",
+        metadata={"tenant_id": "tenant-acme"},
+    )
+
+    assert route.has(MemoryDestination.TENANT_PRIVATE)
+    assert not route.has(MemoryDestination.WIKI_CANDIDATE)
+    assert not route.has(MemoryDestination.INJECT)
+    assert route.inject_allowed is False
+    assert route.honcho_store_allowed is False
+
+
+def test_keyword_only_customer_with_pref_verb_is_not_forced_tenant_private():
+    # Without tenant metadata, the keyword-only customer path keeps its existing
+    # disambiguation: a preference-verb phrasing routes to the user-preference
+    # branch, not tenant-private (this is the behavior the metadata override
+    # deliberately does NOT change).
+    route = classify_memory_route(
+        "The client prefers concise weekly status updates.",
+        target="user",
+    )
+
+    assert not route.has(MemoryDestination.TENANT_PRIVATE)
+    assert route.has(MemoryDestination.INJECT)

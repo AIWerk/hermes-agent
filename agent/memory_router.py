@@ -25,6 +25,8 @@ from enum import Enum
 import re
 from typing import Any, Iterable, Mapping
 
+from agent.secret_patterns import contains_secret as _contains_secret
+
 
 class MemoryDestination(str, Enum):
     INJECT = "inject"
@@ -89,32 +91,20 @@ class MemoryRoute:
         }
 
 
-# The FULL content is scanned for secrets. Every alternative below is bounded
-# (in particular the URL-credential scheme run and its user/pass quantifiers),
-# so _SECRET_RE.search() stays effectively linear even on attacker-controlled
-# multi-KB blobs (measured: ~0.015s on a 1MB non-matching input). Scanning the
-# whole text — not a prefix — is required: a prefix window would let a
-# credential placed after benign padding evade the gate and route to
-# inject/durable memory.
-_SECRET_RE = re.compile(
-    r"(api[_ -]?key|secret|token|password|passwd|credential|private[_ -]?key|"
-    r"BEGIN (RSA|OPENSSH|EC|DSA)? ?PRIVATE KEY|"
-    r"sk[-_][A-Za-z0-9]|(sk|pk|rk)_(live|test)_[A-Za-z0-9]{8,}|"
-    r"xox[baprs]-|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]{20,}|"
-    r"AIza[0-9A-Za-z_-]{20,}|(AKIA|ASIA)[0-9A-Z]{16}|"
-    r"GOCSPX-[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{36,}|"
-    r"Authorization:\s*Bearer\s+[A-Za-z0-9._-]{8,}|"
-    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+|"
-    r"hooks\.slack\.com/services/|"
-    # raw high-entropy run: 64+ hex chars (signing secrets, key material)
-    r"\b[a-fA-F0-9]{64,}\b|"
-    # credentials embedded in URLs: scheme://[user]:password@host. The scheme
-    # run and the user/pass quantifiers are bounded so the alternative cannot
-    # backtrack quadratically on long non-matching input; the userless form
-    # (scheme://:password@) is also covered.
-    r"\b[a-z][a-z0-9+.-]{1,15}://[^\s:/@]{0,256}:[^@/\s]{1,256}@)",
-    re.IGNORECASE,
-)
+# The FULL content is scanned for secrets via the canonical, ReDoS-bounded
+# detector in agent.secret_patterns — the SAME source the session-notes index
+# redactor and the self-learning feedback sanitizer build on, so the durable
+# Honcho/built-in-memory gate can never be weaker than those downstream
+# redactors. Every alternative is bounded (in particular the URL-credential
+# scheme run and its user/pass quantifiers), so detection stays effectively
+# linear even on attacker-controlled multi-KB blobs. Scanning the whole text —
+# not a prefix — is required: a prefix window would let a credential placed
+# after benign padding evade the gate and route to inject/durable memory.
+#
+# ``_SECRET_RE`` is re-exported as the case-insensitive detection union for
+# callers/tests that reference it directly; the case-sensitive bare-AWS-secret
+# shape lives in agent.secret_patterns and is folded in by ``contains_secret``.
+from agent.secret_patterns import SECRET_DETECT_RE as _SECRET_RE  # noqa: E402
 
 
 _CUSTOMER_RE = re.compile(
@@ -236,7 +226,7 @@ def classify_memory_route(
             metadata={"source": source, "target": target},
         )
 
-    if _SECRET_RE.search(text):
+    if _contains_secret(text):
         return MemoryRoute(
             destinations=_dest_tuple(MemoryDestination.DISCARD),
             sensitivity=MemorySensitivity.CREDENTIAL,
@@ -260,7 +250,23 @@ def classify_memory_route(
             metadata={"source": source, "target": target},
         )
 
-    if (meta.get("tenant_id") or meta.get("customer_id") or _CUSTOMER_RE.search(text)) and not _AIWERK_PRODUCT_RE.search(text) and not _USER_PREF_RE.search(text):
+    # Explicit tenant_id/customer_id metadata is the strongest possible tenant
+    # signal and is authoritative: a customer-private fact must route to
+    # TENANT_PRIVATE even when it is phrased with a preference verb ("prefers",
+    # "wants", ...) or mentions an AIWerk product keyword — otherwise the
+    # customer's PII would fall through to the user-preference branch and be
+    # prompt-injected + mirrored to durable Honcho. The _AIWERK_PRODUCT_RE /
+    # _USER_PREF_RE exclusions only disambiguate the *keyword-only* customer
+    # detection path (no metadata), where a product/preference phrasing means
+    # the text is more likely product knowledge or a user preference than a
+    # customer-private fact.
+    has_tenant_metadata = bool(meta.get("tenant_id") or meta.get("customer_id"))
+    keyword_only_customer = (
+        _CUSTOMER_RE.search(text)
+        and not _AIWERK_PRODUCT_RE.search(text)
+        and not _USER_PREF_RE.search(text)
+    )
+    if has_tenant_metadata or keyword_only_customer:
         return MemoryRoute(
             destinations=_dest_tuple(MemoryDestination.TENANT_PRIVATE, MemoryDestination.EXPLICIT_RECALL_ONLY),
             sensitivity=MemorySensitivity.CUSTOMER,
@@ -377,10 +383,13 @@ def dominant_destination(destinations: Iterable[MemoryDestination]) -> MemoryDes
 
 
 def contains_secret(content: str) -> bool:
-    """Return True if content matches the router's credential/secret detection.
+    """Return True if content matches the canonical credential/secret detection.
 
-    Shares the exact ``_SECRET_RE`` pattern that drives the CREDENTIAL
-    classification in :func:`classify_memory_route`, so callers cannot drift
-    into a weaker detection.
+    Shares the exact detector (:func:`agent.secret_patterns.contains_secret`,
+    backed by ``SECRET_DETECT_RE`` + the case-sensitive bare-AWS-secret matcher)
+    that drives the CREDENTIAL classification in :func:`classify_memory_route`.
+    The session-notes index redactor and the self-learning feedback sanitizer
+    build on the same source module, so the durable-memory gate can never drift
+    into a weaker detection than those downstream redactors.
     """
-    return bool(_SECRET_RE.search(content or ""))
+    return _contains_secret(content)

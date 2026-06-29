@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from agent.secret_patterns import AWS_BARE_SECRET_RE, VALUE_ONLY_RE
+
 # ``label <sep> value`` forms — keep the label, redact the value. The key/value
 # matchers are quote-aware so the JSON form this plugin actually serializes
 # (e.g. ``"password": "hunter2"``) is redacted, not just the bare ``token=...`` form.
@@ -18,37 +20,35 @@ _SECRET_KEYED_PATTERNS = [
         r"(?i)(\"?(?:api[_-]?key|secret|token|password|passwd|credential"
         r"|access[_-]?key|client[_-]?secret|private[_-]?key|authorization)\"?)"
         # Quote-aware value: a fully single- or double-quoted string (which may
-        # contain whitespace, ``,`` or ``;``), else an unquoted token. Matching
-        # the closing quote closes the single-quote leak and the multi-word /
-        # ``,``/``;`` remainder leak the bare token class left behind.
-        r"\s*[:=]\s*(?:'[^']*'|\"[^\"]*\"|[^\s'\",;]+)"
+        # contain whitespace, ``,`` or ``;``), else an UNQUOTED value that runs
+        # to the next clear delimiter (newline / quote / ``,`` / ``;``). The
+        # unquoted branch deliberately consumes intervening whitespace so a
+        # multi-word passphrase (``password = correct horse battery staple``) is
+        # redacted in full instead of leaking everything after the first space.
+        r"\s*[:=]\s*(?:'[^']*'|\"[^\"]*\"|[^\n'\",;]+)"
     ),
 ]
 
 # Whole-match secrets — there is no label to keep, so the entire match is the
-# secret and must be replaced in full (the previous single regex kept it verbatim
-# by appending ``=[REDACTED]`` to ``group(1)``, which was the secret itself).
+# secret and must be replaced in full. Sourced from the canonical
+# agent.secret_patterns module so this feedback-inbox sanitizer covers the same
+# value-only vendor shapes (xai-, SG., hf_, pplx-, tvly-, bare AWS secret,
+# Telegram bot token, ...) as the durable-memory gate and the session-notes
+# index redactor — a token the curator might later promote to durable memory can
+# no longer slip past here while another consumer would have caught it.
 _SECRET_VALUE_PATTERNS = [
-    re.compile(
-        r"(?i)\b(?:"
-        r"sk-[A-Za-z0-9_-]{8,}"                       # OpenAI-style
-        r"|(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{8,}"  # Stripe live/test keys
-        r"|xox[baprs]-[A-Za-z0-9-]{10,}"               # Slack tokens
-        r"|gh[pousr]_[A-Za-z0-9_]{12,}"                # GitHub tokens
-        r"|github_pat_[A-Za-z0-9_]{20,}"               # GitHub fine-grained PAT
-        r"|AIza[0-9A-Za-z_-]{20,}"                     # Google API key
-        r"|(?:AKIA|ASIA)[0-9A-Z]{16}"                  # AWS access key id
-        r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"  # JWT
-        r")\b"
-    ),
-    re.compile(r"(?i)https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"),
+    VALUE_ONLY_RE,
+    AWS_BARE_SECRET_RE,
     re.compile(r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
 ]
 
 # ``scheme://user:password@host`` — keep ``scheme://user:``, redact the password.
 # The user segment is optional so userless creds (``redis://:pass@host``) are
-# covered too.
-_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/@]+(@)")
+# covered too. The password class is greedy (``[^\s/]+``) and backtracks to the
+# LAST ``@`` before the host, so a password that itself contains ``@``
+# (``postgres://u:p@ss@host/db``) is redacted in full rather than truncated at
+# the first ``@`` (which previously leaked the ``@ss@host`` remainder).
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/]+(@)")
 
 _CORRECTION_PATTERNS = [
     r"\b(ne mentsd|ne írd|ne ird|ne tedd|ezt ne|nem így|nem igy|rosszul|hibás|hibas|tévedtél|tevedtel)\b",

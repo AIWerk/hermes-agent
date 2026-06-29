@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from agent.session_notes import redact_sensitive_text
+from agent.session_notes import _redact_value, redact_sensitive_text
 
 
 @pytest.mark.parametrize(
@@ -157,6 +157,42 @@ def test_redacts_telegram_bot_token():
     out = redact_sensitive_text("webhook uses " + token)
     assert "AAEabcdefghijklmnopqrstuvwxyz1234567" not in out
     assert "[REDACTED]" in out
+
+
+# --- Tail-leak regression (quoted / multi-word values) ----------------------
+
+
+@pytest.mark.parametrize(
+    "blob,secret_words",
+    [
+        ('DB_PASSWORD="my secret pw value"', ["secret pw value"]),
+        ("DB_PASSWORD='my secret pw value'", ["secret pw value"]),
+        ('export API_SECRET="space separated secret"', ["separated secret"]),
+        ("password = correct horse battery staple", ["horse", "battery", "staple"]),
+        ('"password": "correct horse battery staple"', ["horse", "battery", "staple"]),
+    ],
+)
+def test_keyed_and_env_values_do_not_leak_tail(blob, secret_words):
+    # The keyed/ENV value matchers used to terminate at the first whitespace
+    # (``\S+``), leaking everything after the first space of a quoted/multi-word
+    # secret to the auxiliary title/summary LLM. The value class is now
+    # quote-aware and consumes unquoted multi-word values to the next clear
+    # delimiter.
+    out = redact_sensitive_text(blob)
+    for word in secret_words:
+        assert word not in out, f"leaked {word!r} in {out!r}"
+    assert "[REDACTED]" in out
+
+
+def test_redact_value_redacts_dict_keys_too():
+    # A structured event whose KEY encodes a secret used to keep the secret in
+    # the key (only values were recursively redacted).
+    secret_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+    out = _redact_value({secret_key: "used here", "normal_field": "fine"})
+
+    assert secret_key not in str(out)
+    assert "[REDACTED]" in out  # the redacted key
+    assert out["normal_field"] == "fine"
 
 
 # --- ReDoS regression -------------------------------------------------------
