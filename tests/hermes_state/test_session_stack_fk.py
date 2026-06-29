@@ -104,3 +104,70 @@ def test_reconcile_recovers_from_leftover_session_stack_new(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_stack_new'"
     ).fetchall()
     assert leftover == []
+
+
+def test_fk_rebuild_is_atomic_no_populated_temp_table_left_behind(tmp_path):
+    """After a successful rebuild no populated session_stack_new may survive.
+
+    The rebuild wraps DROP session_stack + RENAME session_stack_new in one
+    transaction, so the table named session_stack is always present and the
+    temp table is always gone once the reconcile returns. (The dangerous crash
+    window was: session_stack dropped while a populated session_stack_new
+    persisted, orphaning the rows permanently.)
+    """
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent", source="cli")
+    db.create_session("side", source="cli")
+
+    conn = db._conn
+    _install_legacy_session_stack(conn)
+    conn.execute(
+        "INSERT INTO session_stack (source, parent_session_id, side_session_id, pushed_at, status) "
+        "VALUES ('cli', 'parent', 'side', 1.0, 'active')"
+    )
+    conn.commit()
+
+    db._init_schema()  # triggers _reconcile_session_stack_fk
+
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('session_stack', 'session_stack_new')"
+        ).fetchall()
+    }
+    assert "session_stack" in tables
+    assert "session_stack_new" not in tables
+    assert conn.execute("SELECT COUNT(*) FROM session_stack").fetchone()[0] == 1
+
+
+def test_fk_rebuild_drops_orphan_rows_referencing_missing_sessions(tmp_path):
+    """Stack rows whose parent/side session is gone are filtered by the rebuild."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent", source="cli")
+    db.create_session("side", source="cli")
+
+    conn = db._conn
+    _install_legacy_session_stack(conn)
+    # One valid row and one orphan referencing a non-existent session. The
+    # orphan can only be inserted with FK enforcement off (the legacy no-CASCADE
+    # schema still rejects it otherwise) — this mirrors rows a pre-FK-pragma
+    # build could accumulate.
+    conn.execute(
+        "INSERT INTO session_stack (source, parent_session_id, side_session_id, pushed_at, status) "
+        "VALUES ('cli', 'parent', 'side', 1.0, 'active')"
+    )
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        "INSERT INTO session_stack (source, parent_session_id, side_session_id, pushed_at, status) "
+        "VALUES ('cli', 'parent', 'ghost', 2.0, 'active')"
+    )
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.commit()
+
+    db._init_schema()  # triggers _reconcile_session_stack_fk
+
+    rows = conn.execute(
+        "SELECT side_session_id FROM session_stack"
+    ).fetchall()
+    assert [r[0] for r in rows] == ["side"]

@@ -22,6 +22,8 @@ BROWSER_BIN="${ROCKY_BROWSER_BIN:-}"
 LAUNCHER_HOST="${ROCKY_BROWSER_LAUNCHER_HOST:-127.0.0.1}"
 LAUNCHER_PORT="${ROCKY_BROWSER_LAUNCHER_PORT:-18765}"
 LAUNCHER_PID_FILE="${ROCKY_BROWSER_LAUNCHER_PID_FILE:-$HOME/.hermes/rocky-browser-launcher.pid}"
+LAUNCHER_TOKEN_FILE="${ROCKY_BROWSER_LAUNCHER_TOKEN_FILE:-$HOME/.hermes/rocky-browser-launcher.token}"
+LAUNCHER_TOKEN="${ROCKY_BROWSER_LAUNCHER_TOKEN:-}"
 LAUNCHER_CONTROL_URL="http://127.0.0.1:${LAUNCHER_PORT}"
 
 mkdir -p "$PROFILE_DIR" "$LOG_DIR"
@@ -78,6 +80,36 @@ ssh_key() {
 ssh_target() {
   [[ -n "$SSH_TARGET" ]] || { err "ROCKY_BROWSER_SSH_TARGET is required for tunnel mode"; return 1; }
   printf '%s\n' "$SSH_TARGET"
+}
+
+# Resolve the shared secret the launcher HTTP endpoint requires on every action
+# request. Precedence: explicit env > existing token file > freshly generated.
+# A generated token is persisted (mode 600) so the same value survives restarts
+# and can be copied into the Hermes tenant config (browser.local_launcher.launcher_token).
+launcher_token() {
+  if [[ -n "$LAUNCHER_TOKEN" ]]; then
+    printf '%s\n' "$LAUNCHER_TOKEN"
+    return 0
+  fi
+  if [[ -f "$LAUNCHER_TOKEN_FILE" ]]; then
+    local existing
+    existing="$(tr -d '[:space:]' < "$LAUNCHER_TOKEN_FILE")"
+    if [[ -n "$existing" ]]; then
+      printf '%s\n' "$existing"
+      return 0
+    fi
+  fi
+  local generated
+  if command -v python3 >/dev/null 2>&1; then
+    generated="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  else
+    generated="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  fi
+  [[ -n "$generated" ]] || { err "failed to generate launcher token"; return 1; }
+  mkdir -p "$(dirname "$LAUNCHER_TOKEN_FILE")"
+  ( umask 077; printf '%s\n' "$generated" > "$LAUNCHER_TOKEN_FILE" )
+  chmod 600 "$LAUNCHER_TOKEN_FILE" 2>/dev/null || true
+  printf '%s\n' "$generated"
 }
 
 start_browser() {
@@ -194,20 +226,25 @@ status() {
 launcher_service() {
   require_loopback ROCKY_BROWSER_LAUNCHER_HOST "$LAUNCHER_HOST"
   require_loopback ROCKY_BROWSER_VPS_BIND "$VPS_BIND"
-  local key target py_pid
+  local key target token py_pid
   key="$(ssh_key)" || return 1
   target="$(ssh_target)" || return 1
+  token="$(launcher_token)" || return 1
   chmod 600 "$key" 2>/dev/null || true
   mkdir -p "$LOG_DIR"
-  say "Starting Rocky launcher HTTP on $LAUNCHER_HOST:$LAUNCHER_PORT"
+  say "Starting Rocky launcher HTTP on $LAUNCHER_HOST:$LAUNCHER_PORT (bearer-token required)"
   ROCKY_BROWSER_SCRIPT="$0" ROCKY_BROWSER_LOG_DIR="$LOG_DIR" ROCKY_BROWSER_LAUNCHER_HOST="$LAUNCHER_HOST" ROCKY_BROWSER_LAUNCHER_PORT="$LAUNCHER_PORT" \
+  ROCKY_BROWSER_LAUNCHER_TOKEN="$token" \
   python3 - <<'PY' > "$LOG_DIR/rocky-browser-launcher.log" 2>&1 &
-import json, os, subprocess, time
+import hmac, json, os, subprocess, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HOST = os.environ.get('ROCKY_BROWSER_LAUNCHER_HOST', '127.0.0.1')
 PORT = int(os.environ.get('ROCKY_BROWSER_LAUNCHER_PORT', '18765'))
 SCRIPT = os.environ['ROCKY_BROWSER_SCRIPT']
+TOKEN = os.environ.get('ROCKY_BROWSER_LAUNCHER_TOKEN', '')
+# /health stays open as a liveness probe; every capability path needs the token.
+PUBLIC_PATHS = ('/health', '/')
 
 def run_cmd(args):
     p = subprocess.run(args, env=os.environ.copy(), text=True, capture_output=True, timeout=90)
@@ -225,11 +262,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+    def authorized(self):
+        if not TOKEN:
+            return True
+        header = self.headers.get('Authorization', '')
+        prefix = 'Bearer '
+        presented = header[len(prefix):] if header.startswith(prefix) else ''
+        return bool(presented) and hmac.compare_digest(presented, TOKEN)
     def do_GET(self):
         path = self.path.split('?', 1)[0]
-        if path in ('/health', '/'):
+        if path in PUBLIC_PATHS:
             self.send_json(200, {'ok': True, 'service': 'hermes-local-browser-launcher', 'time': time.time()})
-        elif path == '/status':
+            return
+        if not self.authorized():
+            self.send_json(401, {'ok': False, 'error': 'unauthorized'})
+            return
+        if path == '/status':
             self.send_json(200, {'ok': True, 'command': 'status', 'result': run_cmd([SCRIPT, 'status'])})
         elif path in ('/open', '/up'):
             self.send_json(200, {'ok': True, 'command': 'up', 'result': run_cmd([SCRIPT, 'up'])})
@@ -288,6 +336,10 @@ ROCKY_BROWSER_LAUNCHER_PORT=18765
 ROCKY_BROWSER_PROFILE_DIR=$HOME/.hermes/rocky-browser
 ROCKY_BROWSER_START_URL=about:blank
 # Optional: ROCKY_BROWSER_BIN=/usr/bin/chromium
+# Shared secret the launcher HTTP endpoint requires (Authorization: Bearer ...).
+# Leave blank to auto-generate one into $HOME/.hermes/rocky-browser-launcher.token;
+# copy that value into the Hermes tenant profile (browser.local_launcher.launcher_token).
+# ROCKY_BROWSER_LAUNCHER_TOKEN=
 EOF
     chmod 600 "$env_file"
   fi

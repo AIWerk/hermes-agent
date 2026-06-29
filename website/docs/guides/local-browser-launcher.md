@@ -10,6 +10,7 @@ This is useful for Rocky or VPS agents where the browser should appear on the us
 - CDP must bind to loopback only: `127.0.0.1`, never `0.0.0.0`.
 - The user desktop initiates SSH. The agent host does not get general shell access to the desktop.
 - The launcher HTTP server binds only to desktop localhost and is exposed to the agent host only as a reverse tunnel on host localhost.
+- The control endpoints require a shared bearer token, so other local processes on the agent host cannot drive the browser even over loopback. Only `/health` stays unauthenticated as a liveness probe.
 - The launcher only supports: `/health`, `/status`, `/open` or `/up`, `/down` or `/close`.
 - No credential capture, password-store access, 2FA/CAPTCHA/payment/order-submit automation.
 - The user stays in control for sensitive actions.
@@ -30,11 +31,14 @@ browser:
     ssh_target: user@agent.example
     ssh_port: 22
     ssh_identity_file: ~/.ssh/tenant-browser-tunnel
+    launcher_token: <paste the desktop launcher token here>
     browser_profile_dir: ~/.hermes/rocky-browser
     browser_binary: ""
     start_url: about:blank
     cdp_poll_timeout_s: 20
 ```
+
+`launcher_token` must match the token the desktop launcher uses (see below). Without it Hermes gets `HTTP 401` from every control call.
 
 Do not put tenant hosts, usernames, or key paths into core Hermes defaults.
 
@@ -66,6 +70,13 @@ ROCKY_BROWSER_LAUNCHER_PORT=18765
 ROCKY_BROWSER_PROFILE_DIR=$HOME/.hermes/rocky-browser
 ROCKY_BROWSER_START_URL=about:blank
 # Optional: ROCKY_BROWSER_BIN=/usr/bin/chromium
+# Optional: ROCKY_BROWSER_LAUNCHER_TOKEN=  (blank = auto-generate)
+```
+
+If you leave `ROCKY_BROWSER_LAUNCHER_TOKEN` blank, the launcher generates one on first start and stores it (mode 600) at `~/.hermes/rocky-browser-launcher.token`. Copy that value into the Hermes profile as `browser.local_launcher.launcher_token`:
+
+```bash
+cat ~/.hermes/rocky-browser-launcher.token
 ```
 
 Start the user service:
@@ -157,7 +168,17 @@ From the agent host:
 curl -fsS http://127.0.0.1:18765/health
 ```
 
-If this fails, the desktop launcher service or its reverse SSH tunnel is not up.
+If this fails, the desktop launcher service or its reverse SSH tunnel is not up. `/health` is unauthenticated; the action endpoints are not.
+
+### HTTP 401 from the launcher
+
+A `401 unauthorized` means the token in the Hermes profile does not match the desktop launcher. On the desktop, read the active token and copy it into `browser.local_launcher.launcher_token`:
+
+```bash
+cat ~/.hermes/rocky-browser-launcher.token
+```
+
+If you set `ROCKY_BROWSER_LAUNCHER_TOKEN` explicitly in the env file, use that value instead and restart the service.
 
 ### CDP not ready
 

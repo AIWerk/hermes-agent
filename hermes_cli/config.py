@@ -1179,6 +1179,10 @@ DEFAULT_CONFIG = {
             "ssh_target": "",
             "ssh_port": 22,
             "ssh_identity_file": "",
+            # Shared secret sent as ``Authorization: Bearer`` to the launcher's
+            # control endpoint so other local processes on the agent host cannot
+            # drive it. Must match ROCKY_BROWSER_LAUNCHER_TOKEN on the desktop.
+            "launcher_token": "",
             "browser_profile_dir": "",
             "browser_binary": "",
             "start_url": "about:blank",

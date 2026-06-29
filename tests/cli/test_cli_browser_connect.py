@@ -1,10 +1,15 @@
 """Tests for CLI browser CDP auto-launch helpers."""
 
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from io import StringIO
 import os
 from queue import Queue
+import socket
 import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 from cli import HermesCLI
@@ -230,12 +235,14 @@ class TestChromeDebugLaunch:
              patch("hermes_cli.browser_connect.os.path.isfile", return_value=False):
             assert manual_chrome_debug_command(9222, "Linux") is None
 
-    def test_connect_context_note_allows_expected_browser_use(self, monkeypatch):
-        """`/browser connect` is an instruction to use the CDP browser.
+    def test_connect_context_note_keeps_normal_approval_flow(self, monkeypatch):
+        """`/browser connect` queues an informational note, not a permission grant.
 
-        The queued context note must not tell the model to wait for a second
-        permission step or imply that the attached browser is the user's main
-        everyday Chrome profile.
+        The note must describe that the tools are now CDP-backed against a
+        possibly-session-bearing debug profile, but it must NOT tell the model to
+        skip the normal per-action approval step ("do not wait for separate
+        permission"). The attached browser controls a live profile, so
+        navigational/destructive actions still go through the usual approval flow.
         """
         cli = HermesCLI.__new__(HermesCLI)
         cli._pending_input = Queue()
@@ -248,9 +255,15 @@ class TestChromeDebugLaunch:
             cli._handle_browser_command("/browser connect")
 
         note = cli._pending_input.get_nowait()
+        # Still informational about what was attached.
         assert "Chromium-family" in note
         assert "dev/debug" in note
-        assert "using browser tools for their current browser-related request is expected" in note
+        assert "logged-in sessions" in note or "cookies" in note
+        # The wait-for-permission step must NOT be removed anymore.
+        assert "do not wait for separate permission" not in note
+        assert "is expected" not in note
+        assert "normal approval flow" in note
+        # Still must not misrepresent the profile as the main everyday browser.
         assert "live Chrome browser" not in note
         assert "real browser" not in note
         assert "Please await their instruction" not in note
@@ -398,6 +411,47 @@ class TestChromeDebugLaunch:
         assert detail == '{"ok": true}'
         urlopen.assert_called_once_with("http://127.0.0.1:18765/open", timeout=1.0)
 
+    def test_local_launcher_config_parses_token(self):
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {"enabled": True, "launcher_token": " secret-123 "}}
+        })
+        assert cfg.launcher_token == "secret-123"
+        # Absent token stays empty so older launchers keep working unchanged.
+        cfg = load_local_browser_launcher_config({"browser": {"local_launcher": {"enabled": True}}})
+        assert cfg.launcher_token == ""
+
+    def test_call_local_launcher_sends_bearer_token_when_configured(self):
+        class FakeResponse:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self, limit):
+                return b'{"ok": true}'
+
+        cfg = load_local_browser_launcher_config({
+            "browser": {"local_launcher": {
+                "enabled": True,
+                "launcher_url": "http://127.0.0.1:18765",
+                "launcher_token": "secret-123",
+            }}
+        })
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["req"] = req
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            ok, _ = call_local_browser_launcher(cfg, "open", timeout=1.0)
+
+        assert ok is True
+        req = captured["req"]
+        assert isinstance(req, urllib.request.Request)
+        assert req.full_url == "http://127.0.0.1:18765/open"
+        assert req.get_header("Authorization") == "Bearer secret-123"
+
     def test_generic_browser_code_has_no_attilla_specific_hardcodes(self):
         root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         paths = [
@@ -410,3 +464,86 @@ class TestChromeDebugLaunch:
                 content = fh.read()
             for marker in forbidden:
                 assert marker not in content
+
+
+def _extract_launcher_server_source():
+    """Pull the embedded launcher HTTP server out of rocky-browser.sh."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    script = os.path.join(
+        root, "scripts", "local-browser-connector", "linux", "rocky-browser.sh"
+    )
+    with open(script, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().endswith("<<'PY' > \"$LOG_DIR/rocky-browser-launcher.log\" 2>&1 &"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "PY")
+    return "\n".join(lines[start + 1:end])
+
+
+def _free_port():
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class TestLauncherHttpAuth:
+    """The embedded launcher HTTP server must require the bearer token."""
+
+    def _run_server(self, tmp_path, token):
+        port = _free_port()
+        src = _extract_launcher_server_source()
+        # A harmless stand-in for the rocky-browser script so /status etc. do not
+        # actually launch a browser; it just prints and exits 0.
+        stub = tmp_path / "rocky-stub.sh"
+        stub.write_text("#!/usr/bin/env bash\necho ok\n")
+        stub.chmod(0o755)
+        env = dict(os.environ)
+        env.update({
+            "ROCKY_BROWSER_LAUNCHER_HOST": "127.0.0.1",
+            "ROCKY_BROWSER_LAUNCHER_PORT": str(port),
+            "ROCKY_BROWSER_SCRIPT": str(stub),
+            "ROCKY_BROWSER_LAUNCHER_TOKEN": token,
+        })
+        proc = subprocess.Popen(
+            [sys.executable, "-c", src],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1):
+                    break
+            except urllib.error.URLError:
+                time.sleep(0.1)
+        else:
+            proc.terminate()
+            raise AssertionError("launcher HTTP server did not become ready")
+        return proc, port
+
+    @staticmethod
+    def _get(port, path, token=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+        if token is not None:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_action_endpoints_require_token(self, tmp_path):
+        proc, port = self._run_server(tmp_path, token="topsecret")
+        try:
+            # Health is an open liveness probe.
+            assert self._get(port, "/health") == 200
+            # Capability endpoints reject missing / wrong tokens.
+            assert self._get(port, "/status") == 401
+            assert self._get(port, "/status", token="wrong") == 401
+            assert self._get(port, "/open") == 401
+            assert self._get(port, "/down", token="nope") == 401
+            # The correct token is accepted.
+            assert self._get(port, "/status", token="topsecret") == 200
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)

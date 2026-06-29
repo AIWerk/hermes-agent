@@ -7368,7 +7368,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         source = os.environ.get("HERMES_SESSION_SOURCE", "cli")
         try:
-            entry = self._session_db.pop_side_session(source=source)
+            # Scope the pop to THIS client's current (side) session so that in a
+            # gateway process shared by several clients under one process-wide
+            # source, one client's /back can't pop another client's parked entry
+            # and load its parent history.
+            entry = self._session_db.pop_side_session(
+                source=source, side_session_id=self.session_id
+            )
         except Exception as e:
             _cprint(f"  Failed to read side-session stack: {e}")
             return
@@ -9529,12 +9535,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     "[System note: The user invoked /browser connect and connected your browser tools to "
                     "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
                     "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
-                    "control that CDP browser. The command itself is a signal that using browser tools for "
-                    "their current browser-related request is expected; do not wait for separate permission "
-                    "just because CDP is connected. This is typically a Hermes-managed isolated debug "
+                    "control that CDP browser. This is typically a Hermes-managed isolated debug "
                     "profile, not the user's main everyday browser. It is still user-visible and may contain "
-                    "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
-                    "closing tabs, or navigating away unless the user's task calls for it.]"
+                    "pages, logged-in sessions, or cookies in that debug profile, so continue to follow the "
+                    "normal approval flow for navigational or destructive browser actions (navigating away, "
+                    "closing tabs, submitting forms) just as you would on any live browser.]"
                 )
 
         if sub in {"launch", "open-local", "open", "up"}:
