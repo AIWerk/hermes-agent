@@ -57,7 +57,7 @@ def _add_server_runtime_args(parser) -> None:
             "ONE machine-level server and preselect the profile."
         ),
     )
-    dashboard_parser.add_argument(
+    parser.add_argument(
         "--assistant",
         action="store_true",
         help=(
