@@ -17,6 +17,14 @@ function numberField(payload: Record<string, unknown>, key: string): number {
   return Number.isFinite(value) ? value : 0;
 }
 
+function compactNumber(value: number): string {
+  return value.toLocaleString();
+}
+
+function keepTogether(text: string): string {
+  return text.replace(/ /g, "\u00a0");
+}
+
 export function formatCuiUsage(payload: Record<string, unknown>): string {
   const calls = numberField(payload, "calls");
   const input = numberField(payload, "input");
@@ -26,18 +34,25 @@ export function formatCuiUsage(payload: Record<string, unknown>): string {
   const contextUsed = numberField(payload, "context_used");
   const contextMax = numberField(payload, "context_max");
   const contextPercent = numberField(payload, "context_percent");
+  const percent = `${Math.round(contextPercent)}%`;
+  const tokenParts = [
+    `Input ${compactNumber(input)}`,
+    `Output ${compactNumber(output)}`,
+  ];
+  if (reasoning) tokenParts.push(`Reasoning ${compactNumber(reasoning)}`);
+  tokenParts.push(`Total ${compactNumber(total)}`);
   const creditsLines = Array.isArray(payload.credits_lines)
     ? payload.credits_lines.filter((line): line is string => typeof line === "string" && Boolean(line.trim()))
     : [];
   const lines = [
     "Session usage",
-    `API calls: ${calls.toLocaleString()}`,
-    `Input tokens: ${input.toLocaleString()}`,
-    `Output tokens: ${output.toLocaleString()}`,
+    `API calls: ${compactNumber(calls)}`,
+    `Tokens: ${tokenParts.join(" · ")}`,
   ];
-  if (reasoning) lines.push(`Reasoning tokens: ${reasoning.toLocaleString()}`);
-  lines.push(`Total tokens: ${total.toLocaleString()}`);
-  if (contextMax) lines.push(`Context: ${contextUsed.toLocaleString()} / ${contextMax.toLocaleString()} (${Math.round(contextPercent)}%)`);
+  if (contextMax) {
+    const contextRange = keepTogether(`${compactNumber(contextUsed)} / ${compactNumber(contextMax)}`);
+    lines.push(`Context: ${contextRange} · ${percent}`);
+  }
   if (creditsLines.length) lines.push("", "Nous credits", ...creditsLines);
   if (!calls && !creditsLines.length) lines.push("", "No API calls yet.");
   return lines.join("\n");

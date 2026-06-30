@@ -34,8 +34,8 @@ describe("CUI slash helpers", () => {
       credits_lines: ["Grant: ok"]
     });
     expect(rendered).toContain("API calls: 2");
-    expect(rendered).toMatch(/Input tokens: 1[,’']000/);
-    expect(rendered).toMatch(/Context: 4[,’']000 \/ 10[,’']000 \(40%\)/);
+    expect(rendered).toMatch(/Tokens: Input 1[,’']000 · Output 250 · Total 1[,’']250/);
+    expect(rendered).toMatch(/Context: 4[,’']000\u00a0\/\u00a010[,’']000 · 40%/);
     expect(rendered).toContain("Grant: ok");
   });
 });
