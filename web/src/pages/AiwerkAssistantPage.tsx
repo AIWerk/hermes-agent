@@ -6,6 +6,7 @@ import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
+import { CUI_SUPPORTED_SLASH_COMMANDS, formatCuiUsage, isCuiSlashInput, slashBase } from "@/lib/cui-slash";
 import { safeWindowOpen } from "@/lib/safe-open";
 
 // Object URLs (blob:) this client minted via URL.createObjectURL. Only these may
@@ -2054,6 +2055,7 @@ export default function AiwerkAssistantPage() {
           for (const pair of catalog.pairs ?? []) {
             const command = String(pair[0] || "").trim();
             if (!command.startsWith("/")) continue;
+            if (!CUI_SUPPORTED_SLASH_COMMANDS.has(command.toLowerCase())) continue;
             const rawDescription = String(pair[1] || "").trim();
             const rawCategory = categoryByCommand.get(command) || "Skills";
             deduped.set(command.toLowerCase(), {
@@ -2299,6 +2301,15 @@ export default function AiwerkAssistantPage() {
     const text = (target === "side" ? sideInput : input).trim();
     const gateway = gatewayRef.current;
     const attachments = target === "main" ? attachedFiles : [];
+    if (text && attachments.length === 0 && isCuiSlashInput(text)) {
+      if (target === "side") {
+        setSideInput("");
+      } else {
+        setInput("");
+      }
+      await sendSlash(text, text);
+      return;
+    }
     if ((!text && attachments.length === 0) || !gateway || !sessionId) return;
     const attachmentNames = attachments.map((file) => file.name).join(", ");
     const submitText = text || `Anhänge: ${attachmentNames || "Dateien"}`;
@@ -2447,22 +2458,83 @@ export default function AiwerkAssistantPage() {
 
   const sendSlash = async (command: string, label: string) => {
     const gateway = gatewayRef.current;
-    if (command === "/side") {
+    const normalized = command.trim();
+    const base = slashBase(normalized);
+    const arg = normalized.slice(base.length).trim();
+    const renderSystem = (text: string) => {
+      const message: ChatMessage = { id: newId("slash-system"), role: "system", text, status: "complete" };
+      if (conversationModeRef.current === "side") {
+        setSideMessages((prev) => [...prev, message]);
+      } else {
+        setMessages((prev) => [...prev, message]);
+      }
+    };
+
+    if (base === "/side") {
       showToast(label);
       void startSideSession();
       return;
     }
-    if (command === "/back") {
+    if (base === "/back") {
       showToast(label);
       void returnFromSideSession();
       return;
     }
-    if (command === "/new") {
+    if (base === "/new") {
       void startNewSession();
       return;
     }
-    if (command === "/compress") {
+    if (base === "/help") {
+      const rows = slashCommands.map((item) => `${item.command} — ${item.description}`).join("\n");
+      renderSystem(rows || "Keine CUI Slash-Befehle verfügbar.");
+      return;
+    }
+    if (base === "/status") {
+      renderSystem([
+        "CUI status",
+        `Connection: ${connection}`,
+        `Session: ${sessionId || "none"}`,
+        `Model: ${currentModelLabel}`,
+        `Busy mode: ${runtimeStatus.busyMode || "default"}`,
+        `Reasoning: ${runtimeStatus.reasoningEffort || "default"} / ${runtimeStatus.reasoningDisplay || "default"}`,
+        `Fast mode: ${runtimeStatus.fastMode || "default"}`,
+      ].join("\n"));
+      if (gateway && sessionId) {
+        window.setTimeout(() => void refreshRuntimeStatus(gateway, sessionId), 100);
+        window.setTimeout(() => void refreshContextUsage(gateway, sessionId), 150);
+      }
+      return;
+    }
+    if (base === "/usage") {
       if (!gateway || !sessionId) return;
+      try {
+        const usage = await gateway.request<Record<string, unknown>>("session.usage", { session_id: sessionId }, 15_000);
+        const nextUsage = contextUsageFromPayload(usage);
+        if (nextUsage) setContextUsage((current) => sameContextUsage(current, nextUsage) ? current : nextUsage);
+        renderSystem(formatCuiUsage(usage));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+    if (base === "/stop") {
+      if (!gateway || !sessionId) return;
+      try {
+        await gateway.request("session.interrupt", { session_id: sessionId }, 15_000);
+        setBusy(false);
+        setError(null);
+        showToast("Laufende Antwort gestoppt");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+    if (base === "/compress") {
+      if (!gateway || !sessionId) return;
+      if (arg) {
+        renderSystem("/compress arguments are not available in the CUI yet. Use the compress button or CLI for advanced compression.");
+        return;
+      }
       if (!canCompress) {
         showToast("Kontext noch zu klein zum Komprimieren");
         return;
@@ -2485,18 +2557,23 @@ export default function AiwerkAssistantPage() {
       }
       return;
     }
-    showToast(label);
-    if (!gateway || !sessionId) return;
-    try {
-      await gateway.request("slash.exec", { session_id: sessionId, command: command.replace(/^\//, "") });
-      window.setTimeout(() => void refreshRuntimeStatus(gateway, sessionId), 900);
-      window.setTimeout(() => void refreshSessionMeta(gateway, sessionId), 900);
-    } catch {
+    if (base === "/reload-mcp") {
+      if (!gateway || !sessionId) return;
+      showToast(label);
       try {
-        await gateway.request("prompt.submit", { session_id: sessionId, text: command });
-      } catch {
-        /* surfaced via gateway error handler */
+        await gateway.request("slash.exec", { session_id: sessionId, command: "reload-mcp" }, 120_000);
+        window.setTimeout(() => void refreshResources({ force: true }), 400);
+        window.setTimeout(() => void refreshRuntimeStatus(gateway, sessionId), 900);
+        window.setTimeout(() => void refreshSessionMeta(gateway, sessionId), 900);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
       }
+      return;
+    }
+
+    if (base) {
+      renderSystem(`${base} is not available in the CUI. Use the CLI/TUI for this slash command.`);
+      return;
     }
   };
 
