@@ -9009,7 +9009,7 @@ class TestAssistantWsGate:
         gate = self._gate()
         for method in [
             "session.create", "session.title", "session.notes",
-            "session.usage", "session.steer", "session.side.start",
+            "session.usage", "session.interrupt", "session.steer", "session.side.start",
             "session.side.back", "prompt.submit", "approval.respond",
         ]:
             assert gate({"id": 1, "method": method, "params": {}}) is None, method

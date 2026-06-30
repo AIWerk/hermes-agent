@@ -370,6 +370,7 @@ _ASSISTANT_ALLOWED_RPC_METHODS: frozenset = frozenset({
     "session.title",
     "session.notes",
     "session.usage",
+    "session.interrupt",
     "session.steer",
     "session.side.start",
     "session.side.back",
