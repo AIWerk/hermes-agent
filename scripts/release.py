@@ -63,6 +63,12 @@ AUTHOR_MAP = {
     "runtime@aiwerk.local": "AIWerk",
     "vinoth12940@users.noreply.github.com": "Vinoth",
 
+
+    "cypher@augmentl.com": "Nickperillo",  # PR #8008 salvage (Discord channel-name matching + flush pending sends on shutdown)
+    "tenoryang@outlook.com": "MarioYounger",  # PR #9028 salvage (bash/sh heredoc approval, NFKC homograph fold, execute_code CREDS/BEARER/APIKEY env filter)
+    "peet.wannasarnmetha@gmail.com": "peetwan",  # PR #51841 salvage (loopback ws-ping tuning + token-frame coalescing + loop heartbeat; #48445/#50005)
+    "297292863+Zyxxx-xxxyZ@users.noreply.github.com": "Zyxxx-xxxyZ",  # PR #54287 salvage (route frontend-polled inline RPCs to _LONG_HANDLERS; #48445/#50005)
+
     "telos@apex-z.com": "telos-oc",  # PR #14353 salvage (propagate custom_providers key_env into ProviderDef.api_key_env_vars; named + bare-custom self-heal paths)
     "256073454+Kolektori@users.noreply.github.com": "Kolektori",  # PR #6436 salvage (require approval for host-bound Docker commands; container guard fast-path)
     "41764686+LIC99@users.noreply.github.com": "LIC99",  # PR #4682 salvage (warn + default to manual on unknown approvals.mode; #4261)
@@ -96,6 +102,7 @@ AUTHOR_MAP = {
     "15205536+595650661@users.noreply.github.com": "595650661",  # PR #37851 salvage (classify MiniMax new_sensitive content filter → content_policy_blocked; #32421)
     "benbenwyb@gmail.com": "benbenlijie",  # PR #47205 salvage (named custom-provider extra_body + Z.AI Coding overload adaptive backoff; #50663)
     "dana@added-value.co.il": "Danamove",  # PR #46726 salvage (kill venv-resident pythonw gateway before recreating venv on Windows; #47036/#47557/#47910)
+    "rcint@klaith.com": "rc-int",  # PR #9126 salvage / co-author (cap subagent summary size vs parent context overflow)
     "145739220+wgu9@users.noreply.github.com": "wgu9",  # PR #51468 salvage (WSL/no-systemd orphan gateway tracking, #51325)
     "165020384+uperLu@users.noreply.github.com": "uperLu",  # PR #50958 salvage (rename plugins/cron → plugins/cron_providers; #50872)
     "277269729+yusekiotacode@users.noreply.github.com": "yusekiotacode",  # PR #48706 salvage (anthropic OAuth login token endpoint → platform.claude.com; #45250/#49821)

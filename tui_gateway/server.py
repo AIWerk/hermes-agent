@@ -212,9 +212,11 @@ _LONG_HANDLERS = frozenset(
         # round-trips per call — so it must never block the reader thread.
         "pet.generate",
         "pet.hatch",
+        "pet.info",
         "pet.select",
         "pet.thumb",
         "plugins.manage",
+        "process.list",
         "projects.discover_repos",
         "projects.record_repos",
         "projects.for_cwd",
@@ -224,6 +226,7 @@ _LONG_HANDLERS = frozenset(
         "session.side.back",
         "session.side.start",
         "session.compress",
+        "session.list",
         "session.resume",
         "shell.exec",
         "skills.manage",
@@ -233,7 +236,7 @@ _LONG_HANDLERS = frozenset(
 
 try:
     _rpc_pool_workers = max(
-        2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "4")
+        2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "8")
     )
 except (ValueError, TypeError):
     _rpc_pool_workers = 4
@@ -3344,9 +3347,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
 
 def _tool_ctx(name: str, args: dict) -> str:
     try:
-        from agent.display import build_tool_preview
+        from agent.display import build_tool_label
 
-        return build_tool_preview(name, args, max_len=80) or ""
+        return build_tool_label(name, args, max_len=80) or ""
     except Exception:
         return ""
 

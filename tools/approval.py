@@ -481,8 +481,10 @@ DANGEROUS_PATTERNS = [
     (r'\bfind\b.*-delete\b', "find -delete"),
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
-    # terminates all running agents mid-work.
-    (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
+    # terminates all running agents mid-work.  Allow global flags between
+    # `hermes` and `gateway` (e.g. `hermes -p ade gateway restart`) so a
+    # profile flag can't slip the agent past the guard.
+    (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
     # Docker container lifecycle — any user with docker.sock mounted (a common
     # Docker Compose pattern) gives the agent the ability to restart/stop/kill
@@ -554,6 +556,12 @@ DANGEROUS_PATTERNS = [
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
+    # Shell execution via heredoc — `bash <<'EOF' ... EOF` runs arbitrary
+    # shell commands without triggering the `bash -c` pattern above. The
+    # inner commands may not individually match any dangerous pattern (e.g.
+    # data-exfiltration pipelines using curl/cat) yet are still executed in
+    # a full shell context.
+    (r'\b(bash|sh|zsh|ksh)\s+<<', "shell execution via heredoc"),
     # Git destructive operations that can lose uncommitted work or rewrite
     # shared history. Not captured by rm/chmod/etc patterns.
     (r'\bgit\s+reset\s+--hard\b', "git reset --hard (destroys uncommitted changes)"),
