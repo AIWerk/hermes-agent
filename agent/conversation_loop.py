@@ -692,6 +692,11 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
+        # Count call attempts independently of provider usage metadata. Some
+        # transports/models return a valid response without a `.usage` object;
+        # the turn result still reports api_call_count, so live /usage must not
+        # stay at zero just because token buckets are unavailable.
+        agent.session_api_calls += 1
         agent._touch_activity(f"starting API call #{api_call_count}")
 
         # Grace call: the budget is exhausted but we gave the model one
@@ -2012,7 +2017,6 @@ def run_conversation(
                     agent.session_prompt_tokens += prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens

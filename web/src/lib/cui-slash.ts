@@ -25,6 +25,14 @@ function keepTogether(text: string): string {
   return text.replace(/ /g, "\u00a0");
 }
 
+function sectionSeparator(): string {
+  return " | ";
+}
+
+function tokenSeparator(): string {
+  return " - ";
+}
+
 export function formatCuiUsage(payload: Record<string, unknown>): string {
   const calls = numberField(payload, "calls");
   const input = numberField(payload, "input");
@@ -44,16 +52,16 @@ export function formatCuiUsage(payload: Record<string, unknown>): string {
   const creditsLines = Array.isArray(payload.credits_lines)
     ? payload.credits_lines.filter((line): line is string => typeof line === "string" && Boolean(line.trim()))
     : [];
-  const lines = [
+  const parts = [
     "Session usage",
     `API calls: ${compactNumber(calls)}`,
-    `Tokens: ${tokenParts.join(" · ")}`,
+    `Tokens: ${tokenParts.join(tokenSeparator())}`,
   ];
   if (contextMax) {
     const contextRange = keepTogether(`${compactNumber(contextUsed)} / ${compactNumber(contextMax)}`);
-    lines.push(`Context: ${contextRange} · ${percent}`);
+    parts.push(`Context: ${contextRange} - ${percent}`);
   }
-  if (creditsLines.length) lines.push("", "Nous credits", ...creditsLines);
-  if (!calls && !creditsLines.length) lines.push("", "No API calls yet.");
-  return lines.join("\n");
+  if (!calls && !creditsLines.length) parts.push("No API calls yet.");
+  if (creditsLines.length) parts.push(`Nous credits: ${creditsLines.join(tokenSeparator())}`);
+  return parts.join(sectionSeparator());
 }
