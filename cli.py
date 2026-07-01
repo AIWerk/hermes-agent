@@ -37,6 +37,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+import subprocess
 from collections import deque
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
@@ -6089,8 +6090,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
 
 
+    def _write_native_clipboard(self, text: str) -> bool:
+        """Best-effort local OS clipboard write for terminals without OSC 52."""
+        if os.environ.get("SSH_CONNECTION"):
+            return False
+
+        candidates: list[tuple[str, list[str]]] = []
+        if sys.platform == "darwin":
+            candidates.append(("pbcopy", []))
+        elif sys.platform.startswith("linux"):
+            if os.environ.get("WAYLAND_DISPLAY"):
+                candidates.append(("wl-copy", []))
+            if os.environ.get("DISPLAY"):
+                candidates.extend(
+                    [
+                        ("xclip", ["-selection", "clipboard", "-target", "UTF8_STRING"]),
+                        ("xsel", ["--clipboard", "--input"]),
+                    ]
+                )
+        elif os.name == "nt":
+            candidates.append(("clip", []))
+
+        for tool, args in candidates:
+            if not shutil.which(tool):
+                continue
+            try:
+                proc = subprocess.Popen(
+                    [tool, *args],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=(os.name == "posix"),
+                    text=True,
+                )
+                if proc.stdin is not None:
+                    proc.stdin.write(text)
+                    proc.stdin.close()
+                # Clipboard tools often fork/hold the selection; do not wait
+                # indefinitely, but give immediate failures a chance to surface.
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+                if proc.poll() in (None, 0):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _write_osc52_clipboard(self, text: str) -> None:
-        """Copy *text* to terminal clipboard via OSC 52."""
+        """Copy *text* to terminal clipboard via native tool plus OSC 52."""
+        self._write_native_clipboard(text)
         payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
         seq = f"\x1b]52;c;{payload}\x07"
         out = getattr(self, "_app", None)
