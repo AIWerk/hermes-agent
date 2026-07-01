@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import base64
 import hashlib
 import hmac
@@ -8,13 +8,10 @@ import json
 import os
 import re
 import shlex
-import socket
-import struct
 import subprocess
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -388,10 +385,6 @@ _SENSITIVE_COMMAND_RE = re.compile(
 
 _cache: dict[str, OperatorVerificationResult] = {}
 _callback_tls = threading.local()
-_broker_proc: subprocess.Popen[str] | None = None
-_broker_lock = threading.Lock()
-_BROKER_SOCKET_ENV = "HERMES_OPERATOR_VERIFIER_BROKER_SOCKET"
-_BROKER_PID_ENV = "HERMES_OPERATOR_VERIFIER_BROKER_PID"
 
 
 def _get_operator_verification_callback():
@@ -407,129 +400,8 @@ def _cache_key(session_id: str | None = None) -> str:
     return session_id or "__process__"
 
 
-def _broker_runtime_dir() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR") or str(Path.home() / ".hermes" / "run")
-    return Path(base) / "hov"
-
-
-def _operator_result_from_payload(payload: Any) -> OperatorVerificationResult | None:
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("ok") is not True:
-        return None
-    actor_id = payload.get("actor_id")
-    role = payload.get("role")
-    if not isinstance(actor_id, str) or not actor_id.strip():
-        return None
-    if not isinstance(role, str) or not role.strip():
-        return None
-    raw_verified_at = payload.get("verified_at")
-    raw_expires_at = payload.get("expires_at")
-    if raw_verified_at is None or raw_expires_at is None:
-        return None
-    try:
-        verified_at = int(raw_verified_at)
-        expires_at = int(raw_expires_at)
-    except (TypeError, ValueError):
-        return None
-    return OperatorVerificationResult(
-        ok=True,
-        actor_id=actor_id.strip(),
-        role=role.strip(),
-        verified_at=verified_at,
-        expires_at=expires_at,
-        reason=str(payload.get("reason") or ""),
-    )
-
-
-def _start_operator_verification_broker(result: OperatorVerificationResult, *, session_id: str | None = None) -> None:
-    global _broker_proc
-    if os.name != "posix" or not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
-        return
-    with _broker_lock:
-        if _broker_proc is not None and _broker_proc.poll() is None:
-            try:
-                _broker_proc.terminate()
-            except Exception:
-                pass
-        runtime_dir = _broker_runtime_dir()
-        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        socket_path = runtime_dir / f"b-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-        payload = json.dumps(
-            {"key": _cache_key(session_id), "result": asdict(result)},
-            separators=(",", ":"),
-        )
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "hermes_cli.operator_verification_broker", str(socket_path)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                start_new_session=True,
-            )
-            if proc.stdin is not None:
-                proc.stdin.write(payload)
-                proc.stdin.close()
-        except Exception:
-            return
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return
-            if socket_path.exists():
-                _broker_proc = proc
-                os.environ[_BROKER_SOCKET_ENV] = str(socket_path)
-                os.environ[_BROKER_PID_ENV] = str(proc.pid)
-                return
-            time.sleep(0.02)
-
-
-def _query_operator_verification_broker(
-    *, session_id: str | None = None, now: int | None = None
-) -> OperatorVerificationResult | None:
-    socket_path = os.environ.get(_BROKER_SOCKET_ENV, "").strip()
-    pid_raw = os.environ.get(_BROKER_PID_ENV, "").strip()
-    if not socket_path or not pid_raw or os.name != "posix" or not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
-        return None
-    try:
-        expected_pid = int(pid_raw)
-    except ValueError:
-        return None
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(1.0)
-            client.connect(socket_path)
-            creds = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-            peer_pid, _peer_uid, _peer_gid = struct.unpack("3i", creds)
-            if peer_pid != expected_pid:
-                return None
-            client.sendall(json.dumps({"session_id": session_id}, separators=(",", ":")).encode("utf-8"))
-            raw = client.recv(8192)
-    except Exception:
-        return None
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
-    result = _operator_result_from_payload(payload)
-    if result is None or not result.is_valid(now=now):
-        return None
-    return result
-
-
 def clear_operator_verification_cache() -> None:
-    global _broker_proc
     _cache.clear()
-    with _broker_lock:
-        if _broker_proc is not None and _broker_proc.poll() is None:
-            try:
-                _broker_proc.terminate()
-            except Exception:
-                pass
-        _broker_proc = None
-        os.environ.pop(_BROKER_SOCKET_ENV, None)
-        os.environ.pop(_BROKER_PID_ENV, None)
 
 
 def cache_operator_verification(
@@ -537,7 +409,6 @@ def cache_operator_verification(
 ) -> None:
     if result.ok and result.actor_id and result.role:
         _cache[_cache_key(session_id)] = result
-        _start_operator_verification_broker(result, session_id=session_id)
 
 
 def get_cached_operator_verification(
@@ -549,13 +420,11 @@ def get_cached_operator_verification(
     if result is None and session_id is not None:
         cache_key = _cache_key(None)
         result = _cache.get(cache_key)
-    if result is not None:
-        if result.is_valid(now=now):
-            return result
+    if result is None:
+        return None
+    if not result.is_valid(now=now):
         _cache.pop(cache_key, None)
-    result = _query_operator_verification_broker(session_id=session_id, now=now)
-    if result is not None:
-        _cache[_cache_key(session_id)] = result
+        return None
     return result
 
 
