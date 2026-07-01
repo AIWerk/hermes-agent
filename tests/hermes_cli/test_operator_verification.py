@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.operator_verification import (
     OperatorVerificationConfig,
@@ -18,6 +20,12 @@ from hermes_cli.operator_verification import (
     run_operator_verifier,
     set_operator_verification_callback,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_operator_cache_after_test():
+    yield
+    clear_operator_verification_cache()
 
 
 def test_default_config_enables_operator_verification_gate():
@@ -328,6 +336,53 @@ def test_operator_verification_cache_is_in_memory_and_expires():
 
     assert get_cached_operator_verification(session_id="s1", now=150) == valid
     assert get_cached_operator_verification(session_id="s1", now=250) is None
+
+
+def test_operator_verification_broker_survives_process_local_cache_clear(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200)
+
+    cache_operator_verification(valid, session_id="s1")
+    from hermes_cli import operator_verification as ov
+
+    ov._cache.clear()
+
+    assert get_cached_operator_verification(session_id="s1", now=150) == valid
+    assert get_cached_operator_verification(session_id="s2", now=150) is None
+    assert get_cached_operator_verification(session_id="s1", now=250) is None
+
+
+def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    verified = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200)
+
+    cache_operator_verification(verified, session_id="tool-worker-session")
+    from hermes_cli import operator_verification as ov
+
+    ov._cache.clear()
+
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, session_id="tool-worker-session", now=150
+    ) is None
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, session_id="other-session", now=150
+    ) is not None
+
+
+def test_operator_verification_broker_rejects_mismatched_server_pid(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200)
+    cache_operator_verification(valid)
+    monkeypatch.setenv("HERMES_OPERATOR_VERIFIER_BROKER_PID", "1")
+    from hermes_cli import operator_verification as ov
+
+    ov._cache.clear()
+
+    assert get_cached_operator_verification(session_id="tool-worker", now=150) is None
 
 
 def test_admin_sensitive_command_is_blocked_until_operator_verified():
