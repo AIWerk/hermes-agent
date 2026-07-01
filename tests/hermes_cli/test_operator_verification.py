@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
+
+import pytest
 
 from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.operator_verification import (
@@ -18,6 +25,12 @@ from hermes_cli.operator_verification import (
     run_operator_verifier,
     set_operator_verification_callback,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_operator_cache_after_test():
+    yield
+    clear_operator_verification_cache()
 
 
 def test_default_config_enables_operator_verification_gate():
@@ -328,6 +341,227 @@ def test_operator_verification_cache_is_in_memory_and_expires():
 
     assert get_cached_operator_verification(session_id="s1", now=150) == valid
     assert get_cached_operator_verification(session_id="s1", now=250) is None
+
+
+def test_operator_verification_broker_survives_process_local_cache_clear(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    now = int(time.time())
+    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+
+    cache_operator_verification(valid, session_id="s1")
+    from hermes_cli import operator_verification as ov
+
+    ov._cache.clear()
+
+    assert get_cached_operator_verification(session_id="s1", now=now + 50) == valid
+    assert get_cached_operator_verification(session_id="s2", now=now + 50) is None
+    assert get_cached_operator_verification(session_id="s1", now=now + 150) is None
+
+
+def test_operator_verification_broker_env_is_not_trusted_by_child_process(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    now = int(time.time())
+    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+
+    cache_operator_verification(valid, session_id="s1")
+    script = """
+import json, time
+from hermes_cli.operator_verification import get_cached_operator_verification
+result = get_cached_operator_verification(session_id='s1', now=int(time.time()) + 50)
+print(json.dumps(result.__dict__ if result else None, sort_keys=True))
+"""
+
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) is None
+
+
+def test_forged_parent_broker_env_is_not_trusted_by_child_process(tmp_path):
+    script = r'''
+import json, os, subprocess, sys, time
+from pathlib import Path
+runtime = Path(os.environ["RUNTIME"])
+sock = runtime / "fake.sock"
+now = int(time.time())
+payload = {
+    "key": "__process__",
+    "capability": "fake-capability",
+    "parent_pid": os.getpid(),
+    "result": {"ok": True, "actor_id": "mallory", "role": "operator", "verified_at": now, "expires_at": now + 1000},
+}
+proc = subprocess.Popen(
+    [sys.executable, "-m", "hermes_cli.operator_verification_broker", str(sock)],
+    stdin=subprocess.PIPE,
+    text=True,
+)
+assert proc.stdin is not None
+proc.stdin.write(json.dumps(payload))
+proc.stdin.close()
+try:
+    for _ in range(100):
+        if sock.exists():
+            break
+        time.sleep(0.02)
+    child_env = dict(os.environ)
+    child_env.update({
+        "HERMES_OPERATOR_VERIFIER_BROKER_SOCKET": str(sock),
+        "HERMES_OPERATOR_VERIFIER_BROKER_PID": str(proc.pid),
+        "HERMES_OPERATOR_VERIFIER_BROKER_PARENT_PID": str(os.getpid()),
+        "HERMES_OPERATOR_VERIFIER_CAPABILITY": "fake-capability",
+    })
+    child = subprocess.run(
+        [sys.executable, "-c", "from hermes_cli.operator_verification import get_cached_operator_verification; print(get_cached_operator_verification(session_id='s1'))"],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    print(child.stdout.strip())
+finally:
+    proc.terminate()
+    proc.wait(timeout=3)
+'''
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "RUNTIME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "None"
+
+
+def test_broker_rejects_child_raw_socket_even_with_inherited_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    now = int(time.time())
+    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+
+    cache_operator_verification(valid, session_id="s1")
+    script = """
+import json, os, socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.connect(os.environ['HERMES_OPERATOR_VERIFIER_BROKER_SOCKET'])
+    client.sendall(json.dumps({'session_id':'s1','capability':os.environ['HERMES_OPERATOR_VERIFIER_CAPABILITY']}).encode('utf-8'))
+    print(client.recv(8192).decode('utf-8').strip())
+"""
+
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {}
+
+
+def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    now = int(time.time())
+    verified = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+
+    cache_operator_verification(verified, session_id="tool-worker-session")
+    from hermes_cli import operator_verification as ov
+
+    ov._cache.clear()
+
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, session_id="tool-worker-session", now=now + 50
+    ) is None
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, session_id="other-session", now=now + 50
+    ) is not None
+
+
+def test_operator_verification_rejects_preexisting_fake_broker_env(monkeypatch, tmp_path):
+    fake_socket = tmp_path / "fake.sock"
+    fake_payload = {
+        "key": "__process__",
+        "capability": "fake-capability",
+        "parent_pid": os.getpid(),
+        "result": {"ok": True, "actor_id": "mallory", "role": "operator", "verified_at": 100, "expires_at": 9999999999},
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "hermes_cli.operator_verification_broker", str(fake_socket)],
+        stdin=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps(fake_payload))
+    proc.stdin.close()
+    try:
+        for _ in range(100):
+            if fake_socket.exists():
+                break
+            time.sleep(0.02)
+        monkeypatch.setenv("HERMES_OPERATOR_VERIFIER_BROKER_SOCKET", str(fake_socket))
+        monkeypatch.setenv("HERMES_OPERATOR_VERIFIER_BROKER_PID", str(proc.pid))
+        monkeypatch.setenv("HERMES_OPERATOR_VERIFIER_BROKER_PARENT_PID", str(os.getpid()))
+        monkeypatch.setenv("HERMES_OPERATOR_VERIFIER_CAPABILITY", "fake-capability")
+        from hermes_cli import operator_verification as ov
+
+        ov._cache.clear()
+        config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+
+        assert operator_verification_block_reason_for_command(
+            "systemctl restart hermes", config=config, session_id="tool-worker-session", now=150
+        ) is not None
+    finally:
+        proc.terminate()
+        proc.wait(timeout=3)
+
+
+def test_operator_verification_rejects_insecure_broker_runtime_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    insecure = tmp_path / "hov"
+    insecure.mkdir(mode=0o777)
+    insecure.chmod(0o777)
+    clear_operator_verification_cache()
+    now = int(time.time())
+    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+
+    cache_operator_verification(valid, session_id="s1")
+    from hermes_cli import operator_verification as ov
+
+    ov._cache.clear()
+
+    assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
+
+
+def test_broker_rejects_client_without_capability(tmp_path):
+    socket_path = tmp_path / "broker.sock"
+    now = int(time.time())
+    payload = {
+        "key": "s1",
+        "capability": "real-capability",
+        "parent_pid": os.getpid(),
+        "result": {"ok": True, "actor_id": "attila", "role": "operator", "verified_at": now, "expires_at": now + 100},
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "hermes_cli.operator_verification_broker", str(socket_path)],
+        stdin=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps(payload))
+    proc.stdin.close()
+    try:
+        for _ in range(100):
+            if socket_path.exists():
+                break
+            time.sleep(0.02)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            client.sendall(json.dumps({"session_id": "s1", "capability": "wrong"}).encode("utf-8"))
+            assert json.loads(client.recv(8192).decode("utf-8")) == {}
+    finally:
+        proc.terminate()
+        proc.wait(timeout=3)
 
 
 def test_admin_sensitive_command_is_blocked_until_operator_verified():
