@@ -450,6 +450,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, done }),
     }),
+  editAssistantTodo: (id: string, text: string, done?: boolean) =>
+    fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, text, done }),
+    }),
   sendAssistantSupport: (body: AssistantSupportRequest) =>
     fetchJSON<AssistantSupportResponse>("/api/assistant/support", {
       method: "POST",
@@ -1931,6 +1937,7 @@ export interface AssistantVaultSummary {
 export interface AssistantTodoItem {
   id: string;
   text: string;
+  full_text?: string;
   line?: number;
   done?: boolean;
 }

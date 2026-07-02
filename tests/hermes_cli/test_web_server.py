@@ -2355,6 +2355,48 @@ class TestWebServerEndpoints:
         assert cached_after_update.json()["todos"]["items"][0]["text"] == "Ölwechsel planen"
         assert self.client.post("/api/assistant/todos/update", json={"id": "bad", "done": True}).status_code == 400
 
+    def test_assistant_todo_edit_updates_text_status_and_preserves_metadata(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        cache_lock = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE_LOCK")
+        cache = getattr(web_server, "_ASSISTANT_RESOURCE_CACHE")
+        with cache_lock:
+            cache.clear()
+        todo_file = tmp_path / "TODO.md"
+        todo_file.write_text(
+            "# TODO\n- [ ] Angebot prüfen <!-- hermes:id=abc status=pending -->\n- [ ] Ölwechsel planen\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+
+        first = self.client.get("/api/assistant/resources?refresh=1&resource=todos")
+        assert first.status_code == 200
+        item = first.json()["todos"]["items"][0]
+        assert item["text"] == "Angebot prüfen"
+        assert item["full_text"] == "Angebot prüfen"
+
+        edited = self.client.post(
+            "/api/assistant/todos/edit",
+            json={"id": item["id"], "text": "  Angebot mit Details prüfen  ", "done": False},
+        )
+        assert edited.status_code == 200
+        edited_item = edited.json()["todos"]["items"][0]
+        assert edited_item["text"] == "Angebot mit Details prüfen"
+        assert edited_item["full_text"] == "Angebot mit Details prüfen"
+        todo_text = todo_file.read_text(encoding="utf-8")
+        assert "- [ ] Angebot mit Details prüfen <!-- hermes:id=abc status=pending -->" in todo_text
+
+        done = self.client.post(
+            "/api/assistant/todos/edit",
+            json={"id": item["id"], "text": "Angebot erledigt", "done": True},
+        )
+        assert done.status_code == 200
+        assert done.json()["todos"]["open_count"] == 1
+        assert done.json()["todos"]["done_count"] == 1
+        assert "- [x] Angebot erledigt <!-- hermes:id=abc status=pending -->" in todo_file.read_text(encoding="utf-8")
+        assert self.client.post("/api/assistant/todos/edit", json={"id": item["id"], "text": "   "}).status_code == 400
+
     def test_assistant_todo_summary_strips_hermes_metadata_from_items(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 

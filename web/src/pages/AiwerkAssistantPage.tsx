@@ -219,7 +219,7 @@ function openSharedFolderCloudUrl(url?: string | null): void {
   safeWindowOpen(url);
 }
 
-type DocumentTabKind = "email" | "calendar" | "contact";
+type DocumentTabKind = "email" | "calendar" | "contact" | "todo";
 
 type PanelTabId = "chat" | string;
 
@@ -232,6 +232,7 @@ interface DocumentTab {
   status: "loading" | "ready" | "error";
   html?: string;
   contact?: AssistantContactItem;
+  todo?: AssistantTodoItem;
   error?: string;
 }
 
@@ -1222,6 +1223,18 @@ export default function AiwerkAssistantPage() {
     setActivePanelTab(id);
   }, []);
 
+  const openTodoInPanel = useCallback((todo: AssistantTodoItem) => {
+    const title = todo.text || "Aufgabe";
+    const subtitle = todo.done ? "Erledigt" : "Offen";
+    const id = `todo:${todo.id}`;
+    setDocumentTabs((current) => {
+      const existing = current.find((tab) => tab.id === id);
+      if (existing) return current.map((tab) => tab.id === id ? { ...tab, title, subtitle, todo, status: "ready", error: undefined } : tab);
+      return [...current, { id, kind: "todo", title, subtitle, openUrl: id, todo, status: "ready" }];
+    });
+    setActivePanelTab(id);
+  }, []);
+
   const startRightRailResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     if (!contentGridRef.current) return;
     event.preventDefault();
@@ -1450,38 +1463,30 @@ export default function AiwerkAssistantPage() {
   }, [sessionId, showToast]);
 
   const attachTodoToComposer = useCallback((item: AssistantTodoItem) => {
-    const taskText = item.text.trim();
+    const taskText = (item.full_text || item.text || "").trim();
     if (!taskText) return;
-    const marker = `Aufgabe-ID: ${item.id}`;
     const prompt = [
-      "Hilf mir, diese Aufgabe zu lösen.",
+      "Bitte hilf mir bei dieser Aufgabe.",
       "",
       "Aufgabe:",
       taskText,
       "",
-      "Status:",
-      item.done ? "erledigt" : "offen",
+      "Aktueller Stand:",
+      item.done ? "bereits erledigt" : "noch offen",
       "",
-      item.line ? `Quelle: TODO.md, Zeile ${item.line}` : "Quelle: TODO.md",
-      marker,
-      "",
-      "Bitte:",
-      "- zerlege die Aufgabe in konkrete Schritte,",
-      "- nutze den aktuellen Gesprächskontext, wenn er relevant ist,",
-      "- frage gezielt nach, falls etwas unklar ist,",
-      "- schlage den nächsten sinnvollen Schritt vor.",
+      "Bitte schlage mir den nächsten sinnvollen Schritt vor. Wenn etwas fehlt, frage kurz nach.",
     ].join("\n");
 
     setActivePanelTab("chat");
     setActiveTurnMode("main");
     conversationModeRef.current = "main";
     setInput((current) => {
-      if (current.includes(marker)) return current;
+      if (current.includes(taskText)) return current;
       const trimmed = current.trim();
       return trimmed ? `${trimmed}\n\n${prompt}` : prompt;
     });
     window.setTimeout(() => mainInputRef.current?.focus(), 0);
-    showToast("Aufgabe in den Chat übernommen");
+    showToast("Aufgabe ins Gespräch übernommen");
   }, [showToast]);
 
   const stopVoiceTracks = useCallback(() => {
@@ -1779,10 +1784,31 @@ export default function AiwerkAssistantPage() {
     try {
       const result = await api.updateAssistantTodo(id, done);
       setResourceSummary((current) => current ? { ...current, todos: result.todos } : current);
+      setDocumentTabs((current) => current.map((tab) => {
+        if (tab.kind !== "todo" || tab.todo?.id !== id) return tab;
+        const updated = result.todos.items.find((item) => item.id === id) ?? { ...tab.todo, done };
+        return { ...tab, title: updated.text || tab.title, subtitle: updated.done ? "Erledigt" : "Offen", todo: updated };
+      }));
       setResourcesError(null);
     } catch (e) {
       setResourceSummary(previous);
       setResourcesError(e instanceof Error ? e.message : "Aufgabe konnte nicht aktualisiert werden.");
+      throw e;
+    }
+  }, []);
+
+  const editTodo = useCallback(async (id: string, text: string, done?: boolean) => {
+    try {
+      const result = await api.editAssistantTodo(id, text, done);
+      setResourceSummary((current) => current ? { ...current, todos: result.todos } : current);
+      setDocumentTabs((current) => current.map((tab) => {
+        if (tab.kind !== "todo" || tab.todo?.id !== id) return tab;
+        const updated = result.todos.items.find((item) => item.id === id) ?? { ...tab.todo, text, full_text: text, done: done ?? tab.todo.done };
+        return { ...tab, title: updated.text || "Aufgabe", subtitle: updated.done ? "Erledigt" : "Offen", todo: updated };
+      }));
+      setResourcesError(null);
+    } catch (e) {
+      setResourcesError(e instanceof Error ? e.message : "Aufgabe konnte nicht gespeichert werden.");
       throw e;
     }
   }, []);
@@ -3181,8 +3207,8 @@ export default function AiwerkAssistantPage() {
                   </button>
                   {documentTabs.map((tab) => {
                     const isActive = activePanelTab === tab.id;
-                    const Icon = tab.kind === "email" ? Mail : tab.kind === "calendar" ? CalendarDays : UserRound;
-                    const tabPrefix = tab.kind === "email" ? "Mail" : tab.kind === "calendar" ? "Termin" : "Kontakt";
+                    const Icon = tab.kind === "email" ? Mail : tab.kind === "calendar" ? CalendarDays : tab.kind === "todo" ? ListChecks : UserRound;
+                    const tabPrefix = tab.kind === "email" ? "Mail" : tab.kind === "calendar" ? "Termin" : tab.kind === "todo" ? "Aufgabe" : "Kontakt";
                     return (
                       <div
                         key={tab.id}
@@ -3270,7 +3296,12 @@ export default function AiwerkAssistantPage() {
                   </div>
                 </div>
               ) : (
-                <DocumentTabPanel tab={activeDocumentTab} />
+                <DocumentTabPanel
+                  tab={activeDocumentTab}
+                  onEditTodo={editTodo}
+                  onUpdateTodoDone={updateTodoDone}
+                  onAttachTodo={attachTodoToComposer}
+                />
               )}
 
               {isChatPanelActive && (
@@ -3530,6 +3561,7 @@ export default function AiwerkAssistantPage() {
               onOpenEmail={openEmailInPanel}
               onOpenCalendar={openCalendarInPanel}
               onOpenContact={openContactInPanel}
+              onOpenTodo={openTodoInPanel}
             />
             </div>
           </section>
@@ -3716,7 +3748,134 @@ function ToolCallsDisclosure({ tools, compact = false }: { tools: ToolCallSummar
     </div>
   );
 }
-function DocumentTabPanel({ tab }: { tab: DocumentTab | null }) {
+function TodoDetailPanel({
+  tab,
+  onEditTodo,
+  onUpdateTodoDone,
+  onAttachTodo,
+}: {
+  tab: DocumentTab;
+  onEditTodo: (id: string, text: string, done?: boolean) => Promise<void>;
+  onUpdateTodoDone: (id: string, done: boolean) => Promise<void>;
+  onAttachTodo: (item: AssistantTodoItem) => void;
+}) {
+  const todo = tab.todo;
+  const [draft, setDraft] = useState(todo?.full_text || todo?.text || "");
+  const [saving, setSaving] = useState(false);
+  const [statusChanging, setStatusChanging] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!todo) {
+    return (
+      <div className="grid min-h-0 place-items-center bg-[#fffaf2] p-[24px] text-center text-[13px] text-[#776d5f]">
+        Aufgabe nicht gefunden.
+      </div>
+    );
+  }
+
+  const save = async (nextDone?: boolean) => {
+    const text = draft.trim();
+    if (!text || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onEditTodo(todo.id, text, nextDone);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Aufgabe konnte nicht gespeichert werden.");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const toggleDone = async () => {
+    if (statusChanging) return;
+    setStatusChanging(true);
+    setError(null);
+    try {
+      await onUpdateTodoDone(todo.id, !todo.done);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Status konnte nicht gespeichert werden.");
+    } finally {
+      setStatusChanging(false);
+    }
+  };
+  const dirty = draft.trim() !== (todo.full_text || todo.text || "").trim();
+
+  return (
+    <div className="aiwerk-scrollbar min-h-0 overflow-y-auto bg-[#fffaf2] p-[18px]">
+      <div className="mx-auto grid max-w-[820px] gap-[14px]">
+        <section className="overflow-hidden rounded-[22px] border border-[#dfd4c4] bg-[#fffdf8] shadow-[0_16px_42px_rgba(56,42,20,.08)]">
+          <header className="flex items-start gap-[14px] border-b border-[#eadfce] bg-[#f8f0e5] px-[18px] py-[16px]">
+            <div className="grid h-[42px] w-[42px] shrink-0 place-items-center rounded-[14px] border border-[#d8cbb9] bg-[#fffaf2] text-[#6d5f4d]">
+              <ListChecks size={20} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="m-0 text-[11px] font-bold uppercase tracking-[.16em] text-[#9a8b73]">Aufgabe</p>
+              <h2 className="m-0 mt-[4px] text-[20px] font-bold tracking-[-0.02em] text-[#302b24]">{todo.text || "Aufgabe"}</h2>
+              <p className="m-0 mt-[5px] text-[12px] text-[#776d5f]">{todo.done ? "Erledigt" : "Offen"}</p>
+            </div>
+          </header>
+          <div className="grid gap-[12px] p-[16px]">
+            <label className="grid gap-[7px] text-[11px] font-bold uppercase tracking-[.12em] text-[#8a7a65]">
+              Aufgabe bearbeiten
+              <textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                rows={8}
+                maxLength={4000}
+                className="aiwerk-scrollbar min-h-[190px] resize-y rounded-[14px] border border-[#d8cbb8] bg-[#fffaf2] px-[12px] py-[10px] text-[14px] font-normal normal-case leading-[1.45] tracking-normal text-[#292720] outline-none transition focus:border-[#9a7b51] focus:ring-2 focus:ring-[#9a7b51]/20"
+              />
+            </label>
+            <div className="flex flex-wrap items-center gap-[8px]">
+              <button
+                type="button"
+                onClick={() => void save()}
+                disabled={!draft.trim() || !dirty || saving}
+                className="inline-flex cursor-pointer items-center gap-[7px] rounded-[12px] border border-[#9a7b51] bg-[#8b724e] px-[13px] py-[9px] text-[13px] font-bold text-white transition hover:bg-[#7a6342] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Pencil size={13} />
+                {saving ? "Speichert…" : "Speichern"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void toggleDone()}
+                disabled={statusChanging}
+                className="inline-flex cursor-pointer items-center gap-[7px] rounded-[12px] border border-[#d8cbb8] bg-[#fffaf2] px-[13px] py-[9px] text-[13px] font-bold text-[#6d5f4d] transition hover:bg-[#f4eadc] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ListChecks size={13} />
+                {todo.done ? "Wieder öffnen" : "Als erledigt markieren"}
+              </button>
+              <button
+                type="button"
+                onClick={() => onAttachTodo({ ...todo, text: draft.trim() || todo.text, full_text: draft.trim() || todo.full_text })}
+                className="inline-flex cursor-pointer items-center gap-[7px] rounded-[12px] border border-[#d8cbb8] bg-[#fffaf2] px-[13px] py-[9px] text-[13px] font-bold text-[#6d5f4d] transition hover:bg-[#f4eadc]"
+              >
+                <Send size={13} />
+                Gemeinsam weiterarbeiten
+              </button>
+            </div>
+            {error && <p className="m-0 rounded-[12px] bg-[#f4e1da] px-[10px] py-[8px] text-[12px] text-[#7b3b2f]">{error}</p>}
+            <div className="rounded-[14px] border border-[#eadfce] bg-[#fffaf2] px-[12px] py-[10px] text-[12px] leading-[1.45] text-[#6f6557]">
+              <strong className="block text-[#3f382f]">Was passiert hier?</strong>
+              <p className="m-0 mt-[5px]">Änderungen werden in deiner Aufgabenliste gespeichert. Mit „Gemeinsam weiterarbeiten“ nimmst du diese Aufgabe ins Gespräch, damit du sie direkt mit Unterstützung weiterbearbeiten kannst.</p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function DocumentTabPanel({
+  tab,
+  onEditTodo,
+  onUpdateTodoDone,
+  onAttachTodo,
+}: {
+  tab: DocumentTab | null;
+  onEditTodo: (id: string, text: string, done?: boolean) => Promise<void>;
+  onUpdateTodoDone: (id: string, done: boolean) => Promise<void>;
+  onAttachTodo: (item: AssistantTodoItem) => void;
+}) {
   if (!tab) {
     return (
       <div className="grid min-h-0 place-items-center bg-[#fffaf2] p-[24px] text-center text-[13px] text-[#776d5f]">
@@ -3742,6 +3901,17 @@ function DocumentTabPanel({ tab }: { tab: DocumentTab | null }) {
           {tab.error && <span className="mt-[4px] block text-[12px]">{tab.error}</span>}
         </div>
       </div>
+    );
+  }
+  if (tab.kind === "todo") {
+    return (
+      <TodoDetailPanel
+        key={tab.id}
+        tab={tab}
+        onEditTodo={onEditTodo}
+        onUpdateTodoDone={onUpdateTodoDone}
+        onAttachTodo={onAttachTodo}
+      />
     );
   }
   if (tab.kind === "contact") {
@@ -3815,6 +3985,7 @@ function ResourcesRail({
   onOpenEmail,
   onOpenCalendar,
   onOpenContact,
+  onOpenTodo,
 }: {
   resources: AssistantResourcesResponse | null;
   loading: boolean;
@@ -3835,6 +4006,7 @@ function ResourcesRail({
   onOpenEmail: (item: AssistantResourceMailItem) => void;
   onOpenCalendar: (item: AssistantResourceEventItem) => void;
   onOpenContact: (item: AssistantContactItem) => void;
+  onOpenTodo: (item: AssistantTodoItem) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({
     email: false,
@@ -4706,12 +4878,20 @@ function ResourcesRail({
                         {updatingTodoId === item.id ? "…" : ""}
                       </span>
                     </button>
-                    <span className="block min-w-0 flex-1 truncate px-[9px] py-[7px]">{item.text}</span>
+                    <button
+                      type="button"
+                      onClick={() => onOpenTodo(item)}
+                      className="block min-w-0 flex-1 truncate px-[9px] py-[7px] text-left transition hover:bg-[#f8f0e5] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]"
+                      title="Aufgabendetails öffnen"
+                      aria-label={`${item.text} Details öffnen`}
+                    >
+                      {item.text}
+                    </button>
                     <button
                       type="button"
                       className="grid w-[34px] shrink-0 place-items-center border-l border-[#e4d8c6] text-[#7b6b57] transition hover:bg-[#f4eadc] focus:outline-none focus:ring-2 focus:ring-[#b9a98f]"
-                      aria-label={`${item.text} in den Chat übernehmen`}
-                      title="Aufgabe in den Chat übernehmen"
+                      aria-label={`${item.text} ins Gespräch übernehmen`}
+                      title="Aufgabe gemeinsam weiterbearbeiten"
                       onClick={(event) => {
                         event.stopPropagation();
                         onAttachTodo(item);
@@ -4723,7 +4903,7 @@ function ResourcesRail({
                 ))}
               </div>
             ) : (
-              <p className="m-0 text-[13px] text-[#776d5f]">Keine offenen Aufgaben in TODO.md.</p>
+              <p className="m-0 text-[13px] text-[#776d5f]">Keine offenen Aufgaben in deiner Aufgabenliste.</p>
             )}
           </ResourceCard>
 
@@ -4931,7 +5111,7 @@ function ResourcesRail({
             <div className="mb-[16px] flex items-start justify-between gap-[16px]">
               <div>
                 <h2 id="new-todo-title" className="m-0 text-[21px] tracking-[-0.02em]">Aufgabe hinzufügen</h2>
-                <p className="mt-[7px] text-[14px] leading-[1.45] text-[#706655]">Neue Aufgabe in TODO.md speichern.</p>
+                <p className="mt-[7px] text-[14px] leading-[1.45] text-[#706655]">Neue Aufgabe in deiner Aufgabenliste speichern.</p>
               </div>
               <button
                 type="button"

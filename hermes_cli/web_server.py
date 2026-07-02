@@ -3402,13 +3402,14 @@ def _todo_path_from_config(config: dict[str, Any]) -> Path:
     return get_hermes_home() / "TODO.md"
 
 
-def _clean_todo_text(text: str) -> str:
+def _clean_todo_text(text: str, *, limit: int = 180) -> str:
     # Drop the agent's hidden round-trip metadata (<!-- hermes:id=.. status=.. -->)
     # so it never renders in the customer Aufgaben panel.
-    text = re.sub(r"<!--.*?-->", "", text)
+    text = re.sub(r"<!--\s*hermes:[^>]*-->", "", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
-    return re.sub(r"\s+", " ", text).strip()[:180]
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    return cleaned[:limit] if limit > 0 else cleaned
 
 
 def _todo_summary(config: dict[str, Any]) -> dict[str, Any]:
@@ -3439,6 +3440,7 @@ def _todo_summary(config: dict[str, Any]) -> dict[str, Any]:
             continue
         done = match.group(1).lower() == "x"
         text = _clean_todo_text(match.group(2))
+        full_text = _clean_todo_text(match.group(2), limit=4000)
         if not text:
             continue
         if done:
@@ -3446,7 +3448,7 @@ def _todo_summary(config: dict[str, Any]) -> dict[str, Any]:
         else:
             open_count += 1
         if not done and len(items) < 8:
-            items.append({"id": f"todo-{index}", "text": text, "line": index, "done": False})
+            items.append({"id": f"todo-{index}", "text": text, "full_text": full_text, "line": index, "done": False})
     total_count = open_count + done_count
     if total_count == 0:
         summary = "Keine Aufgaben in TODO.md"
@@ -3839,20 +3841,35 @@ def _handle_assistant_support(payload: Any, request: Request | None = None) -> d
     return {"ok": True, "support_id": support_id, "delivered": delivered, "queued": not delivered, "errors": errors[:3]}
 
 
-def _update_todo_item_done(config: dict[str, Any], item_id: str, done: bool) -> dict[str, Any]:
+def _todo_line_number(item_id: str) -> int:
     match = re.fullmatch(r"todo-(\d+)", str(item_id or "").strip())
     if not match:
         raise HTTPException(status_code=400, detail="Invalid todo id")
-    line_number = int(match.group(1))
+    return int(match.group(1))
+
+
+def _read_todo_lines(config: dict[str, Any]) -> tuple[Path, list[str]]:
     path = _todo_path_from_config(config)
     try:
         if not path.exists() or not path.is_file():
             raise HTTPException(status_code=404, detail="TODO.md not found")
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return path, path.read_text(encoding="utf-8", errors="replace").splitlines()
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=500, detail="TODO.md could not be read")
+
+
+def _write_todo_lines(path: Path, lines: list[str]) -> None:
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        raise HTTPException(status_code=500, detail="TODO.md could not be updated")
+
+
+def _update_todo_item_done(config: dict[str, Any], item_id: str, done: bool) -> dict[str, Any]:
+    line_number = _todo_line_number(item_id)
+    path, lines = _read_todo_lines(config)
     if line_number < 1 or line_number > len(lines):
         raise HTTPException(status_code=404, detail="Todo item not found")
     line = lines[line_number - 1]
@@ -3861,10 +3878,33 @@ def _update_todo_item_done(config: dict[str, Any], item_id: str, done: bool) -> 
         raise HTTPException(status_code=400, detail="Todo line is not a markdown checkbox")
     marker = "x" if done else " "
     lines[line_number - 1] = f"{checkbox.group(1)}{marker}{checkbox.group(3)}"
-    try:
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except Exception:
-        raise HTTPException(status_code=500, detail="TODO.md could not be updated")
+    _write_todo_lines(path, lines)
+    _assistant_invalidate_resource_cache("todos")
+    return _todo_summary(config)
+
+
+def _update_todo_item_text(config: dict[str, Any], item_id: str, text: str, done: bool | None = None) -> dict[str, Any]:
+    line_number = _todo_line_number(item_id)
+    path, lines = _read_todo_lines(config)
+    if line_number < 1 or line_number > len(lines):
+        raise HTTPException(status_code=404, detail="Todo item not found")
+    line = lines[line_number - 1]
+    checkbox = re.match(r"^(\s*[-*]\s+\[)([ xX])(\]\s+)(.+?)(\s*)$", line)
+    if not checkbox:
+        raise HTTPException(status_code=400, detail="Todo line is not a markdown checkbox")
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Todo text is required")
+    if len(cleaned) > 4000:
+        cleaned = cleaned[:4000].rstrip()
+    raw_tail = checkbox.group(4)
+    meta_match = re.search(r"\s*(<!--\s*hermes:[^>]*-->)\s*$", raw_tail)
+    meta = meta_match.group(1) if meta_match else ""
+    marker = "x" if done is True else " " if done is False else checkbox.group(2)
+    suffix = f" {meta}" if meta else ""
+    lines[line_number - 1] = f"{checkbox.group(1)}{marker}{checkbox.group(3)}{cleaned}{suffix}"
+    _write_todo_lines(path, lines)
     _assistant_invalidate_resource_cache("todos")
     return _todo_summary(config)
 
@@ -5121,6 +5161,12 @@ class AssistantTodoAddRequest(BaseModel):
 class AssistantTodoUpdateRequest(BaseModel):
     id: str
     done: bool
+
+
+class AssistantTodoEditRequest(BaseModel):
+    id: str
+    text: str
+    done: bool | None = None
 
 
 class CuiContactCreateRequest(BaseModel):
@@ -7568,6 +7614,20 @@ async def update_assistant_todo(request: Request, payload: AssistantTodoUpdateRe
     except Exception:
         _log.exception("POST /api/assistant/todos/update failed")
         raise HTTPException(status_code=500, detail="TODO update failed")
+
+
+@app.post("/api/assistant/todos/edit")
+async def edit_assistant_todo(request: Request, payload: AssistantTodoEditRequest):
+    """Edit one Markdown TODO item text/status for the AIWerk CUI right rail."""
+    _require_token(request)
+    try:
+        todos = _update_todo_item_text(load_config(), payload.id, payload.text, payload.done)
+        return {"ok": True, "todos": todos}
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/assistant/todos/edit failed")
+        raise HTTPException(status_code=500, detail="TODO edit failed")
 
 
 @app.get("/api/assistant/email/view")
