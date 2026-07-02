@@ -144,7 +144,7 @@ def _call_title_llm(
     *,
     system_prompt: str,
     user_prompt: str,
-    timeout: float,
+    timeout: Optional[float],
     failure_callback: Optional[FailureCallback],
     main_runtime: Optional[dict],
 ) -> Optional[str]:
@@ -160,7 +160,11 @@ def _call_title_llm(
             timeout=timeout,
             main_runtime=main_runtime,
         )
-        return _clean_title(response.choices[0].message.content or "")
+        content = response.choices[0].message.content or ""
+        # Think-enabled models can emit reasoning XML even for title generation.
+        # Strip it before the normal title cleanup so it never leaks into session titles.
+        from agent.agent_runtime_helpers import strip_think_blocks
+        return _clean_title(strip_think_blocks(None, content))
     except Exception as e:
         logger.warning("Title generation failed: %s", e)
         logger.debug("Title generation traceback", exc_info=True)
@@ -175,7 +179,7 @@ def _call_title_llm(
 def generate_title(
     user_message: str,
     assistant_response: str,
-    timeout: float = 30.0,
+    timeout: Optional[float] = None,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
 ) -> Optional[str]:
