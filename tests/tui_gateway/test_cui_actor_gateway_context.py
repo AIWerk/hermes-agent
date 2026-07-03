@@ -341,3 +341,34 @@ def test_concurrent_threads_do_not_bleed_actor_context(monkeypatch):
     # The shared (non-identifying) env flag may survive a racy concurrent
     # restore; clean it so it does not leak into later tests.
     os.environ.pop("AIWERK_CUI_MANAGED_AUTONOMY", None)
+
+
+def test_row_visibility_customer_can_resume_linked_telegram_session(monkeypatch):
+    cfg = {
+        "dashboard": {
+            "basic_auth": {
+                "users": [
+                    {
+                        "actor_id": "meerwohnen:susanne:user",
+                        "user_id": "Susanne",
+                        "tenant_id": "meerwohnen",
+                        "role": "user",
+                        "telegram_user_ids": ["1461953838"],
+                    }
+                ]
+            }
+        }
+    }
+    monkeypatch.setattr(server, "_load_dashboard_user_config", lambda: cfg)
+    cust = {
+        "tenant_id": "meerwohnen",
+        "actor_id": "meerwohnen:susanne:user",
+        "role": "user",
+        "user_id": "Susanne",
+    }
+
+    own = {"id": "own-tg", "source": "telegram", "user_id": "1461953838", "model_config": None}
+    other = {"id": "other-tg", "source": "telegram", "user_id": "1392690488", "model_config": None}
+
+    assert server._row_visible_to_cui_actor(own, cust) is True
+    assert server._row_visible_to_cui_actor(other, cust) is False

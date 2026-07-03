@@ -9326,6 +9326,72 @@ def _session_cui_metadata(session: dict | None) -> dict[str, str]:
     return {k: v for k, v in result.items() if v}
 
 
+def _dashboard_user_for_cui_actor(actor: dict[str, str]) -> dict:
+    """Return the configured dashboard user matching the authenticated CUI actor."""
+    try:
+        users = (
+            (load_config() or {})
+            .get("dashboard", {})
+            .get("basic_auth", {})
+            .get("users", [])
+        )
+    except Exception:
+        return {}
+    actor_id = str(actor.get("actor_id") or "").strip()
+    user_id = str(actor.get("user_id") or "").strip()
+    for user in users if isinstance(users, list) else []:
+        if not isinstance(user, dict):
+            continue
+        if actor_id and str(user.get("actor_id") or "").strip() == actor_id:
+            return user
+        if user_id and str(user.get("user_id") or user.get("username") or "").strip() == user_id:
+            return user
+    return {}
+
+
+def _configured_gateway_user_ids(user: dict, source: str) -> set[str]:
+    """Configured external-channel ids for one dashboard user."""
+    candidates = []
+    direct = user.get(f"{source}_user_ids") or user.get(f"{source}_user_id")
+    if direct is not None:
+        candidates.append(direct)
+    channel_map = user.get("channel_user_ids") or user.get("gateway_user_ids") or {}
+    if isinstance(channel_map, dict) and channel_map.get(source) is not None:
+        candidates.append(channel_map.get(source))
+    result: set[str] = set()
+    for value in candidates:
+        if isinstance(value, str):
+            result.update(x.strip() for x in value.replace(",", " ").split() if x.strip())
+        elif isinstance(value, (list, tuple, set)):
+            result.update(str(x).strip() for x in value if str(x).strip())
+    return result
+
+
+def _session_gateway_subject_id(session: dict, source: str) -> str:
+    if source == "telegram":
+        return str(session.get("user_id") or session.get("chat_id") or "").strip()
+    return str(session.get("user_id") or session.get("sender_id") or session.get("chat_id") or "").strip()
+
+
+def _cui_actor_owns_gateway_session(session: dict | None, actor: dict[str, str]) -> bool:
+    """Whether a CUI actor owns an untagged external-channel session row.
+
+    New CUI chats persist explicit ``_cui_*`` metadata. Gateway-origin rows
+    such as Telegram DMs may predate that metadata, so ownership must be proven
+    by tenant config mapping the dashboard user to channel user ids.
+    """
+    if not isinstance(session, dict):
+        return False
+    source = str(session.get("source") or "").strip().lower()
+    if not source:
+        return False
+    subject_id = _session_gateway_subject_id(session, source)
+    if not subject_id:
+        return False
+    user = _dashboard_user_for_cui_actor(actor)
+    return subject_id in _configured_gateway_user_ids(user, source)
+
+
 def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | None) -> bool:
     """Fail closed for tagged admin/internal CUI sessions in customer views."""
     actor = actor or {}
@@ -9350,7 +9416,7 @@ def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | 
             source = str(session.get("source") or "").strip().lower()
         if source in {"cli", "tui", "cron", "classifier", "reflection", "system", "internal"}:
             return False
-        return True
+        return _cui_actor_owns_gateway_session(session, actor)
     if meta.get("tenant_id") and actor.get("tenant_id") and meta["tenant_id"] != actor["tenant_id"]:
         return False
     if meta.get("visibility_scope") in {"admin", "internal", "operator"}:

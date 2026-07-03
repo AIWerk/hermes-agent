@@ -372,6 +372,72 @@ def _row_cui_metadata(row: dict | None) -> dict[str, str]:
     return {k: v for k, v in result.items() if v}
 
 
+def _load_dashboard_user_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+
+        return load_config() or {}
+    except Exception:
+        return {}
+
+
+def _dashboard_user_for_cui_actor(actor: dict[str, str]) -> dict:
+    """Return the configured dashboard user matching the authenticated CUI actor."""
+    users = (
+        (_load_dashboard_user_config() or {})
+        .get("dashboard", {})
+        .get("basic_auth", {})
+        .get("users", [])
+    )
+    actor_id = str(actor.get("actor_id") or "").strip()
+    user_id = str(actor.get("user_id") or "").strip()
+    for user in users if isinstance(users, list) else []:
+        if not isinstance(user, dict):
+            continue
+        if actor_id and str(user.get("actor_id") or "").strip() == actor_id:
+            return user
+        if user_id and str(user.get("user_id") or user.get("username") or "").strip() == user_id:
+            return user
+    return {}
+
+
+def _configured_gateway_user_ids(user: dict, source: str) -> set[str]:
+    candidates = []
+    direct = user.get(f"{source}_user_ids") or user.get(f"{source}_user_id")
+    if direct is not None:
+        candidates.append(direct)
+    channel_map = user.get("channel_user_ids") or user.get("gateway_user_ids") or {}
+    if isinstance(channel_map, dict) and channel_map.get(source) is not None:
+        candidates.append(channel_map.get(source))
+    result: set[str] = set()
+    for value in candidates:
+        if isinstance(value, str):
+            result.update(x.strip() for x in value.replace(",", " ").split() if x.strip())
+        elif isinstance(value, (list, tuple, set)):
+            result.update(str(x).strip() for x in value if str(x).strip())
+    return result
+
+
+def _row_gateway_subject_id(row: dict, source: str) -> str:
+    if source == "telegram":
+        return str(row.get("user_id") or row.get("chat_id") or "").strip()
+    return str(row.get("user_id") or row.get("sender_id") or row.get("chat_id") or "").strip()
+
+
+def _cui_actor_owns_gateway_row(row: dict | None, actor: dict[str, str]) -> bool:
+    """Whether a CUI actor owns an untagged external-channel session row."""
+    if not isinstance(row, dict):
+        return False
+    source = str(row.get("source") or "").strip().lower()
+    if not source:
+        return False
+    subject_id = _row_gateway_subject_id(row, source)
+    if not subject_id:
+        return False
+    user = _dashboard_user_for_cui_actor(actor)
+    return subject_id in _configured_gateway_user_ids(user, source)
+
+
 def _row_visible_to_cui_actor(row: dict | None, actor: dict[str, str] | None) -> bool:
     """Whether the resuming CUI actor may read/resume the stored session ``row``.
 
@@ -397,6 +463,8 @@ def _row_visible_to_cui_actor(row: dict | None, actor: dict[str, str] | None) ->
             source = str(row.get("source") or "").strip().lower()
         if source in _CUI_INTERNAL_SOURCES:
             return False
+        if _cui_actor_owns_gateway_row(row, actor):
+            return True
         # Fail closed for a confined customer: without metadata we cannot prove
         # the row belongs to them, so do not expose it.
         return False

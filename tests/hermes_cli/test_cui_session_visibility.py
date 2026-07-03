@@ -52,7 +52,7 @@ def test_customer_cui_actor_cannot_see_legacy_untagged_internal_sessions():
         assert web_server._session_visible_to_cui_actor(session, admin_actor) is True
 
     legacy_human_session = {"id": "legacy-web", "source": "web", "model_config": None}
-    assert web_server._session_visible_to_cui_actor(legacy_human_session, user_actor) is True
+    assert web_server._session_visible_to_cui_actor(legacy_human_session, user_actor) is False
 
 
 def test_customer_cui_actor_only_sees_own_tagged_customer_sessions():
@@ -150,3 +150,36 @@ def test_restricted_actor_sees_no_sessions(monkeypatch):
     assert web_server._session_visible_to_cui_actor(untagged, restricted) is False
     # And the unconfined path (no actor at all) is unchanged.
     assert web_server._session_visible_to_cui_actor(untagged, {}) is True
+
+
+def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):
+    from hermes_cli import web_server
+
+    cfg = {
+        "dashboard": {
+            "basic_auth": {
+                "users": [
+                    {
+                        "actor_id": "meerwohnen:susanne:user",
+                        "user_id": "Susanne",
+                        "tenant_id": "meerwohnen",
+                        "role": "user",
+                        "telegram_user_ids": ["1461953838"],
+                    }
+                ]
+            }
+        }
+    }
+    monkeypatch.setattr(web_server, "load_config", lambda: cfg)
+    user_actor = {
+        "tenant_id": "meerwohnen",
+        "actor_id": "meerwohnen:susanne:user",
+        "role": "user",
+        "user_id": "Susanne",
+    }
+
+    own_telegram = {"id": "own-tg", "source": "telegram", "user_id": "1461953838", "model_config": None}
+    other_telegram = {"id": "other-tg", "source": "telegram", "user_id": "1392690488", "model_config": None}
+
+    assert web_server._session_visible_to_cui_actor(own_telegram, user_actor) is True
+    assert web_server._session_visible_to_cui_actor(other_telegram, user_actor) is False
