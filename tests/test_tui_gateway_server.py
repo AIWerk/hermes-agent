@@ -6538,6 +6538,60 @@ def test_session_resume_reattaches_live_session_by_persistent_key(monkeypatch):
         server._sessions.pop("sid-live", None)
 
 
+def test_customer_resume_preserves_actor_context_for_second_live_resume(monkeypatch):
+    actor = {"tenant_id": "meerwohnen", "actor_id": "meerwohnen:susanne:user", "role": "user"}
+    row = {
+        "id": "customer-session",
+        "model_config": json.dumps(
+            {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": actor["actor_id"],
+                "_cui_tenant_id": actor["tenant_id"],
+            }
+        ),
+    }
+
+    class _DB:
+        def get_session(self, target):
+            return row if target == "customer-session" else None
+
+        def get_session_by_title(self, target):
+            return None
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+        def reopen_session(self, target):
+            return None
+
+        def get_messages_as_conversation(self, target, include_ancestors=False):
+            return [{"role": "user", "content": "hello"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    token = server.bind_cui_actor_context(actor)
+    try:
+        first = server.handle_request(
+            {"id": "1", "method": "session.resume", "params": {"session_id": "customer-session"}}
+        )
+        assert first is not None
+        assert "error" not in first
+        runtime_sid = first["result"]["session_id"]
+        assert server._sessions[runtime_sid]["cui_actor_context"] == actor
+
+        second = server.handle_request(
+            {"id": "2", "method": "session.resume", "params": {"session_id": "customer-session"}}
+        )
+        assert second is not None
+        assert "error" not in second
+        assert second["result"]["session_id"] == runtime_sid
+    finally:
+        server.reset_cui_actor_context(token)
+        server._sessions.pop(locals().get("runtime_sid", ""), None)
+
+
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
     server._sessions["sid-a"] = _session(
