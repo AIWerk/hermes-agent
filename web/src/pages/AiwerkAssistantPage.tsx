@@ -1027,6 +1027,7 @@ export default function AiwerkAssistantPage() {
   const [rightRailWidth, setRightRailWidth] = useState(() => readStoredRightRailWidth());
   const [isResizingRightRail, setIsResizingRightRail] = useState(false);
   const [readAloudBusy, setReadAloudBusy] = useState(false);
+  const [readAloudMessageId, setReadAloudMessageId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [authSession, setAuthSession] = useState<DashboardAuthSession | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
@@ -1296,6 +1297,7 @@ export default function AiwerkAssistantPage() {
       audio.load();
     }
     readAloudAudioRef.current = null;
+    setReadAloudMessageId(null);
     if (readAloudUrlRef.current) {
       URL.revokeObjectURL(readAloudUrlRef.current);
       readAloudUrlRef.current = null;
@@ -1303,39 +1305,70 @@ export default function AiwerkAssistantPage() {
     setReadAloudBusy(false);
   }, []);
 
-  const speakAssistantText = useCallback((text: string) => {
-    if (!readAloudEnabledRef.current) return;
+  const playAssistantSpeech = useCallback((text: string, options: { requireEnabled?: boolean; messageId?: string } = {}) => {
+    if (options.requireEnabled && !readAloudEnabledRef.current) return;
     const speechText = speechTextFromMarkdown(text);
     if (!speechText) return;
     const requestId = readAloudRequestRef.current + 1;
     readAloudRequestRef.current = requestId;
     setReadAloudBusy(true);
+    setReadAloudMessageId(options.messageId ?? null);
     void api.synthesizeAssistantSpeech(speechText, sessionIdRef.current ?? undefined)
       .then((blob) => {
-        if (!readAloudEnabledRef.current || readAloudRequestRef.current !== requestId) return;
+        if ((options.requireEnabled && !readAloudEnabledRef.current) || readAloudRequestRef.current !== requestId) return;
         if (readAloudUrlRef.current) URL.revokeObjectURL(readAloudUrlRef.current);
         const url = URL.createObjectURL(blob);
         readAloudUrlRef.current = url;
         const audio = new Audio(url);
         readAloudAudioRef.current = audio;
+        audio.preload = "auto";
         audio.onended = () => {
-          if (readAloudRequestRef.current === requestId) setReadAloudBusy(false);
+          if (readAloudRequestRef.current === requestId) {
+            setReadAloudBusy(false);
+            setReadAloudMessageId(null);
+          }
         };
         audio.onerror = () => {
           if (readAloudRequestRef.current === requestId) {
             setReadAloudBusy(false);
+            setReadAloudMessageId(null);
             showToast("Vorlesen konnte nicht abgespielt werden.");
           }
         };
-        return audio.play();
+        return new Promise<void>((resolve, reject) => {
+          const play = () => {
+            if (readAloudRequestRef.current !== requestId) return resolve();
+            audio.currentTime = 0;
+            window.setTimeout(() => audio.play().then(() => resolve()).catch(reject), 120);
+          };
+          if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+            play();
+          } else {
+            audio.addEventListener("canplay", play, { once: true });
+            audio.load();
+          }
+        });
       })
       .catch(() => {
         if (readAloudRequestRef.current === requestId) {
           setReadAloudBusy(false);
-          showToast("ElevenLabs-Vorlesen fehlgeschlagen.");
+          setReadAloudMessageId(null);
+          showToast("Vorlesen fehlgeschlagen.");
         }
       });
   }, [showToast]);
+
+  const speakAssistantText = useCallback((text: string) => {
+    playAssistantSpeech(text, { requireEnabled: true });
+  }, [playAssistantSpeech]);
+
+  const playMessageAloud = useCallback((message: ChatMessage) => {
+    if (readAloudBusy && readAloudMessageId === message.id) {
+      stopReadAloud();
+      return;
+    }
+    playAssistantSpeech(displayTextForMessage(message), { messageId: message.id });
+  }, [playAssistantSpeech, readAloudBusy, readAloudMessageId, stopReadAloud]);
 
   const toggleReadAloud = useCallback(() => {
     setReadAloudEnabled((current) => {
@@ -1501,6 +1534,11 @@ export default function AiwerkAssistantPage() {
   const stopVoiceInput = useCallback(() => {
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.requestData();
+      } catch {
+        // Some browsers throw if no encoded data is ready yet; stop still flushes.
+      }
       recorder.stop();
     }
   }, []);
@@ -1570,7 +1608,7 @@ export default function AiwerkAssistantPage() {
           .catch(() => showToast("Sprache konnte nicht erkannt werden."))
           .finally(() => setVoiceState("idle"));
       };
-      recorder.start();
+      recorder.start(250);
       setVoiceSeconds(0);
       setVoiceState("recording");
       voiceTimerRef.current = window.setInterval(() => setVoiceSeconds((seconds) => seconds + 1), 1000);
@@ -3274,9 +3312,20 @@ export default function AiwerkAssistantPage() {
                             className={
                               msg.role === "user"
                                 ? "aiwerk-message-bubble max-w-[74%] self-end rounded-[18px] rounded-tr-[6px] bg-[#7f6b4d] px-4 py-3.5 text-[15px] leading-[1.45] text-white"
-                                : "aiwerk-message-bubble max-w-[74%] rounded-[18px] rounded-tl-[6px] bg-[#eee5d7] px-4 py-3.5 text-[15px] leading-[1.45]"
+                                : "aiwerk-message-bubble group relative max-w-[74%] rounded-[18px] rounded-tl-[6px] bg-[#eee5d7] px-4 py-3.5 pr-[42px] text-[15px] leading-[1.45]"
                             }
                           >
+                            {msg.role === "agent" && msg.id !== "welcome" && msg.status !== "streaming" && (
+                              <button
+                                type="button"
+                                onClick={() => playMessageAloud(msg)}
+                                title={readAloudBusy && readAloudMessageId === msg.id ? "Vorlesen stoppen" : "Diese Antwort vorlesen"}
+                                aria-label={readAloudBusy && readAloudMessageId === msg.id ? "Vorlesen stoppen" : "Diese Antwort vorlesen"}
+                                className="absolute right-[10px] top-[10px] grid h-[26px] w-[26px] cursor-pointer place-items-center rounded-full border border-[#d4c6b4] bg-[#f8f0e5] text-[#6c5d49] opacity-70 transition hover:bg-[#efe4d4] hover:opacity-100 focus:opacity-100"
+                              >
+                                {readAloudBusy && readAloudMessageId === msg.id ? <Square className="h-[12px] w-[12px]" /> : <Volume2 className="h-[14px] w-[14px]" />}
+                              </button>
+                            )}
                             {msg.attachments && msg.attachments.length > 0 && (
                               <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} onOpenImage={setSelectedAttachment} />
                             )}
@@ -3470,9 +3519,20 @@ export default function AiwerkAssistantPage() {
                             className={
                               msg.role === "user"
                                 ? "max-w-[86%] self-end rounded-[16px] rounded-tr-[6px] bg-[#7f6b4d] px-3 py-2.5 text-[14px] leading-[1.45] text-white"
-                                : "max-w-[86%] rounded-[16px] rounded-tl-[6px] bg-[#eee5d7] px-3 py-2.5 text-[14px] leading-[1.45]"
+                                : "relative max-w-[86%] rounded-[16px] rounded-tl-[6px] bg-[#eee5d7] px-3 py-2.5 pr-[38px] text-[14px] leading-[1.45]"
                             }
                           >
+                            {msg.role === "agent" && msg.id !== "welcome" && msg.status !== "streaming" && (
+                              <button
+                                type="button"
+                                onClick={() => playMessageAloud(msg)}
+                                title={readAloudBusy && readAloudMessageId === msg.id ? "Vorlesen stoppen" : "Diese Antwort vorlesen"}
+                                aria-label={readAloudBusy && readAloudMessageId === msg.id ? "Vorlesen stoppen" : "Diese Antwort vorlesen"}
+                                className="absolute right-[8px] top-[8px] grid h-[24px] w-[24px] cursor-pointer place-items-center rounded-full border border-[#d4c6b4] bg-[#f8f0e5] text-[#6c5d49] opacity-70 transition hover:bg-[#efe4d4] hover:opacity-100 focus:opacity-100"
+                              >
+                                {readAloudBusy && readAloudMessageId === msg.id ? <Square className="h-[11px] w-[11px]" /> : <Volume2 className="h-[13px] w-[13px]" />}
+                              </button>
+                            )}
                             {msg.attachments && msg.attachments.length > 0 && (
                               <AttachmentPreviewGrid attachments={msg.attachments} compact tone={msg.role === "user" ? "dark" : "light"} onOpenImage={setSelectedAttachment} />
                             )}

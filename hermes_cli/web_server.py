@@ -18,6 +18,7 @@ import copy
 from dataclasses import dataclass
 import email.header
 import email.utils
+import hashlib
 import html
 import hmac
 from html.parser import HTMLParser
@@ -579,7 +580,27 @@ def _is_active_shared_media_type(name: str, media_type: str) -> bool:
     return Path(name).suffix.lower() in _SHARED_FOLDER_ACTIVE_CONTENT_EXTENSIONS
 
 
-def _safe_shared_open_disposition(name: str, media_type: str) -> tuple[str, str]:
+_SHARED_FOLDER_AGENT_DOWNLOADS_DIR = "Agent-Downloads"
+
+
+def _shared_folder_agent_downloads_html(rel_path: str, name: str) -> bool:
+    clean = _clean_shared_relative_path(rel_path)
+    if not clean:
+        return False
+    parts = clean.split("/")
+    return (
+        len(parts) >= 2
+        and parts[0] == _SHARED_FOLDER_AGENT_DOWNLOADS_DIR
+        and Path(name).suffix.lower() in {".html", ".htm"}
+    )
+
+
+def _safe_shared_open_disposition(
+    name: str,
+    media_type: str,
+    *,
+    allow_inline_active: bool = False,
+) -> tuple[str, str]:
     """Return (media_type, content_disposition) for serving a shared file.
 
     Active-content types are forced to application/octet-stream + attachment so
@@ -595,6 +616,8 @@ def _safe_shared_open_disposition(name: str, media_type: str) -> tuple[str, str]
     application/xhtml+xml — cannot slip through.
     """
     if _is_active_shared_media_type(name, media_type):
+        if allow_inline_active and Path(name).suffix.lower() in {".html", ".htm"}:
+            return media_type, "inline"
         return "application/octet-stream", "attachment"
     if Path(name).suffix.lower() == ".json":
         return media_type, "attachment"
@@ -7872,15 +7895,23 @@ async def open_assistant_shared_folder_file(request: Request):
         if not target:
             raise HTTPException(status_code=404, detail="File not found")
         media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        media_type, disposition = _safe_shared_open_disposition(target.name, media_type)
+        allow_inline_active = _shared_folder_agent_downloads_html(rel_path, target.name)
+        media_type, disposition = _safe_shared_open_disposition(
+            target.name,
+            media_type,
+            allow_inline_active=allow_inline_active,
+        )
+        headers = {
+            "Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(target.name)}",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if allow_inline_active:
+            headers["Content-Security-Policy"] = "sandbox"
         return FileResponse(
             target,
             media_type=media_type,
             filename=target.name,
-            headers={
-                "Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(target.name)}",
-                "X-Content-Type-Options": "nosniff",
-            },
+            headers=headers,
         )
 
     cloud = _shared_cloud_config(config)
@@ -8102,11 +8133,31 @@ async def synthesize_assistant_speech(request: Request, body: AssistantTTSReques
     if len(text) > 4_000:
         text = text[:4_000]
 
+    try:
+        tts_config = load_config().get("tts", {})
+    except Exception:
+        tts_config = {}
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {"text": text, "tts": tts_config, "version": 1},
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+
     session_part = _safe_upload_component(body.session_id or "session", "session")
-    batch_part = f"tts-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
-    target_dir = _assistant_upload_root() / session_part / batch_part
+    target_dir = _assistant_upload_root() / session_part / "tts-cache" / cache_key
     target_dir.mkdir(parents=True, exist_ok=True)
     output_path = target_dir / "answer.mp3"
+
+    if output_path.exists() and output_path.stat().st_size > 0:
+        media_type = mimetypes.guess_type(str(output_path))[0] or "audio/mpeg"
+        return FileResponse(
+            str(output_path),
+            media_type=media_type,
+            filename=output_path.name,
+            headers={"Cache-Control": "private, max-age=86400", "X-Hermes-TTS-Cache": "hit"},
+        )
 
     try:
         from tools.tts_tool import text_to_speech_tool
@@ -8130,7 +8181,7 @@ async def synthesize_assistant_speech(request: Request, body: AssistantTTSReques
         str(file_path),
         media_type=media_type,
         filename=file_path.name,
-        headers={"Cache-Control": "no-store"},
+        headers={"Cache-Control": "private, max-age=86400", "X-Hermes-TTS-Cache": "miss"},
     )
 @app.get("/api/system/stats")
 async def get_system_stats():

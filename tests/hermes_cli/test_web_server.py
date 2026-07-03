@@ -1172,6 +1172,34 @@ class TestWebServerEndpoints:
         assert "/api/audio/speak" in paths
         assert "/api/audio/elevenlabs/voices" in paths
 
+    def test_assistant_tts_reuses_cached_audio(self, monkeypatch):
+        import tools.tts_tool as tts_tool
+
+        calls = []
+
+        def fake_tts(text, output_path):
+            calls.append(text)
+            Path(output_path).write_bytes(b"ID3cached-audio")
+            return json.dumps({
+                "success": True,
+                "file_path": output_path,
+                "provider": "test",
+            })
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+
+        payload = {"text": "Bitte lies diese Antwort vor.", "session_id": "session-a"}
+        first = self.client.post("/api/assistant/tts", json=payload)
+        second = self.client.post("/api/assistant/tts", json=payload)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.content == b"ID3cached-audio"
+        assert second.content == b"ID3cached-audio"
+        assert first.headers["X-Hermes-TTS-Cache"] == "miss"
+        assert second.headers["X-Hermes-TTS-Cache"] == "hit"
+        assert calls == [payload["text"]]
+
     def test_elevenlabs_voices_unavailable_without_key(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
@@ -2221,6 +2249,28 @@ class TestWebServerEndpoints:
             assert not resp.headers["content-type"].startswith("application/octet-stream"), name
             assert resp.headers["content-disposition"].startswith("inline"), name
             assert resp.headers["x-content-type-options"] == "nosniff", name
+
+    def test_assistant_shared_folder_allows_sandboxed_agent_downloads_html(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        downloads = shared / "Agent-Downloads"
+        downloads.mkdir(parents=True)
+        (downloads / "manual.html").write_text("<html><body>Manual</body></html>", encoding="utf-8")
+        (shared / "manual.html").write_text("<html><body>Manual</body></html>", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_SHARED_FOLDER", str(shared))
+
+        normal = self.client.get("/api/assistant/shared-folder/open?path=manual.html")
+        assert normal.status_code == 200
+        assert normal.headers["content-type"].startswith("application/octet-stream")
+        assert normal.headers["content-disposition"].startswith("attachment")
+
+        agent_download = self.client.get(
+            "/api/assistant/shared-folder/open?path=Agent-Downloads%2Fmanual.html"
+        )
+        assert agent_download.status_code == 200
+        assert agent_download.headers["content-type"].startswith("text/html")
+        assert agent_download.headers["content-disposition"].startswith("inline")
+        assert agent_download.headers["x-content-type-options"] == "nosniff"
+        assert agent_download.headers["content-security-policy"] == "sandbox"
 
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server

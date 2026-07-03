@@ -5,6 +5,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def disable_configured_outbound_shared_folder(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(server, "_resolve_outbound_shared_folder_root", lambda: None)
+
+
 @pytest.fixture
 def client_loopback():
     from hermes_cli import web_server
@@ -78,6 +85,35 @@ def test_outbound_json_attachment_is_file_card_without_preview(tmp_path):
     assert payload["safe_renderable"] is False
     assert payload["preview_url"] is None
     assert payload["download_url"].startswith("/api/assistant/artifacts/open?path=")
+
+
+def test_outbound_non_renderable_attachment_copies_to_shared_folder(monkeypatch, tmp_path):
+    from tui_gateway import server
+
+    source_root = tmp_path / "safe-output"
+    source_root.mkdir()
+    shared_root = tmp_path / "Hermes-Shared"
+    shared_root.mkdir()
+    json_path = source_root / "data.json"
+    json_path.write_text('{"ok": true}', encoding="utf-8")
+    monkeypatch.setattr(server, "_resolve_outbound_shared_folder_root", lambda: shared_root)
+    monkeypatch.setattr(server, "_outbound_source_roots", lambda: (source_root,))
+
+    payloads, text = server._outbound_attachment_payloads_and_text(
+        f"Here: MEDIA:{json_path}", append_shared_links=True
+    )
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    shared_copy = shared_root / "Agent-Downloads" / "data.json"
+    assert shared_copy.read_text(encoding="utf-8") == '{"ok": true}'
+    assert payload["path"] == str(shared_copy.resolve())
+    assert payload["open_url"] == "/api/assistant/shared-folder/open?path=Agent-Downloads%2Fdata.json"
+    assert payload["download_url"] == payload["open_url"]
+    assert payload["preview_url"] is None
+    assert payload["shared_folder_path"] == "Agent-Downloads/data.json"
+    assert "Im Shared-Ordner unter Agent-Downloads abgelegt:" in text
+    assert "/api/assistant/shared-folder/open?path=Agent-Downloads%2Fdata.json" in text
 
 
 def test_assistant_preview_kind_keeps_json_as_file_even_with_text_mime():

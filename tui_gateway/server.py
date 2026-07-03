@@ -4766,13 +4766,14 @@ _ACTIVE_ATTACHMENT_EXTENSIONS = frozenset({
     ".js", ".mjs", ".cjs", ".mhtml", ".mht", ".htc",
 })
 _OUTBOUND_ATTACHMENT_EXTENSIONS = _IMAGE_ATTACHMENT_EXTENSIONS | frozenset({
-    ".pdf", ".docx", ".json",
+    ".pdf", ".docx", ".xlsx", ".xls", ".pptx", ".ppt", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".json",
 }) | _TEXT_ATTACHMENT_EXTENSIONS | _AUDIO_ATTACHMENT_EXTENSIONS | _VIDEO_ATTACHMENT_EXTENSIONS | _ACTIVE_ATTACHMENT_EXTENSIONS
 _OUTBOUND_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 _OUTBOUND_ATTACHMENT_RE = re.compile(
-    r"(?:MEDIA:|file://)?(/[^\s)\]>'\"]+\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))",
+    r"(?:MEDIA:|file://)?(/[^\s)\]>'\"]+\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|xlsx?|pptx?|zip|tar|gz|tgz|7z|rar|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))",
     re.IGNORECASE,
 )
+_SHARED_OUTBOUND_FOLDER_NAME = "Agent-Downloads"
 
 
 def _attachment_preview_kind(path: Path, media_type: str) -> str:
@@ -4909,6 +4910,67 @@ def _materialize_outbound_artifact(path: Path) -> Path | None:
         return None
 
 
+def _resolve_outbound_shared_folder_root() -> Path | None:
+    """Return the configured CUI shared-folder root, when a local mount exists."""
+    try:
+        from hermes_cli import web_server
+
+        root = web_server._resolve_shared_folder_root(_load_cfg())
+        return root.resolve() if root else None
+    except Exception:
+        return None
+
+
+def _shared_folder_relative_path(root: Path, path: Path) -> str | None:
+    try:
+        base = root.resolve()
+        target = path.resolve()
+        if target != base and base not in target.parents:
+            return None
+        parts = target.relative_to(base).parts
+        if not parts or any(part in {".", ".."} or part.startswith(".") for part in parts):
+            return None
+        return "/".join(parts)
+    except Exception:
+        return None
+
+
+def _materialize_non_renderable_outbound_artifact(path: Path) -> tuple[Path | None, str | None]:
+    """Copy a non-previewable outbound file into the CUI shared folder."""
+    root = _resolve_outbound_shared_folder_root()
+    if not root:
+        return None, None
+    try:
+        source = path.resolve()
+        if not source.is_file() or source.stat().st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+            return None, None
+        if not _outbound_source_allowed(source):
+            return None, None
+        rel_existing = _shared_folder_relative_path(root, source)
+        if rel_existing:
+            return source, rel_existing
+        stat = source.stat()
+        digest = hashlib.sha256(
+            f"{source}\0{stat.st_mtime_ns}\0{stat.st_size}".encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:12]
+        target_dir = (root / _SHARED_OUTBOUND_FOLDER_NAME).resolve()
+        root_resolved = root.resolve()
+        if target_dir != root_resolved and root_resolved not in target_dir.parents:
+            return None, None
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stem = source.stem or "file"
+        suffix = source.suffix
+        target = target_dir / source.name
+        if target.exists() and target.read_bytes() != source.read_bytes():
+            target = target_dir / f"{stem}-{digest}{suffix}"
+        if not target.exists() or target.stat().st_size != stat.st_size:
+            shutil.copy2(source, target)
+        rel = _shared_folder_relative_path(root, target)
+        return target.resolve(), rel
+    except Exception:
+        return None, None
+
+
 def _attachment_text_block(name: str, path: Path, text: str, note: str = "") -> str:
     header = f"[Attached file: {name}\nPath: {path}"
     if note:
@@ -4960,32 +5022,40 @@ def _process_prompt_attachments(attachments: Any, session_id: Any = None) -> tup
 
 def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
     """Extract local artifacts from assistant text for native CUI attachment cards."""
+    return _outbound_attachment_payloads_and_text(text)[0]
+
+
+def _outbound_attachment_payloads_and_text(
+    text: Any, *, append_shared_links: bool = False
+) -> tuple[list[dict[str, Any]], str]:
+    """Extract local artifacts and optionally append shared-folder links for unsafe previews."""
     if not isinstance(text, str) or not text:
-        return []
+        return [], "" if text is None else str(text)
     attachments: list[dict[str, Any]] = []
+    appended_links: list[str] = []
     seen: set[str] = set()
     for match in _OUTBOUND_ATTACHMENT_RE.finditer(text):
         raw_path = match.group(1)
         try:
-            path = Path(raw_path).expanduser().resolve()
+            source_path = Path(raw_path).expanduser().resolve()
         except Exception:
             continue
-        if str(path) in seen or not path.is_file() or path.suffix.lower() not in _OUTBOUND_ATTACHMENT_EXTENSIONS:
+        if str(source_path) in seen or not source_path.is_file() or source_path.suffix.lower() not in _OUTBOUND_ATTACHMENT_EXTENSIONS:
             continue
-        seen.add(str(path))
+        seen.add(str(source_path))
         # Confine the SOURCE to the safe-output allowlist before doing anything
         # else: the regex extension allowlist matches config/credential files
         # (.yaml/.json/.txt/...) and the assistant text is customer-influenceable,
         # so an unrestricted match would launder secrets into the served root.
-        if not _outbound_source_allowed(path):
+        if not _outbound_source_allowed(source_path):
             continue
         try:
-            size = path.stat().st_size
+            source_size = source_path.stat().st_size
         except Exception:
             continue
-        if size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+        if source_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
             continue
-        materialized = _materialize_outbound_artifact(path)
+        materialized = _materialize_outbound_artifact(source_path)
         if not materialized or not materialized.is_file():
             continue
         path = materialized
@@ -4994,26 +5064,42 @@ def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
             size = path.stat().st_size
         except Exception:
             size = 0
-        open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
         preview_kind = _attachment_preview_kind(path, media_type)
         is_image = preview_kind == "image"
         safe_renderable = preview_kind in {"image", "pdf", "text", "audio", "video"}
-        attachments.append(
-            {
-                "name": path.name,
-                "kind": "file",
-                "path": str(path),
-                "type": media_type,
-                "size": size,
-                "is_image": is_image,
-                "open_url": open_url,
-                "download_url": open_url,
-                "preview_url": open_url if safe_renderable else None,
-                "preview_kind": preview_kind,
-                "safe_renderable": safe_renderable,
-            }
-        )
-    return attachments
+        payload_path = path
+        shared_rel_path: str | None = None
+        if safe_renderable:
+            open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
+        else:
+            shared_path, shared_rel_path = _materialize_non_renderable_outbound_artifact(source_path)
+            if shared_path and shared_rel_path:
+                payload_path = shared_path
+                open_url = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(shared_rel_path, safe='')}"
+                if append_shared_links and open_url not in text:
+                    appended_links.append(f"{source_path.name}: {open_url}")
+            else:
+                open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
+        payload = {
+            "name": payload_path.name,
+            "kind": "file",
+            "path": str(payload_path),
+            "type": media_type,
+            "size": size,
+            "is_image": is_image,
+            "open_url": open_url,
+            "download_url": open_url,
+            "preview_url": open_url if safe_renderable else None,
+            "preview_kind": preview_kind,
+            "safe_renderable": safe_renderable,
+        }
+        if shared_rel_path:
+            payload["shared_folder_path"] = shared_rel_path
+        attachments.append(payload)
+    if append_shared_links and appended_links:
+        suffix = "\n".join(f"- {line}" for line in appended_links)
+        text = f"{text.rstrip()}\n\nIm Shared-Ordner unter Agent-Downloads abgelegt:\n{suffix}"
+    return attachments, text
 
 
 _INBOUND_IMAGE_HINT_RE = re.compile(
@@ -9560,8 +9646,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 raw = str(result)
                 status = "complete"
 
+            outbound_attachments, raw = _outbound_attachment_payloads_and_text(
+                raw, append_shared_links=True
+            )
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-            outbound_attachments = _outbound_image_attachment_payloads(raw)
             if outbound_attachments:
                 payload["attachments"] = outbound_attachments
             if last_reasoning:
