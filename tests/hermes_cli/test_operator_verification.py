@@ -39,7 +39,10 @@ def test_default_config_enables_operator_verification_gate():
     assert section["enabled"] is True
     assert section["require_for_cli_admin"] is True
     assert section["command"]["argv"] == []
-    assert section["interfaces"] == {}
+    assert section["interfaces"] == {
+        "cli": {"verifier": "callback"},
+        "tui": {"verifier": "callback"},
+    }
     assert section["allowed_secret_read_patterns"] == []
 
 

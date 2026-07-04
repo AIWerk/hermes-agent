@@ -2545,7 +2545,15 @@ DEFAULT_CONFIG = {
                 "argv": [],
                 "timeout_seconds": 60,
             },
-            "interfaces": {},
+            "interfaces": {
+                # Interactive CLI/TUI must use Hermes' own masked prompt
+                # callback. Do not default to an external command or /dev/tty
+                # helper: tool workers often have no controlling terminal.
+                # Without an operator-verifier store this remains inert, so
+                # fresh installs do not deadlock admin-sensitive commands.
+                "cli": {"verifier": "callback"},
+                "tui": {"verifier": "callback"},
+            },
             "trusted_actor_ids": [],
             "allowed_secret_read_patterns": [],
         },
