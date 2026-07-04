@@ -188,11 +188,39 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
                 ["python", "-m", "pytest"],
                 ["python3", "-m", "pytest"],
                 ["uv", "run", "pytest"],
+                ["uv", "run", "python", "-m", "pytest"],
+                ["uv", "run", "python3", "-m", "pytest"],
                 ["poetry", "run", "pytest"],
                 ["pipenv", "run", "pytest"],
             ]
         )
     return candidates
+
+
+def _effective_cwd_from_leading_cd(command: str, cwd: str | Path | None) -> str | Path | None:
+    """Return the shell cwd after a leading ``cd ... &&`` segment, if present.
+
+    The terminal tool records evidence with the tool worker cwd, but agents often
+    run checks as ``cd /repo && pytest ...``. Resolve that leading ``cd`` so the
+    verification ledger reads project facts from the checked repo instead of the
+    caller's outer directory.
+    """
+    segments = _split_segment_tokens(command)
+    if not segments:
+        return cwd
+    first = _strip_command_prefix(segments[0])
+    if len(first) < 2 or first[0] not in {"cd", "chdir"}:
+        return cwd
+    target = first[1]
+    if target in {"-", "--"}:
+        return cwd
+    try:
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = Path(cwd or ".").expanduser() / path
+        return path.resolve()
+    except Exception:
+        return cwd
 
 
 def _find_canonical_match(command: str, canonical_commands: list[str]) -> Optional[tuple[str, list[str]]]:
@@ -395,8 +423,10 @@ def classify_verification_command(
     try:
         from agent.coding_context import project_facts_for
 
-        facts = project_facts_for(cwd)
+        effective_cwd = _effective_cwd_from_leading_cd(command, cwd)
+        facts = project_facts_for(effective_cwd)
     except Exception:
+        effective_cwd = cwd
         facts = None
     if not facts:
         return None
@@ -420,8 +450,8 @@ def classify_verification_command(
         scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
         status="passed" if int(exit_code) == 0 else "failed",
         exit_code=int(exit_code),
-        cwd=str(Path(cwd or ".").resolve()),
-        root=str(facts.get("root") or Path(cwd or ".").resolve()),
+        cwd=str(Path(effective_cwd or ".").resolve()),
+        root=str(facts.get("root") or Path(effective_cwd or ".").resolve()),
         session_id=str(session_id or "default"),
         output_summary=_summarize_output(output),
     )

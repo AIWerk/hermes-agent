@@ -170,6 +170,27 @@ def test_uv_run_pytest_matches_detected_pytest(tmp_path, monkeypatch):
     assert evidence.scope == "targeted"
 
 
+def test_leading_cd_uses_project_cwd_for_verification_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path / "project"
+    project.mkdir()
+    _python_project(project)
+
+    evidence = classify_verification_command(
+        f"cd {project} && python3 -m py_compile app.py && uv run python -m pytest tests/test_calc.py -q",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 passed",
+    )
+
+    assert evidence is not None
+    assert evidence.cwd == str(project.resolve())
+    assert evidence.root == str(project.resolve())
+    assert evidence.canonical_command == "pytest"
+    assert evidence.scope == "targeted"
+
+
 def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
