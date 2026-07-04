@@ -2092,6 +2092,55 @@ def test_prompt_learn_rewrites_request_into_agent_turn(monkeypatch):
         server._sessions.pop("learn-sid", None)
 
 
+def test_prompt_submit_materializes_shared_uri_into_attachment_context(monkeypatch, tmp_path):
+    started: list[str] = []
+    upload_root = tmp_path / "dashboard_uploads"
+    source = upload_root / "shared-sid" / "shared" / "doc.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("Shared document body", encoding="utf-8")
+
+    server._sessions["shared-sid"] = _session()
+    monkeypatch.setattr(server, "_DASHBOARD_UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(
+        server,
+        "_shared_uri_prompt_attachments",
+        lambda text, sid: [
+            {
+                "name": "doc.md",
+                "path": str(source),
+                "type": "text/markdown",
+                "extracted_text": "Shared document body",
+                "extraction": "text",
+            }
+        ] if "shared://Folder/doc.md" in str(text) else [],
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda session, text: started.append(text))
+    monkeypatch.setattr(
+        server.threading,
+        "Thread",
+        lambda *a, **k: types.SimpleNamespace(daemon=False, start=lambda: None),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "shared-sid", "text": "Use shared://Folder/doc.md"},
+            }
+        )
+        assert resp["result"]["status"] == "streaming"
+        assert len(started) == 1
+        assert "Use shared://Folder/doc.md" in started[0]
+        assert "[Attached file: doc.md" in started[0]
+        assert f"Path: {source}" in started[0]
+        assert "Shared document body" in started[0]
+    finally:
+        server._sessions.pop("shared-sid", None)
+
+
 
 def test_session_create_does_not_persist_empty_row(monkeypatch):
     """session.create must NOT eagerly write a DB row.

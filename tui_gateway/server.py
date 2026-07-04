@@ -4841,6 +4841,7 @@ _OUTBOUND_ATTACHMENT_RE = re.compile(
     r"(?:MEDIA:|file://)?(/[^\s)\]>'\"]+\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|xlsx?|pptx?|zip|tar|gz|tgz|7z|rar|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))",
     re.IGNORECASE,
 )
+_INBOUND_SHARED_URI_RE = re.compile(r"\bshared://[^\s)\]>'\"]+", re.IGNORECASE)
 _SHARED_OUTBOUND_FOLDER_NAME = "Agent-Downloads"
 
 
@@ -5086,6 +5087,48 @@ def _process_prompt_attachments(attachments: Any, session_id: Any = None) -> tup
                 note = note or "text-read-failed"
         file_blocks.append(_attachment_text_block(name, path, text, note))
     return image_paths, "\n\n".join(file_blocks)
+
+
+def _shared_uri_relative_path(uri: str) -> str | None:
+    raw = str(uri or "").strip().rstrip(".,;")
+    if not raw.lower().startswith("shared://"):
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    rel = "/".join(part for part in (parsed.netloc, parsed.path.lstrip("/")) if part)
+    rel = urllib.parse.unquote(rel).replace("\\", "/")
+    parts = [part for part in rel.split("/") if part]
+    if not parts or any(part in {".", ".."} or part.startswith(".") for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _shared_uri_prompt_attachments(text: Any, session_id: Any) -> list[dict[str, Any]]:
+    """Materialize CUI ``shared://`` references into session upload attachments."""
+    if not isinstance(text, str) or "shared://" not in text.lower():
+        return []
+    try:
+        from hermes_cli import web_server
+
+        config = web_server.load_config()
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _INBOUND_SHARED_URI_RE.finditer(text):
+        rel = _shared_uri_relative_path(match.group(0))
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        item = {
+            "name": Path(rel).name,
+            "reference_uri": f"shared://{urllib.parse.quote(rel, safe='/')}",
+            "open_url": f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel, safe='')}",
+        }
+        try:
+            out.append(web_server._create_shared_file_attachment(config, item, str(session_id or "session")))
+        except Exception:
+            continue
+    return out
 
 
 def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
@@ -9124,7 +9167,9 @@ def _(rid, params: dict) -> dict:
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
-    uploaded_images, attachment_context = _process_prompt_attachments(params.get("attachments"), sid)
+    attachments = list(params.get("attachments") or []) if isinstance(params.get("attachments"), list) else []
+    attachments.extend(_shared_uri_prompt_attachments(text, sid))
+    uploaded_images, attachment_context = _process_prompt_attachments(attachments, sid)
     if attachment_context:
         text = f"{text}\n\n{attachment_context}" if str(text).strip() else attachment_context
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
