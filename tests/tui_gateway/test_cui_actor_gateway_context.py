@@ -14,7 +14,7 @@ def test_dispatch_session_create_stores_authenticated_cui_actor(monkeypatch, tmp
     monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "collapsed")
 
     actor = {
-        "tenant_id": "meerwohnen",
+        "tenant_id": "example-tenant",
         "actor_id": "aiwerk:attila:admin",
         "role": "admin",
         "display_name": "Attila",
@@ -29,7 +29,7 @@ def test_dispatch_session_create_stores_authenticated_cui_actor(monkeypatch, tmp
         sid = resp["result"]["session_id"]
         stored = server._sessions[sid]["cui_actor_context"]
         assert stored == {
-            "tenant_id": "meerwohnen",
+            "tenant_id": "example-tenant",
             "actor_id": "aiwerk:attila:admin",
             "role": "admin",
             "display_name": "Attila",
@@ -64,7 +64,7 @@ def test_row_visibility_admin_actor_sees_all():
 
 
 def test_row_visibility_customer_blocked_from_internal_and_unowned():
-    cust = {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"}
+    cust = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
     # Legacy internal/CLI session with no CUI metadata: fail closed.
     assert server._row_visible_to_cui_actor(_row(source="cli"), cust) is False
     # A tui row with no metadata: cannot prove ownership, fail closed.
@@ -73,7 +73,7 @@ def test_row_visibility_customer_blocked_from_internal_and_unowned():
     admin_tagged = _row(
         source="tui",
         model_config={
-            "_cui_actor_context": {"tenant_id": "meerwohnen", "actor_id": "admin-1", "role": "admin"},
+            "_cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"},
         },
     )
     assert server._row_visible_to_cui_actor(admin_tagged, cust) is False
@@ -81,7 +81,7 @@ def test_row_visibility_customer_blocked_from_internal_and_unowned():
     other_tenant = _row(
         source="tui",
         model_config={
-            "_cui_actor_context": {"tenant_id": "other-co", "actor_id": "cust-1", "role": "user"},
+            "_cui_actor_context": {"tenant_id": "other-co", "actor_id": "customer-1", "role": "user"},
         },
     )
     assert server._row_visible_to_cui_actor(other_tenant, cust) is False
@@ -89,32 +89,32 @@ def test_row_visibility_customer_blocked_from_internal_and_unowned():
     other_actor = _row(
         source="tui",
         model_config={
-            "_cui_actor_context": {"tenant_id": "meerwohnen", "actor_id": "cust-2", "role": "user"},
+            "_cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-2", "role": "user"},
         },
     )
     assert server._row_visible_to_cui_actor(other_actor, cust) is False
 
 
 def test_row_visibility_customer_sees_own_session():
-    cust = {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"}
+    cust = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
     own = _row(
         source="tui",
         model_config={
-            "_cui_actor_context": {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"},
+            "_cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"},
         },
     )
     assert server._row_visible_to_cui_actor(own, cust) is True
 
 
 def test_live_session_visibility_refuses_transport_rebind_for_non_owner():
-    cust = {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"}
+    cust = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
     # Live session owned by a different actor: rebind refused.
-    other = {"cui_actor_context": {"tenant_id": "meerwohnen", "actor_id": "cust-2", "role": "user"}}
+    other = {"cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-2", "role": "user"}}
     assert server._live_session_visible_to_cui_actor(other, cust) is False
     # Live session with no owner identity (standalone TUI): not hijackable.
     assert server._live_session_visible_to_cui_actor({"cui_actor_context": {}}, cust) is False
     # Own live session: allowed.
-    own = {"cui_actor_context": {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"}}
+    own = {"cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}}
     assert server._live_session_visible_to_cui_actor(own, cust) is True
     # Admin actor and no-actor dispatch are unconfined.
     assert server._live_session_visible_to_cui_actor(other, {"role": "admin", "actor_id": "x", "tenant_id": "t"}) is True
@@ -140,9 +140,9 @@ def test_resume_404s_cross_actor_stored_session(tmp_path, monkeypatch):
             {"_cui_actor_context": {"tenant_id": "aiwerk", "actor_id": "admin-1", "role": "admin"}}
         ),
     )
-    db.set_session_title("admin-onboarding-1", "Tenant Setup Meerwohnen")
+    db.set_session_title("admin-onboarding-1", "Tenant Setup Example")
 
-    customer = {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"}
+    customer = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
 
     def _resume(target, actor, **extra):
         # session.resume is a long handler (dispatch returns None and writes via
@@ -164,13 +164,13 @@ def test_resume_404s_cross_actor_stored_session(tmp_path, monkeypatch):
 
         # Resume by human-readable TITLE → 404 (title lookup disabled for
         # confined customers; admin titles are predictable).
-        resp_title = _resume("Tenant Setup Meerwohnen", customer)
+        resp_title = _resume("Tenant Setup Example", customer)
         assert resp_title["error"]["code"] == 4007
 
         # An admin actor CAN resolve the title (affordance preserved): the
         # visibility gate does not 404 it (it resolves to the real id).
         admin = {"tenant_id": "aiwerk", "actor_id": "admin-1", "role": "admin"}
-        resp_admin = _resume("Tenant Setup Meerwohnen", admin, eager_build=False)
+        resp_admin = _resume("Tenant Setup Example", admin, eager_build=False)
         assert resp_admin.get("result") is not None
         assert resp_admin["result"]["resumed"] == "admin-onboarding-1"
     finally:
@@ -195,19 +195,19 @@ def test_ensure_session_db_row_stamps_cui_actor_context(tmp_path, monkeypatch):
     session = {
         "session_key": "owned-1",
         "model_override": None,
-        "cui_actor_context": {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"},
+        "cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"},
         "explicit_cwd": False,
         "parent_session_id": None,
     }
     server._ensure_session_db_row(session)
     row = db.get_session("owned-1")
     cfg = _json.loads(row["model_config"]) if isinstance(row.get("model_config"), str) else row.get("model_config")
-    assert cfg["_cui_actor_context"]["actor_id"] == "cust-1"
-    assert cfg["_cui_tenant_id"] == "meerwohnen"
+    assert cfg["_cui_actor_context"]["actor_id"] == "customer-1"
+    assert cfg["_cui_tenant_id"] == "example-tenant"
     assert cfg["_cui_actor_role"] == "user"
     # And the persisted row is visible to its owner, not to others.
-    owner = {"tenant_id": "meerwohnen", "actor_id": "cust-1", "role": "user"}
-    intruder = {"tenant_id": "meerwohnen", "actor_id": "cust-2", "role": "user"}
+    owner = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
+    intruder = {"tenant_id": "example-tenant", "actor_id": "customer-2", "role": "user"}
     assert server._row_visible_to_cui_actor(row, owner) is True
     assert server._row_visible_to_cui_actor(row, intruder) is False
 
@@ -222,7 +222,7 @@ def test_apply_cui_actor_env_binds_contextvar_not_identity_env(monkeypatch):
     monkeypatch.delenv("AIWERK_CUI_MANAGED_AUTONOMY", raising=False)
     monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "old-role")
     actor = {
-        "tenant_id": "meerwohnen",
+        "tenant_id": "example-tenant",
         "actor_id": "aiwerk:attila:admin",
         "role": "admin",
         "display_name": "Attila",
@@ -349,9 +349,9 @@ def test_row_visibility_customer_can_resume_linked_telegram_session(monkeypatch)
             "basic_auth": {
                 "users": [
                     {
-                        "actor_id": "meerwohnen:susanne:user",
-                        "user_id": "Susanne",
-                        "tenant_id": "meerwohnen",
+                        "actor_id": "example-tenant:customer:user",
+                        "user_id": "Customer",
+                        "tenant_id": "example-tenant",
                         "role": "user",
                         "telegram_user_ids": ["1461953838"],
                     }
@@ -361,10 +361,10 @@ def test_row_visibility_customer_can_resume_linked_telegram_session(monkeypatch)
     }
     monkeypatch.setattr(server, "_load_dashboard_user_config", lambda: cfg)
     cust = {
-        "tenant_id": "meerwohnen",
-        "actor_id": "meerwohnen:susanne:user",
+        "tenant_id": "example-tenant",
+        "actor_id": "example-tenant:customer:user",
         "role": "user",
-        "user_id": "Susanne",
+        "user_id": "Customer",
     }
 
     own = {"id": "own-tg", "source": "telegram", "user_id": "1461953838", "model_config": None}

@@ -6622,7 +6622,7 @@ def test_session_resume_reattaches_live_session_by_persistent_key(monkeypatch):
 
 
 def test_customer_resume_preserves_actor_context_for_second_live_resume(monkeypatch):
-    actor = {"tenant_id": "meerwohnen", "actor_id": "meerwohnen:susanne:user", "role": "user"}
+    actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
     row = {
         "id": "customer-session",
         "model_config": json.dumps(

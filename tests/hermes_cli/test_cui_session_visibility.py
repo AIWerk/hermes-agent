@@ -96,7 +96,7 @@ def test_cui_actor_context_from_authenticated_request(monkeypatch):
                 tenant_id="example-tenant",
                 org_id="",
                 actor_id="example-tenant:customer:user",
-                user_id="Susanne",
+                user_id="Customer",
                 role="user",
             )
         )
@@ -161,7 +161,7 @@ def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):
                 "users": [
                     {
                         "actor_id": "example-tenant:customer:user",
-                        "user_id": "Susanne",
+                        "user_id": "Customer",
                         "tenant_id": "example-tenant",
                         "role": "user",
                         "telegram_user_ids": ["1461953838"],
@@ -175,7 +175,7 @@ def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):
         "tenant_id": "example-tenant",
         "actor_id": "example-tenant:customer:user",
         "role": "user",
-        "user_id": "Susanne",
+        "user_id": "Customer",
     }
 
     own_telegram = {"id": "own-tg", "source": "telegram", "user_id": "1461953838", "model_config": None}
