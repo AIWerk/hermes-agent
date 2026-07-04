@@ -1,4 +1,4 @@
-export const CUI_NATIVE_SLASH_COMMANDS = new Set(["/back", "/help", "/new", "/side", "/status", "/stop", "/usage"]);
+export const CUI_NATIVE_SLASH_COMMANDS = new Set(["/back", "/help", "/learn", "/new", "/side", "/status", "/stop", "/usage"]);
 export const CUI_EXEC_SLASH_COMMANDS = new Set(["/compress", "/reload-mcp"]);
 export const CUI_SUPPORTED_SLASH_COMMANDS = new Set([...CUI_NATIVE_SLASH_COMMANDS, ...CUI_EXEC_SLASH_COMMANDS]);
 

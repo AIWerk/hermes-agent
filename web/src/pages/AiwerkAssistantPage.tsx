@@ -2583,6 +2583,34 @@ export default function AiwerkAssistantPage() {
       void startNewSession();
       return;
     }
+    if (base === "/learn" || base === "/lern") {
+      if (!gateway || !sessionId) return;
+      if (busyRef.current) {
+        renderSystem("/learn ist verfügbar, aber nicht während eine Antwort läuft. Bitte danach erneut senden.");
+        return;
+      }
+      const userMessageId = newId("user");
+      activeTurnModeRef.current = conversationModeRef.current;
+      setActiveTurnMode(conversationModeRef.current);
+      setBusy(true);
+      setError(null);
+      if (conversationModeRef.current === "side") {
+        activeSideToolAnchorRef.current = userMessageId;
+        setSideMessages((prev) => [...prev, { id: userMessageId, role: "user", text: normalized, status: "complete" }]);
+      } else {
+        activeToolAnchorRef.current = userMessageId;
+        setMessages((prev) => [...prev, { id: userMessageId, role: "user", text: normalized, status: "complete" }]);
+      }
+      showToast("Lernen gestartet");
+      try {
+        await gateway.request("prompt.learn", { session_id: sessionId, text: arg });
+        window.setTimeout(() => void refreshSessionMeta(gateway, sessionId), 800);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        setBusy(false);
+      }
+      return;
+    }
     if (base === "/help") {
       const rows = slashCommands.map((item) => `${item.command} — ${item.description}`).join("\n");
       renderSystem(rows || "Keine CUI Slash-Befehle verfügbar.");

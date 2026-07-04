@@ -18,6 +18,7 @@ describe("CUI slash helpers", () => {
     expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/usage")).toBe(true);
     expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/help")).toBe(true);
     expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/stop")).toBe(true);
+    expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/learn")).toBe(true);
     expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/model")).toBe(false);
     expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/tools")).toBe(false);
   });

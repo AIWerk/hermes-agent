@@ -2059,6 +2059,40 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
         server._sessions.pop("trunc-sid", None)
 
 
+def test_prompt_learn_rewrites_request_into_agent_turn(monkeypatch):
+    started: list[str] = []
+
+    server._sessions["learn-sid"] = _session()
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda session, text: started.append(text))
+    monkeypatch.setattr(
+        server.threading,
+        "Thread",
+        lambda *a, **k: types.SimpleNamespace(daemon=False, start=lambda: None),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.learn",
+                "params": {
+                    "session_id": "learn-sid",
+                    "text": "shared://Ligne%20Roset%20Preislisten/TARIF_A_JOUR.pdf",
+                },
+            }
+        )
+        assert resp["result"]["status"] == "streaming"
+        assert len(started) == 1
+        assert started[0].startswith("[/learn]")
+        assert "shared://Ligne%20Roset%20Preislisten/TARIF_A_JOUR.pdf" in started[0]
+        assert server._sessions["learn-sid"]["running"] is True
+    finally:
+        server._sessions.pop("learn-sid", None)
+
+
+
 def test_session_create_does_not_persist_empty_row(monkeypatch):
     """session.create must NOT eagerly write a DB row.
 

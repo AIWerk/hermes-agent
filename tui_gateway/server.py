@@ -9107,6 +9107,20 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+@method("prompt.learn")
+def _(rid, params: dict) -> dict:
+    raw = str(params.get("text") or params.get("request") or "").strip()
+    try:
+        from agent.learn_prompt import build_learn_prompt
+
+        prompt = build_learn_prompt(raw)
+    except Exception as exc:
+        return _err(rid, 5000, f"prompt.learn failed: {exc}")
+    next_params = dict(params)
+    next_params["text"] = prompt
+    return _methods["prompt.submit"](rid, next_params)
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")

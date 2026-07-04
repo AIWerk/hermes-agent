@@ -376,6 +376,7 @@ _ASSISTANT_ALLOWED_RPC_METHODS: frozenset = frozenset({
     "session.side.start",
     "session.side.back",
     "prompt.submit",
+    "prompt.learn",
     "approval.respond",
     "config.get",
     "config.set",
