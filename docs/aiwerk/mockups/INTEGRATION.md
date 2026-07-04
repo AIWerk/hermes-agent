@@ -84,21 +84,21 @@ Implemented files:
 Admin/operator dashboard:
 
 ```bash
-cd /home/agbergsmann/.hermes/hermes-agent
+cd $HOME/.hermes/hermes-agent
 python -m hermes_cli.main dashboard --port 9119 --no-open --tui
 ```
 
 AIWerk Customer UI:
 
 ```bash
-cd /home/agbergsmann/.hermes/hermes-agent
+cd $HOME/.hermes/hermes-agent
 python -m hermes_cli.main dashboard --assistant --port 9120 --no-open --skip-build
 ```
 
 Frontend rebuild:
 
 ```bash
-cd /home/agbergsmann/.hermes/hermes-agent/web
+cd $HOME/.hermes/hermes-agent/web
 npm run build
 ```
 

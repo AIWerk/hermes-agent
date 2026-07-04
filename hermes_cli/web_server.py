@@ -4218,11 +4218,6 @@ def _contacts_from_calendar_resource(calendar_resource: dict[str, Any]) -> list[
 
 _OWN_CONTACT_EMAILS = {
     "kontakt@aiwerk.ch",
-    "a.bergsmann@aiwerk.ch",
-    "bergsmann@gmail.com",
-    "attila@bergsmann.ch",
-    "attila.bergsmann@agbergsmann.ch",
-    "office@agbergsmann.ch",
 }
 _SYSTEM_CONTACT_LOCALPARTS = {
     "root", "postmaster", "mailer-daemon", "daemon", "noreply", "no-reply", "donotreply", "do-not-reply",
@@ -4360,7 +4355,7 @@ def _filter_contacts_payload(payload: dict[str, Any], *, own_emails: set[str]) -
     This is intentionally a final response-level guard as well as a source-level
     filter: contact summaries can be served from the in-process resource cache,
     and search can merge cached/manual/bridge contacts.  The UI should never see
-    configured own addresses such as kontakt@aiwerk.ch or bergsmann@gmail.com —
+    configured own addresses —
     neither as contact email nor as source badge/account label.
     """
     if not isinstance(payload, dict):

@@ -8,15 +8,15 @@ def test_cui_actor_model_config_is_stamped_for_sessions(monkeypatch):
 
     monkeypatch.setenv(
         "AIWERK_CUI_ACTOR_CONTEXT",
-        json.dumps({"tenant_id": "meerwohnen", "actor_id": "aiwerk:attila:admin", "role": "admin"}),
+        json.dumps({"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}),
     )
     agent = AIAgent(provider="openai", model="gpt-4.1", api_key="test-key", base_url="http://127.0.0.1:9/v1", skip_memory=True)
 
     cfg = agent._session_init_model_config
     assert cfg["_cui_visibility_scope"] == "admin"
     assert cfg["_cui_actor_role"] == "admin"
-    assert cfg["_cui_actor_id"] == "aiwerk:attila:admin"
-    assert cfg["_cui_tenant_id"] == "meerwohnen"
+    assert cfg["_cui_actor_id"] == "aiwerk:operator:admin"
+    assert cfg["_cui_tenant_id"] == "example-tenant"
 
 
 def test_customer_cui_actor_cannot_see_tagged_admin_sessions():
@@ -29,12 +29,12 @@ def test_customer_cui_actor_cannot_see_tagged_admin_sessions():
                 "_cui_visibility_scope": "admin",
                 "_cui_actor_role": "admin",
                 "_cui_actor_id": "aiwerk:attila:admin",
-                "_cui_tenant_id": "meerwohnen",
+                "_cui_tenant_id": "example-tenant",
             }
         ),
     }
-    user_actor = {"tenant_id": "meerwohnen", "actor_id": "meerwohnen:susanne:user", "role": "user"}
-    admin_actor = {"tenant_id": "meerwohnen", "actor_id": "aiwerk:attila:admin", "role": "admin"}
+    user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
+    admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
 
     assert web_server._session_visible_to_cui_actor(admin_session, user_actor) is False
     assert web_server._session_visible_to_cui_actor(admin_session, admin_actor) is True
@@ -43,8 +43,8 @@ def test_customer_cui_actor_cannot_see_tagged_admin_sessions():
 def test_customer_cui_actor_cannot_see_legacy_untagged_internal_sessions():
     from hermes_cli import web_server
 
-    user_actor = {"tenant_id": "meerwohnen", "actor_id": "meerwohnen:susanne:user", "role": "user"}
-    admin_actor = {"tenant_id": "meerwohnen", "actor_id": "aiwerk:attila:admin", "role": "admin"}
+    user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
+    admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
 
     for source in ["cli", "tui", "cron", "classifier", "reflection", "system", "internal"]:
         session = {"id": f"legacy-{source}", "source": source, "model_config": None}
@@ -64,8 +64,8 @@ def test_customer_cui_actor_only_sees_own_tagged_customer_sessions():
             {
                 "_cui_visibility_scope": "customer",
                 "_cui_actor_role": "user",
-                "_cui_actor_id": "meerwohnen:susanne:user",
-                "_cui_tenant_id": "meerwohnen",
+                "_cui_actor_id": "example-tenant:customer:user",
+                "_cui_tenant_id": "example-tenant",
             }
         ),
     }
@@ -75,12 +75,12 @@ def test_customer_cui_actor_only_sees_own_tagged_customer_sessions():
             {
                 "_cui_visibility_scope": "customer",
                 "_cui_actor_role": "user",
-                "_cui_actor_id": "meerwohnen:other:user",
-                "_cui_tenant_id": "meerwohnen",
+                "_cui_actor_id": "example-tenant:other:user",
+                "_cui_tenant_id": "example-tenant",
             }
         ),
     }
-    user_actor = {"tenant_id": "meerwohnen", "actor_id": "meerwohnen:susanne:user", "role": "user"}
+    user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
 
     assert web_server._session_visible_to_cui_actor(susanne_session, user_actor) is True
     assert web_server._session_visible_to_cui_actor(other_customer_session, user_actor) is False
@@ -93,9 +93,9 @@ def test_cui_actor_context_from_authenticated_request(monkeypatch):
     request = SimpleNamespace(
         state=SimpleNamespace(
             session=SimpleNamespace(
-                tenant_id="meerwohnen",
+                tenant_id="example-tenant",
                 org_id="",
-                actor_id="meerwohnen:susanne:user",
+                actor_id="example-tenant:customer:user",
                 user_id="Susanne",
                 role="user",
             )
@@ -103,8 +103,8 @@ def test_cui_actor_context_from_authenticated_request(monkeypatch):
     )
 
     assert web_server._cui_actor_context_from_request(request) == {
-        "tenant_id": "meerwohnen",
-        "actor_id": "meerwohnen:susanne:user",
+        "tenant_id": "example-tenant",
+        "actor_id": "example-tenant:customer:user",
         "role": "user",
     }
 
@@ -140,8 +140,8 @@ def test_restricted_actor_sees_no_sessions(monkeypatch):
             {
                 "_cui_visibility_scope": "customer",
                 "_cui_actor_role": "user",
-                "_cui_actor_id": "meerwohnen:susanne:user",
-                "_cui_tenant_id": "meerwohnen",
+                "_cui_actor_id": "example-tenant:customer:user",
+                "_cui_tenant_id": "example-tenant",
             }
         ),
     }
@@ -160,9 +160,9 @@ def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):
             "basic_auth": {
                 "users": [
                     {
-                        "actor_id": "meerwohnen:susanne:user",
+                        "actor_id": "example-tenant:customer:user",
                         "user_id": "Susanne",
-                        "tenant_id": "meerwohnen",
+                        "tenant_id": "example-tenant",
                         "role": "user",
                         "telegram_user_ids": ["1461953838"],
                     }
@@ -172,8 +172,8 @@ def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):
     }
     monkeypatch.setattr(web_server, "load_config", lambda: cfg)
     user_actor = {
-        "tenant_id": "meerwohnen",
-        "actor_id": "meerwohnen:susanne:user",
+        "tenant_id": "example-tenant",
+        "actor_id": "example-tenant:customer:user",
         "role": "user",
         "user_id": "Susanne",
     }

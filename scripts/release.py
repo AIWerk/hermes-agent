@@ -96,9 +96,7 @@ AUTHOR_MAP = {
     "kiljadn@gmail.com": "designnotdrum",  # PR #56480 salvage (toolset static-inference fix)
     "DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",
     "SJWATTS89@OUTLOOK.COM": "lEWFkRAD",
-    "bergsmann@gmail.com": "Halder68",
     "daniel.laforce@argobox.com": "KeyArgo",
-    "hermes-attila@agent.aiwerk.local": "Halder68",
     "ilonagaja509-glitch@users.noreply.github.com": "ilonagaja509-glitch",
     "jerome@ai-werk.ch": "Jerome",
     "konsisumer@users.noreply.github.com": "konsisumer",

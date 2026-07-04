@@ -21,11 +21,11 @@ def test_cui_actor_context_admin_banner_and_memory_suppression(monkeypatch):
         "AIWERK_CUI_ACTOR_CONTEXT",
         json.dumps(
             {
-                "tenant_id": "meerwohnen",
-                "actor_id": "aiwerk:attila:admin",
+                "tenant_id": "example-tenant",
+                "actor_id": "aiwerk:operator:admin",
                 "role": "admin",
-                "display_name": "Attila",
-                "user_id": "Attila",
+                "display_name": "Operator",
+                "user_id": "Operator",
             }
         ),
     )
@@ -49,7 +49,7 @@ def test_cui_actor_context_admin_banner_and_memory_suppression(monkeypatch):
 
     volatile = build_system_prompt_parts(agent)["volatile"]
 
-    assert "current_human='Attila'" in volatile
+    assert "current_human='Operator'" in volatile
     assert "not the primary customer user" in volatile
     assert "USERBLOCK-CUSTOMER" not in volatile
     assert "HONCHO-CUSTOMER-CONTEXT" not in volatile
@@ -70,11 +70,11 @@ def test_cui_actor_context_customer_keeps_customer_memory(monkeypatch):
         "AIWERK_CUI_ACTOR_CONTEXT",
         json.dumps(
             {
-                "tenant_id": "meerwohnen",
-                "actor_id": "meerwohnen:susanne:user",
+                "tenant_id": "example-tenant",
+                "actor_id": "example-tenant:customer:user",
                 "role": "user",
-                "display_name": "Susanne Meer",
-                "user_id": "Susanne",
+                "display_name": "Customer User",
+                "user_id": "Customer",
             }
         ),
     )
@@ -98,7 +98,7 @@ def test_cui_actor_context_customer_keeps_customer_memory(monkeypatch):
 
     volatile = build_system_prompt_parts(agent)["volatile"]
 
-    assert "current_human='Susanne Meer'" in volatile
+    assert "current_human='Customer User'" in volatile
     assert "authenticated customer/user" in volatile
     assert "USERBLOCK-CUSTOMER" in volatile
     assert "HONCHO-CUSTOMER-CONTEXT" in volatile
@@ -115,15 +115,15 @@ def test_cui_admin_memory_write_guard(monkeypatch):
         "AIWERK_CUI_ACTOR_CONTEXT",
         json.dumps(
             {
-                "tenant_id": "meerwohnen",
-                "actor_id": "aiwerk:attila:admin",
+                "tenant_id": "example-tenant",
+                "actor_id": "aiwerk:operator:admin",
                 "role": "admin",
-                "display_name": "Attila",
+                "display_name": "Operator",
             }
         ),
     )
 
-    assert current_cui_actor_context()["actor_id"] == "aiwerk:attila:admin"
+    assert current_cui_actor_context()["actor_id"] == "aiwerk:operator:admin"
     assert is_aiwerk_admin_actor()
     assert memory_write_blocked_for_cui_admin("memory", {"action": "add"})
     assert memory_write_blocked_for_cui_admin("memory", {"action": "replace"})
@@ -140,10 +140,10 @@ def test_cui_customer_memory_write_guard_allows_customer(monkeypatch):
         "AIWERK_CUI_ACTOR_CONTEXT",
         json.dumps(
             {
-                "tenant_id": "meerwohnen",
-                "actor_id": "meerwohnen:susanne:user",
+                "tenant_id": "example-tenant",
+                "actor_id": "example-tenant:customer:user",
                 "role": "user",
-                "display_name": "Susanne Meer",
+                "display_name": "Customer User",
             }
         ),
     )

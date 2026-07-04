@@ -562,7 +562,7 @@ class TestChromeDebugLaunch:
             os.path.join(root, "hermes_cli", "browser_connect.py"),
             os.path.join(root, "cli.py"),
         ]
-        forbidden = ["agent" + ".aiwerk.ch", "hermes" + "-attila", "id_agent" + "_aiwerk_hermes"]
+        forbidden = ["agent" + ".aiwerk.ch", "hermes" + "-demo", "id_agent" + "_aiwerk_hermes"]
         for path in paths:
             with open(path, encoding="utf-8") as fh:
                 content = fh.read()

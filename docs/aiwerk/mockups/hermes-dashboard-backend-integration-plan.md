@@ -156,9 +156,9 @@ Verification:
 ### 8. Build and run locally
 
 Commands:
-- `cd /home/agbergsmann/.hermes/hermes-agent/web && npm run build`
-- Admin/operator: `cd /home/agbergsmann/.hermes/hermes-agent && python -m hermes_cli.main dashboard --port 9119 --no-open --tui`
-- AIWerk Customer UI: `cd /home/agbergsmann/.hermes/hermes-agent && python -m hermes_cli.main dashboard --assistant --port 9120 --no-open --skip-build`
+- `cd $HOME/.hermes/hermes-agent/web && npm run build`
+- Admin/operator: `cd $HOME/.hermes/hermes-agent && python -m hermes_cli.main dashboard --port 9119 --no-open --tui`
+- AIWerk Customer UI: `cd $HOME/.hermes/hermes-agent && python -m hermes_cli.main dashboard --assistant --port 9120 --no-open --skip-build`
 
 Verification performed:
 - Open `http://127.0.0.1:9120`

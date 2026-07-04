@@ -275,13 +275,13 @@ class TestAssistantUserDisplayName:
         memories.mkdir(parents=True)
         (memories / "USER.md").write_text(
             "User wants to call the assistant golem.\n"
-            "User's name is Attila.\n"
-            "golem is Attila's AIWerk test base agent.\n",
+            "User's name is Owner.\n"
+            "golem is Owner's AIWerk test base agent.\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(ws, "get_hermes_home", lambda: home)
 
-        assert ws._assistant_user_display_name() == "Attila"
+        assert ws._assistant_user_display_name() == "Owner"
 
     def test_ignores_generic_assistant_identity_names(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as ws
@@ -1786,11 +1786,11 @@ class TestWebServerEndpoints:
         contact = getattr(web_server, "_normalize_contact")({
             "display_name": "Rustan Khayrov",
             "email": "rustan@example.ch",
-            "source_badges": ["Google Contacts", "bergsmann@gmail.com", "bergsmann@gmail.com", "Aus E-Mail"],
+            "source_badges": ["Google Contacts", "owner@example.test", "owner@example.test", "Aus E-Mail"],
             "source": "google contacts",
         })
         assert contact is not None
-        assert contact["source_badges"] == ["Google Contacts", "bergsmann@gmail.com", "Aus E-Mail"]
+        assert contact["source_badges"] == ["Google Contacts", "owner@example.test", "Aus E-Mail"]
 
         decoded = getattr(web_server, "_contact_from_address")(
             "=?utf-8?b?w4lydGVzw610w6lzIEvDtnpwb250aSBSZW5kc3plcnTFkWw=?= <ertesites@kozpontirendszer.gov.hu>",
@@ -1802,10 +1802,10 @@ class TestWebServerEndpoints:
         assert getattr(web_server, "_is_probably_system_contact")(decoded, own_emails=set()) is True
 
         merged = getattr(web_server, "_dedupe_contacts")([
-            {"display_name": "Rustan Khayrov", "email": "rustan@example.ch", "source_badges": ["Google Contacts", "bergsmann@gmail.com"]},
-            {"display_name": "Rustan Khayrov", "email": "rustan@example.ch", "source_badges": ["bergsmann@gmail.com", "Aus E-Mail"]},
+            {"display_name": "Rustan Khayrov", "email": "rustan@example.ch", "source_badges": ["Google Contacts", "owner@example.test"]},
+            {"display_name": "Rustan Khayrov", "email": "rustan@example.ch", "source_badges": ["owner@example.test", "Aus E-Mail"]},
         ])
-        assert merged[0]["source_badges"] == ["Google Contacts", "bergsmann@gmail.com", "Aus E-Mail"]
+        assert merged[0]["source_badges"] == ["Google Contacts", "owner@example.test", "Aus E-Mail"]
 
     def test_cui_contacts_create_search_and_resource_summary(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -1888,11 +1888,11 @@ class TestWebServerEndpoints:
             if tool == "get_gmail_messages_content_batch":
                 if server == "google-workspace-aiwerk":
                     return {"result": {"structuredContent": {"result": "Retrieved 1 messages:\n\nMessage ID: sent-1\nSubject: Angebot\nFrom: Kontakt <kontakt@aiwerk.ch>\nDate: Tue, 2 Jun 2026 10:00:00 +0000\nTo: Anna AIWerk <anna@aiwerk.ch>\n"}}}
-                return {"result": {"structuredContent": {"result": "Retrieved 2 messages:\n\nMessage ID: sent-1\nSubject: Hallo\nFrom: Attila <bergsmann@gmail.com>\nDate: Tue, 2 Jun 2026 11:00:00 +0000\nTo: Bela Privat <bela@example.ch>\n\nMessage ID: inbox-1\nSubject: Analytics\nFrom: Google Analytics <analytics-noreply@google.com>\nDate: Tue, 2 Jun 2026 12:00:00 +0000\nTo: bergsmann@gmail.com\nPrecedence: bulk\nList-Unsubscribe: <https://example.com/unsub>\n"}}}
+                return {"result": {"structuredContent": {"result": "Retrieved 2 messages:\n\nMessage ID: sent-1\nSubject: Hallo\nFrom: Owner <owner@example.test>\nDate: Tue, 2 Jun 2026 11:00:00 +0000\nTo: Bela Privat <bela@example.ch>\n\nMessage ID: inbox-1\nSubject: Analytics\nFrom: Google Analytics <analytics-noreply@google.com>\nDate: Tue, 2 Jun 2026 12:00:00 +0000\nTo: owner@example.test\nPrecedence: bulk\nList-Unsubscribe: <https://example.com/unsub>\n"}}}
             if tool == "list_contacts" and server == "google-workspace-aiwerk":
                 return {"result": {"structuredContent": {"result": "Contacts for kontakt@aiwerk.ch (1 of 1):\n\nContact ID: c_aiwerk\nName: Anna AIWerk\nEmail: anna@aiwerk.ch (Work)\nPhone: +41 31 555 12 12 (Work)\nOrganization: CEO at AIWerk AG\n\n"}}}
             if tool == "list_contacts":
-                return {"result": {"structuredContent": {"result": "Contacts for bergsmann@gmail.com (1 of 1):\n\nContact ID: c_private\nName: Bela Privat\nEmail: bela@example.ch (Other)\n\n"}}}
+                return {"result": {"structuredContent": {"result": "Contacts for owner@example.test (1 of 1):\n\nContact ID: c_private\nName: Bela Privat\nEmail: bela@example.ch (Other)\n\n"}}}
             return {}
 
         monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
@@ -1901,7 +1901,7 @@ class TestWebServerEndpoints:
                 "email": {
                     "accounts": [
                         {"address": "kontakt@aiwerk.ch", "backend": "google_workspace", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
-                        {"address": "bergsmann@gmail.com", "backend": "google_workspace", "mcp_server": "google-workspace-bergsmann", "user_google_email": "bergsmann@gmail.com"},
+                        {"address": "owner@example.test", "backend": "google_workspace", "mcp_server": "google-workspace-owner", "user_google_email": "owner@example.test"},
                     ]
                 }
             }
@@ -1910,14 +1910,14 @@ class TestWebServerEndpoints:
 
         summary = getattr(web_server, "_contacts_summary")(config, email, {})
 
-        assert {call["server"] for call in calls if call["tool"] == "search_gmail_messages"} == {"google-workspace-aiwerk", "google-workspace-bergsmann"}
+        assert {call["server"] for call in calls if call["tool"] == "search_gmail_messages"} == {"google-workspace-aiwerk", "google-workspace-owner"}
         assert any(call["params"].get("query") == "in:sent newer_than:10d" for call in calls if call["tool"] == "search_gmail_messages")
         assert any(call["params"].get("query") == "newer_than:10d -in:sent" for call in calls if call["tool"] == "search_gmail_messages")
         emails = {item["email"] for item in summary["items"]}
         assert {"anna@aiwerk.ch", "bela@example.ch"}.issubset(emails)
         assert "analytics-noreply@google.com" not in emails
         assert "kontakt@aiwerk.ch" not in emails
-        assert "bergsmann@gmail.com" not in emails
+        assert "owner@example.test" not in emails
         assert summary["google_count"] == 2
         assert summary["summary"] == "2 relevante Kontakte"
         assert summary["source_label"] == "Relevante Kontakte"
@@ -1951,7 +1951,7 @@ class TestWebServerEndpoints:
                     {
                         "id": "s1",
                         "subject": "Offerte",
-                        "from": {"name": "Attila", "addr": "user@example.ch"},
+                        "from": {"name": "Owner", "addr": "user@example.ch"},
                         "to": [{"name": "Client Sent", "addr": "client@example.ch"}],
                         "cc": [{"name": "Self", "addr": "user@example.ch"}],
                         "date": recent,
@@ -2047,7 +2047,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr(web_server, "load_config", lambda: {
             "assistant": {"email": {"accounts": [
                 {"address": "kontakt@aiwerk.ch", "backend": "google_workspace", "mcp_server": "google-workspace-aiwerk", "user_google_email": "kontakt@aiwerk.ch"},
-                {"address": "bergsmann@gmail.com", "backend": "google_workspace", "mcp_server": "google-workspace-bergsmann", "user_google_email": "bergsmann@gmail.com"},
+                {"address": "owner@example.test", "backend": "google_workspace", "mcp_server": "google-workspace-owner", "user_google_email": "owner@example.test"},
             ]}}
         })
 
@@ -2061,7 +2061,7 @@ class TestWebServerEndpoints:
 
         assert resp.status_code == 200
         assert resp.json()["total_count"] == 2
-        assert {call["server"] for call in calls if call["tool"] == "search_contacts"} == {"google-workspace-aiwerk", "google-workspace-bergsmann"}
+        assert {call["server"] for call in calls if call["tool"] == "search_contacts"} == {"google-workspace-aiwerk", "google-workspace-owner"}
         assert all(call["params"].get("query") == "max" for call in calls if call["tool"] == "search_contacts")
 
     def test_cui_contacts_search_falls_back_to_saved_contacts_and_normalizes_accents(self, monkeypatch):
@@ -2142,20 +2142,20 @@ class TestWebServerEndpoints:
             "summary": "3 Kontakte verfügbar",
             "items": [
                 {"display_name": "Kontakt AIWerk", "email": "kontakt@aiwerk.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch"]},
-                {"display_name": "Attila", "email": "bergsmann@gmail.com", "source_badges": ["Google Contacts", "bergsmann@gmail.com"]},
-                {"display_name": "Human", "email": "human@example.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch", "bergsmann@gmail.com"]},
+                {"display_name": "Owner", "email": "owner@example.test", "source_badges": ["Google Contacts", "owner@example.test"]},
+                {"display_name": "Human", "email": "human@example.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch", "owner@example.test"]},
             ],
             "frequent": [
                 {"display_name": "Kontakt AIWerk", "email": "kontakt@aiwerk.ch", "source_badges": ["kontakt@aiwerk.ch"]},
                 {"display_name": "Human", "email": "human@example.ch", "source_badges": ["Google Contacts", "kontakt@aiwerk.ch"]},
             ],
-            "relevant": [{"display_name": "Attila", "email": "bergsmann@gmail.com", "source_badges": ["bergsmann@gmail.com"]}],
+            "relevant": [{"display_name": "Owner", "email": "owner@example.test", "source_badges": ["owner@example.test"]}],
             "total_count": 3,
         }
 
         filtered = getattr(web_server, "_filter_contacts_payload")(
             payload,
-            own_emails={"kontakt@aiwerk.ch", "bergsmann@gmail.com"},
+            own_emails={"kontakt@aiwerk.ch", "owner@example.test"},
         )
 
         assert [item["email"] for item in filtered["items"]] == ["human@example.ch"]
@@ -9328,10 +9328,10 @@ class TestTrustedCuiActorInjection:
         inject = self._inject()
         # Customer tries to spoof admin; server ticket says role=user.
         params = {"_cui_actor_role": "admin", "actor_role": "admin", "method_arg": 1}
-        inject(params, {"role": "user", "actor_id": "cust-1", "tenant_id": "meerwohnen"})
+        inject(params, {"role": "user", "actor_id": "customer-1", "tenant_id": "example-tenant"})
         assert params["_cui_actor_role"] == "user"  # server wins
-        assert params["_cui_actor_id"] == "cust-1"
-        assert params["_cui_tenant_id"] == "meerwohnen"
+        assert params["_cui_actor_id"] == "customer-1"
+        assert params["_cui_tenant_id"] == "example-tenant"
         # The legacy alias key the consumer also reads must be stripped.
         assert "actor_role" not in params
         # Unrelated params are preserved.
@@ -9340,9 +9340,9 @@ class TestTrustedCuiActorInjection:
     def test_client_supplied_actor_and_tenant_are_overwritten(self):
         inject = self._inject()
         params = {"_cui_actor_id": "victim", "_cui_tenant_id": "other-co"}
-        inject(params, {"role": "user", "actor_id": "cust-1", "tenant_id": "meerwohnen"})
-        assert params["_cui_actor_id"] == "cust-1"
-        assert params["_cui_tenant_id"] == "meerwohnen"
+        inject(params, {"role": "user", "actor_id": "customer-1", "tenant_id": "example-tenant"})
+        assert params["_cui_actor_id"] == "customer-1"
+        assert params["_cui_tenant_id"] == "example-tenant"
 
     def test_no_trusted_identity_strips_client_keys(self):
         # If the ticket carries no identity, client-supplied keys must NOT
@@ -9359,7 +9359,7 @@ class TestTrustedCuiActorInjection:
 
         inject = self._inject()
         params = {"_cui_actor_role": "admin"}
-        inject(params, {"role": "user", "actor_id": "cust-1", "tenant_id": "meerwohnen"})
+        inject(params, {"role": "user", "actor_id": "customer-1", "tenant_id": "example-tenant"})
         assert gw._cui_actor_role_from_params(params) == "user"
         assert gw._cui_actor_is_admin(params) is False
 
