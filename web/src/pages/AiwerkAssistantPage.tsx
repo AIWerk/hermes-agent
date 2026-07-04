@@ -1,4 +1,4 @@
-import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, ListChecks, LogOut, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
+import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, Link as LinkIcon, ListChecks, LogOut, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
 import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
@@ -272,6 +272,21 @@ function openSharedFolderFile(item: AssistantSharedFolderItem): void {
     });
 }
 
+function sharedReferenceUriForItem(item: AssistantSharedFolderItem): string | null {
+  const explicit = (item.reference_uri || "").trim();
+  if (explicit) return explicit;
+  if (!item.open_url) return null;
+  try {
+    const path = new URL(item.open_url, window.location.origin).searchParams.get("path")?.trim();
+    if (!path) return null;
+    const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+    if (!parts.length || parts.some((part) => part === "." || part === "..")) return null;
+    return `shared://${parts.map(encodeURIComponent).join("/")}`;
+  } catch {
+    return null;
+  }
+}
+
 interface SessionNotesSnapshot {
   title?: string | null;
   scratchpad?: {
@@ -313,6 +328,7 @@ const RIGHT_RAIL_WIDTH_STORAGE_KEY = "aiwerk-cui.right-rail-width";
 const RIGHT_RAIL_DEFAULT_WIDTH = 340;
 const RIGHT_RAIL_MIN_WIDTH = 280;
 const RIGHT_RAIL_MAX_WIDTH = 560;
+const SHARED_DIRECT_ATTACH_MAX_BYTES = 12 * 1024 * 1024;
 const COMPRESS_CONTEXT_PERCENT_THRESHOLD = 45;
 
 interface RuntimeBadge {
@@ -1494,6 +1510,25 @@ export default function AiwerkAssistantPage() {
       showToast(`${label} konnte nicht angehängt werden.`);
     }
   }, [sessionId, showToast]);
+
+  const insertSharedReferenceToComposer = useCallback((item: AssistantSharedFolderItem) => {
+    const reference = sharedReferenceUriForItem(item);
+    if (!reference) {
+      showToast("Kein Shared-Ordner-Link verfügbar.");
+      return;
+    }
+    const line = reference;
+    setActivePanelTab("chat");
+    setActiveTurnMode("main");
+    conversationModeRef.current = "main";
+    setInput((current) => {
+      if (current.includes(reference)) return current;
+      const trimmed = current.trim();
+      return trimmed ? `${trimmed}\n\n${line}` : line;
+    });
+    window.setTimeout(() => mainInputRef.current?.focus(), 0);
+    showToast("Shared-Ordner-Link zum Chat hinzugefügt");
+  }, [showToast]);
 
   const attachTodoToComposer = useCallback((item: AssistantTodoItem) => {
     const taskText = (item.full_text || item.text || "").trim();
@@ -3617,6 +3652,7 @@ export default function AiwerkAssistantPage() {
               onAddTodo={addTodo}
               onUpdateTodoDone={updateTodoDone}
               onAttachResource={attachResourceToSession}
+              onInsertSharedReference={insertSharedReferenceToComposer}
               onAttachTodo={attachTodoToComposer}
               onOpenEmail={openEmailInPanel}
               onOpenCalendar={openCalendarInPanel}
@@ -4041,6 +4077,7 @@ function ResourcesRail({
   onAddTodo,
   onUpdateTodoDone,
   onAttachResource,
+  onInsertSharedReference,
   onAttachTodo,
   onOpenEmail,
   onOpenCalendar,
@@ -4062,6 +4099,7 @@ function ResourcesRail({
   onAddTodo: (text: string) => Promise<void>;
   onUpdateTodoDone: (id: string, done: boolean) => Promise<void>;
   onAttachResource: (kind: "email" | "calendar_event" | "shared_file" | "contact", item: Record<string, unknown>, label: string) => Promise<void>;
+  onInsertSharedReference: (item: AssistantSharedFolderItem) => void;
   onAttachTodo: (item: AssistantTodoItem) => void;
   onOpenEmail: (item: AssistantResourceMailItem) => void;
   onOpenCalendar: (item: AssistantResourceEventItem) => void;
@@ -4826,6 +4864,7 @@ function ResourcesRail({
                 expandedItems={expandedSharedItems}
                 onToggle={toggleSharedItem}
                 onAttachResource={onAttachResource}
+                onInsertSharedReference={onInsertSharedReference}
                 showCloudFolderLinks={!resources.shared_folder.can_open_folder}
               />
             ) : (
@@ -5289,6 +5328,7 @@ function SharedFolderTree({
   expandedItems,
   onToggle,
   onAttachResource,
+  onInsertSharedReference,
   showCloudFolderLinks,
   depth = 0,
 }: {
@@ -5296,6 +5336,7 @@ function SharedFolderTree({
   expandedItems: Record<string, boolean>;
   onToggle: (id: string) => void;
   onAttachResource: (kind: "email" | "calendar_event" | "shared_file" | "contact", item: Record<string, unknown>, label: string) => Promise<void>;
+  onInsertSharedReference: (item: AssistantSharedFolderItem) => void;
   showCloudFolderLinks: boolean;
   depth?: number;
 }) {
@@ -5307,6 +5348,10 @@ function SharedFolderTree({
         const hasChildren = isFolder && children.length > 0;
         const isExpanded = !!expandedItems[item.id];
         const canOpenFile = !isFolder && !!item.open_url;
+        const referenceUri = sharedReferenceUriForItem(item);
+        const oversizedForDirectAttach = !isFolder && (item.size_bytes ?? 0) > SHARED_DIRECT_ATTACH_MAX_BYTES;
+        const canReferenceFile = !isFolder && oversizedForDirectAttach && !!referenceUri;
+        const canAttachFile = canOpenFile && !oversizedForDirectAttach;
         const canOpenCloudFolder = showCloudFolderLinks && isFolder && !!item.cloud_url;
         const meta = isFolder
           ? `${children.length || item.child_count || 0} Elemente${item.modified_at ? ` · ${formatResourceTime(item.modified_at)}` : ""}`
@@ -5356,7 +5401,7 @@ function SharedFolderTree({
                   <ExternalLink size={13} />
                 </button>
               )}
-              {canOpenFile && (
+              {canAttachFile && (
                 <button
                   type="button"
                   onClick={() => void onAttachResource("shared_file", item as unknown as Record<string, unknown>, "Datei")}
@@ -5367,6 +5412,17 @@ function SharedFolderTree({
                   <Paperclip size={13} />
                 </button>
               )}
+              {canReferenceFile && (
+                <button
+                  type="button"
+                  onClick={() => onInsertSharedReference(item)}
+                  title="Shared-Ordner-Link zum Chat hinzufügen"
+                  aria-label={`${item.name} als Shared-Ordner-Link zum Chat hinzufügen`}
+                  className={RIGHT_RAIL_ROW_ACTION_CLASS}
+                >
+                  <LinkIcon size={13} />
+                </button>
+              )}
             </div>
             {hasChildren && isExpanded && (
               <SharedFolderTree
@@ -5374,6 +5430,7 @@ function SharedFolderTree({
                 expandedItems={expandedItems}
                 onToggle={onToggle}
                 onAttachResource={onAttachResource}
+                onInsertSharedReference={onInsertSharedReference}
                 showCloudFolderLinks={showCloudFolderLinks}
                 depth={depth + 1}
               />

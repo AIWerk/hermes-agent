@@ -2645,6 +2645,7 @@ class TestWebServerEndpoints:
         assert file_item["name"] == "B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf"
         parsed = urllib.parse.urlparse(file_item["open_url"])
         assert urllib.parse.parse_qs(parsed.query)["path"] == ["Bedienungsanleitungen/B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf"]
+        assert file_item["reference_uri"] == "shared://Bedienungsanleitungen/B03900_IM_Kaffeevollautomat_Finessa_0322_WEB.pdf"
 
     def test_webdav_download_uses_file_url_without_trailing_slash(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -2681,6 +2682,41 @@ class TestWebServerEndpoints:
 
         assert downloaded is not None
         assert requested_urls == ["https://dav.example.test/Example%20Customer/Customer-Shared/Bedienungsanleitungen/manual.pdf"]
+
+    def test_webdav_download_allows_large_price_list_under_100mb(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        payload = b"x" * (70 * 1024 * 1024)
+
+        class FakeResponse:
+            status = 200
+            headers = {"content-type": "application/pdf"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, size=-1):
+                assert size == web_server._ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES + 1
+                return payload
+
+        monkeypatch.setattr(web_server, "_pass_first_line", lambda entry: "secret")
+        monkeypatch.setattr(web_server.urllib.request, "urlopen", lambda request, timeout=None: FakeResponse())
+
+        downloaded = web_server._download_webdav_cloud_file({
+            "type": "sftpgo_webdav",
+            "base_url": "https://dav.example.test",
+            "username": "customer.example",
+            "password_pass_entry": "pass/entry",
+            "path": "/",
+        }, "Ligne Roset Preislisten/TARIF_A_JOUR.pdf")
+
+        assert downloaded is not None
+        assert len(downloaded[0]) == len(payload)
+        assert downloaded[1] == "application/pdf"
+        assert downloaded[2] == "TARIF_A_JOUR.pdf"
 
     def test_assistant_resource_attachment_copies_shared_file(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server

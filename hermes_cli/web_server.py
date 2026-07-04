@@ -536,6 +536,10 @@ _ASSISTANT_UPLOAD_MAX_FILES = 10
 _ASSISTANT_UPLOAD_MAX_FILE_BYTES = 12 * 1024 * 1024
 _ASSISTANT_UPLOAD_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 _ASSISTANT_TEXT_EXTRACT_LIMIT = 60_000
+# Cloud-backed Shared Ordner file-open proxy cap. This is intentionally higher
+# than chat-attachment ingestion: opening a PDF in a new tab is a file operation,
+# not automatic prompt/context ingestion.
+_ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES = 100 * 1024 * 1024
 # Cap the decompressed size of a .docx word/document.xml so a small (<=12 MB)
 # upload cannot decompress to many GB (zip bomb) and exhaust server memory.
 _ASSISTANT_DOCX_MAX_XML_BYTES = 50 * 1024 * 1024
@@ -826,6 +830,9 @@ def _shared_folder_items(root: Path, *, base: Path | None = None, depth: int = _
                 }
                 if resolved.is_file():
                     item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel, safe='')}"
+                    reference_uri = _shared_reference_uri(rel)
+                    if reference_uri:
+                        item["reference_uri"] = reference_uri
                 if resolved.is_dir():
                     cloud_url = _shared_cloud_browse_url(cloud, rel)
                     if cloud_url:
@@ -870,6 +877,13 @@ def _clean_shared_cloud_path(value: str) -> str | None:
             return None
         clean_parts.append(part)
     return "/" + "/".join(clean_parts) if clean_parts else "/"
+
+
+def _shared_reference_uri(rel_path: str) -> str | None:
+    clean = _clean_shared_relative_path(rel_path)
+    if not clean:
+        return None
+    return f"shared://{urllib.parse.quote(clean, safe='/')}"
 
 
 def _resolve_shared_folder_file(root: Path, rel_path: str) -> Path | None:
@@ -1232,6 +1246,9 @@ def _webdav_cloud_items(cloud: dict[str, Any]) -> list[dict[str, Any]]:
                     item["child_count"] = len(children)
             else:
                 item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel_path, safe='')}"
+                reference_uri = _shared_reference_uri(rel_path)
+                if reference_uri:
+                    item["reference_uri"] = reference_uri
             items.append(item)
             if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
                 break
@@ -1258,8 +1275,8 @@ def _download_webdav_cloud_file(cloud: dict[str, Any], rel_path: str) -> tuple[b
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             content_type = response.headers.get("content-type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
-            data = response.read(64 * 1024 * 1024 + 1)
-            if response.status >= 400 or len(data) > 64 * 1024 * 1024:
+            data = response.read(_ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES + 1)
+            if response.status >= 400 or len(data) > _ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES:
                 return None
             return data, content_type, filename
     except Exception:
@@ -1313,8 +1330,8 @@ def _download_sftpgo_pubshare_file(cloud: dict[str, Any], rel_path: str) -> tupl
     try:
         with opener.open(urllib.request.Request(file_url, headers=headers), timeout=30) as response:
             content_type = response.headers.get("content-type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
-            data = response.read(64 * 1024 * 1024 + 1)
-            if len(data) > 64 * 1024 * 1024:
+            data = response.read(_ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES + 1)
+            if len(data) > _ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES:
                 return None
             if response.status < 400 and data and "text/html" not in content_type.lower():
                 return data, content_type, filename

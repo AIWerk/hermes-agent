@@ -1903,6 +1903,7 @@ export interface AssistantSharedFolderItem {
   modified_at?: string | null;
   open_url?: string | null;
   cloud_url?: string | null;
+  reference_uri?: string | null;
   child_count?: number;
   children?: AssistantSharedFolderItem[];
 }
