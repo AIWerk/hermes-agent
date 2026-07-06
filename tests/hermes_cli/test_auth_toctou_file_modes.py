@@ -69,6 +69,59 @@ def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
     assert data["providers"]["openai-codex"]["tokens"]["access_token"] == "secret-x"
 
 
+def test_load_auth_store_permission_error_is_not_silent_logout(tmp_path, monkeypatch):
+    """Unreadable auth.json is an ownership/permission fault, not a corrupt or empty store.
+
+    Regression for the Rocky/local failure mode where a root-owned auth.json was
+    treated as ``logged out`` and later writes could replace the real store.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from hermes_cli import auth as auth_mod
+
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({"version": 1, "providers": {"openai-codex": {}}}))
+
+    def unreadable(*args, **kwargs):
+        raise PermissionError("simulated unreadable auth.json")
+
+    monkeypatch.setattr(auth_path.__class__, "read_text", unreadable)
+
+    with pytest.raises(auth_mod.AuthError, match="Auth store is unreadable"):
+        auth_mod._load_auth_store(auth_path)
+
+    assert not auth_path.with_suffix(".json.corrupt").exists()
+
+
+def test_save_auth_store_restores_existing_owner_after_atomic_replace(tmp_path, monkeypatch):
+    """Root/privileged auth refresh must not steal auth.json from the runtime user."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from hermes_cli import auth as auth_mod
+
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({"version": 1, "providers": {}}))
+    sentinel_owner = (12345, 23456)
+    restored: list[tuple[str, tuple[int, int]]] = []
+
+    monkeypatch.setattr(auth_mod, "_preserve_file_owner", lambda path: sentinel_owner)
+    monkeypatch.setattr(
+        auth_mod,
+        "_restore_file_owner",
+        lambda path, owner: restored.append((str(path), owner)),
+    )
+
+    auth_mod._save_auth_store(
+        {
+            "version": auth_mod.AUTH_STORE_VERSION,
+            "providers": {"openai-codex": {"tokens": {"access_token": "secret-y"}}},
+        }
+    )
+
+    assert restored == [(str(auth_path), sentinel_owner)]
+    assert json.loads(auth_path.read_text())["providers"]["openai-codex"]["tokens"]["access_token"] == "secret-y"
+
+
 # ---------------------------------------------------------------------------
 # _save_qwen_cli_tokens  (Qwen CLI OAuth tokens)
 # ---------------------------------------------------------------------------

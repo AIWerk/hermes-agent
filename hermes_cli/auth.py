@@ -46,7 +46,14 @@ import httpx
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import (
+    _preserve_file_owner,
+    _restore_file_owner,
+    atomic_replace,
+    atomic_yaml_write,
+    env_float,
+    is_truthy_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1065,6 +1072,11 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
     try:
         raw = json.loads(auth_file.read_text())
+    except PermissionError as exc:
+        raise AuthError(
+            f"Auth store is unreadable: {auth_file} ({exc}). "
+            "Check file ownership/permissions; refusing to treat this as logged out."
+        ) from exc
     except Exception as exc:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
@@ -1116,6 +1128,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    original_owner = _preserve_file_owner(auth_file)
+    replaced_path = auth_file
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
         # the TOCTOU window where default umask (often 0o644) briefly exposed
@@ -1130,7 +1144,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        atomic_replace(tmp_path, auth_file)
+        replaced_path = Path(atomic_replace(tmp_path, auth_file))
+        _restore_file_owner(replaced_path, original_owner)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:
@@ -1148,7 +1163,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             pass
     # Restrict file permissions to owner only
     try:
-        auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        replaced_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
     return auth_file

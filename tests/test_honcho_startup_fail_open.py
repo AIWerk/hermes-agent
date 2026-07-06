@@ -357,3 +357,34 @@ def test_honcho_tools_lazy_hooks_do_not_prestart_background_init(monkeypatch):
     assert result == {"result": ["ready"]}
     assert init_calls == ["session-1"]
     assert not background_started.is_set()
+
+
+def test_honcho_session_end_drains_background_init_before_flush():
+    """Short-lived CLI exits must not leave Honcho init alive at interpreter shutdown."""
+    provider = HonchoMemoryProvider()
+    cfg = _configured_hybrid_config()
+    cfg.timeout = 1.0
+    provider._config = cfg
+
+    flush_called = threading.Event()
+
+    class FlushManager:
+        def flush_all(self):
+            flush_called.set()
+
+    def finish_init():
+        time.sleep(0.05)
+        provider._manager = FlushManager()
+        provider._session_initialized = True
+
+    provider._init_thread = threading.Thread(
+        target=finish_init,
+        daemon=True,
+        name="honcho-session-init",
+    )
+    provider._init_thread.start()
+
+    provider.on_session_end([])
+
+    assert not provider._init_thread.is_alive()
+    assert flush_called.is_set()

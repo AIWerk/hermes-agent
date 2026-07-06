@@ -1009,6 +1009,35 @@ class HonchoMemoryProvider(MemoryProvider):
             return False
         return True
 
+    def _join_thread_for_shutdown(
+        self,
+        thread: Optional[threading.Thread],
+        *,
+        timeout: float,
+        label: str,
+    ) -> None:
+        """Best-effort drain for Honcho background work at session shutdown.
+
+        Daemon Honcho threads may still be inside the SDK/http stack when a
+        short-lived Hermes process exits. CPython can abort during interpreter
+        finalization if such a thread tries to take the GIL while shutdown is in
+        progress, so session-end cleanup must give in-flight work a bounded
+        chance to finish before returning to process teardown.
+        """
+        if not thread or not thread.is_alive():
+            return
+        try:
+            thread.join(timeout=timeout)
+        except Exception as exc:
+            logger.debug("Honcho %s shutdown join failed: %s", label, exc)
+            return
+        if thread.is_alive():
+            logger.debug(
+                "Honcho %s thread still running after %.1fs shutdown join",
+                label,
+                timeout,
+            )
+
     def _effective_cadence(self) -> int:
         """Cadence plus empty-streak backoff, capped at _BACKOFF_MAX × base."""
         if self._dialectic_empty_streak <= 0:
@@ -1470,6 +1499,23 @@ class HonchoMemoryProvider(MemoryProvider):
         """Flush all pending messages to Honcho on session end."""
         if self._cron_skipped:
             return
+        # Drain startup/prefetch work before process teardown. Returning while
+        # these daemon threads are still in the Honcho/http stack can crash
+        # short-lived CLI runs at CPython finalization (SIGABRT / exit 134).
+        join_timeout = min(
+            10.0,
+            float(self._config.timeout if self._config and self._config.timeout else 8.0),
+        )
+        self._join_thread_for_shutdown(
+            self._init_thread,
+            timeout=join_timeout,
+            label="session-init",
+        )
+        self._join_thread_for_shutdown(
+            self._prefetch_thread,
+            timeout=min(3.0, join_timeout),
+            label="prefetch",
+        )
         if not self._manager:
             return
         if not self._session_initialized and self._init_thread and self._init_thread.is_alive():
@@ -1606,15 +1652,28 @@ class HonchoMemoryProvider(MemoryProvider):
             return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
-        for t in (self._prefetch_thread, self._sync_thread):
-            if t and t.is_alive():
-                t.join(timeout=5.0)
+        join_timeout = min(
+            10.0,
+            float(self._config.timeout if self._config and self._config.timeout else 8.0),
+        )
+        self._join_thread_for_shutdown(
+            self._init_thread,
+            timeout=join_timeout,
+            label="session-init",
+        )
+        for label, t in (("prefetch", self._prefetch_thread), ("sync", self._sync_thread)):
+            self._join_thread_for_shutdown(t, timeout=min(5.0, join_timeout), label=label)
         # Flush any remaining messages
         if self._manager and not (self._init_thread and self._init_thread.is_alive() and not self._session_initialized):
             try:
                 self._manager.flush_all()
             except Exception:
                 pass
+        try:
+            from plugins.memory.honcho.client import reset_honcho_client
+            reset_honcho_client()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

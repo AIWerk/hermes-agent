@@ -916,5 +916,24 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
 
 
 def reset_honcho_client() -> None:
-    """Reset the Honcho client singleton (useful for testing)."""
+    """Reset the Honcho client singleton, closing SDK HTTP clients if present."""
+    client = _honcho_client_slot.peek()
+    if client is not None:
+        for attr in ("_async_http", "_http"):
+            try:
+                http_client = getattr(client, attr, None)
+                close = getattr(http_client, "close", None)
+                if callable(close):
+                    result = close()
+                    # Async clients should normally be absent in Hermes' sync use,
+                    # but close defensively if the SDK ever creates one.
+                    if hasattr(result, "__await__"):
+                        try:
+                            import asyncio
+                            from typing import cast, Coroutine
+                            asyncio.run(cast(Coroutine[object, object, object], result))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
     _honcho_client_slot.reset()

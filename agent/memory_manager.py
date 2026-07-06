@@ -1025,40 +1025,40 @@ class MemoryManager:
         """Shut down the background executor, waiting briefly for drain.
 
         Bounded by ``_SYNC_DRAIN_TIMEOUT_S``: a wedged provider must never
-        hang process/session teardown. We stop accepting new work and
-        cancel anything still queued, then wait at most the drain timeout
-        for the currently-running task on a watcher thread. The worker is
-        daemon, so an over-running task dies with the interpreter.
+        hang process/session teardown. Normal in-flight work is first drained
+        with a sentinel barrier; only if that times out do we abandon the daemon
+        worker. This avoids returning to CPython finalization while a healthy
+        memory-provider thread is still inside SDK/http code, which can abort
+        short-lived CLI processes.
         """
         with self._sync_executor_lock:
             executor = self._sync_executor
             self._sync_executor = None
         if executor is None:
             return
+
+        drained = False
         try:
-            # Stop accepting new work and drop anything still queued, but
-            # do NOT block here — cancel_futures cancels not-yet-started
-            # tasks; the in-flight one keeps running on its daemon thread.
-            executor.shutdown(wait=False, cancel_futures=True)
+            fut = executor.submit(lambda: None)
+            fut.result(timeout=_SYNC_DRAIN_TIMEOUT_S)
+            drained = True
+        except RuntimeError:
+            drained = True
+        except Exception:
+            drained = False
+
+        try:
+            if drained:
+                executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
-            # Older Python without cancel_futures kwarg.
             try:
-                executor.shutdown(wait=False)
+                executor.shutdown(wait=drained)
             except Exception as e:  # pragma: no cover
                 logger.debug("Memory sync executor shutdown failed: %s", e)
-            return
         except Exception as e:  # pragma: no cover
             logger.debug("Memory sync executor shutdown failed: %s", e)
-            return
-        # Give an in-flight sync a bounded chance to finish on a watcher
-        # thread so we don't block the caller past the drain timeout.
-        drainer = threading.Thread(
-            target=lambda: self._bounded_executor_wait(executor),
-            daemon=True,
-            name="mem-sync-drain",
-        )
-        drainer.start()
-        drainer.join(timeout=_SYNC_DRAIN_TIMEOUT_S)
 
     @staticmethod
     def _bounded_executor_wait(executor: ThreadPoolExecutor) -> None:

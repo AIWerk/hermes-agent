@@ -377,8 +377,23 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    result = agent.run_conversation(prompt)
-    return (result.get("final_response") or "", result)
+    result: dict = {}
+    try:
+        result = agent.run_conversation(prompt)
+        return (result.get("final_response") or "", result)
+    finally:
+        # Oneshot bypasses cli.py/HermesCLI._init_agent(), so the normal CLI
+        # atexit cleanup does not know about this AIAgent. Shut memory providers
+        # down here; otherwise Honcho/background HTTP threads can survive into
+        # CPython finalization and abort the short-lived process (SIGABRT / 134).
+        try:
+            messages = getattr(agent, "_session_messages", None)
+            if isinstance(messages, list):
+                agent.shutdown_memory_provider(messages)
+            else:
+                agent.shutdown_memory_provider()
+        except Exception:
+            pass
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:
