@@ -23,7 +23,7 @@ SEVERITY_PATTERNS = (
         "red",
         re.compile(
             r"traceback|uncaught|fatal|panic|segmentation fault|disk full|no space left|"
-            r"permission denied|auth.*fail|\b401\b|unauthorized|forbidden|service.*failed|"
+            r"log_read_error|permission denied|auth.*fail|\b401\b|unauthorized|forbidden|service.*failed|"
             r"failed to start|last_error",
             re.I,
         ),
@@ -117,16 +117,50 @@ def classify(line: str) -> str | None:
     return None
 
 
-def iter_log_lines(path: Path):
+def iter_log_records(path: Path):
+    """Yield timestamped log records, grouping continuation lines.
+
+    Python tracebacks and many Hermes loggers write a timestamp on the first
+    line, followed by stack frames without timestamps. A line-by-line scanner
+    treats those continuation lines as undated fresh findings, so old
+    tracebacks leak into recent time windows. Grouping continuation lines under
+    the preceding timestamp preserves the event's real time and counts one
+    traceback as one finding.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return
     except Exception as exc:  # pragma: no cover - depends on filesystem failure
-        yield None, f"LOG_READ_ERROR {path.name}: {type(exc).__name__}: {exc}"
+        message = f"LOG_READ_ERROR {path.name}: {type(exc).__name__}: {exc}"
+        yield None, message, message
         return
+
+    current_ts: datetime | None = None
+    current_lines: list[str] = []
+
+    def flush():
+        if not current_lines:
+            return None
+        first_line = current_lines[0]
+        return current_ts, first_line, "\n".join(current_lines)
+
     for line in text.splitlines():
-        yield parse_ts(line), line
+        ts = parse_ts(line)
+        if ts is not None:
+            record = flush()
+            if record is not None:
+                yield record
+            current_ts = ts
+            current_lines = [line]
+        elif current_lines:
+            current_lines.append(line)
+        else:
+            current_lines = [line]
+
+    record = flush()
+    if record is not None:
+        yield record
 
 
 def signature(line: str) -> str:
@@ -159,22 +193,23 @@ def render_report(
         if not path.exists():
             continue
         files_seen.append(name)
-        for ts, line in iter_log_lines(path):
-            if ts and ts < since:
-                continue
-            if ts and (newest is None or ts > newest):
-                newest = ts
-            severity = classify(line)
+        for ts, first_line, record_text in iter_log_records(path):
+            if ts is not None:
+                if ts < since:
+                    continue
+                if newest is None or ts > newest:
+                    newest = ts
+            severity = classify(record_text)
             if not severity:
                 continue
-            sig = signature(line)
+            sig = signature(record_text)
             key = (severity, name, sig)
             if key in seen_signatures:
                 continue
             seen_signatures.add(key)
             counts[(severity, name)] += 1
             if len(examples) < max_examples:
-                examples.append((severity, name, redact(line)))
+                examples.append((severity, name, redact(first_line)))
 
     red = sum(value for (severity, _), value in counts.items() if severity == "red")
     yellow = sum(value for (severity, _), value in counts.items() if severity == "yellow")
