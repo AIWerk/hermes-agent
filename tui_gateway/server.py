@@ -1490,6 +1490,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
+                with _sessions_lock:
+                    still_current = _sessions.get(sid) is current
+                if (
+                    not still_current
+                    or current.get("session_key") != key
+                    or current.get("agent_ready") is not ready
+                ):
+                    try:
+                        if hasattr(agent, "close"):
+                            agent.close()
+                    except Exception:
+                        pass
+                    return
             finally:
                 _clear_session_context(tokens)
 
@@ -1546,7 +1559,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key)
+            if current.pop("_auto_reset_boundary_notified_for", None) != key:
+                _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
@@ -1745,6 +1759,191 @@ def _session_source(session: dict | None) -> str:
         if source:
             return source
     return "tui"
+
+
+def _cui_session_reset_policy() -> dict:
+    """Return the session_reset policy CUI should honor.
+
+    The messaging gateway uses GatewayConfig defaults even when config.yaml has
+    no explicit session_reset block. Mirror those defaults here so CUI customers
+    get the same lazy-reset lifecycle without routing through the messaging
+    SessionStore.
+    """
+    raw = _load_cfg().get("session_reset")
+    policy = raw if isinstance(raw, dict) else {}
+    mode = str(policy.get("mode") or "both").strip().lower()
+    if mode not in {"daily", "idle", "both", "none"}:
+        mode = "both"
+    try:
+        at_hour = int(policy.get("at_hour", 4))
+    except (TypeError, ValueError):
+        at_hour = 4
+    at_hour = max(0, min(23, at_hour))
+    try:
+        idle_minutes = int(policy.get("idle_minutes", 1440))
+    except (TypeError, ValueError):
+        idle_minutes = 1440
+    idle_minutes = max(1, idle_minutes)
+    try:
+        bg_hours = int(policy.get("bg_process_max_age_hours", 24))
+    except (TypeError, ValueError):
+        bg_hours = 24
+    return {
+        "mode": mode,
+        "at_hour": at_hour,
+        "idle_minutes": idle_minutes,
+        "bg_process_max_age_hours": max(0, bg_hours),
+    }
+
+
+def _cui_latest_session_activity(db, session_key: str, row: dict) -> float:
+    latest = float(row.get("started_at") or 0.0)
+    try:
+        for msg in db.get_messages(session_key) or []:
+            ts = msg.get("timestamp") if isinstance(msg, dict) else None
+            if ts is not None:
+                latest = max(latest, float(ts))
+    except Exception:
+        pass
+    return latest
+
+
+def _cui_session_reset_reason(db, session_key: str) -> str | None:
+    if not session_key:
+        return None
+    policy = _cui_session_reset_policy()
+    if policy["mode"] == "none":
+        return None
+    try:
+        row = db.get_session(session_key)
+    except Exception:
+        row = None
+    if not row or row.get("ended_at") is not None:
+        return None
+
+    try:
+        from tools.process_registry import process_registry
+
+        max_age_hours = policy["bg_process_max_age_hours"]
+        max_age = max_age_hours * 3600 if max_age_hours > 0 else None
+        if process_registry.has_active_for_session(session_key, max_active_age=max_age):
+            return None
+    except Exception:
+        pass
+
+    last_active = _cui_latest_session_activity(db, session_key, row)
+    now = time.time()
+    if policy["mode"] in {"idle", "both"}:
+        if now > last_active + policy["idle_minutes"] * 60:
+            return "idle"
+    if policy["mode"] in {"daily", "both"}:
+        boundary = datetime.fromtimestamp(now).replace(
+            hour=policy["at_hour"], minute=0, second=0, microsecond=0
+        ).timestamp()
+        if datetime.fromtimestamp(now).hour < policy["at_hour"]:
+            boundary -= 24 * 60 * 60
+        if last_active < boundary:
+            return "daily"
+    return None
+
+
+def _rotate_cui_session_if_expired(sid: str, session: dict) -> dict | None:
+    """Lazy-reset an expired live CUI session in place before the next turn.
+
+    Keeps the short live id stable for the connected UI, but closes the old
+    stored transcript with end_reason=session_reset and assigns a fresh stored
+    session key. The old transcript remains available in the sidebar/resume list.
+    """
+    if not session or session.get("running"):
+        return None
+    old_key = str(session.get("session_key") or "")
+    if not old_key:
+        return None
+    with _session_db(session) as db:
+        if db is None:
+            return None
+        reason = _cui_session_reset_reason(db, old_key)
+        if not reason:
+            return None
+        new_key = _new_session_key()
+        try:
+            db.end_session(old_key, "session_reset")
+        except Exception:
+            logger.debug("failed to mark expired CUI session ended", exc_info=True)
+
+    old_agent = session.get("agent")
+    old_worker = session.get("slash_worker")
+    old_stop = session.get("_notif_stop")
+    if old_stop is not None:
+        try:
+            old_stop.set()
+        except Exception:
+            pass
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        unregister_gateway_notify(old_key)
+    except Exception:
+        pass
+    try:
+        if old_worker:
+            old_worker.close()
+    except Exception:
+        pass
+    try:
+        if old_agent is not None and hasattr(old_agent, "close"):
+            old_agent.close()
+    except Exception:
+        pass
+
+    _notify_session_boundary("on_session_finalize", old_key)
+    _transfer_active_session_slot(sid, session, new_session_id=new_key)
+
+    now = time.time()
+    with session.get("history_lock") or contextlib.nullcontext():
+        session["agent"] = None
+        session["agent_error"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session.pop("agent_build_lock", None)
+        session.pop("resume_session_id", None)
+        session.pop("resume_runtime_overrides", None)
+        session.pop("display_history_prefix", None)
+        session["attached_images"] = []
+        session["edit_snapshots"] = {}
+        session["history"] = []
+        session["history_version"] = 0
+        session["image_counter"] = 0
+        session["inflight_turn"] = None
+        session["last_active"] = now
+        session["created_at"] = now
+        session["pending_title"] = None
+        session["parent_session_id"] = None
+        session["running"] = False
+        session["session_key"] = new_key
+        session["slash_worker"] = None
+        session["tool_started_at"] = {}
+        session["_notif_stop"] = None
+        session["auto_reset_from"] = old_key
+        session["auto_reset_reason"] = reason
+    _register_session_cwd(session)
+    session["_auto_reset_boundary_notified_for"] = new_key
+    _notify_session_boundary("on_session_reset", new_key)
+    _emit(
+        "session.info",
+        sid,
+        {
+            "session_id": new_key,
+            "auto_reset": True,
+            "auto_reset_from": old_key,
+            "auto_reset_reason": reason,
+            "cwd": _display_session_cwd(session),
+            "lazy": True,
+            "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+            "profile_name": _current_profile_name(),
+        },
+    )
+    return {"from": old_key, "to": new_key, "reason": reason}
 
 
 def _register_session_cwd(session: dict | None) -> None:
@@ -9198,6 +9397,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
+    auto_reset = _rotate_cui_session_if_expired(sid, session)
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -9283,7 +9484,14 @@ def _(rid, params: dict) -> dict:
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming"})
+    response: dict[str, Any] = {"status": "streaming"}
+    if auto_reset:
+        response["auto_reset"] = True
+        response["session_key"] = auto_reset["to"]
+        response["stored_session_id"] = auto_reset["to"]
+        response["previous_session_key"] = auto_reset["from"]
+        response["auto_reset_reason"] = auto_reset["reason"]
+    return _ok(rid, response)
 
 
 def _notification_event_belongs_elsewhere(session: dict, evt: dict) -> bool:

@@ -13,7 +13,7 @@ import {
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { setAwaitingResponse, setBusy, setMessages, setRememberedSessionId, setSelectedStoredSessionId } from '@/store/session'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -46,6 +46,15 @@ interface SubmitPromptDeps {
     updater: (state: ClientSessionState) => ClientSessionState,
     storedSessionId?: string | null
   ) => ClientSessionState
+}
+
+interface PromptSubmitResult {
+  auto_reset?: boolean
+  auto_reset_reason?: string
+  previous_session_key?: string
+  session_key?: string
+  status?: string
+  stored_session_id?: string
 }
 
 /** The prompt submit pipeline, extracted from usePromptActions. */
@@ -251,10 +260,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // while the desktop app still holds the old session ID. Detect this,
         // resume the stored session to re-register it, and retry once.
         let submitErr: unknown = null
+        let submitResult: PromptSubmitResult | null = null
+        let effectiveSessionId = sessionId
 
         try {
-          await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+          submitResult = await withSessionBusyRetry(() =>
+            requestGateway<PromptSubmitResult>('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
           if (isSessionNotFoundError(firstErr) && selectedStoredSessionIdRef.current) {
@@ -267,8 +278,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
             if (recoveredId) {
               activeSessionIdRef.current = recoveredId
-              await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+              effectiveSessionId = recoveredId
+              submitResult = await withSessionBusyRetry(() =>
+                requestGateway<PromptSubmitResult>('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
               )
             } else {
               submitErr = firstErr
@@ -280,6 +292,22 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         if (submitErr !== null) {
           throw submitErr
+        }
+
+        const rotatedStoredSessionId = submitResult?.stored_session_id || submitResult?.session_key || null
+
+        if (submitResult?.auto_reset && rotatedStoredSessionId) {
+          selectedStoredSessionIdRef.current = rotatedStoredSessionId
+          setSelectedStoredSessionId(rotatedStoredSessionId)
+          setRememberedSessionId(rotatedStoredSessionId)
+          updateSessionState(
+            effectiveSessionId,
+            state => ({
+              ...state,
+              storedSessionId: rotatedStoredSessionId
+            }),
+            rotatedStoredSessionId
+          )
         }
 
         if (usingComposerAttachments) {

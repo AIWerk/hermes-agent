@@ -113,6 +113,9 @@ export function useSessionStateCache({
         }
 
         if (previousStoredSessionId && previousStoredSessionId !== storedSessionId) {
+          if (runtimeIdByStoredSessionIdRef.current.get(previousStoredSessionId) === sessionId) {
+            runtimeIdByStoredSessionIdRef.current.delete(previousStoredSessionId)
+          }
           setSessionWorking(previousStoredSessionId, false)
         }
       }

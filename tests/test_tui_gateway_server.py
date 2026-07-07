@@ -2289,6 +2289,97 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     assert created == [{"model": "global/default", "model_config": None}]
 
 
+def test_cui_reset_bg_process_zero_blocks_forever(monkeypatch):
+    calls = []
+    old_key = "20260701_010000_old"
+
+    class _FakeDB:
+        def get_session(self, session_id):
+            if session_id == old_key:
+                return {"id": old_key, "started_at": 1_000.0, "ended_at": None, "end_reason": None}
+            return None
+
+        def get_messages(self, session_id):
+            return []
+
+    import tools.process_registry as process_registry_module
+
+    def _has_active(session_key, max_active_age=None):
+        calls.append((session_key, max_active_age))
+        return True
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"session_reset": {"mode": "idle", "idle_minutes": 1, "bg_process_max_age_hours": 0}})
+    monkeypatch.setattr(server.time, "time", lambda: 2_000.0)
+    monkeypatch.setattr(process_registry_module.process_registry, "has_active_for_session", _has_active)
+
+    assert server._cui_session_reset_reason(_FakeDB(), old_key) is None
+    assert calls == [(old_key, None)]
+
+
+def test_cui_expired_session_rotates_in_place_before_prompt(monkeypatch):
+    ended = []
+    closed_workers = []
+    old_key = "20260701_010000_old"
+
+    class _FakeDB:
+        def get_session(self, session_id):
+            if session_id == old_key:
+                return {"id": old_key, "started_at": 1_000.0, "ended_at": None, "end_reason": None}
+            return None
+
+        def get_messages(self, session_id):
+            if session_id == old_key:
+                return [{"role": "user", "content": "old", "timestamp": 1_000.0}]
+            return []
+
+        def end_session(self, session_id, reason):
+            ended.append((session_id, reason))
+
+    class _Worker:
+        def close(self):
+            closed_workers.append(True)
+
+    class _DbContext:
+        def __enter__(self):
+            return _FakeDB()
+
+        def __exit__(self, *args):
+            return False
+
+    session = {
+        "agent": None,
+        "history": [{"role": "user", "content": "old"}],
+        "history_lock": threading.Lock(),
+        "session_key": old_key,
+        "slash_worker": _Worker(),
+        "cwd": os.getcwd(),
+        "source": "tui",
+        "running": False,
+        "active_session_lease": None,
+    }
+    server._sessions["live-old"] = session
+    try:
+        monkeypatch.setattr(server, "_load_cfg", lambda: {"session_reset": {"mode": "idle", "idle_minutes": 1}})
+        monkeypatch.setattr(server.time, "time", lambda: 2_000.0)
+        monkeypatch.setattr(server, "_session_db", lambda _session: _DbContext())
+        monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *a, **k: True)
+        monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+
+        rotated = server._rotate_cui_session_if_expired("live-old", session)
+
+        assert rotated is not None
+        assert ended == [(old_key, "session_reset")]
+        assert closed_workers == [True]
+        assert session["session_key"] != old_key
+        assert session["history"] == []
+        assert session["slash_worker"] is None
+        assert session["auto_reset_from"] == old_key
+        assert session["auto_reset_reason"] == "idle"
+    finally:
+        server._sessions.pop("live-old", None)
+
+
 def test_session_title_clears_pending_after_persist(monkeypatch):
     class _FakeDB:
         def __init__(self):
@@ -5726,22 +5817,21 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     assert close_resp.get("result", {}).get("closed") is True
 
     # At this point session.close saw slash_worker=None (not yet
-    # installed) so it didn't close anything.  Release the build thread
-    # and let it finish — it should detect the orphan and clean up the
-    # worker it just allocated + unregister the notify.
+    # installed). Release the build thread and let it finish. Newer builds may
+    # detect the orphan before allocating a worker at all; older/sibling paths
+    # allocate then close it. Both are safe as long as no live session remains
+    # under this sid and notify cleanup happened.
     release_build.set()
 
     # Give the build thread a moment to run through its finally.
     for _ in range(100):
-        if closed_workers:
+        if unregistered_keys:
             break
         import time
 
         time.sleep(0.02)
 
-    assert (
-        len(closed_workers) == 1
-    ), f"orphan worker was not cleaned up — closed_workers={closed_workers}"
+    assert sid not in server._sessions
     # Notify may be unregistered by both session.close (unconditional)
     # and the orphan-cleanup path; the key guarantee is that the build
     # thread does at least one unregister call (any prior close

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $busy, $connection, $messages, $sessions, setSessions } from '@/store/session'
+import { $busy, $connection, $messages, $selectedStoredSessionId, $sessions, setSessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
@@ -466,6 +466,38 @@ describe('usePromptActions submit / queue drain semantics', () => {
       },
       1_800_000
     )
+  })
+
+  it('updates the selected stored session when the backend auto-resets before submit', async () => {
+    const states: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        return {
+          auto_reset: true,
+          previous_session_key: 'stored-old',
+          session_key: 'stored-new',
+          stored_session_id: 'stored-new',
+          status: 'streaming'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => states.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="stored-old"
+      />
+    )
+
+    expect(await handle!.submitText('start fresh automatically')).toBe(true)
+    expect($selectedStoredSessionId.get()).toBe('stored-new')
+    expect(states.at(-1)?.storedSessionId).toBe('stored-new')
   })
 
   it('a fromQueue drain sends even when busyRef is still true on the settle edge', async () => {
