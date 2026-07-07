@@ -7482,6 +7482,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
 
         old_session_id = self.session_id
+        if self.agent:
+            try:
+                self.agent._flush_messages_to_session_db(self.conversation_history)
+            except Exception:
+                pass
         # End current session
         try:
             self._session_db.end_session(self.session_id, "resumed_other")
@@ -7839,6 +7844,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Save the current session's state before branching
         parent_session_id = self.session_id
+
+        if self.agent:
+            try:
+                self.agent._flush_messages_to_session_db(self.conversation_history)
+            except Exception:
+                pass
 
         # End the old session
         try:

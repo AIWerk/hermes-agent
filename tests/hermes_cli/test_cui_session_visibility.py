@@ -34,10 +34,12 @@ def test_customer_cui_actor_cannot_see_tagged_admin_sessions():
         ),
     }
     user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
-    admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
+    other_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
+    same_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:attila:admin", "role": "admin"}
 
     assert web_server._session_visible_to_cui_actor(admin_session, user_actor) is False
-    assert web_server._session_visible_to_cui_actor(admin_session, admin_actor) is True
+    assert web_server._session_visible_to_cui_actor(admin_session, other_admin_actor) is False
+    assert web_server._session_visible_to_cui_actor(admin_session, same_admin_actor) is True
 
 
 def test_customer_cui_actor_cannot_see_legacy_untagged_internal_sessions():

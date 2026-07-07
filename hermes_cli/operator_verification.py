@@ -429,7 +429,9 @@ def _runtime_dir_is_private(path: Path) -> bool:
         return True
     except Exception:
         return False
-    return st.st_uid == os.getuid() and (st.st_mode & 0o077) == 0
+    if not hasattr(os, "getuid"):
+        return False
+    return st.st_uid == os.getuid() and (st.st_mode & 0o077) == 0  # windows-footgun: ok
 
 
 def _parent_pid(pid: int) -> int | None:

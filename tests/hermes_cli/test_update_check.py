@@ -17,7 +17,7 @@ def test_version_string_no_v_prefix():
 
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
+    """When cache is fresh, check_for_updates returns cached value after the HEAD identity probe."""
     from hermes_cli.banner import check_for_updates
     from hermes_cli import __version__
 
@@ -27,14 +27,23 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 3,
+                "ver": __version__,
+                "repo": str(Path(__file__).parents[2]),
+            }
+        )
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
         result = check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    assert mock_run.call_count == 1
 
 
 def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
@@ -93,8 +102,8 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    # origin probe + is-shallow probe + git fetch + git rev-list
-    assert mock_run.call_count == 4
+    # cache identity HEAD probe + origin probe + is-shallow probe + git fetch + git rev-list
+    assert mock_run.call_count == 5
 
 
 def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):

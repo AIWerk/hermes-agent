@@ -317,14 +317,6 @@ def check_for_updates() -> Optional[int]:
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply. Cached for 6 hours.
     """
-    hermes_home = get_hermes_home()
-    cache_file = hermes_home / ".update_check"
-    embedded_rev = os.environ.get("HERMES_REVISION") or None
-    repo_dir: Optional[Path] = None
-    if not embedded_rev:
-        repo_dir = _resolve_repo_dir()
-    cache_identity = _update_check_cache_identity(repo_dir, embedded_rev)
-
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
     # HERMES_REVISION (that's nix-only). Without this guard the checks below
@@ -343,6 +335,14 @@ def check_for_updates() -> Optional[int]:
             return None
     except Exception:
         pass
+
+    hermes_home = get_hermes_home()
+    cache_file = hermes_home / ".update_check"
+    embedded_rev = os.environ.get("HERMES_REVISION") or None
+    repo_dir: Optional[Path] = None
+    if not embedded_rev:
+        repo_dir = _resolve_repo_dir()
+    cache_identity = _update_check_cache_identity(repo_dir, embedded_rev)
 
     # Read cache — invalidate if the embedded rev, installed version, active
     # repo, or current HEAD changed since the last check. The version guard
