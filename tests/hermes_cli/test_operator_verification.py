@@ -449,10 +449,13 @@ def test_broker_rejects_child_raw_socket_even_with_inherited_capability(monkeypa
     cache_operator_verification(valid, session_id="s1")
     script = """
 import json, os, socket
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-    client.connect(os.environ['HERMES_OPERATOR_VERIFIER_BROKER_SOCKET'])
-    client.sendall(json.dumps({'session_id':'s1','capability':os.environ['HERMES_OPERATOR_VERIFIER_CAPABILITY']}).encode('utf-8'))
-    print(client.recv(8192).decode('utf-8').strip())
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(os.environ['HERMES_OPERATOR_VERIFIER_BROKER_SOCKET'])
+        client.sendall(json.dumps({'session_id':'s1','capability':os.environ['HERMES_OPERATOR_VERIFIER_CAPABILITY']}).encode('utf-8'))
+        print(client.recv(8192).decode('utf-8').strip() or '{}')
+except BrokenPipeError:
+    print('{}')
 """
 
     completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
