@@ -372,7 +372,7 @@ export const api = {
   getSessions: (
     limit = 20,
     offset = 0,
-    options?: { excludeSources?: string[]; profile?: string; order?: "created" | "recent" } | string,
+    options?: { excludeSources?: string[]; profile?: string; order?: "created" | "recent"; hideAutomated?: boolean } | string,
     orderArg: "created" | "recent" = "created",
   ) => {
     const profile = typeof options === "string" ? options : options?.profile ?? getManagementProfile();
@@ -380,6 +380,9 @@ export const api = {
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset), order });
     if (typeof options !== "string" && options?.excludeSources?.length) {
       params.set("exclude_sources", options.excludeSources.join(","));
+    }
+    if (typeof options !== "string" && options?.hideAutomated) {
+      params.set("hide_automated", "1");
     }
     return fetchJSON<PaginatedSessions>(appendProfileParam(`/api/sessions?${params.toString()}`, profile));
   },

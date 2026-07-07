@@ -747,6 +747,68 @@ class TestWebServerEndpoints:
         assert captured["list"] == 3
         assert captured["count"] == 3
 
+    def test_cui_recents_hide_health_check_probe_sessions(self):
+        """Assistant left-rail recents must not show automated health probes."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="real-chat", source="cli")
+            db.append_message("real-chat", role="user", content="Please help with the offer")
+            db.append_message("real-chat", role="assistant", content="Sure")
+            db.create_session(session_id="health-probe", source="cli")
+            db.append_message("health-probe", role="user", content="Health check: reply exactly OK")
+            db.append_message("health-probe", role="assistant", content="OK")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=20&offset=0&hide_automated=1")
+
+        assert resp.status_code == 200
+        ids = [s["id"] for s in resp.json()["sessions"]]
+        assert "real-chat" in ids
+        assert "health-probe" not in ids
+
+    def test_cui_actor_sessions_are_scoped_to_same_actor_for_user_and_admin(self, monkeypatch):
+        """CUI recents are per authenticated actor, not shared per tenant/role."""
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        tenant = "tenant-1"
+        user_actor = {"tenant_id": tenant, "actor_id": "user-1", "role": "user"}
+        admin_actor = {"tenant_id": tenant, "actor_id": "admin-1", "role": "admin"}
+
+        def cfg(actor):
+            return {
+                "_cui_visibility_scope": "customer" if actor["role"] == "user" else "admin",
+                "_cui_actor_role": actor["role"],
+                "_cui_actor_id": actor["actor_id"],
+                "_cui_tenant_id": actor["tenant_id"],
+            }
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="user-chat", source="cli", model_config=cfg(user_actor))
+            db.append_message("user-chat", role="user", content="customer question")
+            db.create_session(session_id="admin-chat", source="cli", model_config=cfg(admin_actor))
+            db.append_message("admin-chat", role="user", content="admin operation")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: user_actor)
+        user_resp = self.client.get("/api/sessions?limit=20&offset=0&hide_automated=1")
+        assert user_resp.status_code == 200
+        user_ids = [s["id"] for s in user_resp.json()["sessions"]]
+        assert "user-chat" in user_ids
+        assert "admin-chat" not in user_ids
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: admin_actor)
+        admin_resp = self.client.get("/api/sessions?limit=20&offset=0&hide_automated=1")
+        assert admin_resp.status_code == 200
+        admin_ids = [s["id"] for s in admin_resp.json()["sessions"]]
+        assert "admin-chat" in admin_ids
+        assert "user-chat" not in admin_ids
+
     def test_rename_session_updates_title(self):
         """PATCH /api/sessions/{id} renames a session (regression: the route
         was missing entirely, so the desktop rename dialog got a 405)."""

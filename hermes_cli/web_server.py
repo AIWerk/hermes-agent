@@ -9502,8 +9502,40 @@ def _cui_actor_owns_gateway_session(session: dict | None, actor: dict[str, str])
     return subject_id in _configured_gateway_user_ids(user, source)
 
 
+def _session_hidden_from_cui_recents(session: dict | None) -> bool:
+    """Hide automated/non-human runs from the assistant left-rail recents."""
+    if not isinstance(session, dict):
+        return True
+    source = str(session.get("source") or "").strip().lower()
+    if source in {"tool", "subagent", "system", "internal", "classifier", "reflection"}:
+        return True
+    raw = session.get("model_config")
+    if raw:
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            cfg = {}
+        if isinstance(cfg, dict) and (
+            cfg.get("_hidden_from_recents")
+            or cfg.get("_cui_hidden_from_recents")
+            or cfg.get("_automated_probe")
+        ):
+            return True
+    preview = str(session.get("preview") or "").strip()
+    title = str(session.get("title") or "").strip()
+    message_count = int(session.get("message_count") or 0)
+    if (
+        source in {"cli", "tui"}
+        and not title
+        and message_count <= 2
+        and preview == "Health check: reply exactly OK"
+    ):
+        return True
+    return False
+
+
 def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | None) -> bool:
-    """Fail closed for tagged admin/internal CUI sessions in customer views."""
+    """Fail closed for CUI sessions not owned by the authenticated actor."""
     actor = actor or {}
     if not actor:
         return True
@@ -9513,27 +9545,33 @@ def _session_visible_to_cui_actor(session: dict | None, actor: dict[str, str] | 
         # visible (fail closed).
         return False
     role = (actor.get("role") or "").strip().lower()
-    if role in {"admin", "owner", "operator"}:
-        return True
+    actor_id = (actor.get("actor_id") or actor.get("user_id") or "").strip()
+    tenant_id = (actor.get("tenant_id") or "").strip()
+    is_admin = role in {"admin", "owner", "operator"}
     meta = _session_cui_metadata(session)
     if not meta:
         # Legacy CLI/TUI/internal sessions from tenant setup predate CUI actor
         # metadata. In customer views they must fail closed; otherwise admin
         # onboarding chats leak into future customer agents. Admin/operator
-        # actors already returned True above.
+        # actors keep seeing legacy admin rows, but tagged customer rows below
+        # are still scoped to the exact actor.
+        if is_admin:
+            return True
         source = ""
         if isinstance(session, dict):
             source = str(session.get("source") or "").strip().lower()
         if source in {"cli", "tui", "cron", "classifier", "reflection", "system", "internal"}:
             return False
         return _cui_actor_owns_gateway_session(session, actor)
-    if meta.get("tenant_id") and actor.get("tenant_id") and meta["tenant_id"] != actor["tenant_id"]:
+    if meta.get("tenant_id") and tenant_id and meta["tenant_id"] != tenant_id:
         return False
+    if meta.get("actor_id"):
+        return bool(actor_id and meta["actor_id"] == actor_id)
+    if is_admin:
+        return meta.get("actor_role") in {"admin", "owner", "operator"}
     if meta.get("visibility_scope") in {"admin", "internal", "operator"}:
         return False
     if meta.get("actor_role") in {"admin", "owner", "operator"}:
-        return False
-    if meta.get("actor_id") and actor.get("actor_id") and meta["actor_id"] != actor["actor_id"]:
         return False
     return True
 
@@ -9554,6 +9592,7 @@ async def get_sessions(
     source: str = None,
     exclude_sources: str = None,
     cwd_prefix: str = None,
+    hide_automated: bool = False,
     profile: Optional[str] = None,
 ):
     """List sessions with source filtering plus upstream archive/order controls."""
@@ -9582,9 +9621,10 @@ async def get_sessions(
             # section (source=cron) into two independent lists.
             exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
             actor = _cui_actor_context_from_request(request)
-            if actor:
-                # Apply visibility before pagination/counting so customer views
-                # cannot infer admin/internal sessions from empty slots or totals.
+            if actor or hide_automated:
+                # Apply CUI visibility / automated-run hiding before pagination
+                # and counting so filtered rows cannot leak through empty slots
+                # or totals.
                 visible_all = db.list_sessions_rich(
                     source=source or None,
                     exclude_sources=exclude_list or None,
@@ -9596,7 +9636,10 @@ async def get_sessions(
                     archived_only=archived_only,
                     order_by_last_active=order == "recent",
                 )
-                visible_all = [s for s in visible_all if _session_visible_to_cui_actor(s, actor)]
+                if actor:
+                    visible_all = [s for s in visible_all if _session_visible_to_cui_actor(s, actor)]
+                if hide_automated:
+                    visible_all = [s for s in visible_all if not _session_hidden_from_cui_recents(s)]
                 total = len(visible_all)
                 sessions = visible_all[offset:offset + limit]
             else:

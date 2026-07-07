@@ -1793,7 +1793,7 @@ export default function AiwerkAssistantPage() {
       return [pinnedSession, ...withoutDuplicate].slice(0, 10);
     };
     try {
-      const res = await api.getSessions(10, 0, { excludeSources: ["cron"] });
+      const res = await api.getSessions(10, 0, { excludeSources: ["cron"], hideAutomated: true });
       setRecentSessions(pinSession(res.sessions ?? []));
     } catch {
       if (pinnedSession?.id) setRecentSessions((current) => pinSession(current));
@@ -2226,7 +2226,7 @@ export default function AiwerkAssistantPage() {
 
     void connect();
     api
-      .getSessions(10, 0, { excludeSources: ["cron"] })
+      .getSessions(10, 0, { excludeSources: ["cron"], hideAutomated: true })
       .then((res) => {
         if (!cancelled) setRecentSessions((res.sessions ?? []).slice(0, 10));
       })
