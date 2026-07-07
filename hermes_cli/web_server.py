@@ -1474,6 +1474,10 @@ def _is_himalaya_email_backend(backend: str) -> bool:
     return backend in {"himalaya", "imap"}
 
 
+def _is_microsoft_calendar_backend(backend: str) -> bool:
+    return backend in {"microsoft_calendar", "microsoft-calendar", "microsoft", "outlook", "outlook_calendar", "outlook-calendar"}
+
+
 def _email_account_label(account_cfg: dict[str, Any], fallback: str) -> str:
     for key in ("address", "email", "user_google_email", "google_email", "label", "name", "account"):
         value = str(account_cfg.get(key) or "").strip()
@@ -2287,10 +2291,10 @@ def _bridge_result_is_error(result: dict[str, Any]) -> bool:
     return isinstance(nested, dict) and nested.get("isError") is True
 
 
-def _bridge_error_status(text: str) -> tuple[str, str]:
+def _bridge_error_status(text: str, *, reconnect_summary: str = "Google Kalender neu verbinden") -> tuple[str, str]:
     normalized = (text or "").lower()
     if any(marker in normalized for marker in ("authentication required", "token expired", "token expired/revoked", "revoked")):
-        return "auth_required", "Google Kalender neu verbinden"
+        return "auth_required", reconnect_summary
     return "error", "Kalender konnte nicht geprüft werden"
 
 
@@ -2606,6 +2610,9 @@ def _calendar_account_configs(config: dict[str, Any] | None) -> list[dict[str, A
     accounts.extend(_email_account_dicts(calendar_cfg.get("accounts") if calendar_cfg else None, backend="google_workspace"))
     accounts.extend(_email_account_dicts(calendar_cfg.get("google_workspace") if calendar_cfg else None, backend="google_workspace"))
     accounts.extend(_email_account_dicts(calendar_cfg.get("google") if calendar_cfg else None, backend="google_workspace"))
+    accounts.extend(_email_account_dicts(calendar_cfg.get("microsoft_calendar") if calendar_cfg else None, backend="microsoft_calendar"))
+    accounts.extend(_email_account_dicts(calendar_cfg.get("microsoft") if calendar_cfg else None, backend="microsoft_calendar"))
+    accounts.extend(_email_account_dicts(calendar_cfg.get("outlook") if calendar_cfg else None, backend="microsoft_calendar"))
     if not accounts and calendar_cfg:
         backend = _email_backend_name(calendar_cfg)
         enabled = calendar_cfg.get("enabled")
@@ -2669,6 +2676,8 @@ def _calendar_account_config_for_ref(config: dict[str, Any] | None, account_ref:
             str(account_cfg.get("address") or "").strip(),
             str(account_cfg.get("email") or "").strip(),
             str(account_cfg.get("user_google_email") or account_cfg.get("google_email") or "").strip(),
+            str(account_cfg.get("microsoft_email") or account_cfg.get("outlook_email") or "").strip(),
+            str(account_cfg.get("user_principal_name") or "").strip(),
         }
         if normalized_ref in candidates:
             return account_cfg
@@ -2733,6 +2742,167 @@ def _parse_google_workspace_event_items(text: str, *, account_label: str, accoun
         items.append(item)
     items.sort(key=lambda item: str(item.get("starts_at") or ""))
     return items
+
+
+def _microsoft_graph_datetime(value: Any) -> str:
+    if isinstance(value, dict):
+        raw = str(value.get("dateTime") or value.get("date") or "").strip()
+        timezone_name = str(value.get("timeZone") or "").strip()
+        if not raw:
+            return ""
+        if "T" not in raw:
+            return raw
+        if raw.endswith("Z") or re.search(r"[+-]\d{2}:?\d{2}$", raw):
+            return raw
+        if timezone_name.upper() in {"UTC", "Z"}:
+            return f"{raw}Z"
+        return f"{raw} [{timezone_name}]" if timezone_name else raw
+    return str(value or "").strip()
+
+
+def _microsoft_graph_email(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    email_address = value.get("emailAddress")
+    if isinstance(email_address, dict):
+        name = str(email_address.get("name") or "").strip()
+        address = str(email_address.get("address") or "").strip()
+        return email.utils.formataddr((name, address)) if name and address else (address or name)
+    return ""
+
+
+def _microsoft_calendar_account_label(account_cfg: dict[str, Any]) -> str:
+    return str(account_cfg.get("label") or account_cfg.get("name") or _email_account_label(account_cfg, "Microsoft Kalender")).strip()
+
+
+def _microsoft_calendar_account_address(account_cfg: dict[str, Any], fallback: str) -> str:
+    for key in ("address", "email", "microsoft_email", "outlook_email", "user_principal_name"):
+        value = str(account_cfg.get(key) or "").strip()
+        if value and value != "me":
+            return value
+    return fallback
+
+
+def _microsoft_graph_event_to_item(event: dict[str, Any], *, account_label: str, account_address: str) -> dict[str, Any] | None:
+    event_id = str(event.get("id") or "").strip()
+    subject = str(event.get("subject") or event.get("title") or "Termin").strip() or "Termin"
+    if not event_id and not subject:
+        return None
+    location = event.get("location") if isinstance(event.get("location"), dict) else {}
+    item: dict[str, Any] = {
+        "id": event_id or _safe_resource_id(subject, "event"),
+        "event_id": event_id,
+        "title": subject,
+        "starts_at": _microsoft_graph_datetime(event.get("start")),
+        "ends_at": _microsoft_graph_datetime(event.get("end")),
+        "location_hint": str(location.get("displayName") or event.get("location_hint") or "").strip(),
+        "account_label": account_label,
+        "account_address": account_address,
+        "source": "microsoft_calendar",
+    }
+    organizer = _microsoft_graph_email(event.get("organizer"))
+    if organizer:
+        item["organizer"] = organizer
+    if event.get("webLink"):
+        item["html_link"] = str(event.get("webLink"))
+    if event_id:
+        params = urllib.parse.urlencode({"account": account_address, "id": event_id})
+        item["open_url"] = f"/api/assistant/calendar/view?{params}"
+    return item
+
+
+def _microsoft_graph_events_from_text(text: str, *, account_label: str, account_address: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(text or "{}")
+    except Exception:
+        return []
+    raw_events = data.get("value") if isinstance(data, dict) else data
+    if not isinstance(raw_events, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            continue
+        item = _microsoft_graph_event_to_item(raw, account_label=account_label, account_address=account_address)
+        if item:
+            items.append(item)
+    items.sort(key=lambda item: str(item.get("starts_at") or ""))
+    return items
+
+
+def _microsoft_calendar_summary(config: dict[str, Any] | None, account_cfg: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any] | None:
+    backend = _email_backend_name(account_cfg)
+    if backend and not _is_microsoft_calendar_backend(backend):
+        return None
+    server = str(account_cfg.get("server") or account_cfg.get("mcp_server") or "microsoft-calendar").strip()
+    account_label = _microsoft_calendar_account_label(account_cfg)
+    account_address = _microsoft_calendar_account_address(account_cfg, account_label)
+    calendar_id = str(account_cfg.get("calendar_id") or account_cfg.get("calendar") or "").strip()
+    now = now or datetime.now(timezone.utc)
+    time_min = str(account_cfg.get("time_min") or now.isoformat())
+    horizon_days = int(account_cfg.get("horizon_days") or os.environ.get("AIWERK_CUI_CALENDAR_HORIZON_DAYS") or 14)
+    time_max = str(account_cfg.get("time_max") or (now + timedelta(days=horizon_days)).isoformat())
+    max_results = int(account_cfg.get("max_results") or os.environ.get("AIWERK_CUI_CALENDAR_MAX_RESULTS") or 5)
+    tool = "get-specific-calendar-view" if calendar_id else "get-calendar-view"
+    params: dict[str, Any] = {"startDateTime": time_min, "endDateTime": time_max}
+    if calendar_id:
+        params["calendarId"] = calendar_id
+    result = _call_aiwerk_bridge_tool(config, server=server, tool=tool, params=params)
+    result_text = _bridge_result_text(result)
+    if _bridge_result_is_error(result):
+        status, summary = _bridge_error_status(result_text, reconnect_summary="Outlook Kalender neu verbinden")
+        return {
+            "label": account_label,
+            "address": account_address,
+            "calendar_id": calendar_id,
+            "source": "microsoft_calendar",
+            "status": status,
+            "summary": summary,
+            "items": [],
+            "last_error": summary,
+        }
+    items = _microsoft_graph_events_from_text(result_text, account_label=account_label, account_address=account_address)[:max_results]
+    return {
+        "label": account_label,
+        "address": account_address,
+        "calendar_id": calendar_id,
+        "source": "microsoft_calendar",
+        "status": "connected",
+        "summary": f"{len(items)} kommende Termine" if items else "Keine kommenden Termine",
+        "items": items,
+    }
+
+
+def _fetch_microsoft_calendar_event_detail(config: dict[str, Any] | None, account_cfg: dict[str, Any] | None, event_id: str) -> dict[str, str]:
+    if not isinstance(account_cfg, dict) or not event_id:
+        return {}
+    backend = _email_backend_name(account_cfg)
+    if backend and not _is_microsoft_calendar_backend(backend):
+        return {}
+    server = str(account_cfg.get("server") or account_cfg.get("mcp_server") or "microsoft-calendar").strip()
+    calendar_id = str(account_cfg.get("calendar_id") or account_cfg.get("calendar") or "").strip()
+    tool = "get-specific-calendar-event" if calendar_id else "get-calendar-event"
+    params: dict[str, Any] = {"eventId": event_id}
+    if calendar_id:
+        params["calendarId"] = calendar_id
+    result = _call_aiwerk_bridge_tool(config, server=server, tool=tool, params=params)
+    try:
+        data = json.loads(_bridge_result_text(result) or "{}")
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    account_label = _microsoft_calendar_account_label(account_cfg)
+    account_address = _microsoft_calendar_account_address(account_cfg, account_label)
+    item = _microsoft_graph_event_to_item(data, account_label=account_label, account_address=account_address)
+    if not item:
+        return {}
+    detail = {k: str(v) for k, v in item.items() if k in {"title", "starts_at", "ends_at", "location_hint", "event_id", "html_link"} and v}
+    body = data.get("body") if isinstance(data.get("body"), dict) else {}
+    body_preview = str(data.get("bodyPreview") or body.get("content") or "").strip()
+    if body_preview:
+        detail["description"] = re.sub(r"<[^>]+>", " ", body_preview).strip()
+    return detail
 
 
 def _google_workspace_calendar_summary(config: dict[str, Any] | None, account_cfg: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any] | None:
@@ -2846,12 +3016,17 @@ def _calendar_summary(config: dict[str, Any] | None = None) -> dict[str, Any]:
         summaries: list[dict[str, Any]] = []
         for account_cfg in account_cfgs:
             try:
-                summary = _google_workspace_calendar_summary(config, account_cfg)
+                backend = _email_backend_name(account_cfg)
+                if _is_microsoft_calendar_backend(backend):
+                    summary = _microsoft_calendar_summary(config, account_cfg)
+                else:
+                    summary = _google_workspace_calendar_summary(config, account_cfg)
             except Exception as exc:
-                _log.debug("CUI Google Workspace calendar summary failed: %s", exc)
-                label = _email_account_label(account_cfg, "Google Kalender")
+                _log.debug("CUI calendar summary failed: %s", exc)
+                label = _email_account_label(account_cfg, "Kalender")
                 address = _email_account_address(account_cfg, label)
-                summary = {"label": label, "address": address, "source": "google_calendar", "status": "error", "summary": "Kalender konnte nicht geprüft werden", "items": []}
+                source = "microsoft_calendar" if _is_microsoft_calendar_backend(_email_backend_name(account_cfg)) else "google_calendar"
+                summary = {"label": label, "address": address, "source": source, "status": "error", "summary": "Kalender konnte nicht geprüft werden", "items": []}
             if summary:
                 summaries.append(summary)
         if summaries:
@@ -7847,11 +8022,11 @@ async def view_assistant_calendar_event(request: Request):
         if not found:
             raise HTTPException(status_code=404, detail="Calendar event not found")
         config = load_config()
-        detail = _fetch_google_workspace_calendar_event_detail(
-            config,
-            _calendar_account_config_for_ref(config, account_label or account_ref),
-            event_id,
-        )
+        account_cfg = _calendar_account_config_for_ref(config, account_label or account_ref)
+        if isinstance(account_cfg, dict) and _is_microsoft_calendar_backend(_email_backend_name(account_cfg)):
+            detail = _fetch_microsoft_calendar_event_detail(config, account_cfg, event_id)
+        else:
+            detail = _fetch_google_workspace_calendar_event_detail(config, account_cfg, event_id)
         if detail:
             found = {**found, **detail}
         title = str(found.get("title") or "Termin")

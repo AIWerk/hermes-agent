@@ -429,7 +429,8 @@ def _runtime_dir_is_private(path: Path) -> bool:
         return True
     except Exception:
         return False
-    return st.st_uid == os.getuid() and (st.st_mode & 0o077) == 0
+    owner_ok = st.st_uid == os.getuid() if hasattr(os, "getuid") else True
+    return owner_ok and (st.st_mode & 0o077) == 0
 
 
 def _parent_pid(pid: int) -> int | None:
