@@ -515,20 +515,16 @@ def _ensure_sdk_installed() -> bool:
         print("  Skipping install. Run: pip install 'honcho-ai>=2.0.1'\n")
         return False
 
-    import subprocess
     print("  Installing honcho-ai...", flush=True)
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "honcho-ai>=2.0.1"],
-        capture_output=True,
-        text=True,
-        stdin=subprocess.DEVNULL,
-    )
+    from hermes_cli.tools_config import _pip_install
+
+    result = _pip_install(["honcho-ai>=2.0.1"])
     if result.returncode == 0:
         print("  Installed.\n")
         return True
     else:
-        print(f"  Install failed:\n{result.stderr.strip()}")
-        print("  Run manually: pip install 'honcho-ai>=2.0.1'\n")
+        print(f"  Install failed:\n{(result.stderr or '').strip()}")
+        print("  Run manually: uv pip install 'honcho-ai>=2.0.1'\n")
         return False
 
 
@@ -1102,7 +1098,7 @@ def cmd_status(args) -> None:
     if write_path != active_path:
         print(f"  Write to:       {write_path}  (profile-local)")
     if active_path == global_path:
-        print(f"  Fallback:       (none — using global ~/.honcho/config.json)")
+        print("  Fallback:       (none — using global ~/.honcho/config.json)")
     elif global_path.exists():
         print(f"  Fallback:       {global_path}  (exists, cross-app interop)")
 
@@ -1597,7 +1593,7 @@ def _cmd_status_all() -> None:
         marker = " *" if name == active else ""
         print(f"  {name + marker:<14} {host:<22} {enabled_str:<9} {recall:<9} {write}")
 
-    print(f"\n  * active profile\n")
+    print("\n  * active profile\n")
 
 
 def cmd_peers(args) -> None:
@@ -1737,7 +1733,7 @@ def cmd_mode(args) -> None:
         for m, desc in MODES.items():
             marker = " <-" if m == current else ""
             print(f"  {m:<10}  {desc}{marker}")
-        print(f"\n  Set with: hermes honcho mode [hybrid|context|tools]\n")
+        print("\n  Set with: hermes honcho mode [hybrid|context|tools]\n")
         return
 
     if mode_arg not in MODES:
@@ -1772,7 +1768,7 @@ def cmd_strategy(args) -> None:
         for s, desc in STRATEGIES.items():
             marker = " <-" if s == current else ""
             print(f"  {s:<15}  {desc}{marker}")
-        print(f"\n  Set with: hermes honcho strategy [per-session|per-directory|per-repo|global]\n")
+        print("\n  Set with: hermes honcho strategy [per-session|per-directory|per-repo|global]\n")
         return
 
     if strat_arg not in STRATEGIES:

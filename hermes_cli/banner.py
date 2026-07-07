@@ -829,18 +829,34 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         skills_by_category = {}
         total_skills = 0
 
+    # Dynamically size skills display based on terminal width.
+    # Rich grid with 2 columns; right column gets roughly 60% of terminal.
+    _term_cols = shutil.get_terminal_size().columns
+    _right_col_width = max(int(_term_cols * 0.6) - 10, 30)
+
     if not _skills_enabled:
         right_lines.append(f"[dim {dim}]Skills toolset disabled[/]")
     elif skills_by_category:
         for category in sorted(skills_by_category.keys()):
             skill_names = sorted(skills_by_category[category])
-            if len(skill_names) > 8:
-                display_names = skill_names[:8]
-                skills_str = ", ".join(display_names) + " " + t('cli.banner.more_skills_suffix', count=len(skill_names) - 8)
-            else:
-                skills_str = ", ".join(skill_names)
-            if len(skills_str) > 50:
-                skills_str = skills_str[:47] + "..."
+            # Account for "category: " prefix
+            _prefix_len = len(category) + 2
+            _avail = max(_right_col_width - _prefix_len, 20)
+            # Accumulate skills until we run out of space.
+            parts, length = [], 0
+            for i, name in enumerate(skill_names):
+                _sep = ", " if parts else ""
+                _needed = len(_sep) + len(name)
+                _after = len(skill_names) - (i + 1)
+                _suffix = t('cli.banner.more_skills_suffix', count=_after) if _after > 0 else ""
+                _ind_len = len(", " + _suffix) if _suffix else 0
+                if parts and length + _needed + _ind_len > _avail:
+                    remaining = len(skill_names) - len(parts)
+                    parts.append(t('cli.banner.more_skills_suffix', count=remaining))
+                    break
+                parts.append(name)
+                length += _needed
+            skills_str = ", ".join(parts)
             right_lines.append(f"[dim {dim}]{category}:[/] [{text}]{skills_str}[/]")
     else:
         right_lines.append(f"[dim {dim}]{t('cli.banner.no_skills_installed')}[/]")
