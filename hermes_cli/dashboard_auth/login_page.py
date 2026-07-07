@@ -485,12 +485,14 @@ def _render_password_form(provider, next_path: str) -> str:
     form-field ordering.
     """
     pname = html.escape(provider.name, quote=True)
-    plabel = html.escape(provider.display_name)
+    # Password providers often expose an internal English display_name such as
+    # "Username & Password". Keep the customer-facing CUI copy German and
+    # stable instead of leaking that provider label into the login page.
     safe_next = html.escape(next_path, quote=True) if next_path else ""
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
         f'autocomplete="on">\n'
-        f'        <div class="form-title">Anmelden mit {plabel}</div>\n'
+        f'        <div class="form-title">Anmelden mit Benutzername und Passwort</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
         f'        <label class="field">\n'
         f'          <span class="field-label">Benutzer</span>\n'
