@@ -202,8 +202,7 @@ _LOGIN_HTML_TEMPLATE = """\
     outline-offset: 3px;
   }}
 
-  /* Password provider form — same visual language as the OAuth buttons:
-     squared inputs, hairline borders, amber focus ring. */
+  /* Zugangsdatenformular — gleiche visuelle Sprache wie die Login-Buttons. */
   .provider-form {{
     display: grid;
     gap: 0.75rem;
@@ -492,10 +491,10 @@ def _render_password_form(provider, next_path: str) -> str:
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
         f'autocomplete="on">\n'
-        f'        <div class="form-title">Anmelden mit Benutzername und Passwort</div>\n'
+        f'        <div class="form-title">Mit Benutzername und Passwort anmelden</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Benutzer</span>\n'
+        f'          <span class="field-label">Benutzername</span>\n'
         f'          <input class="field-input" type="text" name="username" '
         f'autocomplete="username" autocapitalize="none" '
         f'autocorrect="off" spellcheck="false" required>\n'

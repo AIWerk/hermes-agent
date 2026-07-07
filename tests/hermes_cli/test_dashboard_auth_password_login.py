@@ -408,7 +408,8 @@ class TestLoginPageRender:
             assert '<form class="provider-form" data-provider="testpw"' in html
             assert 'name="username"' in html
             assert 'name="password"' in html
-            assert "Anmelden mit Benutzername und Passwort" in html
+            assert "Mit Benutzername und Passwort anmelden" in html
+            assert "Anmelden mit Benutzername und Passwort" not in html
             assert "Anmelden mit Username &amp; Password" not in html
             assert "Anmelden mit Username & Password" not in html
             assert 'value="/sessions"' in html
