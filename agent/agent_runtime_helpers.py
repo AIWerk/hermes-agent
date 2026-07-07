@@ -1823,6 +1823,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             }
             try:
                 from hermes_cli.config import (
+                    apply_custom_provider_extra_headers_to_client_kwargs,
                     apply_custom_provider_tls_to_client_kwargs,
                     get_compatible_custom_providers,
                     load_config_readonly,
@@ -1832,13 +1833,19 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 # snapshot on ``agent._custom_providers``) so ssl_ca_cert /
                 # ssl_verify edits are honored when switching mid-session,
                 # matching the context-length reload below (#15779).
+                _cp_entries = get_compatible_custom_providers(load_config_readonly())
                 apply_custom_provider_tls_to_client_kwargs(
                     agent._client_kwargs,
                     str(effective_base or ""),
-                    get_compatible_custom_providers(load_config_readonly()),
+                    _cp_entries,
+                )
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    agent._client_kwargs,
+                    str(effective_base or ""),
+                    _cp_entries,
                 )
             except Exception:
-                logger.debug("custom-provider TLS resolution skipped on switch_model", exc_info=True)
+                logger.debug("custom-provider TLS/header resolution skipped on switch_model", exc_info=True)
             _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
             if _sm_timeout is not None:
                 agent._client_kwargs["timeout"] = _sm_timeout

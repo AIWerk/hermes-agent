@@ -4523,7 +4523,7 @@ def _normalize_custom_provider_entry(
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body",
+        "discover_models", "extra_body", "extra_headers",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -4630,6 +4630,16 @@ def _normalize_custom_provider_entry(
     if isinstance(extra_body, dict):
         normalized["extra_body"] = dict(extra_body)
 
+    extra_headers = entry.get("extra_headers")
+    if isinstance(extra_headers, dict) and extra_headers:
+        normalized_headers = {
+            str(k): str(v)
+            for k, v in extra_headers.items()
+            if k is not None and str(k) and v is not None
+        }
+        if normalized_headers:
+            normalized["extra_headers"] = normalized_headers
+
     return normalized
 
 
@@ -4657,6 +4667,7 @@ def _custom_provider_entry_to_provider_config(
         "rate_limit_delay",
         "discover_models",
         "extra_body",
+        "extra_headers",
     ):
         if field in normalized:
             provider_entry[field] = normalized[field]
@@ -4744,6 +4755,59 @@ def _normalize_provider_base_url(value: str) -> str:
     path = parsed.path.rstrip("/")
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
 
+
+
+def get_custom_provider_extra_headers(
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Return per-custom-provider extra HTTP headers for an exact ``base_url`` match."""
+    target_url = _normalize_provider_base_url(base_url)
+    if not target_url:
+        return {}
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return {}
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return {}
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = _normalize_provider_base_url(str(entry.get("base_url") or ""))
+        if not entry_url or entry_url != target_url:
+            continue
+        headers = entry.get("extra_headers")
+        if not isinstance(headers, dict) or not headers:
+            return {}
+        return {str(k): str(v) for k, v in headers.items() if k is not None and str(k) and v is not None}
+    return {}
+
+
+def apply_custom_provider_extra_headers_to_client_kwargs(
+    client_kwargs: Dict[str, Any],
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Merge matching custom-provider extra headers into OpenAI client kwargs."""
+    headers = get_custom_provider_extra_headers(
+        base_url,
+        custom_providers=custom_providers,
+        config=config,
+    )
+    if not headers:
+        return
+    existing = client_kwargs.get("default_headers")
+    merged: Dict[str, str] = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(headers)
+    client_kwargs["default_headers"] = merged
 
 def get_custom_provider_tls_settings(
     base_url: str,
