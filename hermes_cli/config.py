@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -4731,6 +4732,69 @@ def get_compatible_custom_providers(
 
     return compatible
 
+
+
+def _normalize_provider_base_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/").lower()
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
+
+
+def get_custom_provider_tls_settings(
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return per-custom-provider TLS settings for an exact ``base_url`` match."""
+    target_url = _normalize_provider_base_url(base_url)
+    if not target_url:
+        return {}
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return {}
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return {}
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = _normalize_provider_base_url(str(entry.get("base_url") or ""))
+        if not entry_url or entry_url != target_url:
+            continue
+        tls: Dict[str, Any] = {}
+        if entry.get("ssl_ca_cert"):
+            tls["ssl_ca_cert"] = str(entry.get("ssl_ca_cert"))
+        if "ssl_verify" in entry:
+            tls["ssl_verify"] = entry.get("ssl_verify")
+        return tls
+    return {}
+
+
+def apply_custom_provider_tls_to_client_kwargs(
+    client_kwargs: Dict[str, Any],
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Apply matching custom-provider TLS settings to OpenAI client kwargs in place."""
+    tls = get_custom_provider_tls_settings(
+        base_url,
+        custom_providers=custom_providers,
+        config=config,
+    )
+    for key in ("ssl_ca_cert", "ssl_verify"):
+        if key in tls:
+            client_kwargs[key] = tls[key]
 
 def get_custom_provider_context_length(
     model: str,
