@@ -116,6 +116,95 @@ def test_outbound_non_renderable_attachment_copies_to_shared_folder(monkeypatch,
     assert "/api/assistant/shared-folder/open?path=Agent-Downloads%2Fdata.json" in text
 
 
+def test_outbound_existing_shared_root_file_is_rehomed_to_agent_downloads(monkeypatch, tmp_path):
+    from tui_gateway import server
+
+    shared_root = tmp_path / "Hermes-Shared"
+    shared_root.mkdir()
+    root_file = shared_root / "root-level.pptx"
+    root_file.write_bytes(b"pptx")
+    monkeypatch.setattr(server, "_resolve_outbound_shared_folder_root", lambda: shared_root)
+    monkeypatch.setattr(server, "_outbound_source_roots", lambda: (shared_root,))
+
+    payloads, text = server._outbound_attachment_payloads_and_text(
+        f"Here: MEDIA:{root_file}", append_shared_links=True
+    )
+
+    shared_copy = shared_root / "Agent-Downloads" / "root-level.pptx"
+    assert shared_copy.read_bytes() == b"pptx"
+    assert payloads[0]["path"] == str(shared_copy.resolve())
+    assert payloads[0]["shared_folder_path"] == "Agent-Downloads/root-level.pptx"
+    assert "Agent-Downloads%2Froot-level.pptx" in text
+
+
+def test_outbound_shared_folder_link_includes_public_cloud_link(monkeypatch, tmp_path):
+    from tui_gateway import server
+    from hermes_cli import web_server
+
+    source_root = tmp_path / "safe-output"
+    source_root.mkdir()
+    shared_root = tmp_path / "Hermes-Shared"
+    shared_root.mkdir()
+    pptx_path = source_root / "slides.pptx"
+    pptx_path.write_bytes(b"pptx")
+    monkeypatch.setattr(server, "_resolve_outbound_shared_folder_root", lambda: shared_root)
+    monkeypatch.setattr(server, "_outbound_source_roots", lambda: (source_root,))
+    monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"shared_cloud": {}}})
+    monkeypatch.setattr(
+        web_server,
+        "_create_shared_file_public_link",
+        lambda config, rel_path, *, name=None: {
+            "url": "https://cloud.aiwerk.ch/web/client/pubshares/share123?compress=false",
+            "download_url": "https://cloud.aiwerk.ch/web/client/pubshares/share123/download",
+        },
+    )
+
+    payloads, text = server._outbound_attachment_payloads_and_text(
+        f"Here: MEDIA:{pptx_path}", append_shared_links=True
+    )
+
+    assert payloads[0]["shared_folder_path"] == "Agent-Downloads/slides.pptx"
+    assert payloads[0]["public_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share123?compress=false"
+    assert payloads[0]["public_download_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/share123/download"
+    assert "Web-Link: https://cloud.aiwerk.ch/web/client/pubshares/share123?compress=false" in text
+    assert "Download: https://cloud.aiwerk.ch/web/client/pubshares/share123/download" in text
+
+
+def test_outbound_non_renderable_attachment_uploads_to_cloud_without_local_mount(monkeypatch, tmp_path):
+    from tui_gateway import server
+    from hermes_cli import web_server
+
+    source_root = tmp_path / "safe-output"
+    source_root.mkdir()
+    pptx_path = source_root / "cloud-only.pptx"
+    pptx_path.write_bytes(b"pptx")
+    monkeypatch.setattr(server, "_resolve_outbound_shared_folder_root", lambda: None)
+    monkeypatch.setattr(server, "_outbound_source_roots", lambda: (source_root,))
+    monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"shared_cloud": {}}})
+    monkeypatch.setattr(
+        web_server,
+        "_upload_shared_file_to_cloud",
+        lambda config, source, rel_path: rel_path,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_create_shared_file_public_link",
+        lambda config, rel_path, *, name=None: {
+            "url": "https://cloud.aiwerk.ch/web/client/pubshares/cloud123?compress=false",
+            "download_url": "https://cloud.aiwerk.ch/web/client/pubshares/cloud123/download",
+        },
+    )
+
+    payloads, text = server._outbound_attachment_payloads_and_text(
+        f"Here: MEDIA:{pptx_path}", append_shared_links=True
+    )
+
+    assert payloads[0]["path"] == str(pptx_path.resolve())
+    assert payloads[0]["shared_folder_path"] == "Agent-Downloads/cloud-only.pptx"
+    assert payloads[0]["open_url"] == "/api/assistant/shared-folder/open?path=Agent-Downloads%2Fcloud-only.pptx"
+    assert "Web-Link: https://cloud.aiwerk.ch/web/client/pubshares/cloud123?compress=false" in text
+
+
 def test_assistant_preview_kind_keeps_json_as_file_even_with_text_mime():
     from hermes_cli import web_server
 

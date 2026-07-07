@@ -5228,16 +5228,23 @@ def _shared_folder_relative_path(root: Path, path: Path) -> str | None:
 def _materialize_non_renderable_outbound_artifact(path: Path) -> tuple[Path | None, str | None]:
     """Copy a non-previewable outbound file into the CUI shared folder."""
     root = _resolve_outbound_shared_folder_root()
-    if not root:
-        return None, None
     try:
         source = path.resolve()
         if not source.is_file() or source.stat().st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
             return None, None
         if not _outbound_source_allowed(source):
             return None, None
+        if not root:
+            try:
+                from hermes_cli import web_server
+
+                rel = f"{_SHARED_OUTBOUND_FOLDER_NAME}/{source.name}"
+                uploaded_rel = web_server._upload_shared_file_to_cloud(web_server.load_config(), source, rel)
+                return (source, uploaded_rel) if uploaded_rel else (None, None)
+            except Exception:
+                return None, None
         rel_existing = _shared_folder_relative_path(root, source)
-        if rel_existing:
+        if rel_existing and rel_existing.split("/", 1)[0] == _SHARED_OUTBOUND_FOLDER_NAME:
             return source, rel_existing
         stat = source.stat()
         digest = hashlib.sha256(
@@ -5401,6 +5408,7 @@ def _outbound_attachment_payloads_and_text(
         safe_renderable = preview_kind in {"image", "pdf", "text", "audio", "video"}
         payload_path = path
         shared_rel_path: str | None = None
+        public_link: dict[str, str] | None = None
         if safe_renderable:
             open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
         else:
@@ -5409,7 +5417,24 @@ def _outbound_attachment_payloads_and_text(
                 payload_path = shared_path
                 open_url = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(shared_rel_path, safe='')}"
                 if append_shared_links and open_url not in text:
-                    appended_links.append(f"{source_path.name}: {open_url}")
+                    line = f"{source_path.name}: {open_url}"
+                    try:
+                        from hermes_cli import web_server
+
+                        public_link = web_server._create_shared_file_public_link(
+                            web_server.load_config(),
+                            shared_rel_path,
+                            name=source_path.stem or source_path.name,
+                        )
+                    except Exception:
+                        public_link = None
+                    if public_link:
+                        line = (
+                            f"{source_path.name}: {open_url}\n"
+                            f"  Web-Link: {public_link.get('url')}\n"
+                            f"  Download: {public_link.get('download_url')}"
+                        )
+                    appended_links.append(line)
             else:
                 open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
         payload = {
@@ -5427,6 +5452,9 @@ def _outbound_attachment_payloads_and_text(
         }
         if shared_rel_path:
             payload["shared_folder_path"] = shared_rel_path
+        if public_link:
+            payload["public_url"] = public_link.get("url")
+            payload["public_download_url"] = public_link.get("download_url")
         attachments.append(payload)
     if append_shared_links and appended_links:
         suffix = "\n".join(f"- {line}" for line in appended_links)

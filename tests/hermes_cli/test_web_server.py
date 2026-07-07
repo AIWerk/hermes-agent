@@ -2334,6 +2334,56 @@ class TestWebServerEndpoints:
         assert agent_download.headers["x-content-type-options"] == "nosniff"
         assert agent_download.headers["content-security-policy"] == "sandbox"
 
+    def test_create_shared_file_public_link_reuses_existing_sftpgo_share(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_sftpgo_user_api_token", lambda cloud: "user-token")
+
+        def fake_api_json(base_url, token, path, *, method="GET", payload=None):
+            assert base_url == "https://cloud.aiwerk.ch"
+            assert token == "user-token"
+            assert method == "GET"
+            assert payload is None
+            return 200, [{"id": "share123", "scope": 1, "paths": ["/Agent-Downloads/report.pptx"]}], {}
+
+        monkeypatch.setattr(web_server, "_sftpgo_user_api_json", fake_api_json)
+        config = {"dashboard": {"shared_cloud": {"base_url": "https://dav.aiwerk.ch", "username": "susanne.meer", "password_pass_entry": "cloud/susanne"}}}
+
+        link = web_server._create_shared_file_public_link(config, "Agent-Downloads/report.pptx")
+
+        assert link == {
+            "url": "https://cloud.aiwerk.ch/web/client/pubshares/share123?compress=false",
+            "download_url": "https://cloud.aiwerk.ch/web/client/pubshares/share123/download",
+        }
+
+    def test_create_shared_file_public_link_creates_sftpgo_share(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+        monkeypatch.setattr(web_server, "_sftpgo_user_api_token", lambda cloud: "user-token")
+
+        def fake_api_json(base_url, token, path, *, method="GET", payload=None):
+            calls.append((base_url, token, path, method, payload))
+            if method == "GET":
+                return 200, [], {}
+            return 201, None, {"X-Object-ID": "newshare"}
+
+        monkeypatch.setattr(web_server, "_sftpgo_user_api_json", fake_api_json)
+        config = {"dashboard": {"shared_cloud": {"base_url": "https://dav.aiwerk.ch", "username": "susanne.meer", "password_pass_entry": "cloud/susanne"}}}
+
+        link = web_server._create_shared_file_public_link(config, "Agent-Downloads/report.pptx", name="Report")
+
+        assert calls[1] == (
+            "https://cloud.aiwerk.ch",
+            "user-token",
+            "/api/v2/user/shares",
+            "POST",
+            {"name": "Report", "scope": 1, "paths": ["/Agent-Downloads/report.pptx"], "expires_at": 0, "max_tokens": 0},
+        )
+        assert link is not None
+        assert link["url"] == "https://cloud.aiwerk.ch/web/client/pubshares/newshare?compress=false"
+        assert link["download_url"] == "https://cloud.aiwerk.ch/web/client/pubshares/newshare/download"
+
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 

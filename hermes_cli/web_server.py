@@ -807,6 +807,165 @@ def _shared_cloud_browse_url(cloud: dict[str, Any] | None, rel_path: str | None 
     return f"{base_url}/web/client/pubshares/{urllib.parse.quote(share_id, safe='')}/browse?path={urllib.parse.quote(path, safe='')}"
 
 
+def _sftpgo_webclient_base_url(cloud: dict[str, Any] | None) -> str | None:
+    if not isinstance(cloud, dict):
+        return None
+    raw = str(
+        cloud.get("web_base_url")
+        or cloud.get("public_base_url")
+        or cloud.get("share_base_url")
+        or cloud.get("base_url")
+        or ""
+    ).rstrip("/")
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.netloc.startswith("dav."):
+        parsed = parsed._replace(netloc="cloud." + parsed.netloc[4:])
+    return urllib.parse.urlunparse(parsed).rstrip("/")
+
+
+def _sftpgo_user_api_token(cloud: dict[str, Any]) -> str | None:
+    base_url = _sftpgo_webclient_base_url(cloud)
+    username = str(cloud.get("username") or "").strip()
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    if not base_url or not username or not pass_entry:
+        return None
+    password = _pass_first_line(pass_entry)
+    if not password:
+        return None
+    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/api/v2/user/token",
+            headers={"Authorization": f"Basic {auth}", "User-Agent": "Hermes-CUI/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if response.status >= 400:
+                return None
+            payload = json.loads(response.read(64_000).decode("utf-8", errors="replace"))
+            token = str(payload.get("access_token") or "").strip()
+            return token or None
+    except Exception:
+        return None
+
+
+def _sftpgo_user_api_json(
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, Any, dict[str, str]]:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "Hermes-CUI/1.0"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=20) as response:
+        body = response.read(512_000)
+        parsed: Any = None
+        if body:
+            try:
+                parsed = json.loads(body.decode("utf-8", errors="replace"))
+            except Exception:
+                parsed = body.decode("utf-8", errors="replace")
+        return response.status, parsed, dict(response.headers.items())
+
+
+def _upload_shared_file_to_cloud(config: dict[str, Any], source: Path, rel_path: str) -> str | None:
+    """Upload a local assistant artifact to the configured SFTPGo shared cloud path."""
+    cloud = _shared_cloud_config(config)
+    if not isinstance(cloud, dict):
+        return None
+    clean = _clean_shared_relative_path(rel_path)
+    base_url = _sftpgo_webclient_base_url(cloud)
+    if not clean or not base_url or not source.is_file():
+        return None
+    token = _sftpgo_user_api_token(cloud)
+    if not token:
+        return None
+    try:
+        data = source.read_bytes()
+        request = urllib.request.Request(
+            f"{base_url}/api/v2/user/files/upload?path={urllib.parse.quote(clean, safe='')}&mkdir_parents=true",
+            data=data,
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "Hermes-CUI/1.0"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if response.status >= 400:
+                return None
+            return clean
+    except Exception:
+        return None
+
+
+def _create_shared_file_public_link(config: dict[str, Any], rel_path: str, *, name: str | None = None) -> dict[str, str] | None:
+    """Create or reuse a user-facing SFTPGo public share for one shared file."""
+    cloud = _shared_cloud_config(config)
+    if not isinstance(cloud, dict):
+        return None
+    clean = _clean_shared_relative_path(rel_path)
+    base_url = _sftpgo_webclient_base_url(cloud)
+    if not clean or not base_url:
+        return None
+    token = _sftpgo_user_api_token(cloud)
+    if not token:
+        return None
+    share_path = "/" + clean
+    try:
+        status, shares, _headers = _sftpgo_user_api_json(base_url, token, "/api/v2/user/shares?limit=500&order=DESC")
+        if status < 400 and isinstance(shares, list):
+            for share in shares:
+                if not isinstance(share, dict) or int(share.get("scope") or 0) != 1:
+                    continue
+                paths = share.get("paths")
+                share_id = str(share.get("id") or "").strip()
+                if share_id and isinstance(paths, list) and paths == [share_path]:
+                    quoted = urllib.parse.quote(share_id, safe="")
+                    return {
+                        "url": f"{base_url}/web/client/pubshares/{quoted}?compress=false",
+                        "download_url": f"{base_url}/web/client/pubshares/{quoted}/download",
+                    }
+        payload = {
+            "name": str(name or Path(clean).stem or Path(clean).name),
+            "scope": 1,
+            "paths": [share_path],
+            "expires_at": 0,
+            "max_tokens": 0,
+        }
+        status, body, headers = _sftpgo_user_api_json(base_url, token, "/api/v2/user/shares", method="POST", payload=payload)
+        if status >= 400:
+            return None
+        share_id = str(headers.get("X-Object-ID") or headers.get("x-object-id") or "").strip()
+        if not share_id and isinstance(body, dict):
+            share_id = str(body.get("id") or "").strip()
+        if not share_id:
+            status, shares, _headers = _sftpgo_user_api_json(base_url, token, "/api/v2/user/shares?limit=500&order=DESC")
+            if status < 400 and isinstance(shares, list):
+                for share in shares:
+                    if not isinstance(share, dict) or int(share.get("scope") or 0) != 1:
+                        continue
+                    paths = share.get("paths")
+                    candidate_id = str(share.get("id") or "").strip()
+                    if candidate_id and isinstance(paths, list) and paths == [share_path]:
+                        share_id = candidate_id
+                        break
+        if not share_id:
+            return None
+        quoted = urllib.parse.quote(share_id, safe="")
+        return {
+            "url": f"{base_url}/web/client/pubshares/{quoted}?compress=false",
+            "download_url": f"{base_url}/web/client/pubshares/{quoted}/download",
+        }
+    except Exception:
+        return None
+
+
 def _shared_folder_items(root: Path, *, base: Path | None = None, depth: int = _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH, cloud: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     try:
