@@ -412,6 +412,9 @@ class TestLoginPageRender:
             assert "Anmelden mit Benutzername und Passwort" not in html
             assert "Anmelden mit Username &amp; Password" not in html
             assert "Anmelden mit Username & Password" not in html
+            assert ".form-title {\n    font-family: inherit;" in html
+            assert "font-family: 'Rules Compressed', 'Collapse', sans-serif;" not in html
+            assert ".field-label {\n    font-size: 0.82rem;\n    letter-spacing: 0;\n    text-transform: none;" in html
             assert 'value="/sessions"' in html
             assert "<script>" in html
             assert "/auth/password-login" in html

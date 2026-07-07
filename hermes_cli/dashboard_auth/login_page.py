@@ -209,22 +209,22 @@ _LOGIN_HTML_TEMPLATE = """\
     text-align: left;
   }}
   .form-title {{
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600;
-    font-size: 0.72rem;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 70%, transparent);
+    font-family: inherit;
+    font-weight: 700;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
+    text-transform: none;
+    color: var(--foreground);
   }}
   .field {{
     display: grid;
     gap: 0.3rem;
   }}
   .field-label {{
-    font-size: 0.72rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 55%, transparent);
+    font-size: 0.82rem;
+    letter-spacing: 0;
+    text-transform: none;
+    color: color-mix(in srgb, var(--foreground) 60%, transparent);
   }}
   .field-input {{
     width: 100%;
