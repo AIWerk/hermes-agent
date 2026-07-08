@@ -3095,17 +3095,31 @@ def _aiwerk_bridge_catalog_slug(name: str, details: dict[str, Any] | None = None
     return _AIWERK_BRIDGE_CATALOG_SLUGS.get(clean, clean)
 
 
-def _default_aiwerk_bridge_subservers() -> list[dict[str, Any]]:
-    return [_aiwerk_bridge_subserver_item(name) for name in _AIWERK_BRIDGE_SUBSERVER_LABELS]
+def _normalize_aiwerk_bridge_subserver_status(details: dict[str, Any] | None) -> str:
+    if not isinstance(details, dict):
+        return "connected"
+    if details.get("enabled", True) is False:
+        return "disabled"
+    raw = str(details.get("status") or details.get("state") or "connected").strip().lower()
+    if raw in {"connected", "running", "ready", "ok", "healthy"}:
+        return "connected"
+    if raw in {"disabled", "off"}:
+        return "disabled"
+    if raw in {"disconnected", "stopped", "starting", "pending", "idle", "lazy"}:
+        return "limited"
+    if raw in {"error", "failed", "unhealthy"}:
+        return "error"
+    return "limited" if raw else "connected"
 
 
 def _aiwerk_bridge_subserver_item(name: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
     clean_name = str(name or "").strip()
+    status = _normalize_aiwerk_bridge_subserver_status(details)
     item = {
         "id": f"aiwerk-bridge-{_safe_resource_id(clean_name)}",
         "label": _aiwerk_bridge_subserver_label(clean_name, details),
-        "status": "connected",
-        "status_label": _resource_status_label("connected"),
+        "status": status,
+        "status_label": _resource_status_label(status),
         "capabilities": ["Bridge-Subserver"],
         "description": _aiwerk_bridge_subserver_description(clean_name, details),
     }
@@ -3173,7 +3187,7 @@ def _aiwerk_bridge_subservers(config: dict[str, Any], bridge_details: dict[str, 
                 return live_children
         except Exception as exc:
             _log.debug("CUI AIWerk Bridge live subserver inventory failed: %s", exc)
-        return _default_aiwerk_bridge_subservers()
+        return []
 
     for name, raw in iterable:
         details = raw if isinstance(raw, dict) else {}
