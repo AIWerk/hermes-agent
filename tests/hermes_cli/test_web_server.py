@@ -2394,6 +2394,57 @@ class TestWebServerEndpoints:
         assert [child["label"] for child in bridge["children"]][:3] == ["CoinMarketCap", "Firecrawl", "Google Maps"]
         assert all(child["capabilities"] == ["Bridge-Subserver"] for child in bridge["children"])
 
+    def test_aiwerk_bridge_connectors_do_not_fall_back_to_demo_catalog(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def bridge_inventory_fails(config):
+            raise RuntimeError("bridge status unavailable")
+
+        monkeypatch.setattr(web_server, "_aiwerk_bridge_live_subservers", bridge_inventory_fails)
+        connectors = web_server._connector_summary(
+            {"mcp_servers": {"aiwerk_bridge": {"url": "http://127.0.0.1:8000/mcp", "enabled": True}}},
+            {},
+            {},
+            {},
+        )
+
+        assert [connector["label"] for connector in connectors] == ["AIWerk Bridge"]
+        assert "children" not in connectors[0]
+
+    def test_aiwerk_bridge_connectors_use_explicit_config_instead_of_demo_catalog(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def bridge_inventory_should_not_be_called(config):
+            raise AssertionError("explicit dashboard subservers should be used without live fallback")
+
+        monkeypatch.setattr(web_server, "_aiwerk_bridge_live_subservers", bridge_inventory_should_not_be_called)
+        connectors = web_server._connector_summary(
+            {
+                "dashboard": {"aiwerk_bridge": {"subservers": ["microsoft-calendar", "vault"]}},
+                "mcp_servers": {"aiwerk_bridge": {"url": "http://127.0.0.1:8000/mcp", "enabled": True}},
+            },
+            {},
+            {},
+            {},
+        )
+
+        bridge = connectors[0]
+        assert [child["label"] for child in bridge["children"]] == ["Microsoft Calendar", "Vault"]
+        assert "CoinMarketCap" not in [child["label"] for child in bridge["children"]]
+
+    def test_aiwerk_bridge_connector_status_comes_from_live_inventory(self):
+        import hermes_cli.web_server as web_server
+
+        item = web_server._aiwerk_bridge_subserver_item(
+            "microsoft-calendar",
+            {"status": "disconnected", "description": "Starts on demand"},
+        )
+
+        assert item["label"] == "Microsoft Calendar"
+        assert item["status"] == "limited"
+        assert item["status_label"] == "Eingeschränkt"
+        assert item["description"] == "Starts on demand"
+
     def test_assistant_todo_update_marks_item_done_and_invalidates_cache(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
