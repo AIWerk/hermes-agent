@@ -3632,6 +3632,185 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert "id=event-1" in summary["items"][0]["open_url"]
         assert summary["accounts"][1]["items"][0]["open_url"].startswith("/api/assistant/calendar/view?")
 
+    def test_microsoft_calendar_summary_reads_graph_events_from_bridge(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+        event_a = "AQMk-long-shared-prefix-AAAA"
+        event_b = "AQMk-long-shared-prefix-BBBB"
+
+        def fake_bridge_call(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            return {
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
+                            "value": [
+                                {
+                                    "id": event_b,
+                                    "subject": "Zweiter Termin",
+                                    "start": {"dateTime": "2026-07-15T11:00:00.0000000", "timeZone": "UTC"},
+                                    "end": {"dateTime": "2026-07-15T11:30:00.0000000", "timeZone": "UTC"},
+                                    "location": {"displayName": "Bern"},
+                                    "organizer": {"emailAddress": {"name": "Susanne Meer", "address": "meerwohnenag@outlook.com"}},
+                                    "webLink": "https://outlook.live.com/calendar/item-b",
+                                },
+                                {
+                                    "id": event_a,
+                                    "subject": "Erster Termin",
+                                    "start": {"dateTime": "2026-07-14T10:00:00.0000000", "timeZone": "UTC"},
+                                    "end": {"dateTime": "2026-07-14T10:30:00.0000000", "timeZone": "UTC"},
+                                    "location": {"displayName": "Zürich"},
+                                    "webLink": "https://outlook.live.com/calendar/item-a",
+                                },
+                            ]
+                        }),
+                    }],
+                }
+            }
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+
+        summary = getattr(web_server, "_calendar_summary")({
+            "calendar": {
+                "accounts": [{
+                    "backend": "microsoft_calendar",
+                    "label": "Susanne Meer Outlook",
+                    "address": "meerwohnenag@outlook.com",
+                    "mcp_server": "microsoft-calendar",
+                    "max_results": 5,
+                }]
+            }
+        })
+
+        assert calls == [{
+            "server": "microsoft-calendar",
+            "tool": "get-calendar-view",
+            "params": {
+                "startDateTime": calls[0]["params"]["startDateTime"],
+                "endDateTime": calls[0]["params"]["endDateTime"],
+            },
+        }]
+        assert summary["status"] == "connected"
+        assert summary["summary"] == "2 kommende Termine"
+        assert summary["accounts"][0]["source"] == "microsoft_calendar"
+        assert summary["accounts"][0]["label"] == "Susanne Meer Outlook"
+        assert [item["title"] for item in summary["items"]] == ["Erster Termin", "Zweiter Termin"]
+        assert [item["id"] for item in summary["items"]] == [event_a, event_b]
+        assert len({item["id"] for item in summary["items"]}) == 2
+        assert summary["items"][0]["account_address"] == "meerwohnenag@outlook.com"
+        assert "account=meerwohnenag%40outlook.com" in summary["items"][0]["open_url"]
+        assert "id=AQMk-long-shared-prefix-AAAA" in summary["items"][0]["open_url"]
+
+    def test_microsoft_calendar_summary_preserves_graph_timezone_context(self):
+        import hermes_cli.web_server as web_server
+
+        assert web_server._microsoft_graph_datetime({"dateTime": "2026-07-14T10:15:00.0000000", "timeZone": "UTC"}) == "2026-07-14T10:15:00.0000000Z"
+        assert web_server._microsoft_graph_datetime({"dateTime": "2026-07-14T10:15:00.0000000", "timeZone": "W. Europe Standard Time"}) == "2026-07-14T10:15:00.0000000 [W. Europe Standard Time]"
+        assert web_server._microsoft_graph_datetime({"date": "2026-07-14", "timeZone": "UTC"}) == "2026-07-14"
+
+    def test_microsoft_calendar_account_lookup_accepts_user_principal_name(self):
+        import hermes_cli.web_server as web_server
+
+        account = web_server._calendar_account_config_for_ref({
+            "calendar": {
+                "accounts": [{
+                    "backend": "microsoft_calendar",
+                    "label": "Susanne Meer Outlook",
+                    "user_principal_name": "meerwohnenag@outlook.com",
+                    "mcp_server": "microsoft-calendar",
+                }]
+            }
+        }, "meerwohnenag@outlook.com")
+
+        assert account is not None
+        assert account["backend"] == "microsoft_calendar"
+
+    def test_microsoft_calendar_summary_surfaces_bridge_auth_error(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def fake_bridge_call(config, *, server, tool, params):
+            return {"isError": True, "result": {"content": [{"type": "text", "text": "Authentication required: token expired"}]}}
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_call)
+
+        summary = getattr(web_server, "_microsoft_calendar_summary")(
+            {},
+            {"backend": "outlook", "address": "meerwohnenag@outlook.com"},
+            now=datetime(2026, 7, 1, 8, 0, tzinfo=timezone.utc),
+        )
+
+        assert summary is not None
+        assert summary["status"] == "auth_required"
+        assert summary["summary"] == "Outlook Kalender neu verbinden"
+        assert summary["source"] == "microsoft_calendar"
+        assert summary["items"] == []
+
+    def test_assistant_calendar_viewer_fetches_microsoft_detail(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_assistant_resources_payload", lambda request, force_refresh=False, **kwargs: {
+            "calendar": {
+                "accounts": [{
+                    "address": "meerwohnenag@outlook.com",
+                    "label": "Susanne Meer Outlook",
+                    "items": [{
+                        "id": "ms-event-1",
+                        "event_id": "ms-event-1",
+                        "title": "BPW",
+                        "starts_at": "2026-07-14T10:15:00Z",
+                        "ends_at": "2026-07-14T10:45:00Z",
+                        "source": "microsoft_calendar",
+                    }],
+                }]
+            }
+        })
+        monkeypatch.setattr(web_server, "load_config", lambda: {
+            "calendar": {
+                "accounts": [{
+                    "backend": "microsoft_calendar",
+                    "label": "Susanne Meer Outlook",
+                    "address": "meerwohnenag@outlook.com",
+                    "mcp_server": "microsoft-calendar",
+                }]
+            }
+        })
+        calls = []
+
+        def fake_bridge_tool(config, *, server, tool, params):
+            calls.append({"server": server, "tool": tool, "params": params})
+            return {
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
+                            "id": "ms-event-1",
+                            "subject": "BPW Detail",
+                            "bodyPreview": "Bitte vorbereiten <script>alert(1)</script>",
+                            "start": {"dateTime": "2026-07-14T10:15:00Z", "timeZone": "UTC"},
+                            "end": {"dateTime": "2026-07-14T10:45:00Z", "timeZone": "UTC"},
+                            "location": {"displayName": "Bern<script>alert(1)</script>"},
+                            "webLink": "https://outlook.live.com/calendar/item",
+                        }),
+                    }]
+                }
+            }
+
+        monkeypatch.setattr(web_server, "_call_aiwerk_bridge_tool", fake_bridge_tool)
+
+        resp = self.client.get("/api/assistant/calendar/view?account=meerwohnenag%40outlook.com&id=ms-event-1")
+
+        assert resp.status_code == 200
+        text = resp.text
+        assert "BPW Detail" in text
+        assert "Bern&lt;script&gt;alert(1)&lt;/script&gt;" in text
+        assert "Bitte vorbereiten" in text
+        assert "<script>alert(1)</script>" not in text
+        assert "outlook.live.com" not in text
+        assert "[LINK]" in text
+        assert calls == [{"server": "microsoft-calendar", "tool": "get-calendar-event", "params": {"eventId": "ms-event-1"}}]
+
     def test_google_workspace_calendar_summary_requests_default_event_type_filter(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
