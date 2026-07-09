@@ -30,6 +30,53 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_happy_path_connect_attempt_logs_at_info_not_warning(monkeypatch, caplog):
+    """Normal Telegram startup progress should not look like a warning."""
+    fake_app = MagicMock()
+    fake_app.bot = MagicMock()
+    fake_app.initialize = AsyncMock(return_value=None)
+    fake_app.start = AsyncMock()
+    fake_app.add_handler = MagicMock()
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", lambda awaitable, timeout, **_: awaitable)
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+    monkeypatch.setattr(adapter, "_delete_webhook_best_effort", AsyncMock())
+    monkeypatch.setattr(adapter, "_start_polling_resilient", AsyncMock(return_value=True))
+    monkeypatch.setattr(adapter, "_polling_heartbeat_loop", AsyncMock(return_value=None))
+    monkeypatch.setattr(adapter, "_start_post_connect_housekeeping", MagicMock())
+
+    caplog.set_level("INFO", logger=tg_adapter.logger.name)
+
+    assert await adapter.connect() is True
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Connecting to Telegram (attempt 1/8)" in msg for msg in messages)
+    assert not any(
+        record.levelname == "WARNING" and "Connecting to Telegram" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelname == "WARNING" and "Discovering Telegram API fallback IPs" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch):
     """A wedged initialize() attempt must not trap startup on attempt 1/8."""
     fake_app = MagicMock()
