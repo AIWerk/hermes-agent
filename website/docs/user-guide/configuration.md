@@ -621,13 +621,13 @@ With `memory.write_approval: true`, memory writes need your approval before they
 Controls how much content Hermes loads from each automatic context file before applying head/tail truncation. This applies to files injected into the system prompt such as `SOUL.md`, `.hermes.md`, `AGENTS.md`, `CLAUDE.md`, and `.cursorrules`. It does **not** affect the `read_file` tool.
 
 ```yaml
-context_file_max_chars: 20000  # default
+context_file_max_chars: 81920  # default
 ```
 
 Raise it when you intentionally keep larger identity or project-context files and run models with enough context window to carry them:
 
 ```yaml
-context_file_max_chars: 25000
+context_file_max_chars: 100000
 ```
 
 ## File Read Safety
@@ -1973,7 +1973,7 @@ Hermes uses two different context scopes:
 - **Project context files use a priority system** — only ONE type is loaded (first match wins): `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules`. SOUL.md is always loaded independently.
 - **AGENTS.md** is hierarchical: if subdirectories also have AGENTS.md, all are combined.
 - Hermes automatically seeds a default `SOUL.md` if one does not already exist.
-- All loaded context files are capped at `context_file_max_chars` characters (default 20,000) with smart truncation.
+- All loaded context files are capped at `context_file_max_chars` characters (default 81,920) with smart truncation.
 
 See also:
 - [Personality & SOUL.md](/user-guide/features/personality)

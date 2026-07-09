@@ -1211,16 +1211,16 @@ def build_environment_hints() -> str:
     return "\n\n".join(hints)
 
 
-CONTEXT_FILE_MAX_CHARS = 20_000
+CONTEXT_FILE_MAX_CHARS = 81_920
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 
 # Dynamic-cap parameters (used when no explicit context_file_max_chars is set).
 # The cap scales with the model's context window so large-context models rarely
-# truncate a project doc, while small-context models stay at the historical
-# 20K floor. ~4 chars/token is the usual English heuristic; we spend a small
-# slice of the window on context files since they share the cached prefix with
-# the system prompt, tools, memory, and the whole conversation.
+# truncate a project doc, while small-context models stay at the 80 KiB floor.
+# ~4 chars/token is the usual English heuristic; we spend a small slice of the
+# window on context files since they share the cached prefix with the system
+# prompt, tools, memory, and the whole conversation.
 _CONTEXT_FILE_CHARS_PER_TOKEN = 4
 _CONTEXT_FILE_WINDOW_FRACTION = 0.06
 _CONTEXT_FILE_DYNAMIC_CEILING = 500_000
@@ -1229,9 +1229,9 @@ _CONTEXT_FILE_DYNAMIC_CEILING = 500_000
 def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
     """Derive a char cap from the model's context window.
 
-    Returns at least ``CONTEXT_FILE_MAX_CHARS`` (the historical 20K floor) and
-    at most ``_CONTEXT_FILE_DYNAMIC_CEILING``. When ``context_length`` is
-    unknown/invalid, returns the flat default so behavior is unchanged.
+    Returns at least ``CONTEXT_FILE_MAX_CHARS`` (the 80 KiB floor) and at most
+    ``_CONTEXT_FILE_DYNAMIC_CEILING``. When ``context_length`` is unknown/invalid,
+    returns the flat default so behavior is unchanged.
     """
     if not isinstance(context_length, int) or context_length <= 0:
         return CONTEXT_FILE_MAX_CHARS
@@ -1248,8 +1248,8 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
       1. Explicit ``context_file_max_chars`` in config.yaml — user knows best,
          always wins (including over the dynamic cap).
       2. Dynamic cap derived from the model's ``context_length`` when provided
-         (scales the budget to the window; floor 20K, ceiling 500K).
-      3. ``CONTEXT_FILE_MAX_CHARS`` (20K) as the upstream-compatible fallback.
+         (scales the budget to the window; floor 80 KiB, ceiling 500K).
+      3. ``CONTEXT_FILE_MAX_CHARS`` (80 KiB) as the fallback.
     """
     try:
         from hermes_cli.config import load_config
@@ -1980,7 +1980,7 @@ def build_context_files_prompt(
 
     Each context source is capped before injection. The cap defaults to the
     model's context window (scaled — see ``_dynamic_context_file_max_chars``)
-    when *context_length* is provided, falling back to 20,000 chars otherwise.
+    when *context_length* is provided, falling back to 81,920 chars otherwise.
     An explicit ``context_file_max_chars`` in config.yaml always wins.
 
     When *skip_soul* is True, SOUL.md is not included here (it was already

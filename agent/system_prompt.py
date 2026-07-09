@@ -137,8 +137,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
-    # None falls back to the historical flat default. This value is stable for
-    # the life of the conversation, so it does not threaten prompt caching.
+    # None falls back to the flat default. This value is stable for the life of
+    # the conversation, so it does not threaten prompt caching.
     _ctx_len: Optional[int] = None
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None:

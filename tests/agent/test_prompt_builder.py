@@ -142,8 +142,8 @@ class TestTruncateContent:
 
         monkeypatch.setattr("hermes_cli.config.load_config", default_load_config)
 
-    def test_context_file_max_chars_default_matches_upstream_limit(self):
-        assert CONTEXT_FILE_MAX_CHARS == 20_000
+    def test_context_file_max_chars_default_matches_aiwerk_limit(self):
+        assert CONTEXT_FILE_MAX_CHARS == 81_920
 
     def test_short_content_unchanged(self):
         content = "Short content"
@@ -248,14 +248,14 @@ class TestDynamicContextFileCap:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
 
     def test_dynamic_floor_for_small_window(self):
-        # A small context window never drops below the historical 20K floor.
+        # A small context window never drops below the default 80 KiB floor.
         assert _dynamic_context_file_max_chars(8_000) == CONTEXT_FILE_MAX_CHARS
 
     def test_dynamic_scales_above_floor_for_large_window(self):
-        # 200K-token window → ~48K (200000 * 4 * 0.06), well above the floor
+        # 400K-token window → ~96K (400000 * 4 * 0.06), well above the floor
         # and above Codex's 32 KiB project_doc default.
-        cap = _dynamic_context_file_max_chars(200_000)
-        assert cap == 48_000
+        cap = _dynamic_context_file_max_chars(400_000)
+        assert cap == 96_000
         assert cap > CONTEXT_FILE_MAX_CHARS
 
     def test_dynamic_respects_ceiling(self):
@@ -268,7 +268,7 @@ class TestDynamicContextFileCap:
 
     def test_get_context_file_max_chars_uses_context_length(self):
         # With no explicit config, the resolver derives the cap from context.
-        assert _get_context_file_max_chars(200_000) == 48_000
+        assert _get_context_file_max_chars(400_000) == 96_000
         assert _get_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
 
     def test_explicit_config_beats_dynamic(self, monkeypatch):
@@ -277,19 +277,19 @@ class TestDynamicContextFileCap:
             "hermes_cli.config.load_config",
             lambda: {"context_file_max_chars": 1_000},
         )
-        assert _get_context_file_max_chars(200_000) == 1_000
+        assert _get_context_file_max_chars(400_000) == 1_000
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
-        # A 30K-char AGENTS.md is truncated at the flat default but survives
-        # whole on a large-context model (dynamic cap ~48K).
-        content = "z" * 30_000
+        # A 90K-char AGENTS.md is truncated at the 80 KiB floor but survives
+        # whole on a large-context model (dynamic cap ~96K).
+        content = "z" * 90_000
         small = _truncate_content(content, "AGENTS.md", context_length=8_000)
-        big = _truncate_content(content, "AGENTS.md", context_length=200_000)
+        big = _truncate_content(content, "AGENTS.md", context_length=400_000)
         assert "truncated" in small.lower()
         assert big == content
 
     def test_marker_points_to_read_path(self):
-        content = "h" * 50_000
+        content = "h" * 90_000
         result = _truncate_content(
             content, "AGENTS.md", context_length=8_000,
             read_path="/proj/AGENTS.md",
@@ -298,7 +298,7 @@ class TestDynamicContextFileCap:
         assert "/proj/AGENTS.md" in result
 
     def test_marker_defaults_to_filename_without_read_path(self):
-        result = _truncate_content("h" * 50_000, "AGENTS.md", context_length=8_000)
+        result = _truncate_content("h" * 90_000, "AGENTS.md", context_length=8_000)
         assert "read_file" in result
         assert "AGENTS.md" in result
 
