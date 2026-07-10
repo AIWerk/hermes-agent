@@ -73,7 +73,11 @@ _ADMIN_READONLY_SUBCOMMANDS = {
 
 def _split_command(command: str) -> list[str]:
     try:
-        return shlex.split(command, comments=False, posix=True)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+        lexer.whitespace_split = True
+        lexer.whitespace = " \t\r"
+        lexer.commenters = ""
+        return list(lexer)
     except ValueError:
         return []
 
@@ -92,6 +96,51 @@ def _first_non_option(args: list[str]) -> str:
         if not arg.startswith("-"):
             return arg.lower()
     return ""
+
+
+_ADMIN_GLOBAL_VALUE_OPTIONS = {
+    "systemctl": {
+        "--host", "-H", "--machine", "-M", "--root", "--image",
+        "--image-policy", "--type", "-t", "--state", "--property", "-p",
+        "--output", "-o", "--lines", "-n", "--job-mode", "--signal",
+        "--kill-whom", "--kill-value", "--what", "--check-inhibitors",
+    },
+    "kubectl": {
+        "--as", "--as-group", "--as-uid", "--cache-dir",
+        "--certificate-authority", "--client-certificate", "--client-key",
+        "--cluster", "--context", "--kubeconfig", "--kuberc", "--namespace", "-n",
+        "--password", "--profile", "--profile-output", "--request-timeout",
+        "--server", "-s", "--tls-server-name", "--token", "--user",
+        "--username", "-v",
+    },
+    "helm": {
+        "--burst-limit", "--kube-apiserver", "--kube-as-group",
+        "--kube-as-user", "--kube-ca-file", "--kube-context", "--kube-token",
+        "--kube-tls-server-name", "--kubeconfig", "--namespace", "-n", "--qps",
+        "--registry-config", "--repository-cache", "--repository-config",
+    },
+    "terraform": {"-chdir"},
+}
+
+
+def _admin_subcommand_and_rest(cmd: str, args: list[str]) -> tuple[str, list[str]]:
+    value_options = _ADMIN_GLOBAL_VALUE_OPTIONS.get(cmd, set())
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if not arg.startswith("-"):
+            return arg.lower(), args[index + 1 :]
+        bare = arg.split("=", 1)[0]
+        if bare in value_options and "=" not in arg:
+            index += 2
+        else:
+            index += 1
+    if index < len(args):
+        return args[index].lower(), args[index + 1 :]
+    return "", []
 
 
 # git global options that consume a following value token; the verb (push, etc.)
@@ -136,7 +185,7 @@ def _eval_payloads(tokens: list[str]) -> list[str]:
     for index, token in enumerate(tokens[:-1]):
         if token == "eval":
             rest = tokens[index + 1 :]
-            if len(rest) == 1:
+            if len(rest) == 1 or any(char.isspace() for char in rest[0]):
                 payload = rest[0].strip()
             else:
                 payload = shlex.join(rest).strip()
@@ -231,11 +280,32 @@ def _rm_requires_verification(args: list[str]) -> bool:
     return bool(recursive and force)
 
 
+def _chown_requires_verification(args: list[str]) -> bool:
+    arg_text = " ".join(args).lower()
+    if re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text):
+        return True
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        bare = arg.split("=", 1)[0]
+        if bare == "--reference":
+            return True
+        if bare == "--from" and "=" not in arg:
+            index += 2
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        owner = arg.lower()
+        return bool(re.fullmatch(r"(?:root|\+?0)(?::[^\s]*)?|:(?:root|\+?0)", owner))
+    return False
+
+
 # Shell statement / pipeline separators. A compound command is split on these
 # so EACH segment is classified independently — a benign leading segment can no
 # longer hide a dangerous trailing one (and a benign segment is not over-blocked
 # by the coarse regex just because a later segment is sensitive).
-_SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "|&"}
+_SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "|&", "\n"}
 
 
 def _split_segments(tokens: list[str]) -> list[list[str]]:
@@ -282,12 +352,25 @@ def _structured_segment_verdict(
         return True
 
     if cmd in _ADMIN_MUTATING_SUBCOMMANDS:
-        if cmd == "service" and len(args) >= 2:
-            verb = args[1].lower()
+        if cmd == "service":
+            verb = args[1].lower() if len(args) >= 2 else ""
+            rest = args[2:] if len(args) >= 2 else []
+        else:
+            verb, rest = _admin_subcommand_and_rest(cmd, args)
+
+        if cmd == "kubectl" and verb == "config":
+            nested, _ = _admin_subcommand_and_rest(cmd, rest)
+            return bool(nested and nested not in {"view", "current-context", "get-contexts"})
+        if cmd == "helm" and verb == "repo":
+            nested, _ = _admin_subcommand_and_rest(cmd, rest)
+            return bool(nested and nested != "list")
+        if cmd == "terraform" and verb == "workspace":
+            nested, _ = _admin_subcommand_and_rest(cmd, rest)
+            return bool(nested and nested not in {"list", "show"})
         if verb in _ADMIN_READONLY_SUBCOMMANDS.get(cmd, set()):
             return False
         if cmd == "kubectl" and verb == "rollout":
-            return any(arg.lower() == "restart" for arg in args)
+            return any(arg.lower() == "restart" for arg in rest)
         return verb in _ADMIN_MUTATING_SUBCOMMANDS[cmd]
 
     if cmd == "docker":
@@ -308,8 +391,7 @@ def _structured_segment_verdict(
     if cmd == "chmod":
         return _chmod_requires_verification(args)
     if cmd == "chown":
-        arg_text = " ".join(args).lower()
-        return "root" in args or bool(re.search(r"(^|\s)-(?:\S*r\S*|\S*recursive\S*)\b", arg_text))
+        return _chown_requires_verification(args)
     if cmd == "rm":
         return _rm_requires_verification(args)
     if cmd in {"dd", "mkfs"}:
@@ -340,8 +422,49 @@ def _segment_text(tokens: list[str]) -> str:
         return " ".join(tokens)
 
 
+def _has_executable_command_substitution(command: str) -> bool:
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not single_quoted:
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not double_quoted:
+            single_quoted = not single_quoted
+            index += 1
+            continue
+        if single_quoted:
+            index += 1
+            continue
+        if char == '"':
+            double_quoted = not double_quoted
+            index += 1
+            continue
+        if char == "`" or (
+            char == "$"
+            and index + 1 < len(command)
+            and command[index + 1] in {"(", "'"}
+        ):
+            return True
+        index += 1
+    return False
+
+
 def _requires_operator_verification(command: str, config: OperatorVerificationConfig) -> bool:
-    tokens = _split_command(command)
+    if _has_executable_command_substitution(command):
+        return True
+    raw_tokens = _split_command(command)
+    if raw_tokens and _wrapped_shell_requires_operator_verification(raw_tokens, config):
+        return True
+    tokens = raw_tokens
     if not tokens:
         return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
     # OR semantics: structured parse, eval payloads, AND the raw-string regex are

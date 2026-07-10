@@ -627,6 +627,180 @@ def test_operator_verification_still_blocks_mutating_admin_tool_subcommands():
         assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
 
 
+def test_operator_verification_allows_compound_read_only_status_pipeline():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    command = (
+        "systemctl --user --no-pager --plain status hermes-gateway.service 2>/dev/null "
+        "| sed -n '1,25p'; printf '\\n'; "
+        "systemctl --user --no-pager --plain status hermes-honcho.service 2>/dev/null "
+        "| sed -n '1,25p'"
+    )
+    newline_command = "systemctl status a.service\nsystemctl status b.service"
+
+    assert operator_verification_block_reason_for_command(command, config=config, now=100) is None
+    assert operator_verification_block_reason_for_command(newline_command, config=config, now=100) is None
+
+
+def test_operator_verification_blocks_newline_delimited_mutations():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    blocked = [
+        "systemctl status demo.service\nsystemctl restart demo.service",
+        "kubectl get pods\nkubectl delete pod web-1",
+        "helm repo list\nhelm repo remove vendor",
+        "terraform workspace list\nterraform destroy",
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_fails_closed_on_sensitive_command_substitution():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    blocked = [
+        'systemctl status "$(systemctl restart demo.service)"',
+        "kubectl get pods --selector \"$(kubectl delete pod web-1)\"",
+        "helm repo list `helm repo remove vendor`",
+        "echo \"$(git $'push' --force origin main)\"",
+        "echo \"$(sys'temctl' restart demo.service)\"",
+        'echo "$(date)"',
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_fails_closed_on_single_quoted_sensitive_literals():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    blocked = [
+        "echo '$(systemctl restart demo.service)'",
+        "printf '%s\\n' '`kubectl delete pod web-1`'",
+        "echo '$(systemctl restart demo.service)'>/tmp/x",
+        "printf '%s' '`kubectl delete pod web-1`'>/tmp/x",
+        "echo '$(systemctl restart demo.service)'2>/dev/null",
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+    assert operator_verification_block_reason_for_command(
+        "echo 'ordinary literal text'", config=config, now=100
+    ) is None
+
+
+def test_operator_verification_blocks_shell_quote_concatenation_bypasses():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    blocked = [
+        "sys'temctl' restart demo.service",
+        "git $'push' --force origin main",
+        "git p'us'h --force origin main",
+        "kub'ectl' delete pod web-1",
+        "helm r'epo' remove vendor",
+        "terraform des'troy'",
+        "docker r'm' prod",
+        "kubectl 'delete' pod web-1",
+        "'kubectl' delete pod web-1",
+        "systemctl 'restart' demo.service",
+        "'git' 'push' --force origin main",
+        "helm 'repo' 'remove' vendor",
+        "terraform 'destroy'",
+        "chown 'root' file",
+        "rm '-rf' /tmp/x",
+        "git $'pu\\x73h' --force origin main",
+        "git $'pu\\163h' --force origin main",
+        "s$'\\x79s'temctl restart demo.service",
+        "kub$'\\145'ctl delete pod web-1",
+        "helm r$'\\145'po remove vendor",
+        "terraform de$'\\x73'troy",
+        "docker $'\\x72m' prod",
+        "eval $'git pu\\x73h --force origin main'",
+        "eval $'sys\\x74emctl restart demo.service'",
+        "systemctl status demo.service\nsys'temctl' restart demo.service",
+        'eval "git $\'push\' --force origin main"',
+        "eval git $'push' --force origin main",
+        'eval "git p\'us\'h --force origin main"',
+        'eval "sys\'temctl\' restart demo.service"',
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_blocks_mutations_after_global_value_options():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    blocked = [
+        "systemctl --host remote restart demo.service",
+        "systemctl --root /tmp/root enable demo.service",
+        "systemctl --image /tmp/os.raw disable demo.service",
+        "systemctl --output short restart demo.service",
+        "systemctl --check-inhibitors auto restart demo.service",
+        "kubectl --context prod delete pod web-1",
+        "kubectl --as alice delete pod web-1",
+        "kubectl --cache-dir /tmp/cache delete pod web-1",
+        "kubectl --kuberc /tmp/k delete pod web-1",
+        "helm --namespace prod upgrade app ./chart",
+        "terraform -chdir /srv/tf apply",
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_classifies_nested_admin_subcommands():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    allowed = [
+        "kubectl config view",
+        "kubectl config current-context",
+        "kubectl config --kubeconfig /tmp/k view",
+        "helm repo list",
+        "helm repo --repository-config /tmp/r list",
+        "terraform workspace list",
+        "terraform workspace show",
+    ]
+    blocked = [
+        "kubectl config set-context prod --namespace=app",
+        "kubectl config delete-context prod",
+        "helm repo add vendor https://example.invalid",
+        "helm repo remove vendor",
+        "terraform workspace new prod",
+        "terraform workspace select prod",
+        "terraform workspace delete prod",
+    ]
+
+    for command in allowed:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is None, command
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
+def test_operator_verification_blocks_root_chown_target_forms():
+    clear_operator_verification_cache()
+    config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
+    blocked = [
+        "chown root file",
+        "chown root:root file",
+        "chown root:users file",
+        "chown 0 file",
+        "chown 0:0 file",
+        "chown 0:users file",
+        "chown +0 file",
+        "chown +0:+0 file",
+        "chown :root file",
+        "chown :0 file",
+        "chown --from user root:root file",
+        "chown --reference privileged-file target-file",
+    ]
+
+    for command in blocked:
+        assert operator_verification_block_reason_for_command(command, config=config, now=100) is not None, command
+
+
 def test_operator_verification_allows_normal_user_file_and_git_operations():
     clear_operator_verification_cache()
     config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
