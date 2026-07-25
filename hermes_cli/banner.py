@@ -378,7 +378,7 @@ def check_for_updates() -> Optional[int]:
     try:
         payload = {"ts": now, "behind": behind, "ver": VERSION}
         payload.update(cache_identity)
-        cache_file.write_text(json.dumps(payload))
+        cache_file.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
 

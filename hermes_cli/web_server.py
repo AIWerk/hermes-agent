@@ -1909,7 +1909,14 @@ def _run_himalaya_envelope_list(*, query: list[str] | None = None, page_size: in
     cmd.extend(["--page-size", str(page_size), "--output", "json"])
     if query:
         cmd.extend(query)
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS,
+    )
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "himalaya failed").strip())
     stdout = (proc.stdout or "").strip()
@@ -1935,7 +1942,14 @@ def _run_himalaya_message_read(*, message_id: str, account: str | None = None, f
     if folder:
         cmd.extend(["--folder", folder])
     cmd.append(clean_message_id)
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS,
+    )
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "himalaya message read failed").strip())
     return proc.stdout or ""
