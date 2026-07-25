@@ -10,7 +10,7 @@ import { type TestInfo } from '@playwright/test'
 import { expect, test, type Page } from './test'
 
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
-import { CORRECTION_SWITCH_TRIGGER, MOCK_REPLY } from './mock-server'
+import { CORRECTION_SWITCH_TRIGGER, MOCK_REPLY, MOCK_TITLE } from './mock-server'
 
 const OTHER_SESSION_PROMPT = 'E2E persisted session used for a warm resume.'
 const ORIGINAL_PROMPT = `${CORRECTION_SWITCH_TRIGGER}: original prompt must remain singular after a correction.`
@@ -170,7 +170,7 @@ test.describe('correction session switch', () => {
 
     // Reproduce the observed race: switch to another persisted session while
     // the foreground tool is live, then return before its redirect settles.
-    await openSidebarSession(page, MOCK_REPLY, OTHER_SESSION_PROMPT)
+    await openSidebarSession(page, MOCK_TITLE, OTHER_SESSION_PROMPT)
     await reopenOriginalSession(page)
     await page.waitForTimeout(500)
     await page.screenshot({ path: testInfo.outputPath('correction-after-warm-resume.png') })
@@ -197,7 +197,7 @@ test.describe('correction session switch', () => {
     await send(page, INFERENCE_CORRECTION)
     await waitForTranscriptText(page, INFERENCE_CORRECTION)
 
-    await openSidebarSession(page, MOCK_REPLY, OTHER_SESSION_PROMPT)
+    await openSidebarSession(page, MOCK_TITLE, OTHER_SESSION_PROMPT)
     await reopenInferenceSession(page)
 
     expect(await textNodeOccurrences(page, INFERENCE_PROMPT)).toBe(1)

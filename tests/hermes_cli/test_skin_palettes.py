@@ -135,7 +135,10 @@ LIGHT_AUTHORED = frozenset({"daylight", "warm-lightmode"})
 def _base_palettes():
     """Yield (skin, palette, is_light) for every built-in's base `colors`."""
     for name, skin in _BUILTIN_SKINS.items():
-        yield name, skin.get("colors", {}), name in LIGHT_AUTHORED
+        # Branding-only variants intentionally inherit the default palette.
+        if "colors" not in skin:
+            continue
+        yield name, skin["colors"], name in LIGHT_AUTHORED
 
 
 def _overlays():

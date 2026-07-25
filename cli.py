@@ -8056,7 +8056,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         old_session_id = self.session_id
         if self.agent:
             try:
-                self.agent._flush_messages_to_session_db(self.conversation_history)
+                self.agent._flush_messages_to_session_db(
+                    self.conversation_history,
+                    conversation_history=self.conversation_history,
+                )
             except Exception:
                 pass
         # End current session
@@ -8071,10 +8074,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pending_title = None
         _sync_process_session_id(target_id)
 
-        # Load conversation history (strip transcript-only metadata entries)
-        restored = self._session_db.get_messages_as_conversation(target_id)
-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
-        self.conversation_history = restored
+        # Load model and display histories separately. Display-only rows must
+        # remain visible after resume without being sent back to the model.
+        model_history, display_history = self._session_db.get_resume_conversations(target_id)
+        self.conversation_history = [
+            m for m in (model_history or []) if m.get("role") != "session_meta"
+        ]
+        self._resume_display_history = [
+            m for m in (display_history or []) if m.get("role") != "session_meta"
+        ]
+        self._restore_session_cwd(session_meta)
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -8420,7 +8429,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if self.agent:
             try:
-                self.agent._flush_messages_to_session_db(self.conversation_history)
+                self.agent._flush_messages_to_session_db(
+                    self.conversation_history,
+                    conversation_history=self.conversation_history,
+                )
             except Exception:
                 pass
 

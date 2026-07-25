@@ -39,7 +39,7 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
   writeMockProviderConfig(sandbox.hermesHome, mock.url)
   fs.appendFileSync(
     path.join(sandbox.hermesHome, 'config.yaml'),
-    '\ncompression:\n  threshold_tokens: 1\n',
+    '\ncompression:\n  threshold_tokens: 40000\n',
     'utf8',
   )
   writeEnvFile(sandbox.hermesHome)

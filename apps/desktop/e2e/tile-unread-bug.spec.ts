@@ -116,7 +116,7 @@ test.describe('sidebar states — tab (hidden) unread is correct', () => {
 
     // ⌃-click opens the session as a TAB (center dock = stacked, not visible
     // unless it's the active tab). The session is NOT on screen.
-    const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.finalText)
+    const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.titleText)
     await row.click({ modifiers: ['Control'] })
     await page.waitForTimeout(2000)
 
@@ -164,7 +164,7 @@ test.describe.skip('sidebar states — split (visible) unread bug (RED)', () => 
     // Drag the session row from the sidebar to the right edge of the workspace
     // zone to create a SPLIT (side-by-side) tile. This triggers the real
     // startSessionDrag → onCommit → openSessionTile(id, 'right', anchor) path.
-    const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.finalText)
+    const row = sessionRow(page, SIDEBAR_CROSS_TEXTS.titleText)
     const rowBox = await row.boundingBox()
     expect(rowBox, 'session row must be visible').not.toBeNull()
 

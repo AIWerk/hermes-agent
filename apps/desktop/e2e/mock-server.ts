@@ -19,6 +19,10 @@ import type { ServerResponse } from 'node:http'
 
 /** A canned assistant reply used for every chat completion request. */
 export const MOCK_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
+export function generatedTitle(text: string): string {
+  return text.replace(/[\s.?!:;,-]+$/g, '')
+}
+export const MOCK_TITLE = generatedTitle(MOCK_REPLY)
 
 export interface MockServerOptions {
   /** Pause the matching stream after its first token for session-switch E2E coverage. */
@@ -756,6 +760,8 @@ export const SIDEBAR_CROSS_TEXTS = {
   interimText: SIDEBAR_CROSS_SCRIPT[0].text,
   /** The final answer text. */
   finalText: SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text,
+  /** Canonical generated session title. */
+  titleText: generatedTitle(SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text),
   /** The longer background process command (sleep 5). */
   bgCommand: 'echo "long bg output" && sleep 5 && echo "finished"',
   /** The subagent's goal. */

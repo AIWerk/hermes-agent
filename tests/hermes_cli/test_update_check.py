@@ -69,13 +69,14 @@ def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_REVISION", raising=False)
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner.subprocess.run") as mock_run, \
+         patch("hermes_cli.banner.check_via_pypi", return_value=0) as mock_pypi:
         result = banner.check_for_updates()
 
-    # Stale-version cache rejected -> fresh check ran. No git checkout and no
-    # embedded rev means we can't determine update status, so result is None.
-    assert result is None
+    # Stale-version cache rejected -> fresh PyPI fallback check ran.
+    assert result == 0
     mock_run.assert_not_called()
+    mock_pypi.assert_called_once_with()
 
     # Cache rewritten with the current installed version.
     written = json.loads(cache_file.read_text())
@@ -231,7 +232,7 @@ def test_check_via_local_git_full_clone_keeps_exact_count(tmp_path):
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
-    """Returns None when .git directory doesn't exist anywhere (no source tree)."""
+    """Falls back to PyPI when no source-tree .git directory exists."""
     import hermes_cli.banner as banner
 
     # Create a fake banner.py so the fallback path also has no .git
@@ -241,10 +242,12 @@ def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
 
     monkeypatch.setattr(banner, "__file__", str(fake_banner))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner.subprocess.run") as mock_run, \
+         patch("hermes_cli.banner.check_via_pypi", return_value=0) as mock_pypi:
         result = banner.check_for_updates()
-    assert result is None
+    assert result == 0
     mock_run.assert_not_called()
+    mock_pypi.assert_called_once_with()
 
 
 def test_check_for_updates_fallback_to_project_root(tmp_path, monkeypatch):

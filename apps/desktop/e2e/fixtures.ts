@@ -154,6 +154,7 @@ export function writeMockProviderConfig(
   modelContextLength?: number,
 ): void {
   const configPath = path.join(hermesHome, 'config.yaml')
+  const contextLength = modelContextLength ?? 131_072
 
   const displaySection = extraDisplayConfig
     ? `\ndisplay:\n${extraDisplayConfig}\n`
@@ -163,7 +164,8 @@ export function writeMockProviderConfig(
 model:
   default: mock-model
   provider: mock
-${modelContextLength ? `  context_length: ${modelContextLength}\n` : ''}providers:
+  context_length: ${contextLength}
+providers:
   mock:
     api: ${mockUrl}/v1
     name: Mock
@@ -171,7 +173,7 @@ ${modelContextLength ? `  context_length: ${modelContextLength}\n` : ''}provider
     key_env: MOCK_API_KEY
     models:
       mock-model: {}
-    context_length: 4096
+    context_length: ${contextLength}
 ${displaySection}${extraConfig ? `\n${extraConfig.trim()}\n` : ''}`
 
   fs.writeFileSync(configPath, config, 'utf8')
