@@ -283,13 +283,18 @@ async def test_drain_path_does_not_echo_transcript_when_flag_off():
             "provider": "local_command",
         },
     ):
-        result = await runner._dequeue_pending_with_transcription(
-            adapter, "telegram:123", source,
+        result, transcripts = await runner._transcribe_and_echo_pending_voice(
+            adapter.get_pending_message(),
+            adapter,
+            source,
+            "",
+            log_context="test-voice-drain",
+            metadata={},
         )
 
     # Agent still receives the dictation as enriched text.
-    assert result is not None
     assert secret in result
+    assert transcripts == [secret]
     # But NOTHING is echoed back to the chat — no '🎙️ "..."' send at all.
     adapter.send.assert_not_awaited()
 
@@ -307,8 +312,13 @@ async def test_drain_path_echoes_transcript_only_when_flag_on():
             "provider": "local_command",
         },
     ):
-        await runner._dequeue_pending_with_transcription(
-            adapter, "telegram:123", source,
+        await runner._transcribe_and_echo_pending_voice(
+            adapter.get_pending_message(),
+            adapter,
+            source,
+            "",
+            log_context="test-voice-drain",
+            metadata={},
         )
 
     adapter.send.assert_awaited_once()

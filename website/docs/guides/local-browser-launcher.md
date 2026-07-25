@@ -2,7 +2,7 @@
 
 Hermes can connect its browser tools to a visible Chromium-family browser running on the user's own Linux desktop. The desktop opens reverse SSH tunnels to the agent host. Hermes only sees localhost endpoints on the agent host.
 
-This is useful for Rocky or VPS agents where the browser should appear on the user's Ubuntu desktop, not inside the VPS.
+This is useful for remote or VPS agents where the browser should appear on the user's Ubuntu desktop, not inside the VPS.
 
 ## Security boundary
 
@@ -132,7 +132,7 @@ and falls back to the normal connect path where possible.
 
 ### Port 22 vs 22222
 
-Set `ROCKY_BROWSER_SSH_PORT` to the SSH port exposed by the agent host. Some deployments use `22`; Rocky staging may use `22222`. A wrong port makes the reverse tunnel fail before Hermes sees the launcher.
+Set `ROCKY_BROWSER_SSH_PORT` to the SSH port exposed by the agent host. Some deployments use `22`; others use a nonstandard port such as `22222`. A wrong port makes the reverse tunnel fail before Hermes sees the launcher.
 
 ### Too many authentication failures
 

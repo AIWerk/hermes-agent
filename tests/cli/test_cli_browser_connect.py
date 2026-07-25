@@ -352,6 +352,8 @@ class TestChromeDebugLaunch:
         cli._pending_input = Queue()
         monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
 
+        # Patch the concrete HermesCLI method's imported readiness probe so no
+        # real network probe or browser launch happens on the test runner.
         with patch("cli.is_browser_debug_ready", return_value=True), \
              patch("tools.browser_tool.cleanup_all_browsers"), \
              patch("tools.browser_tool._ensure_cdp_supervisor"), \

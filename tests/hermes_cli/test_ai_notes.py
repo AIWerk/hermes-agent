@@ -21,19 +21,19 @@ def test_default_config_contains_disabled_ai_notes_section():
 
 
 def test_sanitize_slug_normalizes_to_safe_filename():
-    assert sanitize_slug("  Rocky Demo: Umsatz & Termine! ") == "rocky-demo-umsatz-termine"
+    assert sanitize_slug("  Demo Assistant: Umsatz & Termine! ") == "demo-assistant-umsatz-termine"
     assert sanitize_slug("../../etc/passwd") == "etc-passwd"
 
 
 def test_publish_html_note_writes_dated_html_and_returns_public_url(tmp_path):
     result = publish_html_note(
         html="<html><body><h1>Hallo</h1></body></html>",
-        title="Rocky Demo",
-        slug="Rocky Demo",
+        title="Demo Assistant",
+        slug="Demo Assistant",
         config={
             "enabled": True,
-            "agent_name": "rocky",
-            "public_base_url": "https://rocky.ainotes.ch/",
+            "agent_name": "demo-assistant",
+            "public_base_url": "https://notes.example.test/",
             "publish_root": str(tmp_path / "public"),
             "visibility": "public_static_html",
         },
@@ -41,9 +41,9 @@ def test_publish_html_note_writes_dated_html_and_returns_public_url(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["url"] == "https://rocky.ainotes.ch/2026-06-10/rocky-demo.html"
-    assert result["path"].endswith("/2026-06-10/rocky-demo.html")
-    assert (tmp_path / "public" / "2026-06-10" / "rocky-demo.html").read_text() == "<html><body><h1>Hallo</h1></body></html>"
+    assert result["url"] == "https://notes.example.test/2026-06-10/demo-assistant.html"
+    assert result["path"].endswith("/2026-06-10/demo-assistant.html")
+    assert (tmp_path / "public" / "2026-06-10" / "demo-assistant.html").read_text() == "<html><body><h1>Hallo</h1></body></html>"
 
 
 @pytest.mark.parametrize(
@@ -70,7 +70,7 @@ def test_publish_html_note_rejects_private_paths_and_secret_like_content(tmp_pat
             slug="bad",
             config={
                 "enabled": True,
-                "public_base_url": "https://rocky.ainotes.ch",
+                "public_base_url": "https://notes.example.test",
                 "publish_root": str(tmp_path / "public"),
             },
             today=date(2026, 6, 10),
@@ -127,7 +127,7 @@ def test_publish_html_note_requires_publish_root_when_enabled():
             slug="missing-root",
             config={
                 "enabled": True,
-                "public_base_url": "https://rocky.ainotes.ch",
+                "public_base_url": "https://notes.example.test",
             },
         )
 
@@ -144,7 +144,7 @@ def test_ai_notes_tool_requirements_follow_enabled_config(tmp_path, monkeypatch)
         lambda: {
             "ai_notes": {
                 "enabled": True,
-                "public_base_url": "https://rocky.ainotes.ch",
+                "public_base_url": "https://notes.example.test",
                 "publish_root": str(tmp_path),
             }
         },
@@ -158,7 +158,7 @@ def test_publish_ai_note_tool_returns_json_success(tmp_path, monkeypatch):
         lambda: {
             "ai_notes": {
                 "enabled": True,
-                "public_base_url": "https://rocky.ainotes.ch",
+                "public_base_url": "https://notes.example.test",
                 "publish_root": str(tmp_path / "public"),
             }
         },
@@ -174,4 +174,4 @@ def test_publish_ai_note_tool_returns_json_success(tmp_path, monkeypatch):
     )
 
     assert payload["ok"] is True
-    assert payload["url"] == "https://rocky.ainotes.ch/2026-06-10/tool-note.html"
+    assert payload["url"] == "https://notes.example.test/2026-06-10/tool-note.html"

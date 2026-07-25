@@ -108,7 +108,7 @@ def test_operator_verification_config_selects_interface_specific_command(monkeyp
 
 
 def test_cui_admin_actor_context_verifies_without_prompt(monkeypatch):
-    monkeypatch.setenv("AIWERK_CUI_ACTOR_CONTEXT", json.dumps({"actor_id": "attila", "role": "aiwerk_admin"}))
+    monkeypatch.setenv("AIWERK_CUI_ACTOR_CONTEXT", json.dumps({"actor_id": "operator", "role": "aiwerk_admin"}))
 
     result = run_operator_verifier(
         OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
@@ -116,7 +116,7 @@ def test_cui_admin_actor_context_verifies_without_prompt(monkeypatch):
     )
 
     assert result.ok is True
-    assert result.actor_id == "attila"
+    assert result.actor_id == "operator"
     assert result.role == "aiwerk_admin"
     assert result.expires_at == 160
 
@@ -147,7 +147,7 @@ def test_cui_actor_verification_sources_context_from_canonical_helper(monkeypatc
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(
         "agent.cui_actor_context.current_cui_actor_context",
-        lambda: {"actor_id": "attila", "role": "aiwerk_admin"},
+        lambda: {"actor_id": "operator", "role": "aiwerk_admin"},
     )
 
     result = run_operator_verifier(
@@ -155,7 +155,7 @@ def test_cui_actor_verification_sources_context_from_canonical_helper(monkeypatc
         now=200,
     )
     assert result.ok is True
-    assert result.actor_id == "attila"
+    assert result.actor_id == "operator"
     assert result.role == "aiwerk_admin"
 
     # An empty helper (no actor) fails closed even with the verifier configured.
@@ -216,7 +216,7 @@ def test_callback_operator_verifier_uses_masked_callback_and_store(monkeypatch, 
     salt = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY="
     store.write_text(json.dumps({
         "version": 1,
-        "actor_id": "attila",
+        "actor_id": "operator",
         "role": "operator",
         "salt": salt,
         "hash": _derive_operator_secret("secret", salt),
@@ -230,7 +230,7 @@ def test_callback_operator_verifier_uses_masked_callback_and_store(monkeypatch, 
     )
 
     assert result.ok is True
-    assert result.actor_id == "attila"
+    assert result.actor_id == "operator"
     assert result.role == "operator"
     assert result.expires_at == 160
     set_operator_verification_callback(None)
@@ -266,7 +266,7 @@ def test_cli_agent_thread_wires_operator_verifier_callback():
 def test_operator_verification_result_valid_until_expiry():
     result = OperatorVerificationResult(
         ok=True,
-        actor_id="attila",
+        actor_id="operator",
         role="operator",
         verified_at=100,
         expires_at=200,
@@ -278,8 +278,8 @@ def test_operator_verification_result_valid_until_expiry():
 
 def test_operator_verification_result_requires_actor_and_role():
     assert OperatorVerificationResult(ok=True, actor_id="", role="operator", expires_at=200).is_valid(now=100) is False
-    assert OperatorVerificationResult(ok=True, actor_id="attila", role="", expires_at=200).is_valid(now=100) is False
-    assert OperatorVerificationResult(ok=False, actor_id="attila", role="operator", expires_at=200).is_valid(now=100) is False
+    assert OperatorVerificationResult(ok=True, actor_id="operator", role="", expires_at=200).is_valid(now=100) is False
+    assert OperatorVerificationResult(ok=False, actor_id="operator", role="operator", expires_at=200).is_valid(now=100) is False
 
 
 def _write_script(path: Path, body: str) -> None:
@@ -291,7 +291,7 @@ def test_run_operator_verifier_parses_success_without_exposing_secret(tmp_path):
     script = tmp_path / "verify.py"
     _write_script(
         script,
-        "import json\nprint(json.dumps({'ok': True, 'actor_id': 'attila', 'role': 'operator', 'ttl_seconds': 60}))\n",
+        "import json\nprint(json.dumps({'ok': True, 'actor_id': 'operator', 'role': 'operator', 'ttl_seconds': 60}))\n",
     )
 
     result = run_operator_verifier(
@@ -300,7 +300,7 @@ def test_run_operator_verifier_parses_success_without_exposing_secret(tmp_path):
     )
 
     assert result.ok is True
-    assert result.actor_id == "attila"
+    assert result.actor_id == "operator"
     assert result.role == "operator"
     assert result.verified_at == 100
     assert result.expires_at == 160
@@ -337,7 +337,7 @@ def test_run_operator_verifier_fails_closed_when_disabled_or_missing_command():
 
 def test_operator_verification_cache_is_in_memory_and_expires():
     clear_operator_verification_cache()
-    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200)
+    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200)
 
     assert get_cached_operator_verification(session_id="s1", now=150) is None
     cache_operator_verification(valid, session_id="s1")
@@ -350,7 +350,7 @@ def test_operator_verification_broker_survives_process_local_cache_clear(monkeyp
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
 
     cache_operator_verification(valid, session_id="s1")
     from hermes_cli import operator_verification as ov
@@ -366,7 +366,7 @@ def test_operator_verification_broker_env_is_not_trusted_by_child_process(monkey
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
 
     cache_operator_verification(valid, session_id="s1")
     script = """
@@ -444,7 +444,7 @@ def test_broker_rejects_child_raw_socket_even_with_inherited_capability(monkeypa
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
 
     cache_operator_verification(valid, session_id="s1")
     script = """
@@ -469,7 +469,7 @@ def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeyp
     clear_operator_verification_cache()
     config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
     now = int(time.time())
-    verified = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+    verified = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
 
     cache_operator_verification(verified, session_id="tool-worker-session")
     from hermes_cli import operator_verification as ov
@@ -529,7 +529,7 @@ def test_operator_verification_rejects_insecure_broker_runtime_dir(monkeypatch, 
     insecure.chmod(0o777)
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=now, expires_at=now + 100)
+    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
 
     cache_operator_verification(valid, session_id="s1")
     from hermes_cli import operator_verification as ov
@@ -546,7 +546,7 @@ def test_broker_rejects_client_without_capability(tmp_path):
         "key": "s1",
         "capability": "real-capability",
         "parent_pid": os.getpid(),
-        "result": {"ok": True, "actor_id": "attila", "role": "operator", "verified_at": now, "expires_at": now + 100},
+        "result": {"ok": True, "actor_id": "operator", "role": "operator", "verified_at": now, "expires_at": now + 100},
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "hermes_cli.operator_verification_broker", str(socket_path)],
@@ -581,7 +581,7 @@ def test_admin_sensitive_command_is_blocked_until_operator_verified():
     assert blocked is not None
     assert "verify_operator_identity" in blocked
 
-    verified = OperatorVerificationResult(ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200)
+    verified = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200)
     cache_operator_verification(verified)
     assert operator_verification_block_reason_for_command("systemctl restart hermes", config=config, now=150) is None
 
@@ -808,7 +808,7 @@ def test_operator_verification_allows_normal_user_file_and_git_operations():
     allowed = [
         "chmod 644 README.md",
         "chmod 755 scripts/run.sh",
-        "chown attila notes.txt",
+        "chown operator notes.txt",
         "git push origin main",
         "docker compose up -d",
     ]
@@ -1117,7 +1117,7 @@ def test_callback_verifier_with_store_is_provisioned(monkeypatch, tmp_path):
     store = tmp_path / "operator-verifier.json"
     store.write_text(json.dumps({
         "version": 1,
-        "actor_id": "attila",
+        "actor_id": "operator",
         "role": "operator",
         "salt": "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY=",
         "hash": "unused",
@@ -1146,7 +1146,7 @@ def test_block_check_honors_session_scoped_verification_cache():
     ) is not None
 
     verified = OperatorVerificationResult(
-        ok=True, actor_id="attila", role="operator", verified_at=100, expires_at=200
+        ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200
     )
     cache_operator_verification(verified, session_id="s1")
 

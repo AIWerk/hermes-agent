@@ -28,14 +28,14 @@ def test_customer_cui_actor_cannot_see_tagged_admin_sessions():
             {
                 "_cui_visibility_scope": "admin",
                 "_cui_actor_role": "admin",
-                "_cui_actor_id": "aiwerk:attila:admin",
+                "_cui_actor_id": "aiwerk:operator:admin",
                 "_cui_tenant_id": "example-tenant",
             }
         ),
     }
     user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
-    other_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
-    same_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:attila:admin", "role": "admin"}
+    other_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:other-admin:admin", "role": "admin"}
+    same_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
 
     assert web_server._session_visible_to_cui_actor(admin_session, user_actor) is False
     assert web_server._session_visible_to_cui_actor(admin_session, other_admin_actor) is False
@@ -60,8 +60,8 @@ def test_customer_cui_actor_cannot_see_legacy_untagged_internal_sessions():
 def test_customer_cui_actor_only_sees_own_tagged_customer_sessions():
     from hermes_cli import web_server
 
-    susanne_session = {
-        "id": "susanne-session",
+    customer_session = {
+        "id": "customer-session",
         "model_config": json.dumps(
             {
                 "_cui_visibility_scope": "customer",
@@ -84,7 +84,7 @@ def test_customer_cui_actor_only_sees_own_tagged_customer_sessions():
     }
     user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
 
-    assert web_server._session_visible_to_cui_actor(susanne_session, user_actor) is True
+    assert web_server._session_visible_to_cui_actor(customer_session, user_actor) is True
     assert web_server._session_visible_to_cui_actor(other_customer_session, user_actor) is False
 
 
@@ -152,6 +152,30 @@ def test_restricted_actor_sees_no_sessions(monkeypatch):
     assert web_server._session_visible_to_cui_actor(untagged, restricted) is False
     # And the unconfined path (no actor at all) is unchanged.
     assert web_server._session_visible_to_cui_actor(untagged, {}) is True
+
+
+def test_incomplete_actor_sees_no_sessions():
+    from hermes_cli import web_server
+
+    tagged_customer = {
+        "id": "cust-session",
+        "model_config": json.dumps(
+            {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": "example-tenant:customer:user",
+                "_cui_tenant_id": "example-tenant",
+            }
+        ),
+    }
+    incomplete = [
+        {"role": "user"},
+        {"tenant_id": "example-tenant", "role": "user"},
+        {"actor_id": "example-tenant:customer:user", "role": "user"},
+        {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user"},
+    ]
+    for actor in incomplete:
+        assert web_server._session_visible_to_cui_actor(tagged_customer, actor) is False
 
 
 def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):

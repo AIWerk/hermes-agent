@@ -7,7 +7,7 @@ def _operator_store():
     store = MemoryStore()
     store.operator_session_context = {
         "mode": "operator",
-        "actor_id": "attila",
+        "actor_id": "operator",
         "role": "operator",
         "acting_for": "aiwerk",
         "memory_scope": "operator",

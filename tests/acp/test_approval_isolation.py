@@ -15,6 +15,7 @@ Both fixed together by:
 
 import threading
 
+import pytest
 
 
 class TestThreadLocalApprovalCallback:
@@ -201,6 +202,16 @@ class TestAcpExecAskGate:
     (HERMES_EXEC_ASK takes the gateway-queue path which requires a
     notify_cb registered in _gateway_notify_cbs — not applicable to ACP,
     which uses a direct callback shape.)"""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_approval_state(self, monkeypatch):
+        """Full-suite collection may preload the operator's permanent patterns."""
+        from tools import approval
+
+        monkeypatch.setattr(approval, "_permanent_approved", set())
+        approval.clear_session("default")
+        yield
+        approval.clear_session("default")
 
     def test_interactive_env_var_routes_to_callback(self, monkeypatch):
         """When HERMES_INTERACTIVE is set and an approval callback is

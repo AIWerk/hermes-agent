@@ -9,7 +9,15 @@ from typing import Any, Dict
 
 _ADMIN_ROLES = {"admin", "operator", "owner", "support"}
 
-_ACTOR_KEYS = ("tenant_id", "actor_id", "role", "display_name", "user_id", "provider")
+_ACTOR_KEYS = (
+    "tenant_id",
+    "actor_id",
+    "role",
+    "display_name",
+    "user_id",
+    "provider",
+    "_restricted",
+)
 
 # Per-turn actor context, bound by in-process gateway turns. ``os.environ`` is
 # process-global, so concurrent in-process turns in the TUI gateway would clobber
