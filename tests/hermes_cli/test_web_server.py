@@ -1874,6 +1874,244 @@ class TestWebServerEndpoints:
         full_rows = [s for s in full.json()["sessions"] if s["id"] == "lean-profiles-row"]
         assert full_rows and full_rows[0]["system_prompt"].startswith("# SOUL.md")
 
+    def test_profiles_session_lists_filter_before_count_pagination_and_full(self, monkeypatch):
+        """Cross-profile list projections must use the canonical actor predicate."""
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+
+        def actor_cfg(actor_id):
+            return {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": actor_id,
+                "_cui_tenant_id": "tenant-1",
+            }
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="profiles-owned", source="cli", model_config=actor_cfg("user-1"))
+            db.append_message("profiles-owned", role="user", content="owned")
+            db.create_session(session_id="profiles-foreign", source="cli", model_config=actor_cfg("user-2"))
+            db.append_message("profiles-foreign", role="user", content="foreign")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+        for suffix in ("", "&full=1"):
+            resp = self.client.get(f"/api/profiles/sessions?limit=1&offset=0{suffix}")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["total"] == 1
+            assert data["profile_totals"]["default"] == 1
+            assert [row["id"] for row in data["sessions"]] == ["profiles-owned"]
+
+        actor.update({"actor_id": "admin-1", "role": "admin"})
+        admin = self.client.get("/api/profiles/sessions?limit=20&offset=0&full=1").json()
+        assert "profiles-foreign" not in {row["id"] for row in admin["sessions"]}
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: {"role": "user", "_restricted": "1"})
+        restricted = self.client.get("/api/profiles/sessions?limit=20&offset=0&full=1").json()
+        assert restricted["sessions"] == []
+        assert restricted["total"] == 0
+
+    def test_profiles_sidebar_filters_every_slice_and_fails_closed(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        def cfg(actor_id):
+            return {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": actor_id,
+                "_cui_tenant_id": "tenant-1",
+            }
+
+        db = SessionDB()
+        try:
+            for sid, source, owner in (
+                ("sidebar-owned", "cli", "user-1"),
+                ("sidebar-foreign", "cli", "user-2"),
+                ("cron-owned", "cron", "user-1"),
+                ("cron-foreign", "cron", "user-2"),
+            ):
+                db.create_session(session_id=sid, source=source, model_config=cfg(owner))
+                db.append_message(sid, role="user", content=sid)
+        finally:
+            db.close()
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+        data = self.client.get("/api/profiles/sessions/sidebar").json()
+        all_ids = {
+            row["id"]
+            for section in ("recents", "cron", "messaging")
+            for row in data[section]["sessions"]
+        }
+        assert {"sidebar-owned", "cron-owned"} <= all_ids
+        assert "sidebar-foreign" not in all_ids
+        assert "cron-foreign" not in all_ids
+        assert data["recents"]["total"] == 2
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: {"role": "user", "_restricted": "1"})
+        restricted = self.client.get("/api/profiles/sessions/sidebar").json()
+        assert all(not restricted[name]["sessions"] for name in ("recents", "cron", "messaging"))
+        assert restricted["recents"]["total"] == 0
+
+    def test_session_mutations_hide_foreign_targets_and_bulk_delete_is_atomic(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+
+        def cfg(actor_id):
+            return {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": actor_id,
+                "_cui_tenant_id": "tenant-1",
+            }
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="mutate-owned", source="cli", model_config=cfg("user-1"))
+            db.create_session(session_id="mutate-foreign", source="cli", model_config=cfg("user-2"))
+        finally:
+            db.close()
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+
+        assert self.client.delete("/api/sessions/mutate-foreign").status_code == 404
+        for payload in ({"title": "stolen"}, {"archived": True}, {"pinned": True}):
+            assert self.client.patch("/api/sessions/mutate-foreign", json=payload).status_code == 404
+
+        bulk = self.client.post(
+            "/api/sessions/bulk-delete",
+            json={"ids": ["mutate-owned", "mutate-foreign"]},
+        )
+        assert bulk.status_code == 404
+        db = SessionDB()
+        try:
+            assert db.get_session("mutate-owned") is not None
+            foreign = db.get_session("mutate-foreign")
+            assert foreign is not None
+            assert not foreign.get("title") and not foreign.get("archived") and not foreign.get("pinned")
+        finally:
+            db.close()
+
+    def test_session_sibling_routes_confine_reads_and_authorize_sets_before_delete(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+
+        def cfg(actor_id):
+            return {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": actor_id,
+                "_cui_tenant_id": "tenant-1",
+            }
+
+        db = SessionDB()
+        try:
+            for sid, owner in (("route-owned", "user-1"), ("route-foreign", "user-2")):
+                db.create_session(session_id=sid, source="cli", model_config=cfg(owner))
+                db.append_message(sid, role="user", content=sid)
+                db.end_session(sid, end_reason="done")
+            for sid, owner in (("empty-owned", "user-1"), ("empty-foreign", "user-2")):
+                db.create_session(session_id=sid, source="cli", model_config=cfg(owner))
+                db.end_session(sid, end_reason="done")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+
+        assert self.client.get("/api/sessions/route-foreign/export").status_code == 404
+        stats = self.client.get("/api/sessions/stats").json()
+        assert stats["total"] == 2
+        assert stats["messages"] == 1
+        assert stats["by_source"] == {"cli": 2}
+        assert self.client.get("/api/sessions/empty/count").json() == {"count": 1}
+
+        dry_run = self.client.post(
+            "/api/sessions/prune", json={"started_before": 9999999999, "dry_run": True}
+        )
+        assert dry_run.status_code == 200
+        assert {row["id"] for row in dry_run.json()["sessions"]} == {
+            "route-owned", "empty-owned"
+        }
+
+        assert self.client.delete("/api/sessions/empty").status_code == 404
+        assert self.client.post(
+            "/api/sessions/prune", json={"started_before": 9999999999}
+        ).status_code == 404
+        db = SessionDB()
+        try:
+            for sid in ("route-owned", "route-foreign", "empty-owned", "empty-foreign"):
+                assert db.get_session(sid) is not None
+        finally:
+            db.close()
+
+    def test_session_import_is_actor_scoped_and_cross_profile_is_admin_only(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+
+        def payload(sid, owner):
+            return {
+                "id": sid,
+                "source": "cli",
+                "model_config": {
+                    "_cui_visibility_scope": "customer",
+                    "_cui_actor_role": "user",
+                    "_cui_actor_id": owner,
+                    "_cui_tenant_id": "tenant-1",
+                },
+                "messages": [],
+            }
+
+        foreign = self.client.post(
+            "/api/sessions/import",
+            json={"sessions": [payload("import-owned", "user-1"), payload("import-foreign", "user-2")]},
+        )
+        assert foreign.status_code == 404
+        db = SessionDB()
+        try:
+            assert db.get_session("import-owned") is None
+            assert db.get_session("import-foreign") is None
+        finally:
+            db.close()
+
+        cross_profile = self.client.post(
+            "/api/sessions/import",
+            json={"profile": "worker", "sessions": [payload("worker-owned", "user-1")]},
+        )
+        assert cross_profile.status_code == 403
+
+    def test_actor_filtered_session_scan_pages_until_exhaustion(self):
+        import hermes_cli.web_server as ws
+
+        class FakeDB:
+            def __init__(self):
+                self.offsets = []
+
+            def list_sessions_rich(self, *, limit, offset, **kwargs):
+                self.offsets.append(offset)
+                if offset >= 10001:
+                    return []
+                stop = min(offset + limit, 10001)
+                return [{"id": f"s{i}"} for i in range(offset, stop)]
+
+        db = FakeDB()
+        rows = ws._list_sessions_rich_all(db, compact_rows=False)
+
+        assert len(rows) == 10001
+        assert db.offsets[-1] == 10000
+        assert len(db.offsets) > 1
+
 
     def test_rename_session_updates_title(self):
         """PATCH /api/sessions/{id} renames a session (regression: the route
@@ -2165,6 +2403,26 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400
 
+    def test_profiles_sessions_trusted_deep_page_is_not_capped_at_500(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for i in range(520):
+                db.create_session(session_id=f"deep-page-{i:03d}", source="deep-page")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions?source=deep-page&min_messages=0"
+            "&order=created&offset=510&limit=5"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 520
+        assert len(data["sessions"]) == 5
+        assert all(row["id"].startswith("deep-page-") for row in data["sessions"])
+
     def test_profiles_sessions_sidebar_batches_three_slices(self):
         """The batched sidebar endpoint returns recents/cron/messaging in one
         pass, each source-scoped by the caller-supplied excludes, so the desktop
@@ -2210,6 +2468,28 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
+
+    def test_profiles_sidebar_messaging_total_is_exact_beyond_display_limit(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            for i in range(7):
+                sid = f"sb-message-{i}"
+                db.create_session(session_id=sid, source="telegram")
+                db.append_message(session_id=sid, role="user", content="hi")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=all&recents_limit=1"
+            "&cron_limit=1&messaging_limit=3"
+            "&messaging_exclude=cron,cli,codex,desktop,gateway,local,tui"
+        )
+        assert resp.status_code == 200
+        messaging = resp.json()["messaging"]
+        assert messaging["total"] == 7
+        assert len(messaging["sessions"]) == 3
 
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
@@ -7277,6 +7557,145 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert cfg["model"]["default"] == "gpt-5.4"
         assert cfg["model"]["base_url"] == "http://127.0.0.1:8081/v1"
 
+    def test_custom_endpoint_save_refusal_does_not_persist_config(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        saved = []
+        monkeypatch.setattr(ws, "save_env_value", lambda key, value: False)
+        monkeypatch.setattr(ws, "save_config", lambda cfg: saved.append(cfg))
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "managed-proxy",
+                "name": "Managed Proxy",
+                "base_url": "https://proxy.example/v1",
+                "model": "proxy/model",
+                "api_key": "new-key",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert saved == []
+
+    def test_custom_endpoint_rollback_prefers_actual_dotenv_over_inherited_value(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import custom_endpoint_key_env, load_env
+
+        env_var = custom_endpoint_key_env("conflict-proxy")
+        assert ws.save_env_value(env_var, "dotenv-old") is True
+        monkeypatch.setenv(env_var, "inherited-old")
+        monkeypatch.setattr(ws, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "conflict-proxy",
+                "name": "Conflict Proxy",
+                "base_url": "https://proxy.example/v1",
+                "model": "proxy/model",
+                "api_key": "new-key",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert load_env()[env_var] == "dotenv-old"
+        assert os.environ[env_var] == "inherited-old"
+
+    def test_custom_endpoint_rollback_preserves_inherited_only_absence_from_dotenv(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import custom_endpoint_key_env, load_env
+
+        env_var = custom_endpoint_key_env("inherited-proxy")
+        monkeypatch.setenv(env_var, "inherited-only")
+        assert env_var not in load_env()
+        monkeypatch.setattr(ws, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "inherited-proxy",
+                "name": "Inherited Proxy",
+                "base_url": "https://proxy.example/v1",
+                "model": "proxy/model",
+                "api_key": "new-key",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert env_var not in load_env()
+        assert os.environ[env_var] == "inherited-only"
+
+    def test_custom_endpoint_delete_refusal_does_not_persist_config(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import load_config
+
+        created = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "managed-delete",
+                "name": "Managed Delete",
+                "base_url": "https://proxy.example/v1",
+                "model": "proxy/model",
+                "api_key": "keep-key",
+            },
+        )
+        assert created.status_code == 200
+        saved = []
+        monkeypatch.setattr(ws, "remove_env_value", lambda key: False)
+        monkeypatch.setattr(ws, "save_config", lambda cfg: saved.append(cfg))
+
+        resp = self.client.delete("/api/providers/custom-endpoints/managed-delete")
+
+        assert resp.status_code == 500
+        assert saved == []
+        assert "managed-delete" in load_config()["providers"]
+
+    def test_custom_endpoint_upsert_restores_env_credential_when_config_save_fails(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value
+
+        env_var = custom_endpoint_key_env("rollback-proxy")
+        ws.save_env_value(env_var, "old-key")
+        monkeypatch.setattr(ws, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "rollback-proxy",
+                "name": "Rollback Proxy",
+                "base_url": "https://proxy.example/v1",
+                "model": "proxy/model",
+                "api_key": "new-key",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert get_env_value(env_var) == "old-key"
+
+    def test_custom_endpoint_delete_restores_env_credential_when_config_save_fails(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value
+
+        created = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "delete-rollback",
+                "name": "Delete Rollback",
+                "base_url": "https://proxy.example/v1",
+                "model": "proxy/model",
+                "api_key": "keep-key",
+            },
+        )
+        assert created.status_code == 200
+        env_var = custom_endpoint_key_env("delete-rollback")
+        monkeypatch.setattr(ws, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
+
+        resp = self.client.delete("/api/providers/custom-endpoints/delete-rollback")
+
+        assert resp.status_code == 500
+        assert get_env_value(env_var) == "keep-key"
+
     def _seed_custom_provider_with_key(self):
         from hermes_cli.config import load_config, save_config
 
@@ -7415,15 +7834,15 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert models["acme/model-1"]["context_length"] == 200000
 
     def test_deleting_the_active_custom_endpoint_clears_its_model_mirror(self):
-        """Deleting an endpoint must not leave its key running the agent.
+        """Deleting an endpoint must not leave its credential running the agent.
 
-        ``activate`` copies the endpoint's base_url + api_key onto ``model``,
-        and ``model.api_key`` outranks the environment at client construction
-        (#62269). Without clearing that mirror the agent keeps authenticating
-        to the deleted host with the deleted key, and the key the operator
-        just removed through the dashboard stays in config.yaml.
+        ``activate`` mirrors the endpoint's base_url + credential reference
+        onto ``model``, and that mirror outranks the environment at client
+        construction (#62269). Without clearing it the agent keeps
+        authenticating to the deleted host, and the credential the operator
+        just removed through the dashboard survives the delete.
         """
-        from hermes_cli.config import load_config
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_config
 
         self.client.post(
             "/api/providers/custom-endpoints",
@@ -7439,8 +7858,10 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
             "/api/providers/custom-endpoints/acme/activate", json={}
         ).status_code == 200
 
+        env_var = custom_endpoint_key_env("acme")
         cfg = load_config()
-        assert cfg["model"]["api_key"] == "sk-acme-secret"
+        assert cfg["model"]["key_env"] == env_var
+        assert get_env_value(env_var) == "sk-acme-secret"
 
         assert self.client.request(
             "DELETE", "/api/providers/custom-endpoints/acme"
@@ -7450,12 +7871,14 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert "acme" not in (cfg.get("providers") or {})
         model_cfg = cfg.get("model") or {}
         assert not model_cfg.get("api_key"), "deleted endpoint's key still in config.yaml"
+        assert not model_cfg.get("key_env"), "deleted endpoint's key ref still in config.yaml"
         assert not model_cfg.get("base_url"), "deleted endpoint's host still routed to"
         assert not model_cfg.get("provider")
+        assert not get_env_value(env_var), "deleted endpoint's key still in .env"
 
     def test_deleting_an_inactive_custom_endpoint_leaves_the_active_one_alone(self):
-        """Only the mirror of the DELETED provider is scrubbed."""
-        from hermes_cli.config import load_config
+        """Only the DELETED provider's mirror and .env slot are scrubbed."""
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_config
 
         for name, key in (("acme", "sk-acme"), ("other", "sk-other")):
             self.client.post(
@@ -7474,8 +7897,283 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
 
         model_cfg = load_config().get("model") or {}
         assert model_cfg.get("provider") == "other"
-        assert model_cfg.get("api_key") == "sk-other"
+        assert model_cfg.get("key_env") == custom_endpoint_key_env("other")
         assert model_cfg.get("base_url") == "https://llm.other.corp/v1"
+        assert get_env_value(custom_endpoint_key_env("other")) == "sk-other"
+
+    def test_custom_endpoint_save_persists_the_whole_discovered_catalogue(self):
+        """Test discovers N models; Save must keep all N (#69988).
+
+        Every downstream picker reads ``providers.<id>.models`` straight from
+        config.yaml with no live probe, so persisting only the one hand-typed
+        model left a provider serving dozens showing a single-entry list.
+        """
+        from hermes_cli.config import load_config
+
+        discovered = ["glm-5.2", "qwen3-max", "llama-4-405b", "deepseek-v4"]
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "proxy",
+                "name": "Proxy",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "model": "glm-5.2",
+                "models": discovered,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert sorted(load_config()["providers"]["proxy"]["models"]) == sorted(discovered)
+        endpoint = next(e for e in resp.json()["endpoints"] if e["id"] == "proxy")
+        assert sorted(endpoint["models"]) == sorted(discovered)
+
+    def test_custom_endpoint_save_with_catalogue_keeps_known_context_lengths(self):
+        """A discovered list merges onto the entry; it doesn't reset it."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "proxy": {
+                "name": "Proxy",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "model": "a",
+                "models": {"a": {"context_length": 200000}},
+            }
+        }
+        save_config(cfg)
+
+        self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "proxy",
+                "name": "Proxy",
+                "base_url": "http://127.0.0.1:8000/v1",
+                "model": "a",
+                "models": ["a", "b"],
+            },
+        )
+
+        models = load_config()["providers"]["proxy"]["models"]
+        assert sorted(models) == ["a", "b"]
+        assert models["a"]["context_length"] == 200000
+
+    def test_custom_endpoint_save_keeps_the_api_key_out_of_config(self):
+        """The key belongs in .env behind key_env, never in config.yaml (#69449)."""
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_config
+
+        self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "proxy",
+                "name": "Proxy",
+                "base_url": "https://llm.example.com/v1",
+                "model": "m",
+                "api_key": "sk-super-secret",
+                "make_default": True,
+            },
+        )
+
+        cfg = load_config()
+        entry = cfg["providers"]["proxy"]
+        env_var = custom_endpoint_key_env("proxy")
+        assert entry["key_env"] == env_var
+        assert "api_key" not in entry
+        assert "api_key" not in cfg["model"]
+        assert get_env_value(env_var) == "sk-super-secret"
+        assert "sk-super-secret" not in yaml.safe_dump(cfg)
+
+    def test_custom_endpoint_edit_without_a_key_keeps_the_stored_one(self):
+        """The panel sends no api_key on an unrelated edit (the field is blank)."""
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_config
+
+        common = {
+            "id": "proxy",
+            "name": "Proxy",
+            "base_url": "https://llm.example.com/v1",
+        }
+        self.client.post(
+            "/api/providers/custom-endpoints",
+            json={**common, "model": "m1", "api_key": "sk-keep-me"},
+        )
+        self.client.post("/api/providers/custom-endpoints", json={**common, "model": "m2"})
+
+        entry = load_config()["providers"]["proxy"]
+        assert entry["model"] == "m2"
+        assert entry["key_env"] == custom_endpoint_key_env("proxy")
+        assert get_env_value(custom_endpoint_key_env("proxy")) == "sk-keep-me"
+
+    def test_custom_endpoint_save_migrates_a_legacy_plaintext_key(self):
+        """Entries written before #69449 get cleaned up on their next save.
+
+        Requiring the user to re-type the key to get it out of config.yaml
+        would leave the plaintext sitting there for anyone who never edits the
+        endpoint again.
+        """
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "proxy": {
+                "name": "Proxy",
+                "base_url": "https://llm.example.com/v1",
+                "model": "m",
+                "api_key": "sk-legacy-plaintext",
+                "models": {"m": {}},
+            }
+        }
+        save_config(cfg)
+
+        self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "proxy",
+                "name": "Proxy",
+                "base_url": "https://llm.example.com/v1",
+                "model": "m",
+            },
+        )
+
+        entry = load_config()["providers"]["proxy"]
+        assert "api_key" not in entry
+        assert entry["key_env"] == custom_endpoint_key_env("proxy")
+        assert get_env_value(custom_endpoint_key_env("proxy")) == "sk-legacy-plaintext"
+
+    def test_custom_endpoint_save_leaves_a_hand_written_env_ref_alone(self, monkeypatch):
+        """``api_key: ${MY_KEY}`` is already safe — don't copy it elsewhere.
+
+        load_config() expands env refs, so such an entry looks like a literal
+        secret by the time Save sees it. Migrating it would duplicate the
+        user's secret into a second env var they never asked for.
+        """
+        import yaml
+
+        from hermes_cli.config import custom_endpoint_key_env, get_config_path, get_env_value
+
+        monkeypatch.setenv("MY_PROXY_KEY", "sk-user-managed")
+        get_config_path().write_text(
+            yaml.safe_dump({
+                "providers": {
+                    "proxy": {
+                        "name": "Proxy",
+                        "base_url": "https://llm.example.com/v1",
+                        "model": "m",
+                        "api_key": "${MY_PROXY_KEY}",
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "proxy",
+                "name": "Proxy",
+                "base_url": "https://llm.example.com/v1",
+                "model": "m",
+            },
+        )
+
+        raw = yaml.safe_load(get_config_path().read_text(encoding="utf-8"))
+        assert raw["providers"]["proxy"]["api_key"] == "${MY_PROXY_KEY}"
+        assert not get_env_value(custom_endpoint_key_env("proxy"))
+
+    def test_custom_endpoint_blank_api_key_clears_the_credential(self):
+        """An explicitly emptied field means "remove the key", not "keep it"."""
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_config
+
+        common = {
+            "id": "proxy",
+            "name": "Proxy",
+            "base_url": "https://llm.example.com/v1",
+            "model": "m",
+        }
+        self.client.post(
+            "/api/providers/custom-endpoints", json={**common, "api_key": "sk-drop-me"}
+        )
+        self.client.post("/api/providers/custom-endpoints", json={**common, "api_key": ""})
+
+        entry = load_config()["providers"]["proxy"]
+        assert "api_key" not in entry
+        assert "key_env" not in entry
+        assert not get_env_value(custom_endpoint_key_env("proxy"))
+
+    def test_two_endpoints_on_one_host_keep_separate_credentials(self):
+        """Two local servers must not share an .env slot.
+
+        Deriving the env var from the hostname collapses ``127.0.0.1:8000``
+        and ``:8001`` onto one name, so saving the second silently overwrites
+        the first's key.
+        """
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value
+
+        for port, key in ((8000, "sk-first"), (8001, "sk-second")):
+            self.client.post(
+                "/api/providers/custom-endpoints",
+                json={
+                    "id": f"local-{port}",
+                    "name": f"Local {port}",
+                    "base_url": f"http://127.0.0.1:{port}/v1",
+                    "model": "m",
+                    "api_key": key,
+                },
+            )
+
+        assert get_env_value(custom_endpoint_key_env("local-8000")) == "sk-first"
+        assert get_env_value(custom_endpoint_key_env("local-8001")) == "sk-second"
+
+    def test_custom_endpoint_response_reports_a_key_held_in_env(self):
+        """has_api_key must follow key_env, not just a plaintext api_key.
+
+        Reading only ``api_key`` made the panel report "no API key" for every
+        endpoint whose credential had been moved to .env.
+        """
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "proxy",
+                "name": "Proxy",
+                "base_url": "https://llm.example.com/v1",
+                "model": "m",
+                "api_key": "sk-in-env",
+            },
+        )
+
+        endpoint = next(e for e in resp.json()["endpoints"] if e["id"] == "proxy")
+        assert endpoint["has_api_key"] is True
+        assert "sk-in-env" not in (endpoint["api_key_preview"] or "")
+
+    def test_activating_an_endpoint_carries_its_credential_either_way(self):
+        """Activate must work for both key_env and pre-#69449 plaintext entries."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "legacy": {
+                "name": "Legacy",
+                "base_url": "https://llm.legacy.com/v1",
+                "model": "m",
+                "api_key": "sk-legacy",
+                "models": {"m": {}},
+            },
+            "modern": {
+                "name": "Modern",
+                "base_url": "https://llm.modern.com/v1",
+                "model": "m",
+                "key_env": "MODERN_API_KEY",
+                "models": {"m": {}},
+            },
+        }
+        save_config(cfg)
+
+        self.client.post("/api/providers/custom-endpoints/modern/activate", json={})
+        model_cfg = load_config()["model"]
+        assert model_cfg["key_env"] == "MODERN_API_KEY"
+        assert "api_key" not in model_cfg
+
+        self.client.post("/api/providers/custom-endpoints/legacy/activate", json={})
+        model_cfg = load_config()["model"]
+        assert model_cfg["api_key"] == "sk-legacy"
 
     def test_set_model_main_preserves_base_url_for_named_custom_provider(self):
         """Selecting a named custom endpoint from the Desktop model picker
@@ -12805,6 +13503,21 @@ class TestAdminApiPermissionEnforcement:
 
         for _method, _prefix, action in web_server._ADMIN_API_ACTIONS:
             assert is_admin_only_action(action), action
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/api/providers/custom-endpoints"),
+            ("POST", "/api/providers/custom-endpoints/acme/activate"),
+            ("POST", "/api/providers/custom-endpoints/validate"),
+            ("DELETE", "/api/providers/custom-endpoints/acme"),
+            ("POST", "/api/providers/validate"),
+        ],
+    )
+    def test_custom_provider_mutations_and_network_probes_are_admin_actions(self, method, path):
+        import hermes_cli.web_server as web_server
+
+        assert web_server._admin_api_action_for(method, path) is not None
 
     def test_non_admin_session_is_denied_admin_endpoint(self):
         import hermes_cli.web_server as web_server

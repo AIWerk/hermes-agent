@@ -84,6 +84,8 @@ from hermes_cli.config import (
     save_config,
     save_env_value,
     remove_env_value,
+    get_env_value,
+    custom_endpoint_key_env,
     check_config_version,
     detect_install_method,
     format_docker_update_message,
@@ -538,6 +540,11 @@ _ADMIN_API_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("DELETE", "/api/webhooks", "security.policy_weaken"),
     ("POST", "/api/pairing/approve", "identity.user_invite"),
     ("POST", "/api/pairing/revoke", "identity.user_remove"),
+    # These routes persist credentials, redirect runtime traffic, or issue
+    # server-side requests to arbitrary operator-supplied URLs (SSRF surface).
+    ("POST", "/api/providers/custom-endpoints", "security.policy_weaken"),
+    ("DELETE", "/api/providers/custom-endpoints", "security.policy_weaken"),
+    ("POST", "/api/providers/validate", "security.policy_weaken"),
 )
 
 
@@ -6809,6 +6816,7 @@ class CustomEndpointUpdate(BaseModel):
     context_length: Optional[int] = None
     discover_models: bool = True
     make_default: bool = False
+    models: Optional[List[str]] = None
 
 
 class MessagingPlatformUpdate(BaseModel):
@@ -8572,6 +8580,16 @@ async def get_ssh_ownership(request: Request):
     if not _SSH_OWNER_NONCE:
         raise HTTPException(status_code=404, detail="SSH ownership is not active")
     return {"ok": True, "sshOwnerNonce": _SSH_OWNER_NONCE, "protocolVersion": 1}
+
+
+@app.get("/api/health")
+async def get_health():
+    """Lightweight process liveness for desktop/backend readiness probes."""
+    return {
+        "ok": True,
+        "version": __version__,
+        "auth_required": bool(getattr(app.state, "auth_required", False)),
+    }
 
 
 @app.get("/api/status")
@@ -11140,6 +11158,23 @@ def _enforce_cui_session_visible(session: dict | None, actor: dict[str, str] | N
     if not _session_visible_to_cui_actor(session, actor):
         raise HTTPException(status_code=404, detail="Session not found")
 
+
+def _list_sessions_rich_all(db, **kwargs) -> List[Dict[str, Any]]:
+    """Page a rich-session query to exhaustion without a silent row cap."""
+    page_size = 1000
+    offset = 0
+    rows: List[Dict[str, Any]] = []
+    query = dict(kwargs)
+    query.pop("limit", None)
+    query.pop("offset", None)
+    while True:
+        page = db.list_sessions_rich(limit=page_size, offset=offset, **query)
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += len(page)
+    return rows
+
 # Per-row fields that no session LIST consumer reads but that dominate the
 # payload. ``system_prompt`` is the fully rendered prompt — tens of KB per
 # row — and made a 21-row /api/sessions response 528KB (96% dead weight),
@@ -11202,17 +11237,16 @@ async def get_sessions(
             exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
             actor = _cui_actor_context_from_request(request)
             if actor or hide_automated:
-                visible_all = db.list_sessions_rich(
+                visible_all = _list_sessions_rich_all(
+                    db,
                     source=source or None,
                     exclude_sources=exclude_list or None,
                     cwd_prefix=(cwd_prefix or None),
-                    limit=10000,
-                    offset=0,
                     min_message_count=min_message_count,
                     include_archived=include_archived,
                     archived_only=archived_only,
                     order_by_last_active=order == "recent",
-                    compact_rows=not full,
+                    compact_rows=False,
                 )
                 if actor:
                     visible_all = [s for s in visible_all if _session_visible_to_cui_actor(s, actor)]
@@ -11266,6 +11300,7 @@ async def get_sessions(
 
 @app.get("/api/profiles/sessions")
 def get_profiles_sessions(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     min_messages: int = 0,
@@ -11318,9 +11353,10 @@ def get_profiles_sessions(
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
     exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-    # Over-fetch per profile so the merged+sorted window is correct for the
-    # requested page. Capped so a huge profile can't blow up the response.
-    per_profile = min(max(limit + offset, limit), 500)
+    # Each profile can contribute at most the requested global window. Do not
+    # cap this below offset+limit: deep pages would otherwise be incomplete.
+    actor = _cui_actor_context_from_request(request)
+    per_profile = max(limit + offset, limit)
 
     merged: List[Dict[str, Any]] = []
     total = 0
@@ -11340,26 +11376,35 @@ def get_profiles_sessions(
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
-            rows = db.list_sessions_rich(
+            query = dict(
                 source=source_filter,
                 exclude_sources=exclude_list or None,
-                limit=per_profile,
-                offset=0,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
                 order_by_last_active=order == "recent",
                 # Same SQL-level blob skip as /api/sessions (see above).
-                compact_rows=not full,
+                # Visibility metadata lives in model_config, so actor-scoped
+                # reads must load it even when the response is compact.
+                compact_rows=not full and not actor,
             )
-            profile_total = db.session_count(
-                source=source_filter,
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
+            rows = (
+                _list_sessions_rich_all(db, **query)
+                if actor
+                else db.list_sessions_rich(limit=per_profile, offset=0, **query)
             )
+            if actor:
+                rows = [s for s in rows if _session_visible_to_cui_actor(s, actor)]
+                profile_total = len(rows)
+            else:
+                profile_total = db.session_count(
+                    source=source_filter,
+                    exclude_sources=exclude_list or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    exclude_children=True,
+                )
             total += profile_total
             profile_totals[name] = profile_total
             for s in rows:
@@ -11393,6 +11438,7 @@ def get_profiles_sessions(
 
 @app.get("/api/profiles/sessions/sidebar")
 def get_profiles_sessions_sidebar(
+    request: Request,
     recents_profile: str = "all",
     recents_limit: int = 20,
     recents_exclude: str = None,
@@ -11431,6 +11477,7 @@ def get_profiles_sessions_sidebar(
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
+    actor = _cui_actor_context_from_request(request)
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
@@ -11442,6 +11489,7 @@ def get_profiles_sessions_sidebar(
     recents_rows: List[Dict[str, Any]] = []
     cron_rows: List[Dict[str, Any]] = []
     messaging_rows: List[Dict[str, Any]] = []
+    messaging_total = 0
     recents_total = 0
     recents_profile_totals: Dict[str, int] = {}
     errors: List[Dict[str, str]] = []
@@ -11459,17 +11507,23 @@ def get_profiles_sessions_sidebar(
         return rows
 
     def _slice(db, *, source=None, exclude=None, cap):
-        return db.list_sessions_rich(
+        query = dict(
             source=source,
             exclude_sources=exclude or None,
-            limit=cap,
-            offset=0,
             min_message_count=1,
             include_archived=False,
             archived_only=False,
             order_by_last_active=True,
-            compact_rows=True,
+            compact_rows=not actor,
         )
+        rows = (
+            _list_sessions_rich_all(db, **query)
+            if actor
+            else db.list_sessions_rich(limit=cap, offset=0, **query)
+        )
+        if actor:
+            rows = [s for s in rows if _session_visible_to_cui_actor(s, actor)]
+        return rows
 
     for name, home in targets:
         db_path = Path(home) / "state.db"
@@ -11482,22 +11536,33 @@ def get_profiles_sessions_sidebar(
             continue
         try:
             if recents_scope == "all" or name == recents_scope:
-                recents_rows.extend(
-                    _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
-                )
-                rtotal = db.session_count(
-                    exclude_sources=recents_exclude_list or None,
+                profile_recents = _slice(db, exclude=recents_exclude_list, cap=recents_cap)
+                recents_rows.extend(_tag(profile_recents, name))
+                if actor:
+                    rtotal = len(profile_recents)
+                else:
+                    rtotal = db.session_count(
+                        exclude_sources=recents_exclude_list or None,
+                        min_message_count=1,
+                        include_archived=False,
+                        archived_only=False,
+                        exclude_children=True,
+                    )
+                recents_total += rtotal
+                recents_profile_totals[name] = rtotal
+            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
+            profile_messaging = _slice(db, exclude=messaging_exclude_list, cap=messaging_cap)
+            messaging_rows.extend(_tag(profile_messaging, name))
+            if actor:
+                messaging_total += len(profile_messaging)
+            else:
+                messaging_total += db.session_count(
+                    exclude_sources=messaging_exclude_list or None,
                     min_message_count=1,
                     include_archived=False,
                     archived_only=False,
                     exclude_children=True,
                 )
-                recents_total += rtotal
-                recents_profile_totals[name] = rtotal
-            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
-            messaging_rows.extend(
-                _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
-            )
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
         finally:
@@ -11518,7 +11583,7 @@ def get_profiles_sessions_sidebar(
         "cron": {"sessions": _window(cron_rows, cron_cap)},
         "messaging": {
             "sessions": _window(messaging_rows, messaging_cap),
-            "total": len(messaging_rows),
+            "total": messaging_total,
         },
         "errors": errors,
     }
@@ -13968,6 +14033,72 @@ def _models_from_custom_endpoint_entry(entry: Dict[str, Any]) -> List[str]:
     return [model for model in models if model and not (model in seen or seen.add(model))]
 
 
+def _api_key_display(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Return ``(has_api_key, preview)`` for a provider or model config block.
+
+    Keys live in ``.env`` behind ``key_env``; only entries written before
+    #69449 still carry a plaintext ``api_key``. Checking both keeps the panel
+    honest either way — reading only ``api_key`` reported "no API key" for
+    every endpoint whose key had been moved to ``.env``.
+    """
+    plaintext = str(entry.get("api_key") or "").strip()
+    if plaintext:
+        return True, redact_key(plaintext)
+    key_env = str(entry.get("key_env") or "").strip()
+    if key_env:
+        return True, f"${{{key_env}}}"
+    return False, None
+
+
+def _config_api_key_is_env_ref(endpoint_id: str) -> bool:
+    """True when this endpoint's on-disk ``api_key`` is a ``${VAR}`` template.
+
+    ``load_config()`` expands env refs, so a hand-written
+    ``api_key: ${MY_KEY}`` is indistinguishable from a literal secret by the
+    time it reaches us. Such an entry is already keeping its secret out of
+    config.yaml, so migrating it would only copy that secret into a second
+    env var the user didn't ask for.
+    """
+    providers = read_raw_config().get("providers")
+    entry = providers.get(endpoint_id) if isinstance(providers, dict) else None
+    raw_key = entry.get("api_key") if isinstance(entry, dict) else None
+    return bool(isinstance(raw_key, str) and re.search(r"\$\{[^}]+\}", raw_key))
+
+
+def _snapshot_custom_endpoint_env(
+    env_var: str,
+) -> Tuple[bool, Optional[str], bool, Optional[str]]:
+    """Capture dotenv and inherited process state separately for rollback."""
+    dotenv = load_env()
+    return (
+        env_var in dotenv,
+        dotenv.get(env_var),
+        env_var in os.environ,
+        os.environ.get(env_var),
+    )
+
+
+def _restore_custom_endpoint_env(
+    env_var: str,
+    snapshot: Tuple[bool, Optional[str], bool, Optional[str]],
+) -> None:
+    """Best-effort exact credential rollback after config persistence fails."""
+    dotenv_present, dotenv_value, process_present, process_value = snapshot
+    try:
+        current_dotenv = load_env()
+        if dotenv_present:
+            if not save_env_value(env_var, dotenv_value or ""):
+                raise RuntimeError(f"credential rollback refused for {env_var}")
+        elif env_var in current_dotenv and not remove_env_value(env_var):
+            raise RuntimeError(f"credential rollback removal refused for {env_var}")
+        if process_present:
+            os.environ[env_var] = process_value or ""
+        else:
+            os.environ.pop(env_var, None)
+    except Exception:
+        _log.exception("Failed to roll back custom endpoint credential %s", env_var)
+
+
 def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     current_provider = str(model_cfg.get("provider", "") or "")
@@ -13986,6 +14117,7 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             endpoint_id = str(provider_id)
             models = _models_from_custom_endpoint_entry(raw_entry)
             endpoint_model = str(raw_entry.get("model") or raw_entry.get("default_model") or (models[0] if models else ""))
+            has_api_key, api_key_preview = _api_key_display(raw_entry)
             endpoints.append({
                 "id": endpoint_id,
                 "name": str(raw_entry.get("name") or endpoint_id),
@@ -13994,13 +14126,14 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "models": models,
                 "context_length": raw_entry.get("context_length"),
                 "discover_models": bool(raw_entry.get("discover_models", True)),
-                "has_api_key": bool(str(raw_entry.get("api_key", "") or "").strip()),
-                "api_key_preview": redact_key(str(raw_entry.get("api_key", "") or "")) if raw_entry.get("api_key") else None,
+                "has_api_key": has_api_key,
+                "api_key_preview": api_key_preview,
                 "is_current": endpoint_id == current_provider,
                 "source": "providers",
             })
 
     if current_provider.lower() == "custom" and current_base_url and not any(e["id"] == "custom" for e in endpoints):
+        has_api_key, api_key_preview = _api_key_display(model_cfg)
         endpoints.insert(0, {
             "id": "custom",
             "name": "Custom",
@@ -14009,8 +14142,8 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "models": [current_model] if current_model else [],
             "context_length": model_cfg.get("context_length"),
             "discover_models": True,
-            "has_api_key": bool(str(model_cfg.get("api_key", "") or "").strip()),
-            "api_key_preview": redact_key(str(model_cfg.get("api_key", "") or "")) if model_cfg.get("api_key") else None,
+            "has_api_key": has_api_key,
+            "api_key_preview": api_key_preview,
             "is_current": True,
             "source": "direct-config",
         })
@@ -14043,7 +14176,7 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
         return
     if str(model_cfg.get("provider") or "").strip().lower() != provider_key:
         return
-    for field in ("provider", "base_url", "api_key"):
+    for field in ("provider", "base_url", "api_key", "key_env"):
         model_cfg.pop(field, None)
     cfg["model"] = model_cfg
 
@@ -14085,19 +14218,50 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         "model": model,
         "discover_models": bool(body.discover_models),
     })
-    # Same for the model map: the panel names one default model, it does not
-    # enumerate the provider's catalogue. Keep the other models (and their
-    # context lengths) and just ensure this one is present.
+    # Same for the model map: merge rather than replace, so existing models
+    # keep their context lengths. ``body.models`` is the catalogue the panel's
+    # Test button already discovered — without it only the one hand-typed
+    # model survived Save, and every picker showed a single-entry list for a
+    # provider serving dozens (#69988). A payload with no ``models`` (older
+    # UI) still just ensures the named default is present.
     existing_models = entry.get("models")
     models_map: Dict[str, Any] = dict(existing_models) if isinstance(existing_models, dict) else {}
-    current_model_entry = models_map.get(model)
-    models_map[model] = dict(current_model_entry) if isinstance(current_model_entry, dict) else {}
+    for candidate in (*(body.models or ()), model):
+        model_id = str(candidate).strip()
+        if not model_id:
+            continue
+        current = models_map.get(model_id)
+        models_map[model_id] = dict(current) if isinstance(current, dict) else {}
     entry["models"] = models_map
     if body.context_length and body.context_length > 0:
         entry["context_length"] = int(body.context_length)
         entry["models"][model]["context_length"] = int(body.context_length)
-    if body.api_key is not None and body.api_key.strip():
-        entry["api_key"] = body.api_key.strip()
+
+    # API keys never belong in config.yaml (#69449). Write to .env and
+    # reference it via ``key_env`` — the same indirection built-in providers
+    # use and that runtime_provider.py already resolves at load time.
+    env_var = custom_endpoint_key_env(endpoint_id)
+    submitted_key = body.api_key.strip() if body.api_key is not None else None
+    if submitted_key:
+        if not save_env_value(env_var, submitted_key):
+            raise RuntimeError(f"credential persistence refused for {env_var}")
+        entry["key_env"] = env_var
+        entry.pop("api_key", None)
+    elif submitted_key is not None:
+        # Blank field means "clear the key", not "leave it alone".
+        if env_var in load_env() and not remove_env_value(env_var):
+            raise RuntimeError(f"credential removal refused for {env_var}")
+        entry.pop("key_env", None)
+        entry.pop("api_key", None)
+    elif str(entry.get("api_key") or "").strip() and not _config_api_key_is_env_ref(endpoint_id):
+        # No new key submitted, but this entry still carries one an earlier
+        # release wrote in plaintext. Migrate it on the next save so endpoints
+        # configured before the fix get cleaned up too, without the user
+        # having to re-enter the key.
+        if not save_env_value(env_var, entry["api_key"].strip()):
+            raise RuntimeError(f"credential migration refused for {env_var}")
+        entry["key_env"] = env_var
+        entry.pop("api_key", None)
 
     providers[endpoint_id] = entry
     cfg["providers"] = providers
@@ -14106,8 +14270,9 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         cfg["model"] = _apply_main_model_assignment(
             cfg.get("model", {}), endpoint_id, model, base_url
         )
-        if entry.get("api_key") and isinstance(cfg["model"], dict):
-            cfg["model"]["api_key"] = entry["api_key"]
+        if entry.get("key_env") and isinstance(cfg["model"], dict):
+            cfg["model"]["key_env"] = entry["key_env"]
+            cfg["model"].pop("api_key", None)
 
     return endpoint_id, entry
 
@@ -14127,8 +14292,15 @@ def upsert_custom_endpoint(body: CustomEndpointUpdate):
     """Create or update a v12+ ``providers`` custom endpoint entry."""
     try:
         cfg = load_config()
-        endpoint_id, _entry = _write_custom_endpoint(cfg, body)
-        save_config(cfg)
+        endpoint_id = _custom_endpoint_id(body.id or body.name)
+        env_var = custom_endpoint_key_env(endpoint_id)
+        previous_env_state = _snapshot_custom_endpoint_env(env_var)
+        try:
+            endpoint_id, _entry = _write_custom_endpoint(cfg, body)
+            save_config(cfg)
+        except Exception:
+            _restore_custom_endpoint_env(env_var, previous_env_state)
+            raise
         response = _custom_endpoint_response(cfg)
         response["ok"] = True
         response["id"] = endpoint_id
@@ -14158,7 +14330,10 @@ def activate_custom_endpoint(endpoint_id: str):
             raise HTTPException(status_code=400, detail="custom endpoint is incomplete")
 
         model_cfg = _apply_main_model_assignment(cfg.get("model", {}), provider_key, model, base_url)
-        if entry.get("api_key"):
+        if entry.get("key_env"):
+            model_cfg["key_env"] = entry["key_env"]
+            model_cfg.pop("api_key", None)
+        elif entry.get("api_key"):
             model_cfg["api_key"] = entry["api_key"]
         cfg["model"] = model_cfg
         save_config(cfg)
@@ -14182,7 +14357,15 @@ def delete_custom_endpoint(endpoint_id: str):
         providers.pop(provider_key, None)
         cfg["providers"] = providers
         _detach_main_model_from_provider(cfg, provider_key)
-        save_config(cfg)
+        env_var = custom_endpoint_key_env(provider_key)
+        previous_env_state = _snapshot_custom_endpoint_env(env_var)
+        if env_var in load_env() and not remove_env_value(env_var):
+            raise RuntimeError(f"credential removal refused for {env_var}")
+        try:
+            save_config(cfg)
+        except Exception:
+            _restore_custom_endpoint_env(env_var, previous_env_state)
+            raise
         response = _custom_endpoint_response(cfg)
         response["ok"] = True
         return response
@@ -17735,7 +17918,7 @@ def _import_sessions_for_profile(profile: Optional[str], sessions: List[Dict[str
 
 
 @app.post("/api/sessions/bulk-delete")
-async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
+async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions, request: Request = None):
     """Delete every session in ``body.ids`` in a single DB transaction.
 
     Backs the dashboard's bulk-select-and-delete flow on the sessions
@@ -17776,10 +17959,24 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
+    actor = _cui_actor_context_from_request(request)
+
     def _delete() -> int:
         db = _open_session_db_for_profile(body.profile)
         try:
-            return db.delete_sessions(body.ids)
+            if not actor:
+                return db.delete_sessions(body.ids)
+            # Authorize the complete set before entering the destructive DB
+            # transaction. One foreign row must fail the whole batch rather
+            # than deleting the owned subset first.
+            resolved: List[str] = []
+            for requested_id in body.ids:
+                sid = db.resolve_session_id(requested_id)
+                if not sid:
+                    continue
+                _enforce_cui_session_visible(db.get_session(sid), actor)
+                resolved.append(sid)
+            return db.delete_sessions(resolved)
         finally:
             db.close()
 
@@ -17803,6 +18000,16 @@ async def import_sessions_endpoint(request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid session import payload") from exc
 
+    actor = _cui_actor_context_from_request(request)
+    if actor:
+        if body.profile and str(actor.get("role") or "").lower() not in {"admin", "owner", "operator"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Admin privileges required for cross-profile import",
+            )
+        for session in body.sessions:
+            _enforce_cui_session_visible(session, actor)
+
     try:
         result = await asyncio.to_thread(_import_sessions_for_profile, body.profile, body.sessions)
     except ValueError as exc:
@@ -17814,7 +18021,7 @@ async def import_sessions_endpoint(request: Request):
 
 
 @app.get("/api/sessions/empty/count")
-async def count_empty_sessions_endpoint(profile: Optional[str] = None):
+async def count_empty_sessions_endpoint(request: Request, profile: Optional[str] = None):
     """Return the number of empty, ended, non-archived sessions.
 
     Drives the dashboard's "Delete empty (N)" button — when N is 0 the
@@ -17824,7 +18031,18 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     def _count() -> int:
         db = _open_session_db_for_profile(profile)
         try:
-            return db.count_empty_sessions()
+            actor = _cui_actor_context_from_request(request)
+            if not actor:
+                return db.count_empty_sessions()
+            rows = _list_sessions_rich_all(db, include_archived=True, compact_rows=False)
+            return sum(
+                1
+                for row in rows
+                if row.get("ended_at") is not None
+                and not row.get("archived")
+                and int(row.get("message_count") or 0) == 0
+                and _session_visible_to_cui_actor(row, actor)
+            )
         finally:
             db.close()
 
@@ -17832,7 +18050,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @app.delete("/api/sessions/empty")
-async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
+async def delete_empty_sessions_endpoint(request: Request, profile: Optional[str] = None):
     """Delete every empty (``message_count == 0``), ended,
     non-archived session in a single transaction.
 
@@ -17854,7 +18072,20 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     def _delete() -> int:
         db = _open_session_db_for_profile(profile)
         try:
-            return db.delete_empty_sessions()
+            actor = _cui_actor_context_from_request(request)
+            if not actor:
+                return db.delete_empty_sessions()
+            rows = _list_sessions_rich_all(db, include_archived=True, compact_rows=False)
+            candidates = [
+                row
+                for row in rows
+                if row.get("ended_at") is not None
+                and not row.get("archived")
+                and int(row.get("message_count") or 0) == 0
+            ]
+            for row in candidates:
+                _enforce_cui_session_visible(row, actor)
+            return db.delete_sessions([row["id"] for row in candidates])
         finally:
             db.close()
 
@@ -17863,7 +18094,7 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @app.get("/api/sessions/stats")
-async def get_session_stats(profile: Optional[str] = None):
+async def get_session_stats(request: Request, profile: Optional[str] = None):
     """Session-store statistics for the Sessions page (mirrors `hermes sessions stats`).
 
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
@@ -17871,6 +18102,27 @@ async def get_session_stats(profile: Optional[str] = None):
     """
     db = _open_session_db_for_profile(profile)
     try:
+        actor = _cui_actor_context_from_request(request)
+        if actor:
+            rows = [
+                row
+                for row in _list_sessions_rich_all(
+                    db, include_archived=True, compact_rows=False
+                )
+                if _session_visible_to_cui_actor(row, actor)
+            ]
+            by_source: Dict[str, int] = {}
+            for row in rows:
+                src = str(row.get("source") or "cli")
+                by_source[src] = by_source.get(src, 0) + 1
+            archived = sum(1 for row in rows if row.get("archived"))
+            return {
+                "total": len(rows),
+                "active_store": len(rows) - archived,
+                "archived": archived,
+                "messages": sum(db.message_count(row["id"]) for row in rows),
+                "by_source": by_source,
+            }
         total = db.session_count(include_archived=True)
         active_store = db.session_count(include_archived=False)
         archived = db.session_count(archived_only=True)
@@ -18057,10 +18309,12 @@ async def get_session_messages(
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def delete_session_endpoint(session_id: str, request: Request, profile: Optional[str] = None):
     # ``profile`` deletes a session belonging to another (local) profile by
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
+    actor = _cui_actor_context_from_request(request)
+
     def _delete():
         db = _open_session_db_for_profile(profile)
         try:
@@ -18076,6 +18330,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
+            _enforce_cui_session_visible(db.get_session(sid), actor)
             db.delete_session(sid)
             return {"ok": True}
         finally:
@@ -18096,7 +18351,7 @@ class SessionRename(BaseModel):
 
 
 @app.patch("/api/sessions/{session_id}")
-async def rename_session_endpoint(session_id: str, body: SessionRename):
+async def rename_session_endpoint(session_id: str, body: SessionRename, request: Request):
     """Update a session: rename, archive, and/or pin it.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
@@ -18109,6 +18364,9 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
+        _enforce_cui_session_visible(
+            db.get_session(sid), _cui_actor_context_from_request(request)
+        )
         if body.title is None and body.archived is None and body.pinned is None:
             raise HTTPException(
                 status_code=400,
@@ -18135,12 +18393,18 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
 
 
 @app.get("/api/sessions/{session_id}/export")
-async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def export_session_endpoint(
+    session_id: str, request: Request, profile: Optional[str] = None
+):
     """Export a single session (metadata + messages) as JSON."""
+    actor = _cui_actor_context_from_request(request)
+
     def _export():
         db = _open_session_db_for_profile(profile)
         try:
             sid = db.resolve_session_id(session_id)
+            if sid:
+                _enforce_cui_session_visible(db.get_session(sid), actor)
             return db.export_session(sid) if sid else None
         finally:
             db.close()
@@ -18179,7 +18443,7 @@ class SessionPrune(BaseModel):
     dry_run: bool = False
 
 
-def _prune_sessions(body: SessionPrune):
+def _prune_sessions(body: SessionPrune, actor: Optional[Dict[str, str]] = None):
     """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
     has_window = (
         body.started_before is not None or body.started_after is not None
@@ -18230,8 +18494,20 @@ def _prune_sessions(body: SessionPrune):
             max_tool_calls=body.max_tool_calls,
             archived=None if body.include_archived else False,
         )
-        if body.dry_run:
+        if body.dry_run or actor:
             rows = db.list_prune_candidates(**filters)
+            if actor and body.dry_run:
+                rows = [
+                    row
+                    for row in rows
+                    if _session_visible_to_cui_actor(db.get_session(row["id"]), actor)
+                ]
+            elif actor:
+                # Destructive set operations are all-or-nothing: authorize every
+                # resolved candidate before the single delete transaction.
+                for row in rows:
+                    _enforce_cui_session_visible(db.get_session(row["id"]), actor)
+        if body.dry_run:
             return {
                 "ok": True,
                 "removed": 0,
@@ -18252,6 +18528,12 @@ def _prune_sessions(body: SessionPrune):
                 ],
             }
         sessions_dir = profile_home / "sessions"
+        if actor:
+            removed = db.delete_sessions(
+                [row["id"] for row in rows],
+                sessions_dir=sessions_dir if sessions_dir.exists() else None,
+            )
+            return {"ok": True, "removed": removed}
         removed = db.prune_sessions(
             sessions_dir=sessions_dir if sessions_dir.exists() else None,
             **filters,
@@ -18262,9 +18544,10 @@ def _prune_sessions(body: SessionPrune):
 
 
 @app.post("/api/sessions/prune")
-async def prune_sessions_endpoint(body: SessionPrune):
+async def prune_sessions_endpoint(body: SessionPrune, request: Request):
     """Delete ended sessions matching filters without blocking the event loop."""
-    return await asyncio.to_thread(_prune_sessions, body)
+    actor = _cui_actor_context_from_request(request)
+    return await asyncio.to_thread(_prune_sessions, body, actor)
 
 
 # ---------------------------------------------------------------------------

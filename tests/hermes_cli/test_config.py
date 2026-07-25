@@ -505,6 +505,16 @@ class TestSaveAndLoadRoundtrip:
 
 
 class TestSaveEnvValueSecure:
+    def test_save_env_value_returns_explicit_success_or_managed_refusal(self, tmp_path, monkeypatch):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}, clear=False):
+            monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+            monkeypatch.setattr("hermes_cli.managed_scope.is_env_managed", lambda key: False)
+            assert save_env_value("TENOR_API_KEY", "value") is True
+
+            monkeypatch.setattr("hermes_cli.managed_scope.is_env_managed", lambda key: True)
+            assert save_env_value("TENOR_API_KEY", "blocked") is False
+            assert load_env()["TENOR_API_KEY"] == "value"
+
     def test_save_env_value_writes_without_stdout(self, tmp_path, capsys):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             save_env_value("TENOR_API_KEY", "sk-test-secret")

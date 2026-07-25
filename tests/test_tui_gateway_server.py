@@ -294,6 +294,8 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
     monkeypatch.setattr(server, "_wait_agent", lambda _session, _rid: None)
+    # The deferred inline-fallback thread now waits via the patient variant.
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda _session, _rid, _sid: None)
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
@@ -5999,7 +6001,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["session_key"] = get_current_session_key(default="")
             return {
@@ -6041,7 +6043,7 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
         api_key = ""
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["prompt"] = prompt
             return {
@@ -7076,7 +7078,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
 
     class _RacyAgent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             # Simulate: something external bumped history_version
             # while we were running.
@@ -7139,7 +7141,7 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             captured["prompt"] = prompt
             return {
@@ -7183,7 +7185,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "reply",
@@ -7234,7 +7236,7 @@ def test_prompt_submit_delivers_pending_steer_as_next_turn(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             prompts.append(prompt)
             if len(prompts) == 1:
@@ -7290,7 +7292,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             seen["prompt"] = prompt
             seen["history"] = conversation_history
@@ -8349,6 +8351,9 @@ def test_session_delete_refuses_active_session(monkeypatch):
     called: list[str] = []
 
     class _DB:
+        def get_session(self, sid):
+            return {"id": sid, "source": "tui"}
+
         def delete_session(self, sid, sessions_dir=None):
             called.append(sid)
             return True
@@ -8379,6 +8384,9 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
     delete (fail closed) rather than fall through and allow it."""
 
     class _DB:
+        def get_session(self, sid):
+            return {"id": sid, "source": "tui"}
+
         def delete_session(self, *a, **kw):
             raise AssertionError("delete must not run when active snapshot fails")
 
@@ -8400,6 +8408,9 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
+        def get_session(self, sid):
+            return None
+
         def delete_session(self, sid, sessions_dir=None):
             return False
 
@@ -8415,6 +8426,9 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
+        def get_session(self, sid):
+            return {"id": sid, "source": "tui"}
+
         def delete_session(self, sid, sessions_dir=None):
             raise RuntimeError("disk full")
 
@@ -8436,6 +8450,9 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
+        def get_session(self, sid):
+            return {"id": sid, "source": "tui"}
+
         def delete_session(self, sid, sessions_dir=None):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
@@ -8589,6 +8606,9 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
     class ProfileDB:
         def __init__(self, db_path=None):
             captured["db_path"] = db_path
+
+        def get_session(self, sid):
+            return {"id": sid, "source": "tui"}
 
         def delete_session(self, sid, sessions_dir=None):
             captured["sid"] = sid
@@ -9282,7 +9302,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
         api_mode = "codex_responses"
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "Rome was founded in 753 BC.",
@@ -9327,7 +9347,7 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "partial answer",
@@ -9359,7 +9379,7 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": "",
@@ -9392,7 +9412,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": None,
@@ -9439,7 +9459,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             return {
                 "final_response": None,
@@ -9603,7 +9623,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     class _Agent:
         model = "model-live"
 
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             assert prompt == "write a long answer"
             assert conversation_history == []
             stream_callback("partial ")
@@ -9867,7 +9887,9 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, limit=200, offset=0, order_by_last_active=False, compact_rows=False
+        ):
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
@@ -9886,7 +9908,9 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
 
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, limit=200, offset=0, order_by_last_active=False, compact_rows=False
+        ):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -9904,7 +9928,9 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
     'no answer' (Copilot review on #17130)."""
 
     class _BrokenDB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, limit=200, offset=0, order_by_last_active=False, compact_rows=False
+        ):
             raise RuntimeError("db locked")
 
     monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
@@ -11033,7 +11059,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
     emitted = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
             return {
                 "final_response": "ok",
@@ -11104,7 +11130,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     turns = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
             return {"final_response": "ok", "messages": []}
 
@@ -13010,7 +13036,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
     replaced = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             seen["prompt"] = prompt
             seen["history"] = conversation_history
             return {
@@ -13354,3 +13380,997 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch):
     }
     assert server._session_owns_notification_event("origin", origin, event) is True
     assert server._session_owns_notification_event("other", other, event) is False
+
+
+# Upstream regression coverage retained across the AIWerk test additions.
+
+def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
+    """A turn cancelled during lazy agent startup must surface an error event.
+
+    Sibling of test_interrupt_before_agent_ready_prevents_late_turn_start: that
+    test only asserts `_run_prompt_submit` is skipped, mocking `_emit` to a
+    no-op so it cannot catch a silent drop. This test captures `_emit` and
+    asserts the client receives an `error` event with a human-readable message,
+    so the Desktop composer can show feedback instead of hanging on a
+    `{"status":"streaming"}` reply that never produces a turn (issue #63078
+    server-side half).
+    """
+    threads = []
+    emitted = []
+    calls = {"run_prompt": 0}
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    session = _session()
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *args, **kwargs: calls.__setitem__(
+                "run_prompt", calls["run_prompt"] + 1
+            ),
+        )
+
+        submit = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+        assert submit.get("result"), f"got error: {submit.get('error')}"
+        assert session["running"] is True
+
+        # User hits Stop while the agent is still building.
+        stop = server.handle_request(
+            {"id": "2", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+        assert stop.get("result"), f"got error: {stop.get('error')}"
+        assert session.get("_turn_cancel_requested") is True
+
+        # The deferred run thread now wakes up; without the emit it would bail
+        # silently and the Desktop would never learn the turn was dropped.
+        threads[0].target()
+
+        assert calls["run_prompt"] == 0
+        assert session["running"] is False
+        assert session.get("inflight_turn") is None
+        # Exactly one error event addressed to this session.
+        error_events = [e for e in emitted if e and len(e) >= 2 and e[0] == "error" and e[1] == "sid"]
+        assert len(error_events) == 1, f"expected one error event, got: {emitted}"
+        msg = error_events[0][2].get("message", "")
+        assert "cancelled" in msg.lower(), f"unexpected message: {msg}"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
+    """When `running` is cleared by something other than an explicit interrupt
+    (e.g. a concurrent session.create race that resets the flag), the deferred
+    run thread must still emit an error event rather than disappearing silently.
+    """
+    threads = []
+    emitted = []
+    calls = {"run_prompt": 0}
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    session = _session()
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *args, **kwargs: calls.__setitem__(
+                "run_prompt", calls["run_prompt"] + 1
+            ),
+        )
+
+        submit = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+        assert submit.get("result"), f"got error: {submit.get('error')}"
+        assert session["running"] is True
+
+        # Simulate a concurrent path clearing `running` without setting the
+        # cancel flag (the other branch of the guard).
+        with session["history_lock"]:
+            session["running"] = False
+
+        threads[0].target()
+
+        assert calls["run_prompt"] == 0
+        assert session.get("inflight_turn") is None
+        error_events = [e for e in emitted if e and len(e) >= 2 and e[0] == "error" and e[1] == "sid"]
+        assert len(error_events) == 1, f"expected one error event, got: {emitted}"
+        msg = error_events[0][2].get("message", "")
+        assert "no longer running" in msg.lower(), f"unexpected message: {msg}"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
+    """#63078 server-side half: a deferred build slower than the old 30s
+    ``_wait_agent`` cliff must NOT eat the first message. The patient wait
+    keeps the pending prompt attached and delivers it as soon as the
+    still-running build completes."""
+    threads = []
+    emitted = []
+    calls = {"run_prompt": 0}
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    ready = threading.Event()
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    # The build "completes" only after the wait loop has already gone through
+    # several empty slices — i.e. well past what a single fixed-timeout wait
+    # slice would tolerate.
+    slices = {"n": 0}
+
+    class _SlowReady:
+        def wait(self, timeout=None):
+            slices["n"] += 1
+            if slices["n"] >= 3:
+                ready.set()
+                session["agent"] = types.SimpleNamespace()
+                return True
+            return False
+
+        def is_set(self):
+            return ready.is_set()
+
+    session["agent_ready"] = _SlowReady()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *args, **kwargs: calls.__setitem__(
+                "run_prompt", calls["run_prompt"] + 1
+            ),
+        )
+
+        submit = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "first message"},
+            }
+        )
+        assert submit.get("result"), f"got error: {submit.get('error')}"
+
+        threads[0].target()
+
+        # The message was DELIVERED, not dropped, and no error event fired.
+        assert calls["run_prompt"] == 1
+        error_events = [e for e in emitted if e and e[0] == "error"]
+        assert not error_events, f"unexpected error events: {error_events}"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
+    """Past the slow threshold the patient wait must tell the user once
+    (keyed notification.show) and clear the notice when the build lands —
+    a long wait is acceptable, a silent one is not."""
+    threads = []
+    emitted = []
+    calls = {"run_prompt": 0}
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    ready = threading.Event()
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    slices = {"n": 0}
+
+    class _SlowReady:
+        def wait(self, timeout=None):
+            slices["n"] += 1
+            if slices["n"] >= 3:
+                ready.set()
+                session["agent"] = types.SimpleNamespace()
+                return True
+            return False
+
+        def is_set(self):
+            return ready.is_set()
+
+    session["agent_ready"] = _SlowReady()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        # Every wait slice lands past the slow threshold.
+        monkeypatch.setattr(server, "_AGENT_BUILD_SLOW_NOTICE_AFTER", 0.0)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *args, **kwargs: calls.__setitem__(
+                "run_prompt", calls["run_prompt"] + 1
+            ),
+        )
+
+        submit = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "first message"},
+            }
+        )
+        assert submit.get("result"), f"got error: {submit.get('error')}"
+
+        threads[0].target()
+
+        assert calls["run_prompt"] == 1
+        shows = [e for e in emitted if e and e[0] == "notification.show" and e[1] == "sid"]
+        clears = [e for e in emitted if e and e[0] == "notification.clear" and e[1] == "sid"]
+        # Exactly one keyed notice, replaced-in-place semantics, then cleared.
+        assert len(shows) == 1, f"expected one slow-build notice, got: {shows}"
+        assert shows[0][2].get("key") == server._AGENT_BUILD_SLOW_NOTICE_KEY
+        assert len(clears) == 1 and clears[0][2].get("key") == server._AGENT_BUILD_SLOW_NOTICE_KEY
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
+    """When the build itself FAILS (agent_error set when ready fires), the
+    prompt must not run and the failure must reach the client as a visible
+    error event — never a silent drop."""
+    threads = []
+    emitted = []
+    calls = {"run_prompt": 0}
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    ready = threading.Event()
+    ready.set()  # build finished...
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    session["agent_error"] = "No LLM provider configured"  # ...but failed
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *args, **kwargs: calls.__setitem__(
+                "run_prompt", calls["run_prompt"] + 1
+            ),
+        )
+
+        submit = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "first message"},
+            }
+        )
+        assert submit.get("result"), f"got error: {submit.get('error')}"
+
+        threads[0].target()
+
+        assert calls["run_prompt"] == 0
+        assert session["running"] is False
+        # #71184 upgraded failure delivery from a bare "error" event to a
+        # terminal message.complete frame (status=error, recoverable) so
+        # failed turns are retained as replayable inflight snapshots. The
+        # contract this test pins is unchanged: the build failure must reach
+        # the client VISIBLY — never a silent drop.
+        failure_frames = [
+            e
+            for e in emitted
+            if e
+            and e[0] in ("error", "message.complete")
+            and e[1] == "sid"
+            and (
+                "No LLM provider configured" in str(e[2].get("message", ""))
+                or "No LLM provider configured" in str(e[2].get("error", ""))
+                or "No LLM provider configured" in str(e[2].get("text", ""))
+            )
+        ]
+        assert len(failure_frames) == 1, f"expected one visible failure frame, got: {emitted}"
+        frame = failure_frames[0]
+        if frame[0] == "message.complete":
+            assert frame[2].get("status") == "error"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_dead_build_thread_fails_fast_not_full_cap(monkeypatch):
+    """A build thread that died without setting agent_ready means the build
+    died hard — the waiter must fail promptly with a visible error instead of
+    sitting out the full wait cap on a corpse."""
+    emitted = []
+
+    class _DeadThread:
+        def is_alive(self):
+            return False
+
+    ready = threading.Event()  # never set
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    session["running"] = True
+    session["_agent_build_thread"] = _DeadThread()
+    session["agent_error"] = "agent init failed: boom"
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        # Short slices so the test is fast; the dead-thread check fires on the
+        # first empty slice, far below the cap.
+        monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+
+        start = time.monotonic()
+        err = server._wait_agent_for_prompt(session, "rid-1", "sid")
+        elapsed = time.monotonic() - start
+
+        assert err is not None
+        assert "boom" in (err.get("error") or {}).get("message", "")
+        assert elapsed < 5.0, f"dead-thread detection took {elapsed:.1f}s"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_wait_agent_for_prompt_honors_cancel_mid_wait(monkeypatch):
+    """A cancel arriving during the patient wait must end it promptly and
+    return None (the caller's cancel branch owns the user-visible event)."""
+    ready = threading.Event()  # never set
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    session["running"] = True
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+
+        def cancel_soon():
+            time.sleep(0.05)
+            with session["history_lock"]:
+                session["_turn_cancel_requested"] = True
+
+        canceller = threading.Thread(target=cancel_soon)
+        canceller.start()
+        start = time.monotonic()
+        err = server._wait_agent_for_prompt(session, "rid-1", "sid")
+        elapsed = time.monotonic() - start
+        canceller.join()
+
+        assert err is None
+        assert elapsed < 5.0, f"cancel honored only after {elapsed:.1f}s"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_agent_build_wait_cap_config_override(monkeypatch):
+    """agent.build_wait_timeout in config.yaml overrides the default cap;
+    invalid/absent values fall back to 600s."""
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"build_wait_timeout": 90}})
+    assert server._agent_build_wait_cap() == 90.0
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {}})
+    assert server._agent_build_wait_cap() == 600.0
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"build_wait_timeout": 0}})
+    assert server._agent_build_wait_cap() == 600.0
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"build_wait_timeout": "nonsense"}})
+    assert server._agent_build_wait_cap() == 600.0
+
+
+def test_wait_agent_for_prompt_expires_at_cap(monkeypatch):
+    """A genuinely hung build (thread alive, never ready) still fails at the
+    bounded cap with a message that tells the user their text was not sent."""
+    class _AliveThread:
+        def is_alive(self):
+            return True
+
+    ready = threading.Event()  # never set
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    session["running"] = True
+    session["_agent_build_thread"] = _AliveThread()
+    server._sessions["sid"] = session
+
+    try:
+        monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+        monkeypatch.setattr(server, "_agent_build_wait_cap", lambda: 0.05)
+
+        err = server._wait_agent_for_prompt(session, "rid-1", "sid")
+
+        assert err is not None
+        message = (err.get("error") or {}).get("message", "")
+        assert "timed out" in message and "was not sent" in message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_build_persist_message_with_image_refs_without_images_returns_text(monkeypatch):
+    """#70720: when no images are attached the persisted message is the raw
+    prompt — no @image directive prefix is introduced."""
+    assert server._build_persist_message_with_image_refs("what is this?", []) == "what is this?"
+    assert server._build_persist_message_with_image_refs("", []) == ""
+
+
+def test_build_persist_message_with_image_refs_appends_existing_paths(monkeypatch, tmp_path):
+    """Attached images that still exist on disk are persisted as trailing
+    ``@image:<path>`` directive lines so the desktop renders them after a
+    restart (instead of the vision-only enrichment that silently breaks)."""
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"\x89PNG")
+
+    result = server._build_persist_message_with_image_refs("what is in this photo?", [str(img)])
+
+    assert result == f"what is in this photo?\n@image:{img}"
+
+
+def test_build_persist_message_keeps_the_caption_on_the_first_line(tmp_path):
+    """Session previews are the first 60 characters of the first user message,
+    so a leading directive would title the session with a truncated file path
+    in the sidebar, switcher, and command palette."""
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"png")
+
+    result = server._build_persist_message_with_image_refs("what is in this photo?", [str(img)])
+
+    assert result.split("\n", 1)[0] == "what is in this photo?"
+
+
+def test_build_persist_message_with_image_refs_skips_missing_paths(monkeypatch, tmp_path):
+    """Only paths that still exist are persisted; a missing file must not
+    inject a dangling @image ref into the transcript."""
+    existing = tmp_path / "a.png"
+    existing.write_bytes(b"png")
+    missing = str(tmp_path / "gone.png")
+
+    result = server._build_persist_message_with_image_refs("compare them", [str(existing), missing])
+
+    assert result == f"compare them\n@image:{existing}"
+
+
+def test_build_persist_message_with_image_refs_without_text_is_refs_only(monkeypatch, tmp_path):
+    """A stand-alone attachment (no caption) persists as just the directive
+    line, so a bare image survives in history and is not dropped as empty."""
+    img = tmp_path / "only.png"
+    img.write_bytes(b"png")
+
+    assert server._build_persist_message_with_image_refs("", [str(img)]) == f"@image:{img}"
+
+
+def test_build_persist_message_quotes_paths_containing_spaces(tmp_path):
+    """The unquoted alternative in the directive pattern is ``\\S+``, so a path
+    with a space parses as a truncated ref with the tail left as loose text.
+    Desktop composer images live in the app's userData dir, which on macOS is
+    ``~/Library/Application Support/...`` — a space every time."""
+    img_dir = tmp_path / "Application Support" / "Hermes" / "composer-images"
+    img_dir.mkdir(parents=True)
+    img = img_dir / "cat.png"
+    img.write_bytes(b"png")
+
+    result = server._build_persist_message_with_image_refs("what is this?", [str(img)])
+
+    assert result == f"what is this?\n@image:`{img}`"
+
+
+def test_persist_user_message_mirrors_the_shape_sent_to_the_model(tmp_path):
+    """A native-vision turn sends ``content`` as a parts list, and the session
+    store ignores a plain-string override for a list payload. The override must
+    mirror the list shape (ref text + the original image parts) or it is
+    silently dropped and the attachment never reaches history."""
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"png")
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    native_parts = [{"type": "text", "text": "api-only text"}, image_part]
+
+    override = server._build_persist_user_message("what is this?", [str(img)], native_parts)
+
+    assert override == [{"type": "text", "text": f"what is this?\n@image:{img}"}, image_part]
+
+
+def test_persist_user_message_stays_a_string_for_text_mode(tmp_path):
+    """Text-mode (vision-preprocessed) turns send a string, so the override
+    stays a string — the shape the session store rewrites directly."""
+    img = tmp_path / "cat.png"
+    img.write_bytes(b"png")
+
+    override = server._build_persist_user_message("what is this?", [str(img)], "enriched api-only text")
+
+    assert override == f"what is this?\n@image:{img}"
+
+
+def test_native_vision_turn_persists_a_renderable_image_ref(tmp_path):
+    """End to end through the real session-store flush: whichever image input
+    mode the turn used, the durable row carries an ``@image:`` ref the desktop
+    can render after a restart."""
+    from unittest.mock import MagicMock
+
+    from agent.image_routing import build_native_content_parts
+    from run_agent import AIAgent
+
+    img_dir = tmp_path / "Application Support" / "composer-images"
+    img_dir.mkdir(parents=True)
+    img = img_dir / "cat.png"
+    img.write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+            "01f15c4890000000a49444154789c6360000002000100ffff0300000600"
+            "0557bfabd40000000049454e44ae426082"
+        )
+    )
+    native_parts, skipped = build_native_content_parts("what is in this photo?", [str(img)])
+    assert not skipped
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.session_id = "s-1"
+    agent._last_flushed_db_idx = 0
+    agent._persist_disabled = False
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._pending_cli_user_message = None
+    agent._persist_user_message_timestamp = None
+    agent._persist_user_message_idx = 0
+    agent._persist_user_message_override = server._build_persist_user_message(
+        "what is in this photo?", [str(img)], native_parts
+    )
+
+    agent._flush_messages_to_session_db([{"role": "user", "content": native_parts}], [])
+
+    written = agent._session_db.append_message.call_args.kwargs["content"]
+    assert f"@image:`{img}`" in written
+    assert "what is in this photo?" in written
+    # The model keeps the pixels for the rest of the session.
+    assert any(part.get("type") == "image_url" for part in agent._persist_user_message_override)
+
+
+def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
+    """#70720: _run_prompt_submit must forward the (image-ref-aware) persisted
+    user message to run_conversation via persist_user_message, so the gateway
+    stores the UI-recognizable form instead of the vision enrichment."""
+    captured = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            captured["persist_user_message"] = _kwargs.get("persist_user_message")
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+        assert resp.get("result")
+
+        # Without attachments the persist form equals the raw prompt.
+        assert captured.get("persist_user_message") == "hi"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+# Persisted-session CUI confinement regressions.
+def _persisted_actor(actor_id="tenant:owner", role="user", **extra):
+    return {"tenant_id": "tenant", "actor_id": actor_id, "role": role, **extra}
+
+
+def _persisted_row(session_id, actor_id="tenant:owner", role="user", **extra):
+    return {
+        "id": session_id,
+        "source": "tui",
+        "title": extra.pop("title", session_id),
+        "preview": extra.pop("preview", f"preview-{session_id}"),
+        "started_at": extra.pop("started_at", 1),
+        "message_count": extra.pop("message_count", 1),
+        "model_config": {"_cui_actor_context": _persisted_actor(actor_id, role)},
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        _persisted_actor(_restricted="1"),
+        {"tenant_id": "tenant", "role": "user"},
+        _persisted_actor("tenant:foreign"),
+        _persisted_actor("tenant:other-admin", "admin"),
+    ],
+    ids=["restricted", "incomplete", "foreign-customer", "different-admin"],
+)
+def test_session_create_rejects_invisible_parent_before_side_effects(monkeypatch, actor):
+    parent = _persisted_row("parent")
+    writes = []
+
+    class _DB:
+        def get_session(self, session_id):
+            return parent if session_id == "parent" else None
+
+        def create_session(self, *args, **kwargs):
+            writes.append((args, kwargs))
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *a, **k: pytest.fail("denied parent must not claim a live slot"),
+    )
+    before = set(server._sessions)
+    token = server.bind_cui_actor_context(actor)
+    try:
+        response = server.handle_request(
+            {"id": "create-denied", "method": "session.create", "params": {"parent_session_id": "parent"}}
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert response["error"] == {"code": 4007, "message": "session not found"}
+    assert set(server._sessions) == before
+    assert writes == []
+
+
+@pytest.mark.parametrize("actor", [_persisted_actor(), None], ids=["owner", "trusted-no-actor"])
+def test_session_create_accepts_visible_parent(monkeypatch, actor):
+    parent = _persisted_row("parent")
+
+    class _DB:
+        def get_session(self, session_id):
+            return parent if session_id == "parent" else None
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
+    token = server.bind_cui_actor_context(actor) if actor is not None else None
+    sid = ""
+    try:
+        response = server.handle_request(
+            {"id": "create-ok", "method": "session.create", "params": {"parent_session_id": "parent"}}
+        )
+        assert "error" not in response
+        sid = response["result"]["session_id"]
+        assert server._sessions[sid]["parent_session_id"] == "parent"
+    finally:
+        if token is not None:
+            server.reset_cui_actor_context(token)
+        if sid:
+            server._sessions.pop(sid, None)
+
+
+def test_session_list_filters_invisible_rows_before_pagination(monkeypatch):
+    rows = [
+        _persisted_row("foreign", "tenant:foreign", title="secret"),
+        _persisted_row("owned", title="mine"),
+    ]
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            return rows
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(_persisted_actor())
+    try:
+        response = server.handle_request(
+            {"id": "list", "method": "session.list", "params": {"limit": 1}}
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert [row["id"] for row in response["result"]["sessions"]] == ["owned"]
+    assert response["result"]["sessions"][0]["title"] == "mine"
+
+
+@pytest.mark.parametrize(
+    ("actor", "expected_ids", "expected_total"),
+    [
+        (_persisted_actor(), ["owned-older"], 2),
+        (_persisted_actor("tenant:foreign"), ["foreign-1"], 258),
+        (_persisted_actor(_restricted="1"), [], 0),
+        ({"tenant_id": "tenant", "role": "user"}, [], 0),
+        (_persisted_actor("tenant:other-admin", "admin"), [], 0),
+        (None, ["foreign-1"], 260),
+    ],
+    ids=["owner", "foreign", "restricted", "incomplete", "different-admin", "trusted-no-actor"],
+)
+def test_session_list_pages_to_exhaustion_before_visible_offset_and_exact_total(
+    monkeypatch, actor, expected_ids, expected_total
+):
+    rows = [
+        *[_persisted_row(f"foreign-{i}", "tenant:foreign") for i in range(205)],
+        _persisted_row("owned-newer"),
+        *[_persisted_row(f"foreign-{i}", "tenant:foreign") for i in range(205, 258)],
+        _persisted_row("owned-older"),
+    ]
+    calls = []
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            calls.append(kwargs)
+            start = kwargs.get("offset", 0)
+            return rows[start : start + kwargs["limit"]]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(actor) if actor is not None else None
+    try:
+        response = server.handle_request(
+            {
+                "id": "list-exact",
+                "method": "session.list",
+                "params": {"offset": 1, "limit": 1},
+            }
+        )
+    finally:
+        if token is not None:
+            server.reset_cui_actor_context(token)
+
+    assert [row["id"] for row in response["result"]["sessions"]] == expected_ids
+    assert response["result"]["total"] == expected_total
+    assert [call.get("offset", 0) for call in calls] == [0, 200]
+    assert all(call.get("compact_rows") is True for call in calls)
+
+
+def test_session_list_applies_visible_offset_beyond_scan_page(monkeypatch):
+    rows = [_persisted_row(f"owned-{i}") for i in range(430)]
+    calls = []
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            calls.append(kwargs)
+            start = kwargs.get("offset", 0)
+            return rows[start : start + kwargs["limit"]]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(_persisted_actor())
+    try:
+        response = server.handle_request(
+            {
+                "id": "list-deep-offset",
+                "method": "session.list",
+                "params": {"offset": 325, "limit": 2},
+            }
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert [row["id"] for row in response["result"]["sessions"]] == [
+        "owned-325",
+        "owned-326",
+    ]
+    assert response["result"]["total"] == 430
+    assert [call["offset"] for call in calls] == [0, 200, 400]
+
+
+@pytest.mark.parametrize(
+    ("actor", "expected"),
+    [
+        (_persisted_actor(_restricted="1"), None),
+        ({"tenant_id": "tenant", "role": "user"}, None),
+        (_persisted_actor(), "owned"),
+        (None, "foreign"),
+    ],
+    ids=["restricted", "incomplete", "owner", "trusted-no-actor"],
+)
+def test_session_most_recent_selects_only_visible_rows(monkeypatch, actor, expected):
+    rows = [_persisted_row("foreign", "tenant:foreign"), _persisted_row("owned")]
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            return rows
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(actor) if actor is not None else None
+    try:
+        response = server.handle_request(
+            {"id": "recent", "method": "session.most_recent", "params": {}}
+        )
+    finally:
+        if token is not None:
+            server.reset_cui_actor_context(token)
+
+    assert response["result"]["session_id"] == expected
+    if expected is None:
+        assert response["result"] == {"session_id": None}
+
+
+@pytest.mark.parametrize(
+    ("actor", "expected"),
+    [
+        (_persisted_actor(), "owned"),
+        (_persisted_actor("tenant:foreign"), "foreign-0"),
+        (_persisted_actor(_restricted="1"), None),
+        ({"tenant_id": "tenant", "role": "user"}, None),
+        (_persisted_actor("tenant:other-admin", "admin"), None),
+        (None, "foreign-0"),
+    ],
+    ids=["owner", "foreign", "restricted", "incomplete", "different-admin", "trusted-no-actor"],
+)
+def test_session_most_recent_pages_past_200_foreign_rows(monkeypatch, actor, expected):
+    rows = [
+        *[_persisted_row(f"foreign-{i}", "tenant:foreign") for i in range(225)],
+        _persisted_row("owned"),
+    ]
+    calls = []
+
+    class _DB:
+        def list_sessions_rich(self, **kwargs):
+            calls.append(kwargs)
+            start = kwargs.get("offset", 0)
+            return rows[start : start + kwargs["limit"]]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(actor) if actor is not None else None
+    try:
+        response = server.handle_request(
+            {"id": "recent-exact", "method": "session.most_recent", "params": {}}
+        )
+    finally:
+        if token is not None:
+            server.reset_cui_actor_context(token)
+
+    assert response["result"]["session_id"] == expected
+    expected_offsets = [0] if expected == "foreign-0" else [0, 200]
+    assert [call.get("offset", 0) for call in calls] == expected_offsets
+    assert all(call.get("compact_rows") is True for call in calls)
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [
+        _persisted_actor(_restricted="1"),
+        {"tenant_id": "tenant", "role": "user"},
+        _persisted_actor("tenant:foreign"),
+        _persisted_actor("tenant:other-admin", "admin"),
+    ],
+    ids=["restricted", "incomplete", "foreign-customer", "different-admin"],
+)
+def test_session_delete_invisible_row_is_not_found_and_not_mutated(monkeypatch, actor):
+    rows = {"owned": _persisted_row("owned")}
+    deleted = []
+
+    class _DB:
+        def get_session(self, session_id):
+            return rows.get(session_id)
+
+        def delete_session(self, session_id, sessions_dir=None):
+            deleted.append(session_id)
+            rows.pop(session_id, None)
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(actor)
+    try:
+        response = server.handle_request(
+            {"id": "delete-denied", "method": "session.delete", "params": {"session_id": "owned"}}
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert response["error"] == {"code": 4007, "message": "session not found"}
+    assert deleted == []
+    assert "owned" in rows
+
+
+@pytest.mark.parametrize("actor", [_persisted_actor(), None], ids=["owner", "trusted-no-actor"])
+def test_session_delete_visible_row_succeeds(monkeypatch, actor):
+    rows = {"owned": _persisted_row("owned")}
+
+    class _DB:
+        def get_session(self, session_id):
+            return rows.get(session_id)
+
+        def delete_session(self, session_id, sessions_dir=None):
+            return rows.pop(session_id, None) is not None
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    token = server.bind_cui_actor_context(actor) if actor is not None else None
+    try:
+        response = server.handle_request(
+            {"id": "delete-ok", "method": "session.delete", "params": {"session_id": "owned"}}
+        )
+    finally:
+        if token is not None:
+            server.reset_cui_actor_context(token)
+
+    assert response["result"] == {"deleted": "owned"}
+    assert rows == {}
