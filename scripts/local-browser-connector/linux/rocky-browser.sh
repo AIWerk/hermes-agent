@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generic Hermes/Rocky local browser connector for Linux desktops.
+# Generic Hermes local browser connector for Linux desktops.
 # Starts a visible isolated Chromium-family browser and optionally opens reverse
 # SSH tunnels for CDP and the localhost launcher. Tenant values come from env.
 
@@ -117,11 +117,11 @@ start_browser() {
   local existing bin pid
   existing="$(read_pid "$PID_FILE")"
   if is_pid_alive "$existing" && port_ready; then
-    say "Rocky browser already running (pid $existing)."
+    say "Hermes browser already running (pid $existing)."
     return 0
   fi
   bin="$(find_browser)" || { err "No supported Chromium-family browser found. Install Chromium/Chrome/Brave/Edge or set ROCKY_BROWSER_BIN."; return 1; }
-  say "Starting Rocky browser with isolated profile: $PROFILE_DIR"
+  say "Starting Hermes browser with isolated profile: $PROFILE_DIR"
   nohup "$bin" \
     --remote-debugging-address="$CDP_HOST" \
     --remote-debugging-port="$CDP_PORT" \
@@ -136,7 +136,7 @@ start_browser() {
   echo "$pid" > "$PID_FILE"
   for _ in {1..30}; do
     if port_ready; then
-      say "Rocky browser ready at http://$CDP_HOST:$CDP_PORT (pid $pid)."
+      say "Hermes browser ready at http://$CDP_HOST:$CDP_PORT (pid $pid)."
       return 0
     fi
     sleep 0.5
@@ -149,10 +149,10 @@ stop_browser() {
   local pid
   pid="$(read_pid "$PID_FILE")"
   if is_pid_alive "$pid"; then
-    say "Stopping Rocky browser (pid $pid)."
+    say "Stopping Hermes browser (pid $pid)."
     kill "$pid" 2>/dev/null || true
   else
-    say "Rocky browser is not running."
+    say "Hermes browser is not running."
   fi
   rm -f "$PID_FILE"
 }
@@ -211,7 +211,7 @@ status() {
   bpid="$(read_pid "$PID_FILE")"
   tpid="$(read_pid "$TUNNEL_PID_FILE")"
   lpid="$(read_pid "$LAUNCHER_PID_FILE")"
-  say "Rocky browser connector status"
+  say "Hermes browser connector status"
   say "  browser pid:    ${bpid:-none} $(is_pid_alive "$bpid" && echo '(running)' || echo '(not running)')"
   say "  local CDP:      http://$CDP_HOST:$CDP_PORT $(port_ready && echo '(ready)' || echo '(not ready)')"
   say "  profile:        $PROFILE_DIR"
@@ -232,7 +232,7 @@ launcher_service() {
   token="$(launcher_token)" || return 1
   chmod 600 "$key" 2>/dev/null || true
   mkdir -p "$LOG_DIR"
-  say "Starting Rocky launcher HTTP on $LAUNCHER_HOST:$LAUNCHER_PORT (bearer-token required)"
+  say "Starting Hermes launcher HTTP on $LAUNCHER_HOST:$LAUNCHER_PORT (bearer-token required)"
   ROCKY_BROWSER_SCRIPT="$0" ROCKY_BROWSER_LOG_DIR="$LOG_DIR" ROCKY_BROWSER_LAUNCHER_HOST="$LAUNCHER_HOST" ROCKY_BROWSER_LAUNCHER_PORT="$LAUNCHER_PORT" \
   ROCKY_BROWSER_LAUNCHER_TOKEN="$token" \
   python3 - <<'PY' > "$LOG_DIR/rocky-browser-launcher.log" 2>&1 &
@@ -345,7 +345,7 @@ EOF
   fi
   cat > "$service_file" <<EOF
 [Unit]
-Description=Hermes Rocky local browser launcher reverse tunnel
+Description=Hermes local browser launcher reverse tunnel
 After=network-online.target
 
 [Service]

@@ -133,7 +133,7 @@ _SESSION_PROGRESS_RE = re.compile(
 )
 
 _USER_PREF_RE = re.compile(
-    r"\b(user|Attila|prefers|likes|dislikes|expects|wants|does not want|"
+    r"\b(user|prefers|likes|dislikes|expects|wants|does not want|"
     r"communication style|speaks|lives|timezone|role|building)\b",
     re.IGNORECASE,
 )

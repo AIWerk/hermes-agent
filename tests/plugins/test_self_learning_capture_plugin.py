@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -14,16 +16,37 @@ from plugins.self_learning_capture import (
 
 def _setup_paths(tmp_path: Path, monkeypatch):
     hermes_home = tmp_path / "hermes-home"
-    wiki = tmp_path / "wiki"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setenv("WIKI_PATH", str(wiki))
-    return wiki / "feedback" / "_inbox.md"
+    monkeypatch.setenv("HERMES_PROFILE", "test-profile")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "legacy-wiki"))
+    return (
+        hermes_home
+        / "state"
+        / "self_learning_capture"
+        / "tenants"
+        / "local"
+        / "profiles"
+        / "test-profile"
+        / "feedback_inbox.md"
+    )
+
+
+def test_capture_is_disabled_by_default(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(user_message="Nem ezt kértem, jegyezd meg így.", session_id="disabled-default")
+
+    assert not inbox.exists()
 
 
 def test_pre_llm_call_captures_correction_candidate(tmp_path, monkeypatch):
     inbox = _setup_paths(tmp_path, monkeypatch)
 
-    pre_llm_call(user_message="Ezt rosszul csináltad, legközelebb ne így.", session_id="s1")
+    pre_llm_call(
+        user_message="Ezt rosszul csináltad, legközelebb ne így.",
+        session_id="s1",
+        config={"enabled": True},
+    )
 
     text = inbox.read_text(encoding="utf-8")
     assert "correction-detector" in text
@@ -35,12 +58,12 @@ def test_pre_llm_call_captures_correction_candidate(tmp_path, monkeypatch):
 def test_pre_llm_call_ignores_and_deduplicates_non_corrections(tmp_path, monkeypatch):
     inbox = _setup_paths(tmp_path, monkeypatch)
 
-    pre_llm_call(user_message="Kérlek nézd meg a logot.", session_id="s1")
+    pre_llm_call(user_message="Kérlek nézd meg a logot.", session_id="s1", config={"enabled": True})
     assert not inbox.exists()
 
     msg = "Nem ezt kértem, jegyezd meg így."
-    pre_llm_call(user_message=msg, session_id="s1")
-    pre_llm_call(user_message=msg, session_id="s1")
+    pre_llm_call(user_message=msg, session_id="s1", config={"enabled": True})
+    pre_llm_call(user_message=msg, session_id="s1", config={"enabled": True})
 
     text = inbox.read_text(encoding="utf-8")
     assert text.count("correction-detector") == 1
@@ -61,7 +84,7 @@ def test_configured_feedback_inbox_path_overrides_wiki_path(tmp_path, monkeypatc
     pre_llm_call(
         user_message="Nem ezt kértem, jegyezd meg így.",
         session_id="s4",
-        config={"feedback_inbox": str(custom_inbox)},
+        config={"enabled": True, "feedback_inbox": str(custom_inbox)},
     )
 
     assert custom_inbox.exists()
@@ -78,6 +101,7 @@ def test_post_tool_call_captures_failed_tool_and_sanitizes_secrets(tmp_path, mon
         result={"success": False, "error": "token=abcd1234 failed", "exit_code": 1},
         session_id="s2",
         duration_ms=12,
+        config={"enabled": True},
     )
 
     text = inbox.read_text(encoding="utf-8")
@@ -94,6 +118,123 @@ def test_post_tool_call_ignores_successful_result(tmp_path, monkeypatch):
     post_tool_call(tool_name="terminal", result={"success": True, "exit_code": 0}, session_id="s3")
 
     assert not inbox.exists()
+
+
+def test_default_inbox_is_tenant_and_profile_qualified(tmp_path, monkeypatch):
+    default_inbox = _setup_paths(tmp_path, monkeypatch)
+    tenant_inbox = Path(str(default_inbox).replace("/local/", "/tenant-example/"))
+
+    pre_llm_call(
+        user_message="Nem ezt kértem, jegyezd meg így.",
+        session_id="tenant-scope",
+        tenant_id="tenant-example",
+        profile="test-profile",
+        config={"enabled": True},
+    )
+
+    assert tenant_inbox.exists()
+    assert not default_inbox.exists()
+    assert not (tmp_path / "legacy-wiki" / "feedback" / "_inbox.md").exists()
+
+
+def test_capture_files_have_restrictive_permissions(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(
+        user_message="Nem ezt kértem, jegyezd meg így.",
+        session_id="private-mode",
+        config={"enabled": True},
+    )
+
+    assert stat.S_IMODE(inbox.stat().st_mode) == 0o600
+    current = inbox.parent
+    hermes_home = inbox.parents[6]
+    # Every directory created for the capture path, including HERMES_HOME and
+    # state/tenant/profile ancestors, is private.
+    while True:
+        assert stat.S_IMODE(current.stat().st_mode) == 0o700
+        if current == hermes_home:
+            break
+        current = current.parent
+
+
+def test_capture_allowlists_fields_and_redacts_pii(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    post_tool_call(
+        tool_name="terminal",
+        args={
+            "command": "notify person@example.test at +41 79 123 45 67 from 192.0.2.44",
+            "headers": {"X-Private-Contact": "private@example.test"},
+        },
+        result={
+            "success": False,
+            "error": "person@example.test unavailable at +41 79 123 45 67",
+            "exit_code": 1,
+            "raw_customer_record": "Jane Example, private@example.test",
+        },
+        session_id="pii-filter",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert "person@example.test" not in text
+    assert "private@example.test" not in text
+    assert "+41 79 123 45 67" not in text
+    assert "192.0.2.44" not in text
+    assert "headers" not in text
+    assert "raw_customer_record" not in text
+    assert "[REDACTED:EMAIL]" in text
+    assert "[REDACTED:PHONE]" in text
+    assert "[REDACTED:IP]" in text
+
+
+def test_json_string_result_is_parsed_before_allowlisting(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+    result = json.dumps(
+        {
+            "success": False,
+            "error": "structured failure",
+            "raw_customer_record": "Private Person confidential dossier",
+        }
+    )
+
+    post_tool_call(
+        tool_name="terminal",
+        result=result,
+        session_id="json-result",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert "structured failure" in text
+    assert "raw_customer_record" not in text
+    assert "Private Person confidential dossier" not in text
+
+
+def test_unstructured_failure_result_does_not_persist_raw_text(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+    private_text = "error executing request for Private Person confidential dossier"
+
+    post_tool_call(
+        tool_name="terminal",
+        result=private_text,
+        session_id="plain-result",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert private_text not in text
+    assert "Private Person" not in text
+
+
+def test_sanitize_redacts_formatted_phones_and_ipv6():
+    values = ["(555) 867-5309", "202-555-0100", "2001:db8::1"]
+    out = _sanitize("contact " + " or ".join(values))
+    for value in values:
+        assert value not in out
+    assert "[REDACTED:PHONE]" in out
+    assert "[REDACTED:IP]" in out
 
 
 # Synthetic secrets are assembled from fragments at runtime so the contiguous

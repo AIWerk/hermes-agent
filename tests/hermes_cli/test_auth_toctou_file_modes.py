@@ -72,7 +72,7 @@ def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
 def test_load_auth_store_permission_error_is_not_silent_logout(tmp_path, monkeypatch):
     """Unreadable auth.json is an ownership/permission fault, not a corrupt or empty store.
 
-    Regression for the Rocky/local failure mode where a root-owned auth.json was
+    Regression for the deployed/local failure mode where a root-owned auth.json was
     treated as ``logged out`` and later writes could replace the real store.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

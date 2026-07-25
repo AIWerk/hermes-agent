@@ -964,7 +964,7 @@ def _callback_operator_verification(config: OperatorVerificationConfig, *, now: 
         return _failure("verification_failed", now=now)
     return OperatorVerificationResult(
         ok=True,
-        actor_id=str(data.get("actor_id") or "attila"),
+        actor_id=str(data.get("actor_id") or "operator"),
         role=str(data.get("role") or "operator"),
         verified_at=now,
         expires_at=now + config.ttl_seconds,

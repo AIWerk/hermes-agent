@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch as mock_patch
 
+import pytest
+
 import tools.approval as approval_module
 from hermes_constants import get_hermes_home
 from tools.approval import (
@@ -112,13 +114,13 @@ class TestCuiManagedAutonomy:
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv(
             "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"rocky","actor_id":"rocky:op","role":"operator"}',
+            '{"tenant_id":"example-tenant","actor_id":"example-tenant:operator","role":"operator"}',
         )
         assert _is_cui_managed_autonomy_enabled() is True
 
         monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:op")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:operator")
         monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
         assert _is_cui_managed_autonomy_enabled() is True
 
@@ -131,13 +133,13 @@ class TestCuiManagedAutonomy:
         PR-2 lands), not re-parse os.environ itself."""
         monkeypatch.setenv(
             "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"rocky","actor_id":"rocky:op","role":"operator"}',
+            '{"tenant_id":"example-tenant","actor_id":"example-tenant:operator","role":"operator"}',
         )
         # The helper is the single source of truth for the actor dict.
         from agent.cui_actor_context import current_cui_actor_context
 
         assert approval_module._cui_actor_context() == current_cui_actor_context()
-        assert approval_module._cui_actor_context()["actor_id"] == "rocky:op"
+        assert approval_module._cui_actor_context()["actor_id"] == "example-tenant:operator"
 
         # Delegation, not a private re-parse: stubbing the helper changes what
         # approval sees, proving it does not read os.environ directly.
@@ -154,8 +156,8 @@ class TestCuiManagedAutonomy:
     def test_lay_customer_roles_do_not_get_managed_autonomy(self, monkeypatch):
         """'user'/'tenant_user' are customers, not operators — no bypass."""
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:user")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:user")
         for role in ("user", "tenant_user"):
             monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", role)
             assert _is_cui_managed_autonomy_enabled() is False
@@ -165,7 +167,7 @@ class TestCuiManagedAutonomy:
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
         monkeypatch.setenv(
             "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"rocky","actor_id":"rocky:op","role":"operator"}',
+            '{"tenant_id":"example-tenant","actor_id":"example-tenant:operator","role":"operator"}',
         )
 
         approved = check_all_command_guards("rm -rf /tmp/hermes-demo", "local")
@@ -179,8 +181,8 @@ class TestCuiManagedAutonomy:
     def test_execute_code_auto_approves_low_risk_public_reads_in_cui_autonomy(self, monkeypatch):
         monkeypatch.setenv("HERMES_EXEC_ASK", "true")
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:op")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:operator")
         monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
 
         code = """
@@ -197,8 +199,8 @@ print(result)
     def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(self, monkeypatch):
         monkeypatch.setenv("HERMES_EXEC_ASK", "true")
         monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "rocky")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "rocky:op")
+        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
+        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:operator")
         monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
 
         with mock_patch("tools.approval._get_approval_mode", return_value="manual"), \
@@ -336,14 +338,14 @@ class TestWindowsShellDestructiveCommands:
         assert dangerous is True
         assert desc == "Windows PowerShell destructive delete"
 
-    def test_powershell_benign_path_containing_del_not_flagged(self):
-        # A benign file path that merely contains "del" must NOT trip the guard
-        # (verb-position anchoring prevents matching inside a -File arg).
+    def test_powershell_benign_path_containing_del_not_matched_as_delete(self):
+        # The path text must not be mistaken for a destructive verb. Running a
+        # script via -File is independently approval-worthy.
         dangerous, key, desc = detect_dangerous_command(
             r"powershell -File C:\del-logs\run.ps1"
         )
-        assert dangerous is False
-        assert key is None
+        assert dangerous is True
+        assert key != "Windows PowerShell destructive delete"
 
     def test_plain_text_does_not_trigger_windows_delete(self):
         dangerous, key, desc = detect_dangerous_command(
@@ -804,12 +806,13 @@ class TestHermesConfigWriteProtection:
         assert dangerous is True
 
     def test_perl_eval_no_inplace_safe(self):
-        # `perl -e` with no -i flag is code evaluation, not file mutation —
-        # the perl/ruby -i pattern must not fire on it.
+        # `perl -e` with no -i flag is code evaluation, not file mutation. It
+        # requires approval, but must not be attributed to the in-place rule.
         dangerous, key, desc = detect_dangerous_command(
             "perl -wne 'print' ~/.hermes/config.yaml"
         )
-        assert dangerous is False
+        assert dangerous is True
+        assert key != "in-place edit of Hermes config/env (perl/ruby)"
 
     def test_read_is_safe(self):
         # Reading config is not a write — must not trip.
@@ -1242,6 +1245,110 @@ class TestFullCommandAlwaysShown:
         short_cmd = "rm -rf /tmp"
         with mock_patch("builtins.input", return_value="v"):
             result = prompt_dangerous_approval(short_cmd, "recursive delete")
+        assert result == "deny"
+
+
+class TestSmartDeniedPrompt:
+    def test_callback_receives_smart_denied_capability(self):
+        captured = {}
+
+        def callback(command, description, **kwargs):
+            captured.update(kwargs)
+            return "deny"
+
+        result = prompt_dangerous_approval(
+            "rm -rf /tmp/example",
+            "recursive delete",
+            allow_permanent=False,
+            smart_denied=True,
+            approval_callback=callback,
+        )
+
+        assert result == "deny"
+        assert captured == {"allow_permanent": False, "smart_denied": True}
+
+    def test_short_prompt_smart_deny_rejects_session_input(self):
+        with mock_patch("builtins.input", return_value="session"):
+            result = prompt_dangerous_approval(
+                "rm -rf /tmp/example",
+                "recursive delete",
+                allow_permanent=False,
+                smart_denied=True,
+            )
+
+        assert result == "deny"
+
+    def test_short_prompt_smart_deny_displays_only_once_and_deny(self, capsys):
+        prompts = []
+
+        def input_once(prompt):
+            prompts.append(prompt)
+            return "deny"
+
+        with mock_patch("builtins.input", side_effect=input_once):
+            prompt_dangerous_approval(
+                "rm -rf /tmp/example",
+                "recursive delete",
+                allow_permanent=False,
+                smart_denied=True,
+            )
+
+        rendered = capsys.readouterr().out
+        assert "[o]nce" in rendered and "[d]eny" in rendered
+        assert "[s]ession" not in rendered and "[a]lways" not in rendered
+        assert prompts == ["      Choice [o/D]: "]
+
+    @pytest.mark.parametrize(
+        ("lang", "once_key", "deny_key", "once_label", "deny_label"),
+        [
+            ("tr", "b", "r", "[b]ir kez", "[r]eddet"),
+            ("fr", "o", "r", "[o]ne fois", "[r]efuser"),
+            ("ja", "o", "d", "[o]今回のみ", "[d]拒否"),
+        ],
+    )
+    def test_smart_deny_uses_locale_specific_once_deny_choices(
+        self, monkeypatch, capsys, lang, once_key, deny_key, once_label, deny_label,
+    ):
+        monkeypatch.setenv("HERMES_LANGUAGE", lang)
+        from agent import i18n
+        i18n.reset_language_cache()
+        prompts = []
+
+        def choose_once(prompt):
+            prompts.append(prompt)
+            return once_key
+
+        try:
+            with mock_patch("builtins.input", side_effect=choose_once):
+                result = prompt_dangerous_approval(
+                    "rm -rf /tmp/example", "recursive delete",
+                    allow_permanent=False, smart_denied=True,
+                )
+        finally:
+            i18n.reset_language_cache()
+
+        rendered = capsys.readouterr().out
+        assert result == "once"
+        assert once_label in rendered
+        assert deny_label in rendered
+        assert i18n.t("approval.choose_short", lang=lang).split("|")[1].strip() not in rendered
+        assert "/".join((once_key, deny_key.upper())) in prompts[0]
+
+    @pytest.mark.parametrize(("lang", "forbidden"), [("tr", "o"), ("fr", "s"), ("ja", "a")])
+    def test_smart_deny_rejects_localized_session_or_always_shortcuts(
+        self, monkeypatch, lang, forbidden,
+    ):
+        monkeypatch.setenv("HERMES_LANGUAGE", lang)
+        from agent import i18n
+        i18n.reset_language_cache()
+        try:
+            with mock_patch("builtins.input", return_value=forbidden):
+                result = prompt_dangerous_approval(
+                    "rm -rf /tmp/example", "recursive delete",
+                    allow_permanent=False, smart_denied=True,
+                )
+        finally:
+            i18n.reset_language_cache()
         assert result == "deny"
 
 
@@ -2247,7 +2354,7 @@ class TestApprovalTimeoutIsNotConsent:
     SESSION_KEY = "test-no-consent-session"
 
     def setup_method(self):
-        """Reset module state and force tight gateway_timeout for fast tests."""
+        """Reset module state and force a tight approval timeout for fast tests."""
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
@@ -2287,7 +2394,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         monkeypatch.setattr(
             mod, "_get_approval_config",
-            lambda: {"mode": "manual", "gateway_timeout": seconds, "timeout": seconds},
+            lambda: {"mode": "manual", "timeout": seconds},
         )
 
     def test_timeout_returns_approved_false_with_no_consent(self, monkeypatch):

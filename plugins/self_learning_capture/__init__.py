@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -49,6 +50,25 @@ _SECRET_VALUE_PATTERNS = [
 # (``postgres://u:p@ss@host/db``) is redacted in full rather than truncated at
 # the first ``@`` (which previously leaked the ``@ss@host`` remainder).
 _URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/]+(@)")
+_EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_PHONE_RE = re.compile(r"(?<!\w)\+\d(?:[\d ().-]{6,}\d)")
+_FORMATTED_PHONE_RE = re.compile(
+    r"(?<![\w.+-])"
+    r"(?:\+?1[ .-])?"
+    r"(?:\(\d{3}\)[ .-]?|\d{3}[.-])"
+    r"\d{3}[.-]\d{4}"
+    r"(?![\w-])"
+)
+_IPV4_RE = re.compile(
+    r"(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])"
+)
+_IPV6_CANDIDATE_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"
+)
+
+_ALLOWED_ARG_FIELDS = frozenset({"action", "command", "direction", "method", "path", "pattern", "query", "url"})
+_ALLOWED_RESULT_FIELDS = frozenset({"error", "exit_code", "message", "returncode", "status", "success"})
 
 _CORRECTION_PATTERNS = [
     r"\b(ne mentsd|ne írd|ne ird|ne tedd|ezt ne|nem így|nem igy|rosszul|hibás|hibas|tévedtél|tevedtel)\b",
@@ -94,27 +114,69 @@ def _truthy(value: Any, *, default: bool = False) -> bool:
 def _settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     cfg: Mapping[str, Any] = config if isinstance(config, Mapping) else _load_plugin_config()
     return {
-        "enabled": _truthy(cfg.get("enabled"), default=True),
+        "enabled": _truthy(cfg.get("enabled"), default=False),
         "feedback_inbox": str(cfg.get("feedback_inbox") or "").strip(),
     }
 
 
-def _feedback_inbox(config: Mapping[str, Any] | None = None) -> Path:
+def _safe_scope_segment(value: Any, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip()).strip(".-")
+    return cleaned[:80] or fallback
+
+
+def _capture_scope(kwargs: Mapping[str, Any]) -> tuple[str, str]:
+    tenant = str(kwargs.get("tenant_id") or "").strip()
+    if not tenant:
+        try:
+            from agent.cui_actor_context import current_cui_actor_context
+
+            tenant = str(current_cui_actor_context().get("tenant_id") or "").strip()
+        except Exception:
+            tenant = ""
+    profile = str(kwargs.get("profile") or os.environ.get("HERMES_PROFILE") or "").strip()
+    if not profile:
+        home = _home()
+        profile = home.name if home.parent.name == "profiles" else "default"
+    return _safe_scope_segment(tenant, "local"), _safe_scope_segment(profile, "default")
+
+
+def _feedback_inbox(
+    config: Mapping[str, Any] | None = None,
+    *,
+    scope: tuple[str, str] = ("local", "default"),
+) -> Path:
     configured = _settings(config).get("feedback_inbox") or ""
     if configured:
         return Path(configured).expanduser()
-    wiki = os.environ.get("WIKI_PATH")
-    if not wiki:
-        wiki = str(Path.home() / "wiki")
-    return Path(wiki).expanduser() / "feedback" / "_inbox.md"
+    tenant, profile = scope
+    return (
+        _home()
+        / "state"
+        / "self_learning_capture"
+        / "tenants"
+        / tenant
+        / "profiles"
+        / profile
+        / "feedback_inbox.md"
+    )
 
 
-def _state_dir() -> Path:
-    return _home() / "state" / "self_learning_capture"
+def _state_dir(scope: tuple[str, str]) -> Path:
+    tenant, profile = scope
+    return _home() / "state" / "self_learning_capture" / "tenants" / tenant / "profiles" / profile / "seen"
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _redact_ipv6(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return candidate
+    return "[REDACTED:IP]" if address.version == 6 else candidate
 
 
 def _sanitize(text: str) -> str:
@@ -124,7 +186,27 @@ def _sanitize(text: str) -> str:
     value = _URL_CRED_RE.sub(lambda m: m.group(1) + "[REDACTED]" + m.group(2), value)
     for pattern in _SECRET_VALUE_PATTERNS:
         value = pattern.sub("[REDACTED]", value)
+    value = _EMAIL_RE.sub("[REDACTED:EMAIL]", value)
+    value = _PHONE_RE.sub("[REDACTED:PHONE]", value)
+    value = _FORMATTED_PHONE_RE.sub("[REDACTED:PHONE]", value)
+    value = _IPV4_RE.sub("[REDACTED:IP]", value)
+    value = _IPV6_CANDIDATE_RE.sub(_redact_ipv6, value)
     return value
+
+
+def _allowlisted(value: Any, allowed_fields: frozenset[str]) -> Any:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            if allowed_fields == _ALLOWED_RESULT_FIELDS:
+                return {"error": "Non-structured failure result omitted for privacy."}
+            return {}
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items() if str(key) in allowed_fields}
+    if allowed_fields == _ALLOWED_RESULT_FIELDS:
+        return {"status": "Non-object result omitted for privacy."}
+    return {}
 
 
 def _excerpt(value: Any, limit: int = _MAX_EXCERPT) -> str:
@@ -146,21 +228,58 @@ def _hash(kind: str, session_id: str, text: str) -> str:
     return digest[:20]
 
 
-def _already_seen(key: str) -> bool:
-    state = _state_dir()
-    state.mkdir(parents=True, exist_ok=True)
+def _secure_mkdir(path: Path) -> None:
+    home = _home()
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(0o700)
+        return
+
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.chmod(0o700)
+    current = home
+    for part in relative.parts:
+        current /= part
+        current.mkdir(exist_ok=True, mode=0o700)
+        current.chmod(0o700)
+
+
+def _already_seen(key: str, scope: tuple[str, str]) -> bool:
+    state = _state_dir(scope)
+    _secure_mkdir(state)
     marker = state / f"{key}.seen"
     if marker.exists():
         return True
-    marker.write_text(_now() + "\n", encoding="utf-8")
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return True
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(_now() + "\n")
     return False
 
 
-def _append_inbox(kind: str, session_id: str, body: str, key: str, *, config: Mapping[str, Any] | None = None) -> None:
-    inbox = _feedback_inbox(config)
-    inbox.parent.mkdir(parents=True, exist_ok=True)
+def _append_inbox(
+    kind: str,
+    session_id: str,
+    body: str,
+    key: str,
+    *,
+    config: Mapping[str, Any] | None = None,
+    scope: tuple[str, str] = ("local", "default"),
+) -> None:
+    inbox = _feedback_inbox(config, scope=scope)
+    _secure_mkdir(inbox.parent)
     if not inbox.exists():
-        inbox.write_text("# Feedback Inbox\n\n", encoding="utf-8")
+        try:
+            fd = os.open(inbox, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("# Feedback Inbox\n\n")
+        except FileExistsError:
+            pass
+    inbox.chmod(0o600)
     entry = (
         f"\n## [{_now()}] {kind} | {key}\n"
         f"- session_id: `{_sanitize(session_id or 'unknown')}`\n"
@@ -168,7 +287,8 @@ def _append_inbox(kind: str, session_id: str, body: str, key: str, *, config: Ma
         f"- routing_hint: daily-memory-curator should classify as user memory, Hermes memory, wiki, skill, or discard.\n\n"
         f"{body.strip()}\n"
     )
-    with inbox.open("a", encoding="utf-8") as fh:
+    fd = os.open(inbox, os.O_WRONLY | os.O_APPEND)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
         fh.write(entry)
 
 
@@ -208,7 +328,8 @@ def pre_llm_call(**kwargs: Any) -> None:
         return None
     session_id = str(kwargs.get("session_id") or "")
     key = _hash("correction", session_id, message)
-    if _already_seen(key):
+    scope = _capture_scope(kwargs)
+    if _already_seen(key, scope):
         return None
     body = (
         "Detected a possible user correction or preference signal. Do not treat this as already durable; "
@@ -217,7 +338,7 @@ def pre_llm_call(**kwargs: Any) -> None:
         f"{_excerpt(message)}\n"
         "```\n"
     )
-    _append_inbox("correction-detector", session_id, body, key, config=config)
+    _append_inbox("correction-detector", session_id, body, key, config=config, scope=scope)
     return None
 
 
@@ -234,7 +355,8 @@ def post_tool_call(**kwargs: Any) -> None:
     duration_ms = kwargs.get("duration_ms")
     raw = f"{tool_name}\n{args}\n{result}"
     key = _hash("failure", session_id, raw)
-    if _already_seen(key):
+    scope = _capture_scope(kwargs)
+    if _already_seen(key, scope):
         return None
     body = (
         "Detected a failed tool call. This is a learning candidate only. Save it only if it reveals a reusable workflow, "
@@ -243,14 +365,14 @@ def post_tool_call(**kwargs: Any) -> None:
         f"- duration_ms: `{duration_ms}`\n\n"
         "Args excerpt:\n\n"
         "```json\n"
-        f"{_excerpt(args, 1000)}\n"
+        f"{_excerpt(_allowlisted(args, _ALLOWED_ARG_FIELDS), 1000)}\n"
         "```\n\n"
         "Result excerpt:\n\n"
         "```text\n"
-        f"{_excerpt(result, 1400)}\n"
+        f"{_excerpt(_allowlisted(result, _ALLOWED_RESULT_FIELDS), 1400)}\n"
         "```\n"
     )
-    _append_inbox("failure-capture", session_id, body, key, config=config)
+    _append_inbox("failure-capture", session_id, body, key, config=config, scope=scope)
     return None
 
 

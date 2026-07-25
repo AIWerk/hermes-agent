@@ -14,8 +14,8 @@ from gateway.session import SessionSource
 
 class TestAutoVoiceReplyFormat:
     @pytest.mark.asyncio
-    async def test_telegram_auto_voice_reply_uses_mp3_audio_to_avoid_voice_playlist(self):
-        """Telegram auto-TTS should use sendAudio/MP3 so clients do not autoplay older voice notes."""
+    async def test_telegram_auto_voice_reply_requests_ogg_for_native_voice_bubble(self):
+        """Telegram auto-TTS should use OGG/Opus for a native voice bubble."""
         runner = _make_runner()
         adapter = _make_adapter(Platform.TELEGRAM)
         runner.adapters[Platform.TELEGRAM] = adapter
@@ -24,23 +24,23 @@ class TestAutoVoiceReplyFormat:
 
         def fake_tts(*, text, output_path):
             requested_paths.append(output_path)
-            assert output_path.endswith(".mp3")
+            assert output_path.endswith(".ogg")
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(output_path).write_bytes(b"fake mp3")
+            Path(output_path).write_bytes(b"fake ogg")
             return json.dumps({
                 "success": True,
                 "file_path": output_path,
                 "provider": "gemini",
-                "voice_compatible": False,
+                "voice_compatible": True,
             })
 
         with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
             await runner._send_voice_reply(event, "hello from auto tts")
 
         assert requested_paths
-        assert requested_paths[0].endswith(".mp3")
+        assert requested_paths[0].endswith(".ogg")
         adapter.send_voice.assert_awaited_once()
-        assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".mp3")
+        assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".ogg")
 
     @pytest.mark.asyncio
     async def test_non_telegram_auto_voice_reply_keeps_mp3_default(self):

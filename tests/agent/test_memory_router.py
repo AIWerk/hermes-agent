@@ -62,7 +62,7 @@ def test_jwt_is_discarded():
 
 def test_user_preference_routes_to_injected_memory_and_honcho():
     ok, route = should_write_builtin_memory(
-        "Attila prefers concise terminal responses.",
+        "The user prefers concise terminal responses.",
         target="user",
     )
 
@@ -174,7 +174,7 @@ def test_stable_environment_fact_can_route_to_builtin_memory():
 
 def test_honcho_mirror_uses_same_high_signal_boundary():
     ok, route = should_mirror_to_honcho(
-        "Attila prefers no raw customer data in shared memory.",
+        "The user prefers no raw customer data in shared memory.",
         target="user",
     )
 
@@ -298,7 +298,7 @@ def test_credential_free_string_is_not_misclassified():
     # trip the credential gate (the 64-hex and URL-credential additions stay
     # tight). This routes to INJECT as a normal user preference.
     ok, route = should_write_builtin_memory(
-        "Attila prefers concise replies and reads docs at https://example.com/guide.",
+        "The user prefers concise replies and reads docs at https://example.com/guide.",
         target="user",
     )
 

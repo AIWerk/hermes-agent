@@ -18,7 +18,7 @@ class DummyAgent:
     session_id = "sid"
     operator_session_context = {
         "mode": "operator",
-        "actor_id": "attila",
+        "actor_id": "operator",
         "role": "operator",
         "acting_for": "aiwerk",
         "memory_scope": "operator",
@@ -32,6 +32,6 @@ def test_operator_session_context_is_in_stable_prompt():
 
     stable = parts["stable"]
     assert "Operator session context" in stable
-    assert "actor_id='attila'" in stable
+    assert "actor_id='operator'" in stable
     assert "not to customer/end-user memory" in stable
     assert "secret" in stable.lower()

@@ -1,7 +1,9 @@
-"""Tests for ${ENV_VAR} substitution in config.yaml values."""
+"""Tests for ${ENV_VAR} substitution and config cache invalidation."""
+
+import os
 
 import pytest
-from hermes_cli.config import _expand_env_vars, load_config
+from hermes_cli.config import _expand_env_vars, load_config, read_raw_config
 
 
 class TestExpandEnvVars:
@@ -145,6 +147,124 @@ class TestLoadConfigCacheEnvStaleness:
 
         assert first is second
         assert first["providers"]["mistral"]["api_key"] == "key-stable"
+
+
+class TestConfigCacheContentStaleness:
+    def test_raw_config_same_size_same_mtime_edit_invalidates_cache(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("marker: alpha\n")
+        monkeypatch.setitem(read_raw_config.__globals__, "get_config_path", lambda: config_file)
+        read_raw_config.__globals__["_RAW_CONFIG_CACHE"].clear()
+
+        assert read_raw_config()["marker"] == "alpha"
+        before = config_file.stat()
+        config_file.write_text("marker: bravo\n")
+        os.utime(config_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        assert read_raw_config()["marker"] == "bravo"
+
+    def test_load_config_same_size_same_mtime_edit_invalidates_cache(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("marker: alpha\n")
+        monkeypatch.setitem(load_config.__globals__, "get_config_path", lambda: config_file)
+        load_config.__globals__["_LOAD_CONFIG_CACHE"].clear()
+
+        assert load_config()["marker"] == "alpha"
+        before = config_file.stat()
+        config_file.write_text("marker: bravo\n")
+        os.utime(config_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        assert load_config()["marker"] == "bravo"
+
+    def test_managed_same_size_same_mtime_edit_invalidates_cache(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        managed_file = managed_dir / "config.yaml"
+        managed_file.write_text("marker: alpha\n")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.setitem(load_config.__globals__, "get_config_path", lambda: config_file)
+        load_config.__globals__["_LOAD_CONFIG_CACHE"].clear()
+
+        assert load_config()["marker"] == "alpha"
+        before = managed_file.stat()
+        managed_file.write_text("marker: bravo\n")
+        os.utime(managed_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        assert load_config()["marker"] == "bravo"
+
+    def test_raw_config_parses_the_exact_bytes_it_fingerprints(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("marker: alpha\n")
+        before = config_file.stat()
+        monkeypatch.setitem(read_raw_config.__globals__, "get_config_path", lambda: config_file)
+        read_raw_config.__globals__["_RAW_CONFIG_CACHE"].clear()
+        path_type = type(config_file)
+        original_read_bytes = path_type.read_bytes
+        raced = False
+
+        def racing_read_bytes(path):
+            nonlocal raced
+            data = original_read_bytes(path)
+            if path == config_file and not raced:
+                raced = True
+                path.write_text("marker: bravo\n")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return data
+
+        monkeypatch.setattr(path_type, "read_bytes", racing_read_bytes)
+
+        assert read_raw_config()["marker"] == "alpha"
+
+    def test_load_config_parses_the_exact_bytes_it_fingerprints(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("marker: alpha\n")
+        before = config_file.stat()
+        monkeypatch.setitem(load_config.__globals__, "get_config_path", lambda: config_file)
+        load_config.__globals__["_LOAD_CONFIG_CACHE"].clear()
+        path_type = type(config_file)
+        original_read_bytes = path_type.read_bytes
+        raced = False
+
+        def racing_read_bytes(path):
+            nonlocal raced
+            data = original_read_bytes(path)
+            if path == config_file and not raced:
+                raced = True
+                path.write_text("marker: bravo\n")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return data
+
+        monkeypatch.setattr(path_type, "read_bytes", racing_read_bytes)
+
+        assert load_config()["marker"] == "alpha"
+
+    def test_managed_config_parses_the_exact_bytes_it_fingerprints(self, tmp_path, monkeypatch):
+        from hermes_cli import managed_scope
+
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        managed_file = managed_dir / "config.yaml"
+        managed_file.write_text("marker: alpha\n")
+        before = managed_file.stat()
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        managed_scope.invalidate_managed_cache()
+        path_type = type(managed_file)
+        original_read_bytes = path_type.read_bytes
+        raced = False
+
+        def racing_read_bytes(path):
+            nonlocal raced
+            data = original_read_bytes(path)
+            if path == managed_file and not raced:
+                raced = True
+                path.write_text("marker: bravo\n")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return data
+
+        monkeypatch.setattr(path_type, "read_bytes", racing_read_bytes)
+
+        assert managed_scope.load_managed_config()["marker"] == "alpha"
 
 
 class TestLoadCliConfigExpansion:

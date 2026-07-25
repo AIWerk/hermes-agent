@@ -10,4 +10,4 @@ Boundary:
 - The intended promotion path is: local Hermes prototype → verified AIWerk/hermes-agent runtime/UI capability → AIWerk/base-agent template/runtime lock and verifier → VPS-hosted customer agents.
 
 Current mockup:
-- `hermes-agent-dashboard.html` — Rocky / AIWerk Customer UI concept with chat, session controls, agent controls, history, file attachment, and approval card.
+- `hermes-agent-dashboard.html` — AIWerk Customer UI concept with chat, session controls, agent controls, history, file attachment, and approval card.

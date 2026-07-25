@@ -18,7 +18,7 @@ def test_verify_operator_identity_returns_sanitized_success(tmp_path, monkeypatc
     script = tmp_path / "verify.py"
     _write_script(
         script,
-        "import json\nprint(json.dumps({'ok': True, 'actor_id': 'attila', 'role': 'operator', 'ttl_seconds': 60}))\n",
+        "import json\nprint(json.dumps({'ok': True, 'actor_id': 'operator', 'role': 'operator', 'ttl_seconds': 60}))\n",
     )
     monkeypatch.setattr(
         "tools.operator_verification_tool.load_operator_verification_config",
@@ -34,7 +34,7 @@ def test_verify_operator_identity_returns_sanitized_success(tmp_path, monkeypatc
 
     assert payload["success"] is True
     assert payload["verified"] is True
-    assert payload["actor_id"] == "attila"
+    assert payload["actor_id"] == "operator"
     assert payload["role"] == "operator"
     assert "secret" not in json.dumps(payload).lower()
 

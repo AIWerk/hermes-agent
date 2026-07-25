@@ -13,7 +13,7 @@ def test_build_operator_session_context_is_sanitized_and_memory_scoped():
     ctx = build_operator_session_context(
         OperatorVerificationResult(
             ok=True,
-            actor_id="attila",
+            actor_id="operator",
             role="operator",
             verified_at=now,
             expires_at=now + 900,
@@ -22,7 +22,7 @@ def test_build_operator_session_context_is_sanitized_and_memory_scoped():
 
     assert ctx == {
         "mode": "operator",
-        "actor_id": "attila",
+        "actor_id": "operator",
         "role": "operator",
         "acting_for": "aiwerk",
         "memory_scope": "operator",
@@ -39,7 +39,7 @@ def test_bootstrap_operator_session_sets_env_and_cache(monkeypatch):
     now = int(time.time())
     result = OperatorVerificationResult(
         ok=True,
-        actor_id="attila",
+        actor_id="operator",
         role="operator",
         verified_at=now,
         expires_at=now + 900,
@@ -49,14 +49,14 @@ def test_bootstrap_operator_session_sets_env_and_cache(monkeypatch):
 
     ctx = operator_session.bootstrap_operator_session(session_id="sid-1", quiet=True)
 
-    assert ctx["actor_id"] == "attila"
+    assert ctx["actor_id"] == "operator"
     assert ctx["memory_scope"] == "operator"
     env_payload = json.loads(operator_session.os.environ["HERMES_OPERATOR_SESSION_CONTEXT"])
     assert env_payload["role"] == "operator"
     assert env_payload["bootstrap_pid"] == operator_session.os.getpid()
     assert operator_session.load_operator_session_context_from_env() == ctx
     assert operator_session.get_current_operator_session_context() == ctx
-    assert get_cached_operator_verification(session_id="sid-1").actor_id == "attila"
+    assert get_cached_operator_verification(session_id="sid-1").actor_id == "operator"
 
 
 def test_operator_session_env_rejects_forged_or_expired_context(monkeypatch):
@@ -65,7 +65,7 @@ def test_operator_session_env_rejects_forged_or_expired_context(monkeypatch):
     now = int(time.time())
     forged = {
         "mode": "operator",
-        "actor_id": "attila",
+        "actor_id": "operator",
         "role": "operator",
         "acting_for": "aiwerk",
         "memory_scope": "operator",
@@ -91,7 +91,7 @@ def test_forged_operator_env_does_not_populate_current_context(monkeypatch):
         json.dumps(
             {
                 "mode": "operator",
-                "actor_id": "attila",
+                "actor_id": "operator",
                 "role": "operator",
                 "acting_for": "aiwerk",
                 "memory_scope": "operator",
@@ -113,7 +113,7 @@ def test_current_operator_context_expires(monkeypatch):
         "_CURRENT_OPERATOR_SESSION_CONTEXT",
         {
             "mode": "operator",
-            "actor_id": "attila",
+            "actor_id": "operator",
             "role": "operator",
             "acting_for": "aiwerk",
             "memory_scope": "operator",
@@ -154,7 +154,7 @@ def test_expired_process_cache_fallback_is_removed():
     clear_operator_verification_cache()
     expired = OperatorVerificationResult(
         ok=True,
-        actor_id="attila",
+        actor_id="operator",
         role="operator",
         verified_at=10,
         expires_at=20,
