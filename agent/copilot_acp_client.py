@@ -106,6 +106,12 @@ def _build_subprocess_env() -> dict[str, str]:
     env = hermes_subprocess_env(inherit_credentials=True)
     home = _resolve_home_dir()
     env["HOME"] = home
+    # Copilot is an external user CLI whose auth lives under the real HOME.
+    # Keep an explicit operator override, but do not let container auto-mode
+    # redirect it into {HERMES_HOME}/home and hide the user's Copilot login.
+    env["TERMINAL_HOME_MODE"] = (
+        os.environ.get("TERMINAL_HOME_MODE", "").strip() or "real"
+    )
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
     return env

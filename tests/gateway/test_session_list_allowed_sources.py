@@ -75,8 +75,8 @@ def test_session_list_default_limit_is_200(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: db)
 
     _call()  # no explicit limit
-    # fetch_limit = max(limit * 2, 200); limit defaults to 200, so 400.
-    assert db.calls[0].get("limit") == 400, db.calls[0]
+    # Exact actor-aware pagination scans in fixed 200-row pages.
+    assert db.calls[0].get("limit") == 200, db.calls[0]
 
 
 def test_session_list_respects_explicit_limit(monkeypatch):
