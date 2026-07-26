@@ -560,7 +560,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         try {
           submitResult = await withSessionBusyRetry(() =>
-            requestGateway<PromptSubmitResult>('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            requestGateway<PromptSubmitResult>(
+              'prompt.submit',
+              submitParams(sessionId),
+              PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+            )
           )
         } catch (firstErr) {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
@@ -596,7 +600,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
               effectiveSessionId = recoveredId
               submitResult = await withSessionBusyRetry(() =>
-                requestGateway<PromptSubmitResult>('prompt.submit', submitParams(recoveredId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestGateway<PromptSubmitResult>(
+                  'prompt.submit',
+                  submitParams(recoveredId),
+                  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                )
               )
             } else {
               submitErr = firstErr

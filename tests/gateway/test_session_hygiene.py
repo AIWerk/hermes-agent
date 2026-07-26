@@ -1600,6 +1600,15 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
     runner._hygiene_compression_failure_cooldowns = {}
     runner._session_db = SimpleNamespace(_db=MagicMock())
 
+    wait_timeouts = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(awaitable, timeout):
+        wait_timeouts.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
+
     started = time.monotonic()
     try:
         result = await runner._handle_message(event)
@@ -1608,9 +1617,14 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
     elapsed = time.monotonic() - started
 
     assert result == "ok"
-    # The second wait must use only the 50ms remaining ceiling, not another
-    # full 200ms idle window (the old behavior took about 400ms here).
-    assert elapsed < 0.35
+    # The second wait must use only the remaining ceiling, not another full
+    # idle window. Inspect the budget directly so runner load cannot make this
+    # regression test flaky after the correct timeout has already fired.
+    short_waits = [timeout for timeout in wait_timeouts if timeout <= 0.21]
+    assert len(short_waits) >= 2, short_waits
+    assert short_waits[0] == pytest.approx(0.2, abs=0.02)
+    assert short_waits[1] < 0.1
+    assert elapsed < 0.5  # Coarse hang guard; timeout-budget assertions carry the contract.
     timeout_warnings = [
         s for s in adapter.sent if "Context compression timed out" in s["content"]
     ]

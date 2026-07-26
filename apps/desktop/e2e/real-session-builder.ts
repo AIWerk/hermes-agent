@@ -35,8 +35,7 @@ export interface RealSessionTurn {
 }
 
 export interface RealSessionSpec {
-  /** Session label. The durable row stores no title, so clients fall back to
-   * the preview (the first 60 characters of the first user message). */
+  /** Explicit durable sidebar label for the seeded session. */
   title: string
   /** Each item becomes one real user prompt followed by the mock provider's reply. */
   turns: readonly (RealSessionTurn | string)[]

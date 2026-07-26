@@ -1283,6 +1283,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
 
   it('updates the selected stored session when the backend auto-resets before submit', async () => {
     const states: Record<string, unknown>[] = []
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'prompt.submit') {
         return {

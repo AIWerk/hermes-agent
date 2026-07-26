@@ -32,9 +32,7 @@ describe('session refs open the session', () => {
   it('opens the session from an agent-written link', async () => {
     let finishProfileSwitch!: () => void
 
-    ensureGatewayProfile.mockImplementationOnce(
-      () => new Promise<void>(resolve => (finishProfileSwitch = resolve))
-    )
+    ensureGatewayProfile.mockImplementationOnce(() => new Promise<void>(resolve => (finishProfileSwitch = resolve)))
     render(<MarkdownTextContent isRunning={false} text="Picked up in @session:work/20260101_abc123 last night." />)
 
     fireEvent.click(await screen.findByTitle('work/20260101_abc123'))
@@ -62,9 +60,7 @@ describe('session refs open the session', () => {
   it('waits for an in-flight profile switch before opening a profileless ref', async () => {
     let finishProfileSwitch!: () => void
 
-    ensureGatewayProfile.mockImplementationOnce(
-      () => new Promise<void>(resolve => (finishProfileSwitch = resolve))
-    )
+    ensureGatewayProfile.mockImplementationOnce(() => new Promise<void>(resolve => (finishProfileSwitch = resolve)))
     render(<MarkdownTextContent isRunning={false} text="Continue @session:20260101_abc123 here." />)
 
     fireEvent.click(await screen.findByTitle('20260101_abc123'))
