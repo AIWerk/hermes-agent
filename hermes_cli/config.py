@@ -1697,6 +1697,20 @@ DEFAULT_CONFIG = {
     # Each aux task is independent — main-agent provider_routing and
     # openrouter.min_coding_score do NOT propagate to aux calls by design.
     "auxiliary": {
+        # Same-provider retries for a transient transport blip (connection
+        # reset / timeout / 5xx / 408) on ANY auxiliary call before falling
+        # back. Default 2 (→ 3 total attempts), clamped [0,6]. Matters most for
+        # pinned calls like MoA reference advisors, where provider fallback is
+        # not a meaningful recovery, so an unretried blip silently loses the
+        # call.
+        "transient_retries": 2,
+        # Endpoints that reject NON-streaming chat requests outright (e.g.
+        # Tencent Copilot returns HTTP 400 "Non-stream chat request is
+        # currently not supported"). Auxiliary calls to a matching endpoint
+        # are sent with stream=True and aggregated client-side. Entries are
+        # case-insensitive substrings matched against the endpoint URL;
+        # copilot.tencent.com is always treated as stream-only.
+        "stream_only_base_urls": [],
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"

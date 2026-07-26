@@ -16,6 +16,7 @@ These tests lock in:
     legacy ``"max_tokens"`` / ``"unsupported_parameter"`` substring checks
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -77,6 +78,94 @@ class TestIsUnsupportedParameterError:
 def _dummy_response():
     """Sentinel — real code calls ``_validate_llm_response`` which we patch out."""
     return {"ok": True}
+
+
+def _stream_chunk(content="ok"):
+    return SimpleNamespace(
+        id="chunk-1",
+        model="m1",
+        usage=None,
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            delta=SimpleNamespace(
+                content=content,
+                reasoning=None,
+                reasoning_content=None,
+                tool_calls=[],
+            ),
+        )],
+    )
+
+
+class TestStreamOnlyParameterRetries:
+    def test_sync_temperature_retry_stays_streaming(self):
+        calls = []
+
+        def _create(**kwargs):
+            calls.append(dict(kwargs))
+            assert kwargs.get("stream") is True
+            if "temperature" in kwargs:
+                raise RuntimeError("Unsupported parameter: temperature")
+            return iter([_stream_chunk()])
+
+        client = MagicMock()
+        client.base_url = "https://stream-only.example/v1"
+        client.chat.completions.create.side_effect = _create
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("custom", "m1", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(client, "m1")),
+            patch("agent.auxiliary_client._provider_requires_stream",
+                  return_value=True),
+        ):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.3,
+            )
+
+        assert result.choices[0].message.content == "ok"
+        assert len(calls) == 2
+        assert all(call["stream"] is True for call in calls)
+        assert "temperature" not in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_async_temperature_retry_stays_streaming(self):
+        calls = []
+
+        async def _create(**kwargs):
+            calls.append(dict(kwargs))
+            assert kwargs.get("stream") is True
+            if "temperature" in kwargs:
+                raise RuntimeError("Unsupported parameter: temperature")
+
+            async def _chunks():
+                yield _stream_chunk()
+
+            return _chunks()
+
+        client = MagicMock()
+        client.base_url = "https://stream-only.example/v1"
+        client.chat.completions.create = AsyncMock(side_effect=_create)
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("custom", "m1", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(client, "m1")),
+            patch("agent.auxiliary_client._provider_requires_stream",
+                  return_value=True),
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.3,
+            )
+
+        assert result.choices[0].message.content == "ok"
+        assert len(calls) == 2
+        assert all(call["stream"] is True for call in calls)
+        assert "temperature" not in calls[1]
 
 
 class TestMaxTokensRetryHardening:
