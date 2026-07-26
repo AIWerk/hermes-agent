@@ -61,7 +61,9 @@ import re
 import threading
 import time
 import uuid
+import warnings
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -70,6 +72,18 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+
+@contextmanager
+def _suppress_lark_pkg_resources_warning():
+    """Silence lark-oapi#108's upstream pkg_resources UserWarning."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"pkg_resources is deprecated as an API\..*",
+            category=UserWarning,
+        )
+        yield
 
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
@@ -86,7 +100,8 @@ except ImportError:
     websockets = None  # type: ignore[assignment]
 
 try:
-    import lark_oapi as lark
+    with _suppress_lark_pkg_resources_warning():
+        import lark_oapi as lark
     from lark_oapi.api.application.v6 import GetApplicationRequest
     from lark_oapi.api.im.v1 import (
         CreateFileRequest,
@@ -1381,7 +1396,8 @@ def check_feishu_requirements() -> bool:
         return True
 
     def _import():
-        import lark_oapi as lark
+        with _suppress_lark_pkg_resources_warning():
+            import lark_oapi as lark
         from lark_oapi.api.application.v6 import GetApplicationRequest
         from lark_oapi.api.im.v1 import (
             CreateFileRequest, CreateFileRequestBody,

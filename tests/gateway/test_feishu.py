@@ -1,6 +1,7 @@
 """Tests for the Feishu gateway integration."""
 
 import asyncio
+import importlib.util
 import json
 import os
 import socket
@@ -15,11 +16,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.platforms.base import ProcessingOutcome
 
-try:
-    import lark_oapi
-    _HAS_LARK_OAPI = True
-except ImportError:
-    _HAS_LARK_OAPI = False
+_HAS_LARK_OAPI = importlib.util.find_spec("lark_oapi") is not None
 
 
 class _FakeRequestContent:
