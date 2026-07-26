@@ -143,14 +143,16 @@ jobs:
         with:
           pattern: test-durations-slice-*
           path: durations
-          merge-multiple: true
+          # Keep each slice in its own artifact directory. Merging artifacts
+          # that all contain test_durations.json races under download-artifact v8.
+          merge-multiple: false
 
       - name: Merge into single durations file
         run: |
           python3 -c "
           import json, glob, os
           merged = {}
-          for f in glob.glob('durations/*test_durations.json'):
+          for f in glob.glob('durations/**/test_durations.json', recursive=True):
             with open(f) as fh:
               merged.update(json.load(fh))
           with open('test_durations.json', 'w') as fh:
