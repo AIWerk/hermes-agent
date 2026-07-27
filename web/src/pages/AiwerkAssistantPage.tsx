@@ -2,7 +2,7 @@ import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image a
 import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
-import { buildWelcomeMessage, resolveGreetingName, type CuiGreetingContext } from "@/lib/cui-greeting";
+import { buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, type CuiGreetingContext } from "@/lib/cui-greeting";
 
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
@@ -103,6 +103,10 @@ interface DashboardAuthSession {
   display_name?: string;
   tenant_id?: string;
   role?: string;
+  greeting?: {
+    name?: string | null;
+    context?: CuiGreetingContext;
+  };
 }
 
 interface SlashCommandItem {
@@ -463,15 +467,15 @@ function cleanUserDisplayName(value?: string | null): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function resolvedUserDisplayName(modelInfo?: ModelInfoResponse | null): string | null {
+function resolvedUserDisplayName(authSession?: DashboardAuthSession | null): string | null {
   return resolveGreetingName(
-    cleanUserDisplayName(modelInfo?.user_display_name),
-    resolvedGreetingContext(modelInfo),
+    cleanUserDisplayName(authSession?.greeting?.name),
+    resolvedGreetingContext(authSession),
   );
 }
 
-function resolvedGreetingContext(modelInfo?: ModelInfoResponse | null): CuiGreetingContext {
-  return modelInfo?.greeting_context ?? "unknown";
+function resolvedGreetingContext(authSession?: DashboardAuthSession | null): CuiGreetingContext {
+  return authSession?.greeting?.context ?? "unknown";
 }
 
 function welcomeMessage(
@@ -486,16 +490,15 @@ function welcomeMessage(
   };
 }
 
-function welcomeMessageForModelInfo(modelInfo?: ModelInfoResponse | null): ChatMessage {
+function welcomeMessageForAuthSession(authSession?: DashboardAuthSession | null): ChatMessage {
   return welcomeMessage(
-    resolvedUserDisplayName(modelInfo),
-    resolvedGreetingContext(modelInfo),
+    resolvedUserDisplayName(authSession),
+    resolvedGreetingContext(authSession),
   );
 }
 
 async function messagesFromGateway(
   history?: GatewayHistoryMessage[],
-  modelInfo?: ModelInfoResponse | null,
 ): Promise<ChatMessage[]> {
   const mapped: ChatMessage[] = [];
   for (const message of history ?? []) {
@@ -512,19 +515,18 @@ async function messagesFromGateway(
       mapped.push({ id: newId("resume-system"), role: "system", text, status: "complete", attachments });
     }
   }
-  return mapped.length > 0 ? mapped : [welcomeMessageForModelInfo(modelInfo)];
+  return mapped;
 }
 
 async function messagesWithInflight(
   history?: GatewayHistoryMessage[],
   inflight?: SessionInflightTurn | null,
-  modelInfo?: ModelInfoResponse | null,
 ): Promise<ChatMessage[]> {
-  const base = await messagesFromGateway(history, modelInfo);
+  const base = await messagesFromGateway(history);
   if (!inflight || !inflight.streaming) return base;
   const user = inflight.user?.trim() || "";
   const assistant = inflight.assistant || "";
-  const next = base[0]?.id === "welcome" && user ? [] : [...base];
+  const next = [...base];
   if (user && next[next.length - 1]?.text !== user) {
     next.push({ id: newId("resume-inflight-user"), role: "user", text: user, status: "complete" });
   }
@@ -1047,7 +1049,6 @@ export default function AiwerkAssistantPage() {
   const [liveNotes, setLiveNotes] = useState<SessionNotesSnapshot | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({});
   const [modelInfo, setModelInfo] = useState<ModelInfoResponse | null>(null);
-  const modelInfoRef = useRef<ModelInfoResponse | null>(null);
   const [resourceSummary, setResourceSummary] = useState<AssistantResourcesResponse | null>(null);
   const [resourcesLoading, setResourcesLoading] = useState(false);
   const [resourceRefreshing, setResourceRefreshing] = useState<Partial<Record<ResourcePanelKey, boolean>>>({});
@@ -1071,6 +1072,7 @@ export default function AiwerkAssistantPage() {
   const [readAloudMessageId, setReadAloudMessageId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [authSession, setAuthSession] = useState<DashboardAuthSession | null>(null);
+  const authSessionRef = useRef<DashboardAuthSession | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
   const [sessionTitleBubble, setSessionTitleBubble] = useState<SessionTitleBubble | null>(null);
   const [activeTurnMode, setActiveTurnMode] = useState<ConversationMode>("main");
@@ -1176,10 +1178,21 @@ export default function AiwerkAssistantPage() {
     fetch(`${HERMES_BASE_PATH}/api/auth/me`, { credentials: "include" })
       .then((resp) => (resp.ok ? resp.json() : null))
       .then((data: DashboardAuthSession | null) => {
-        if (!cancelled) setAuthSession(data);
+        if (!cancelled) {
+          authSessionRef.current = data;
+          setAuthSession(data);
+          setMessages((current) => (
+            current.length === 1 && current[0]?.id === "welcome"
+              ? [welcomeMessageForAuthSession(data)]
+              : current
+          ));
+        }
       })
       .catch(() => {
-        if (!cancelled) setAuthSession(null);
+        if (!cancelled) {
+          authSessionRef.current = null;
+          setAuthSession(null);
+        }
       });
     return () => {
       cancelled = true;
@@ -2152,9 +2165,13 @@ export default function AiwerkAssistantPage() {
       // and re-rendered, minting fresh object URLs; without this revoke the prior
       // ones leak (a bounded re-mint leak that grows with each reconnect).
       revokeHistoryAttachmentUrls();
-      const resumedMessages = result.resumed
-        ? await messagesWithInflight(result.messages, result.inflight, modelInfoRef.current)
-        : [welcomeMessageForModelInfo(modelInfoRef.current)];
+      const loadedMessages = result.resumed
+        ? await messagesWithInflight(result.messages, result.inflight)
+        : [];
+      const resumedMessages = withAuthenticatedWelcome(
+        loadedMessages,
+        () => welcomeMessageForAuthSession(authSessionRef.current),
+      );
       registerHistoryAttachmentUrls(resumedMessages);
       setMessages(resumedMessages);
       setBusy(recoveredRunning);
@@ -2262,13 +2279,7 @@ export default function AiwerkAssistantPage() {
       .getModelInfo()
       .then((info) => {
         if (!cancelled) {
-          modelInfoRef.current = info;
           setModelInfo(info);
-          setMessages((current) => (
-            current.length === 1 && current[0]?.id === "welcome"
-              ? [welcomeMessageForModelInfo(info)]
-              : current
-          ));
         }
       })
       .catch(() => {
@@ -2352,7 +2363,11 @@ export default function AiwerkAssistantPage() {
       setToolCalls(toolCallsFromGateway(history));
       // Reclaim the previous session's preview blobs before swapping messages.
       revokeHistoryAttachmentUrls();
-      const resumedMessages = await messagesWithInflight(history, inflight);
+      const loadedMessages = await messagesWithInflight(history, inflight);
+      const resumedMessages = withAuthenticatedWelcome(
+        loadedMessages,
+        () => welcomeMessageForAuthSession(authSessionRef.current),
+      );
       registerHistoryAttachmentUrls(resumedMessages);
       setMessages(resumedMessages);
       setBusy(resumedRunning);
@@ -2387,7 +2402,7 @@ export default function AiwerkAssistantPage() {
       storeActiveSessionId(activeId);
       // Reclaim the previous session's preview blobs when starting fresh.
       revokeHistoryAttachmentUrls();
-      setMessages([welcomeMessage(resolvedUserDisplayName(modelInfo), resolvedGreetingContext(modelInfo))]);
+      setMessages([welcomeMessageForAuthSession(authSessionRef.current)]);
       setSessionTitle("Neue Unterhaltung");
       setLiveNotes(null);
       setContextUsage(null);
@@ -2421,7 +2436,7 @@ export default function AiwerkAssistantPage() {
       setError(e instanceof Error ? e.message : String(e));
       showToast("Neue Unterhaltung konnte nicht gestartet werden");
     }
-  }, [modelInfo, refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, revokeHistoryAttachmentUrls, showToast, stopReadAloud]);
+  }, [refreshContextUsage, refreshRecentSessions, refreshRuntimeStatus, revokeHistoryAttachmentUrls, showToast, stopReadAloud]);
 
   const submit = async (target: ConversationMode = conversationModeRef.current) => {
     const text = (target === "side" ? sideInput : input).trim();

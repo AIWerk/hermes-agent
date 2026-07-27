@@ -306,7 +306,9 @@ class TestTransparentRefreshOnAccessTokenEviction:
         response = gated_app.get("/api/auth/me")
 
         assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
         assert response.json()["provider"] == "stub"
+        assert response.json()["greeting"] == {"name": "Stub", "context": "customer"}
 
     @pytest.mark.parametrize(
         "error_type",

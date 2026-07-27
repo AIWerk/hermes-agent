@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildWelcomeMessage, resolveGreetingName } from "./cui-greeting";
+import { buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome } from "./cui-greeting";
 
 
 describe("buildWelcomeMessage", () => {
@@ -26,5 +26,24 @@ describe("buildWelcomeMessage", () => {
     expect(resolveGreetingName(null, "admin")).toBeNull();
     expect(resolveGreetingName(null, "unknown")).toBeNull();
     expect(resolveGreetingName(null, "customer")).toBeNull();
+  });
+});
+
+describe("withAuthenticatedWelcome", () => {
+  it("reads authenticated identity only after deferred history conversion completes", async () => {
+    let resolveHistory!: (messages: string[]) => void;
+    const history = new Promise<string[]>((resolve) => {
+      resolveHistory = resolve;
+    });
+    let authenticatedName: string | null = null;
+
+    const completed = history.then((messages) => withAuthenticatedWelcome(
+      messages,
+      () => authenticatedName ?? "neutral",
+    ));
+    authenticatedName = "Authenticated";
+    resolveHistory([]);
+
+    await expect(completed).resolves.toEqual(["Authenticated"]);
   });
 });
