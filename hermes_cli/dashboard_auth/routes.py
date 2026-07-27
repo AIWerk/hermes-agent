@@ -21,7 +21,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Tuple
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
@@ -47,6 +47,7 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.identity import greeting_identity_from_session
 
 _log = logging.getLogger(__name__)
 
@@ -776,7 +777,7 @@ async def auth_logout(request: Request):
 
 
 @router.get("/api/auth/me", name="auth_me")
-async def api_auth_me(request: Request):
+async def api_auth_me(request: Request, response: Response):
     """Return the verified session as JSON. Auth-required (gate enforces)."""
     sess = getattr(request.state, "session", None)
     if sess is None:
@@ -784,6 +785,7 @@ async def api_auth_me(request: Request):
     tenant_id = getattr(sess, "tenant_id", "") or sess.org_id
     actor_id = getattr(sess, "actor_id", "") or sess.user_id
     role = getattr(sess, "role", "") or "user"
+    response.headers["Cache-Control"] = "private, no-store"
     return {
         "user_id": sess.user_id,
         "email": sess.email,
@@ -794,6 +796,7 @@ async def api_auth_me(request: Request):
         "tenant_id": tenant_id,
         "actor_id": actor_id,
         "role": role,
+        "greeting": greeting_identity_from_session(sess, role=role),
         "actor_context": {
             "tenant_id": tenant_id,
             "actor_id": actor_id,

@@ -21,3 +21,10 @@ export function buildWelcomeMessage(
   }
   return "Hallo, schön, dass du da bist. Was soll ich heute für dich erledigen?";
 }
+
+export function withAuthenticatedWelcome<T>(
+  messages: readonly T[],
+  createWelcome: () => T,
+): T[] {
+  return messages.length > 0 ? [...messages] : [createWelcome()];
+}

@@ -5869,22 +5869,6 @@ def _assistant_user_display_name() -> Optional[str]:
     return None
 
 
-def _assistant_greeting_identity(request: Request) -> dict[str, Optional[str]]:
-    """Resolve a safe, authenticated identity for the customer UI greeting."""
-    session = getattr(getattr(request, "state", None), "session", None)
-    if session is None:
-        return {"name": None, "context": "unknown"}
-
-    role = str(getattr(session, "role", "") or "").strip().lower()
-    actor_name = _clean_dashboard_display_name(
-        getattr(session, "display_name", ""), first_token_only=True,
-    )
-    if role in {"admin", "owner", "aiwerk_admin", "operator", "support"}:
-        return {"name": actor_name, "context": "admin"}
-    if role in {"user", "customer", "tenant_user", "member"}:
-        return {"name": actor_name, "context": "customer"}
-    return {"name": None, "context": "unknown"}
-
 
 def _has_valid_session_token(request: Request) -> bool:
     """True if the request carries a valid dashboard session token.
@@ -13046,7 +13030,6 @@ def get_model_info(request: Request, profile: Optional[str] = None):
     try:
         with _profile_scope(profile):
             cfg = load_config()
-        greeting = _assistant_greeting_identity(request)
         model_cfg = cfg.get("model", "")
 
         # Extract model name and provider from the config
@@ -13066,8 +13049,8 @@ def get_model_info(request: Request, profile: Optional[str] = None):
                 _EMPTY_MODEL_INFO,
                 provider=provider,
                 agent_name=_assistant_display_name_from_config(cfg),
-                user_display_name=greeting["name"],
-                greeting_context=greeting["context"],
+                user_display_name=None,
+                greeting_context="unknown",
             )
 
         # Resolve auto-detected context length (pass config_ctx=None to get
@@ -13115,8 +13098,8 @@ def get_model_info(request: Request, profile: Optional[str] = None):
             "effective_context_length": effective_ctx,
             "capabilities": caps,
             "agent_name": _assistant_display_name_from_config(cfg),
-            "user_display_name": greeting["name"],
-            "greeting_context": greeting["context"],
+            "user_display_name": None,
+            "greeting_context": "unknown",
         }
     except HTTPException:
         # Unknown/invalid profile must surface as 404, not degrade into a
