@@ -2640,6 +2640,7 @@ export interface ModelInfoResponse {
   effective_context_length: number;
   agent_name?: string;
   user_display_name?: string | null;
+  greeting_context?: "customer" | "admin" | "unknown";
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;

@@ -2,7 +2,8 @@ import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image a
 import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
-import { getHermesUserDisplayName } from "@/lib/dashboard-flags";
+import { buildWelcomeMessage, resolveGreetingName, type CuiGreetingContext } from "@/lib/cui-greeting";
+
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
@@ -463,20 +464,39 @@ function cleanUserDisplayName(value?: string | null): string | null {
 }
 
 function resolvedUserDisplayName(modelInfo?: ModelInfoResponse | null): string | null {
-  return cleanUserDisplayName(modelInfo?.user_display_name) ?? getHermesUserDisplayName();
+  return resolveGreetingName(
+    cleanUserDisplayName(modelInfo?.user_display_name),
+    resolvedGreetingContext(modelInfo),
+  );
 }
 
-function welcomeMessage(displayName = getHermesUserDisplayName()): ChatMessage {
-  const greetingName = displayName ? ` ${displayName}` : "";
+function resolvedGreetingContext(modelInfo?: ModelInfoResponse | null): CuiGreetingContext {
+  return modelInfo?.greeting_context ?? "unknown";
+}
+
+function welcomeMessage(
+  displayName: string | null = null,
+  context: CuiGreetingContext = "unknown",
+): ChatMessage {
   return {
     id: "welcome",
     role: "agent",
-    text: `Hallo${greetingName}, schön, dass du da bist. Was soll ich heute für dich erledigen?`,
+    text: buildWelcomeMessage(displayName, context),
     status: "complete",
   };
 }
 
-async function messagesFromGateway(history?: GatewayHistoryMessage[]): Promise<ChatMessage[]> {
+function welcomeMessageForModelInfo(modelInfo?: ModelInfoResponse | null): ChatMessage {
+  return welcomeMessage(
+    resolvedUserDisplayName(modelInfo),
+    resolvedGreetingContext(modelInfo),
+  );
+}
+
+async function messagesFromGateway(
+  history?: GatewayHistoryMessage[],
+  modelInfo?: ModelInfoResponse | null,
+): Promise<ChatMessage[]> {
   const mapped: ChatMessage[] = [];
   for (const message of history ?? []) {
     const text = message.text?.trim() || message.context?.trim() || message.content?.trim() || "";
@@ -492,11 +512,15 @@ async function messagesFromGateway(history?: GatewayHistoryMessage[]): Promise<C
       mapped.push({ id: newId("resume-system"), role: "system", text, status: "complete", attachments });
     }
   }
-  return mapped.length > 0 ? mapped : [welcomeMessage()];
+  return mapped.length > 0 ? mapped : [welcomeMessageForModelInfo(modelInfo)];
 }
 
-async function messagesWithInflight(history?: GatewayHistoryMessage[], inflight?: SessionInflightTurn | null): Promise<ChatMessage[]> {
-  const base = await messagesFromGateway(history);
+async function messagesWithInflight(
+  history?: GatewayHistoryMessage[],
+  inflight?: SessionInflightTurn | null,
+  modelInfo?: ModelInfoResponse | null,
+): Promise<ChatMessage[]> {
+  const base = await messagesFromGateway(history, modelInfo);
   if (!inflight || !inflight.streaming) return base;
   const user = inflight.user?.trim() || "";
   const assistant = inflight.assistant || "";
@@ -1023,6 +1047,7 @@ export default function AiwerkAssistantPage() {
   const [liveNotes, setLiveNotes] = useState<SessionNotesSnapshot | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({});
   const [modelInfo, setModelInfo] = useState<ModelInfoResponse | null>(null);
+  const modelInfoRef = useRef<ModelInfoResponse | null>(null);
   const [resourceSummary, setResourceSummary] = useState<AssistantResourcesResponse | null>(null);
   const [resourcesLoading, setResourcesLoading] = useState(false);
   const [resourceRefreshing, setResourceRefreshing] = useState<Partial<Record<ResourcePanelKey, boolean>>>({});
@@ -2127,7 +2152,9 @@ export default function AiwerkAssistantPage() {
       // and re-rendered, minting fresh object URLs; without this revoke the prior
       // ones leak (a bounded re-mint leak that grows with each reconnect).
       revokeHistoryAttachmentUrls();
-      const resumedMessages = result.resumed ? await messagesWithInflight(result.messages, result.inflight) : [welcomeMessage()];
+      const resumedMessages = result.resumed
+        ? await messagesWithInflight(result.messages, result.inflight, modelInfoRef.current)
+        : [welcomeMessageForModelInfo(modelInfoRef.current)];
       registerHistoryAttachmentUrls(resumedMessages);
       setMessages(resumedMessages);
       setBusy(recoveredRunning);
@@ -2235,11 +2262,11 @@ export default function AiwerkAssistantPage() {
       .getModelInfo()
       .then((info) => {
         if (!cancelled) {
+          modelInfoRef.current = info;
           setModelInfo(info);
-          const displayName = resolvedUserDisplayName(info);
           setMessages((current) => (
             current.length === 1 && current[0]?.id === "welcome"
-              ? [welcomeMessage(displayName)]
+              ? [welcomeMessageForModelInfo(info)]
               : current
           ));
         }
@@ -2360,7 +2387,7 @@ export default function AiwerkAssistantPage() {
       storeActiveSessionId(activeId);
       // Reclaim the previous session's preview blobs when starting fresh.
       revokeHistoryAttachmentUrls();
-      setMessages([welcomeMessage(resolvedUserDisplayName(modelInfo))]);
+      setMessages([welcomeMessage(resolvedUserDisplayName(modelInfo), resolvedGreetingContext(modelInfo))]);
       setSessionTitle("Neue Unterhaltung");
       setLiveNotes(null);
       setContextUsage(null);
