@@ -9,11 +9,13 @@ import { MarkdownTextContent } from './markdown-text'
 const openSessionTile = vi.fn()
 const ensureGatewayProfile = vi.fn(async (_profile?: string) => {})
 
-vi.mock('@/store/session-states', () => ({
+vi.mock('@/store/session-states', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   openSessionTile: (...args: unknown[]) => openSessionTile(...args)
 }))
 
-vi.mock('@/store/profile', () => ({
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   ensureGatewayProfile: (profile?: string) => ensureGatewayProfile(profile)
 }))
 

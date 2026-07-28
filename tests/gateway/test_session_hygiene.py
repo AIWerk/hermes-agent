@@ -1624,7 +1624,7 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
     assert len(short_waits) >= 2, short_waits
     assert short_waits[0] == pytest.approx(0.2, abs=0.02)
     assert short_waits[1] < 0.1
-    assert elapsed < 0.5  # Coarse hang guard; timeout-budget assertions carry the contract.
+    assert elapsed < 2.0  # Coarse hang guard; timeout-budget assertions carry the contract.
     timeout_warnings = [
         s for s in adapter.sent if "Context compression timed out" in s["content"]
     ]

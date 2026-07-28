@@ -13,7 +13,11 @@ from pathlib import Path
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
 
-    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setattr(
+        executions,
+        "_executions_file",
+        lambda: tmp_path / "cron" / "executions.db",
+    )
     return executions
 
 
@@ -67,12 +71,12 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
-    executions.EXECUTIONS_FILE.write_bytes(b"not a sqlite database")
+    executions._executions_file().parent.mkdir(parents=True)
+    executions._executions_file().write_bytes(b"not a sqlite database")
 
     with __import__("pytest").raises(sqlite3.DatabaseError):
         executions.create_execution("new", source="builtin")
-    assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
+    assert executions._executions_file().read_bytes() == b"not a sqlite database"
 
 
 def test_execution_history_is_paginated(monkeypatch, tmp_path):
@@ -133,7 +137,7 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("other-live", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+    with sqlite3.connect(executions._executions_file()) as conn:
         conn.execute(
             "UPDATE executions SET process_id=?, pid=? WHERE id=?",
             ("another-import", os.getpid(), record["id"]),
@@ -146,7 +150,7 @@ def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
 def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("recycled", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+    with sqlite3.connect(executions._executions_file()) as conn:
         conn.execute(
             "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
             ("old-import", -1, record["id"]),
