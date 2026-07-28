@@ -351,6 +351,38 @@ class TestTelegramAutoTtsCaptionDelivery:
         assert adapter.sent == []
 
     @pytest.mark.asyncio
+    async def test_markdown_heavy_long_telegram_auto_tts_remains_audio_only(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+        adapter._keep_typing = self._hold_typing()
+        adapter._should_auto_tts_for_chat = lambda _chat_id: True
+        adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
+        # AIWerk's voice-to-voice policy is audio-only even when the original
+        # reply is markdown-heavy and longer than Telegram's caption limit.
+        # The spoken script may be shorter after normalization, but neither
+        # form is duplicated as a caption or follow-up text message.
+        long_reply = "\n".join(
+            f"- **item {i}** [details](https://example.com/some/very/long/path/{i:04d})"
+            for i in range(20)
+        )
+        assert len(long_reply) > 1024
+        assert len(adapter.prepare_tts_text(long_reply)) <= 1024
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=long_reply))
+
+        tts_path = tmp_path / "reply.ogg"
+        tts_path.write_text("audio", encoding="utf-8")
+        event = self._make_voice_event()
+
+        with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=json.dumps({"file_path": str(tts_path)}),
+        ):
+            await adapter._process_message_background(event, build_session_key(event.source))
+
+        adapter.play_tts.assert_awaited_once()
+        assert adapter.play_tts.await_args.kwargs["caption"] is None
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
     async def test_telegram_auto_tts_send_failure_keeps_followup_text(self, tmp_path):
         adapter = DummyTelegramAdapter()
         adapter._keep_typing = self._hold_typing()
