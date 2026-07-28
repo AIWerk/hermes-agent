@@ -4724,13 +4724,26 @@ class TestAuxiliaryProviderProfileReasoning:
         }
         assert "reasoning" not in kwargs["extra_body"]
 
-    def test_custom_openai_compatible_reasoning_uses_top_level_effort(self):
+    def test_custom_remote_openai_compatible_omits_ollama_reasoning_fields(self):
         kwargs = _build_call_kwargs(
             "custom",
             "glm-5.2",
             [{"role": "user", "content": "hi"}],
             reasoning_config={"enabled": True, "effort": "max"},
             base_url="https://example.test/v1",
+        )
+
+        assert "reasoning_effort" not in kwargs
+        assert "reasoning" not in kwargs.get("extra_body", {})
+        assert "think" not in kwargs.get("extra_body", {})
+
+    def test_custom_local_openai_compatible_keeps_top_level_effort(self):
+        kwargs = _build_call_kwargs(
+            "custom",
+            "glm-5.2",
+            [{"role": "user", "content": "hi"}],
+            reasoning_config={"enabled": True, "effort": "max"},
+            base_url="http://127.0.0.1:11434/v1",
         )
 
         assert kwargs["reasoning_effort"] == "max"
