@@ -96,7 +96,9 @@ def _auto_title_enabled() -> bool:
 
 
 def _clean_title(title: str) -> Optional[str]:
-    title = re.sub(r"\s+", " ", str(title or "")).strip().strip('"\'')
+    raw = str(title or "").strip().strip('"\'')
+    title = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+    title = re.sub(r"\s+", " ", title).strip().strip('"\'')
     if title.lower().startswith("title:"):
         title = title[6:].strip()
     title = re.sub(r"[\s.?!:;,-]+$", "", title).strip()
@@ -196,6 +198,20 @@ def _call_title_llm(
         return None
 
 
+def _summarize_user_message(user_message: str) -> str:
+    """Collapse a slash-skill-expanded turn back to what the user typed."""
+    if not user_message:
+        return ""
+    try:
+        from agent.skill_commands import describe_skill_invocation
+
+        described = describe_skill_invocation(user_message)
+    except Exception:
+        logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
+        return user_message
+    return described if described is not None else user_message
+
+
 def generate_title(
     user_message: str,
     assistant_response: str,
@@ -216,7 +232,9 @@ def generate_title(
         except Exception:
             # Fail open: a broken validator must not disable titling.
             logger.debug("Title runtime validator raised; proceeding", exc_info=True)
-    user_snippet = redact_sensitive_text(user_message[:500] if user_message else "")
+    user_snippet = redact_sensitive_text(
+        _summarize_user_message(user_message)[:500] if user_message else ""
+    )
     assistant_snippet = redact_sensitive_text(assistant_response[:500] if assistant_response else "")
     language = _title_language()
     prompt = _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language) if language else _TITLE_PROMPT

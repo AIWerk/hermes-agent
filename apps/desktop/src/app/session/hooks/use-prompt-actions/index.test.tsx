@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $notifications, clearNotifications } from '@/store/notifications'
@@ -16,10 +17,13 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $turnStartedAt,
+  getRememberedSessionId,
   setCurrentUsage,
   setMessages,
+  setRememberedSessionId,
   setSessions
 } from '@/store/session'
+import { dropSessionState, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 import type { SubmitTextOptions } from './utils'
@@ -928,6 +932,51 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     vi.restoreAllMocks()
   })
 
+  it('executes /approvals against the focused profile session and persists its mode', async () => {
+    const focusedProfile = 'work'
+    const focusedSessionId = 'work-runtime-session'
+    const persistedModes = new Map<string, string>()
+    const sessionProfiles = new Map([[focusedSessionId, focusedProfile]])
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'slash.exec') {
+        const sessionId = String(params?.session_id ?? '')
+        const profile = sessionProfiles.get(sessionId)
+        const command = String(params?.command ?? '')
+
+        if (profile && command === 'approvals off') {
+          persistedModes.set(profile, 'off')
+        }
+
+        return { output: 'Approval mode: off (persistent profile setting).' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={focusedSessionId}
+        activeSessionIdRef={{ current: focusedSessionId }}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={focusedSessionId}
+      />
+    )
+
+    await handle!.submitText('/approvals off')
+
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
+      command: 'approvals off',
+      session_id: focusedSessionId
+    })
+    expect(persistedModes.get(focusedProfile)).toBe('off')
+    expect(persistedModes.has('default')).toBe(false)
+  })
+
   it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     const states: Record<string, unknown>[] = []
@@ -1041,6 +1090,178 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(renderedText).toContain('⊙ Goal set (20-turn budget): ship the release notes')
     expect(renderedText).toContain('queued')
 
+    $queuedPromptsBySession.set({})
+  })
+
+  it('gates the busy queue on the TARGET session, not the foreground busy flag', async () => {
+    // `busyRef` is the FOREGROUND view's busy flag; a slash command runs against
+    // the session `resolveTargetSessionId` picked, which is frequently not the
+    // foreground one (tile, route rebind, freshly created session). A stale
+    // foreground `true` — e.g. left behind by a warm resume of a *different*,
+    // still-running session — parked the kickoff of an idle session's command
+    // on the queue and told the user "session busy" about a session that was
+    // doing nothing.
+    $queuedPromptsBySession.set({})
+    publishSessionState(RUNTIME_SESSION_ID, createClientSessionState(RUNTIME_SESSION_ID))
+
+    const calls: string[] = []
+    const busyRef = { current: true }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      return (method === 'slash.exec' ? { type: 'send', message: 'audit the session states' } : {}) as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        busyRef={busyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/audit-only audit the session states')
+
+    // The target session is idle, so the command sends now — nothing queues.
+    expect(calls).toContain('prompt.submit')
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID)).toEqual([])
+
+    dropSessionState(RUNTIME_SESSION_ID)
+    $queuedPromptsBySession.set({})
+  })
+
+  it('still queues when the TARGET session is busy and the foreground flag is not', async () => {
+    // The converse leak: a background/tile command must not submit mid-turn
+    // just because the foreground view happens to be idle.
+    $queuedPromptsBySession.set({})
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(RUNTIME_SESSION_ID),
+      busy: true
+    })
+
+    const calls: string[] = []
+    const busyRef = { current: false }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      return (method === 'slash.exec' ? { type: 'send', message: 'audit the session states' } : {}) as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        busyRef={busyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/audit-only audit the session states')
+
+    expect(calls).toEqual(['slash.exec'])
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID).map(entry => entry.text)).toEqual(['audit the session states'])
+
+    dropSessionState(RUNTIME_SESSION_ID)
+    $queuedPromptsBySession.set({})
+  })
+
+  it('binds slash output and the busy queue to the TARGET session, not the foreground selection', async () => {
+    // A tile (⌘T tab, split pane) routes its slash commands through this hook
+    // with an explicit runtime id while the foreground selection names a
+    // different conversation. Binding the output writer to the foreground
+    // selection re-keyed the tile's cache entry onto the primary's stored
+    // session and parked its queued payload on the primary's queue.
+    const tileRuntimeId = 'tile-runtime'
+    const tileStoredId = 'tile-stored'
+
+    $queuedPromptsBySession.set({})
+    publishSessionState(tileRuntimeId, {
+      ...createClientSessionState(tileStoredId),
+      busy: true
+    })
+
+    const boundStoredIds: (null | string | undefined)[] = []
+
+    const requestGateway = vi.fn(
+      async (method: string) => (method === 'slash.exec' ? { type: 'send', message: 'run it in the tab' } : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onUpdateState={(_sessionId, storedSessionId) => boundStoredIds.push(storedSessionId)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="primary-stored"
+      />
+    )
+
+    await handle!.submitText('/audit-only run it in the tab', { sessionId: tileRuntimeId })
+
+    // Every transcript write lands on the tile's own stored session.
+    expect(boundStoredIds).not.toHaveLength(0)
+    expect(new Set(boundStoredIds)).toEqual(new Set([tileStoredId]))
+    // …and the kickoff queues against the tile, never the foreground chat.
+    expect(getQueuedPrompts(tileStoredId).map(entry => entry.text)).toEqual(['run it in the tab'])
+    expect(getQueuedPrompts('primary-stored')).toEqual([])
+
+    dropSessionState(tileRuntimeId)
+    $queuedPromptsBySession.set({})
+  })
+
+  it("sends a skill's kickoff into the TAB that invoked it, not the foreground chat", async () => {
+    // `/work` in a fresh ⌘T tab: slash.exec returns a skill dispatch whose
+    // `message` is the kickoff prompt. The dispatcher resolved the tab as its
+    // target, printed "⚡ loading skill" there — then submitted the kickoff
+    // with no target at all, so submit re-resolved from activeSessionIdRef and
+    // fired it as a user message into whatever conversation was on screen.
+    const tabRuntimeId = 'tab-runtime'
+    const tabStoredId = 'tab-stored'
+
+    $queuedPromptsBySession.set({})
+    publishSessionState(tabRuntimeId, createClientSessionState(tabStoredId))
+
+    const submitted: (Record<string, unknown> | undefined)[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'prompt.submit') {
+        submitted.push(params)
+      }
+
+      return (
+        method === 'slash.exec'
+          ? { type: 'skill', name: 'work', message: 'Load the work skill, then: fix the tab bug' }
+          : {}
+      ) as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="foreground-runtime"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="foreground-stored"
+      />
+    )
+
+    await handle!.submitText('/work fix the tab bug', { sessionId: tabRuntimeId })
+
+    expect(submitted).toEqual([
+      expect.objectContaining({
+        session_id: tabRuntimeId,
+        text: 'Load the work skill, then: fix the tab bug'
+      })
+    ])
+
+    dropSessionState(tabRuntimeId)
     $queuedPromptsBySession.set({})
   })
 
@@ -1281,8 +1502,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
   })
 
-  it('updates the selected stored session when the backend auto-resets before submit', async () => {
+  it('publishes auto-reset rotation without preempting the guarded foreground selection', async () => {
     const states: Record<string, unknown>[] = []
+    const updates: { storedSessionId: null | string | undefined; state: Record<string, unknown> }[] = []
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'prompt.submit') {
@@ -1298,11 +1520,13 @@ describe('usePromptActions submit / queue drain semantics', () => {
       return {} as never
     })
 
+    $selectedStoredSessionId.set('stored-old')
     let handle: HarnessHandle | null = null
     render(
       <Harness
         onReady={h => (handle = h)}
         onSeedState={s => states.push(s)}
+        onUpdateState={(_sessionId, storedSessionId, state) => updates.push({ storedSessionId, state })}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
         storedSessionId="stored-old"
@@ -1310,8 +1534,39 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
 
     expect(await handle!.submitText('start fresh automatically')).toBe(true)
-    expect($selectedStoredSessionId.get()).toBe('stored-new')
+    expect($selectedStoredSessionId.get()).toBe('stored-old')
     expect(states.at(-1)?.storedSessionId).toBe('stored-new')
+    expect(updates.at(-1)?.storedSessionId).toBe('stored-new')
+  })
+
+  it('does not write an auto-reset continuation into the default remembered profile', async () => {
+    setRememberedSessionId('default-existing', 'default')
+    setRememberedSessionId('research-existing', 'research')
+    const requestGateway = vi.fn(async (method: string) =>
+      (method === 'prompt.submit'
+        ? {
+            auto_reset: true,
+            previous_session_key: 'research-old',
+            session_key: 'research-new',
+            stored_session_id: 'research-new',
+            status: 'streaming'
+          }
+        : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="research-old"
+      />
+    )
+
+    expect(await handle!.submitText('rotate research session')).toBe(true)
+    expect(getRememberedSessionId('default')).toBe('default-existing')
+    expect(getRememberedSessionId('research')).toBe('research-existing')
   })
 
   it('flags prompt.submit with interrupted:true after a voice-playback barge', async () => {
@@ -1416,6 +1671,51 @@ describe('usePromptActions submit / queue drain semantics', () => {
     ).toBe(true)
     // Offscreen queue drains must not flip the foreground composer into Thinking.
     expect($busy.get()).toBe(false)
+  })
+
+  it('a background auto-reset rotates only its target state and never steals foreground selection', async () => {
+    $busy.set(false)
+    $selectedStoredSessionId.set('stored-foreground')
+    const selectedRef = { current: 'stored-foreground' }
+    const updates: { sessionId: string; storedSessionId: null | string | undefined }[] = []
+    const requestGateway = vi.fn(async (method: string) =>
+      (method === 'prompt.submit'
+        ? {
+            auto_reset: true,
+            previous_session_key: 'stored-background-old',
+            session_key: 'stored-background-new',
+            stored_session_id: 'stored-background-new',
+            status: 'streaming'
+          }
+        : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="rt-foreground"
+        onReady={h => (handle = h)}
+        onUpdateState={(sessionId, storedSessionId) => updates.push({ sessionId, storedSessionId })}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedRef}
+        storedSessionId="stored-foreground"
+      />
+    )
+
+    expect(
+      await handle!.submitText('queued for background session', {
+        fromQueue: true,
+        sessionId: 'rt-background',
+        storedSessionId: 'stored-background-old'
+      })
+    ).toBe(true)
+    expect($selectedStoredSessionId.get()).toBe('stored-foreground')
+    expect(selectedRef.current).toBe('stored-foreground')
+    expect(updates.at(-1)).toEqual({
+      sessionId: 'rt-background',
+      storedSessionId: 'stored-background-new'
+    })
   })
 
   it('a fromQueue drain with null runtime id does NOT land in the foreground session (cross-session leak guard)', async () => {

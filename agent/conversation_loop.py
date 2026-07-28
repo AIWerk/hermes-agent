@@ -48,6 +48,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -71,7 +72,10 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
-from agent.prompt_caching import apply_anthropic_cache_control
+from agent.prompt_caching import (
+    apply_anthropic_cache_control,
+    strip_anthropic_cache_control,
+)
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -512,30 +516,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # first turn — flip-flopping the wire shape mid-conversation and
         # silently degrading to the legacy single-breakpoint layout.
         #
-        # Safety: the rebuilt stable tier is used ONLY when the restored
-        # prompt literally starts with it (checked here AND re-checked by
-        # ``_apply_system_cache_markers``'s ``startswith`` gate). If any
-        # stable-tier input changed since the prompt was persisted (skills
-        # edited, identity changed), the prefix mismatches, ``_static``
-        # stays None, and the request falls back to the legacy layout with
-        # the restored prompt bytes untouched — never a rewritten prompt.
-        #
-        # Gated on ``_use_prompt_caching`` so non-Anthropic routes skip the
-        # rebuild entirely (the static prefix is only consumed by
-        # ``apply_anthropic_cache_control``).
-        if getattr(agent, "_use_prompt_caching", False):
-            try:
-                from agent.system_prompt import build_system_prompt_parts as _build_parts
+        # ``reconstruct_static_prefix`` gates on ``_use_prompt_caching`` (so
+        # non-Anthropic routes skip the rebuild), applies the startswith
+        # safety gate (stored prompt bytes are never rewritten), and
+        # fails open to the legacy cache layout.
+        from agent.system_prompt import reconstruct_static_prefix
 
-                _static = _build_parts(agent, system_message=system_message)["stable"]
-                if _static and stored_prompt.startswith(_static):
-                    agent._cached_system_prompt_static = _static
-            except Exception:
-                # Fail-open: restore continues with the legacy cache layout.
-                logger.debug(
-                    "static system-prefix reconstruction failed on restore",
-                    exc_info=True,
-                )
+        reconstruct_static_prefix(agent, system_message=system_message)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -608,15 +595,49 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted Model/Provider lines are stale."""
+    """Return False when the persisted runtime-identity lines are stale."""
 
     def line_value(label: str) -> str:
+        """Last matching line wins.
+
+        Safe ONLY for fields emitted in the volatile tier at the very END of
+        the prompt (Model / Provider / Platform). User-supplied project
+        context (AGENTS.md / CLAUDE.md / .cursorrules) is embedded in the
+        middle context tier, so a last-match scan lets project prose shadow
+        any field emitted EARLIER — see ``host_info_value``.
+        """
         prefix = f"{label}:"
         value = ""
         for line in prompt.splitlines():
             if line.startswith(prefix):
                 value = line[len(prefix):].strip()
         return value
+
+    def host_info_value(label: str) -> str:
+        """Read a field from the prompt's own host-info block.
+
+        The host-info block (``build_environment_hints``) sits in the STABLE
+        tier, ahead of the embedded project context files. A bare scan of the
+        whole prompt would therefore match a user's ``AGENTS.md`` that merely
+        contains a line starting with the same label, comparing runtime state
+        against project prose. That mismatch never clears, so the check would
+        reject the stored prompt on EVERY turn — rebuilding the system prompt
+        each message and destroying the prefix cache for the whole session,
+        which is far worse than the staleness this function guards against.
+
+        Anchor on the ``User home directory:`` line that immediately precedes
+        the working-directory line in that block, and take the FIRST such
+        occurrence, so only Hermes' own emitted block can satisfy the read.
+        """
+        prefix = f"{label}:"
+        lines = prompt.splitlines()
+        for idx, line in enumerate(lines):
+            if not line.startswith("User home directory:"):
+                continue
+            for candidate in lines[idx + 1: idx + 4]:
+                if candidate.startswith(prefix):
+                    return candidate[len(prefix):].strip()
+        return ""
 
     stored_model = line_value("Model")
     current_model = str(getattr(agent, "model", "") or "").strip()
@@ -626,6 +647,24 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_provider = line_value("Provider")
     current_provider = str(getattr(agent, "provider", "") or "").strip()
     if stored_provider and current_provider and stored_provider != current_provider:
+        return False
+
+    # Detect cwd drift: if the stored prompt was built in a different working
+    # directory, reuse would silently inject a stale path into the prefix cache.
+    # Compare against resolve_agent_cwd() — the SAME resolver used to build the
+    # prompt — so gateway/TUI sessions that set TERMINAL_CWD are not falsely
+    # rejected (they would always differ from the launch dir's os.getcwd()).
+    stored_cwd = host_info_value("Current working directory")
+    if stored_cwd:
+        if stored_cwd != str(resolve_agent_cwd()):
+            return False
+
+    # Detect runtime-surface drift: the stored prompt records which platform it
+    # was built for (e.g. "desktop" vs "cli"). Reusing a desktop-built prompt on
+    # a terminal session (or vice versa) would inject the wrong runtime hints.
+    stored_platform = line_value("Platform")
+    current_platform = str(getattr(agent, "platform", "") or "").strip()
+    if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
     return True
@@ -790,6 +829,41 @@ def _compression_deferred_result(
     }
 
 
+def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
+    """Rewrite a cache-decorated system message in place, keeping its blocks.
+
+    ``apply_anthropic_cache_control`` runs once per call block, *before* the
+    retry loop, and splits the system prompt into ``[static prefix, volatile
+    tail]`` text blocks carrying the cache_control breakpoints. Assigning a bare
+    string over that list drops both breakpoints, so the failover retry ships
+    the whole system prompt uncached and re-bills it in full.
+
+    ``rewrite_prompt_model_identity`` only touches the LAST ``Model:`` /
+    ``Provider:`` lines, and those live in the volatile tail — so the static
+    prefix stays byte-identical and its cache entry keeps matching. Returns
+    False when the shape is not one we can safely patch, so the caller falls
+    back to the plain-string assignment.
+    """
+    content = system_message.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    if not all(
+        isinstance(part, dict) and part.get("type") == "text" for part in content
+    ):
+        return False
+    if len(content) == 1:
+        content[0]["text"] = effective
+        return True
+    if len(content) == 2:
+        head = content[0].get("text") or ""
+        if head and effective.startswith(head):
+            tail = effective[len(head):]
+            if tail:
+                content[1]["text"] = tail
+                return True
+    return False
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -812,8 +886,107 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         effective = sp
         if agent.ephemeral_system_prompt:
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
-        api_messages[0]["content"] = effective
+        if not _rewrite_system_content_blocks(api_messages[0], effective):
+            api_messages[0]["content"] = effective
     return sp
+
+
+def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
+    """Rebuild ``_cached_system_prompt_static`` when caching becomes active.
+
+    Sessions restored under a cache-off primary skip the static-prefix rebuild
+    (gated on ``_use_prompt_caching`` at restore time). A later failover to a
+    cache-on provider would otherwise redecorate with ``static_system_prefix=
+    None`` and silently fall back to the legacy system-plus-3 layout (#72626).
+
+    Thin wrapper over :func:`agent.system_prompt.reconstruct_static_prefix`,
+    which memoizes failed rebuilds so this stays cheap on the retry-loop hot
+    path (it runs at the top of every attempt).
+    """
+    from agent.system_prompt import reconstruct_static_prefix
+
+    reconstruct_static_prefix(
+        agent, system_message=system_message, log_label="failover redecoration"
+    )
+
+
+def _peel_moa_guidance(
+    messages: List[Dict[str, Any]],
+    guidance: Any,
+) -> List[Dict[str, Any]]:
+    """Remove MoA reference guidance previously attached by ``_attach_reference_guidance``.
+
+    Thin wrapper over :func:`agent.moa_loop.peel_reference_guidance` (kept
+    adjacent to the attach so the forward/inverse shapes evolve together).
+    Lazy import mirrors the module's other moa_loop touchpoints.
+    """
+    from agent.moa_loop import peel_reference_guidance
+
+    return peel_reference_guidance(messages, guidance)
+
+
+def _redecorate_prompt_cache_for_provider(
+    agent,
+    api_messages: List[Dict[str, Any]],
+    *,
+    system_message=None,
+    moa_prepared: Optional[Dict[str, Any]] = None,
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Strip and re-apply cache_control for the *current* provider policy.
+
+    Decoration runs once per call block before the retry loop for the primary
+    provider. ``try_activate_fallback`` refreshes ``_use_prompt_caching`` /
+    ``_use_native_cache_layout`` but the nine failover ``continue`` paths reused
+    the old ``api_messages`` (#72626). Mirror ``_reapply_reasoning_echo_for_provider``
+    by reshaping at the top of each retry attempt.
+
+    The source list is the mutated in-flight request (image shrink / ASCII /
+    reasoning_details recoveries already applied) — never a pristine
+    pre-decoration snapshot. MoA guidance is peeled, the base is redecorated,
+    then ``rebase_prepared_request`` re-attaches guidance outside the cached
+    span.
+    """
+    messages: List[Dict[str, Any]] = [
+        dict(m) if isinstance(m, dict) else m for m in (api_messages or [])
+    ]
+    prepared = moa_prepared
+    guidance = prepared.get("guidance") if isinstance(prepared, dict) else None
+    if guidance:
+        messages = _peel_moa_guidance(messages, guidance)
+
+    strip_anthropic_cache_control(messages)
+
+    # Direct attribute access matches the call-block decoration site — the
+    # flags are unconditionally initialized on AIAgent, and a getattr
+    # default here would mask a real init bug as silent cache-off.
+    if agent._use_prompt_caching:
+        _ensure_cached_system_prompt_static(agent, system_message=system_message)
+        static = getattr(agent, "_cached_system_prompt_static", None)
+        messages = apply_anthropic_cache_control(
+            messages,
+            cache_ttl=agent._cache_ttl,
+            native_anthropic=agent._use_native_cache_layout,
+            static_system_prefix=static if isinstance(static, str) else None,
+        )
+
+    if (
+        prepared is not None
+        and getattr(agent, "provider", None) == "moa"
+    ):
+        # No `and guidance` here: guidance=None is a real prepared shape
+        # (all-references-failed / silent degraded policy builds the
+        # prepared request without attaching guidance), and the MoA facade
+        # sends prepared["messages"] — not api_kwargs["messages"] — so the
+        # rebase must refresh the prepared object even when there is no
+        # guidance to re-attach. rebase_prepared_request handles falsy
+        # guidance by copying the messages and skipping the attach.
+        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+        rebase = getattr(completions, "rebase_prepared_request", None)
+        if callable(rebase):
+            prepared = rebase(prepared, messages)
+            messages = prepared["messages"]
+
+    return messages, prepared
 
 
 def _apply_context_engine_selection(
@@ -1041,6 +1214,9 @@ def run_conversation(
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    # A configured SessionDB append failure halts only the affected turn. A
+    # cached gateway agent must recover on the next message if storage did.
+    agent._incremental_persistence_failed = False
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -1891,6 +2067,18 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                # Same story for prompt-cache decoration (#72626): try_activate_
+                # fallback refreshes the policy flags, but the decorated list
+                # still carries the primary's breakpoints (or none). Strip and
+                # re-render for the current provider before building kwargs.
+                api_messages, _moa_prepared_request = (
+                    _redecorate_prompt_cache_for_provider(
+                        agent,
+                        api_messages,
+                        system_message=system_message,
+                        moa_prepared=_moa_prepared_request,
+                    )
+                )
                 api_kwargs = agent._build_api_kwargs(api_messages)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
@@ -3579,7 +3767,7 @@ def run_conversation(
                         agent._buffer_vprint("🔐 Vertex AI token refreshed after 401. Retrying request...")
                         continue
                 if (
-                    agent.api_mode == "chat_completions"
+                    agent.api_mode in ("chat_completions", "anthropic_messages")
                     and agent.provider == "nous"
                     and status_code == 401
                     and not _retry.nous_auth_retry_attempted
@@ -5453,6 +5641,14 @@ def run_conversation(
                         args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
                         logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
                 
+                # Uniquify duplicate tool-call ids BEFORE any downstream
+                # consumer (validation error paths, dispatch, history build,
+                # Responses item-id derivation). Models that reuse one id for
+                # different calls in a batch otherwise lose the later call's
+                # result: the pre-API sanitizer keeps only the first
+                # call/result pair per id. See _uniquify_tool_call_ids.
+                agent._uniquify_tool_call_ids(assistant_message.tool_calls)
+
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
@@ -5761,8 +5957,6 @@ def run_conversation(
                     and previous_interim_visible == current_interim_visible
                 )
                 messages.append(assistant_msg)
-                if not duplicate_previous_interim:
-                    agent._emit_interim_assistant_message(assistant_msg)
 
                 # Mixed batch: error-result the invalid calls and strip them
                 # from the execution set. The assistant message above keeps
@@ -5784,19 +5978,39 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
+                _tool_turn_persisted = None
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or
                     # terminates Hermes mid-turn, resume logic still sees the
                     # exact tool-call block that already executed.
-                    agent._flush_messages_to_session_db(messages, conversation_history)
+                    _tool_turn_persisted = agent._flush_messages_to_session_db(
+                        messages, conversation_history
+                    )
                 except Exception as exc:
+                    _tool_turn_persisted = False
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",
                         agent.session_id or "none",
                         exc,
                     )
+
+                if _tool_turn_persisted is False:
+                    # The canonical append failed. Do not project the row or
+                    # run side-effecting tools from state that exists only in
+                    # this process. Breaking also avoids retrying the same
+                    # unpersisted turn until the iteration budget is exhausted.
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
+
+                # A UI must never observe an assistant/tool-call row that is
+                # still only an ephemeral in-memory projection. Emit interim
+                # commentary only after the canonical SessionDB append above.
+                if not duplicate_previous_interim:
+                    agent._emit_interim_assistant_message(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may
@@ -5811,6 +6025,15 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(agent, "_incremental_persistence_failed", False):
+                    # A tool result could not be made canonical. Do not send
+                    # the in-memory result back to the model or project any
+                    # later events from this turn.
+                    _turn_exit_reason = "session_persistence_failed"
+                    final_response = ""
+                    failed = True
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -6284,7 +6507,28 @@ def run_conversation(
                                ". No fallback providers configured.")
                         )
 
-                    final_response = "(empty)"
+                    # Deliver a labeled reasoning excerpt instead of a bare
+                    # "(empty)" when the model DID think but never produced
+                    # visible text. This is delivery-only: the persisted
+                    # assistant message above keeps the "(empty)" sentinel
+                    # (its replay semantics prevent empty-response loops),
+                    # and raw chain-of-thought is never promoted to a normal
+                    # answer earlier in the ladder — prefill continuation,
+                    # empty-content retries, and provider fallback all run
+                    # first. Only at this terminal, where the alternative is
+                    # returning nothing, is showing the model's own reasoning
+                    # (clearly labeled as such) strictly more useful.
+                    # Idea credit: PR #48795 (@ligl0325).
+                    if reasoning_text:
+                        final_response = (
+                            "⚠️ The model produced only internal reasoning and "
+                            "no final answer, despite retries"
+                            + (" and fallback" if agent._fallback_chain else "")
+                            + ". Its last reasoning, which may contain the "
+                            "answer:\n\n" + reasoning_preview
+                        )
+                    else:
+                        final_response = "(empty)"
                     break
                 
                 # Reset retry counter/signature on successful content

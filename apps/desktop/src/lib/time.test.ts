@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-import { calendarBucket, DAY, formatAgo, HOUR, MINUTE, nominalDayStart, SECOND, sessionBucketLabel } from './time'
+import {
+  calendarBucket,
+  DAY,
+  fmtMonth,
+  fmtMonthYear,
+  formatAgo,
+  HOUR,
+  MINUTE,
+  nominalDayStart,
+  SECOND,
+  sessionBucketLabel
+} from './time'
 
 const labels = {
   ageNow: 'now',
@@ -117,8 +128,7 @@ describe('sessionBucketLabel', () => {
   })
 
   it('formats month (same year) and month + year (prior year) via Intl', () => {
-    // en-US default in the test env: month name, plus year for the prior year.
-    expect(labelAt(2026, 2, 3)).toBe('March')
-    expect(labelAt(2025, 11, 3)).toBe('December 2025')
+    expect(labelAt(2026, 2, 3)).toBe(fmtMonth.format(new Date(2026, 2, 1)))
+    expect(labelAt(2025, 11, 3)).toBe(fmtMonthYear.format(new Date(2025, 11, 1)))
   })
 })

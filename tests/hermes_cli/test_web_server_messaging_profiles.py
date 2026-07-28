@@ -9,6 +9,7 @@ profile's HERMES_HOME, and the dashboard's own profile stays untouched.
 """
 import pytest
 import yaml
+from types import SimpleNamespace
 
 
 _VALID_WORKER_BOT_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_1234"
@@ -67,6 +68,25 @@ def _env_field(platform, key):
 
 
 class TestProfileScopedMessagingReads:
+    def test_platform_catalog_resolves_gateway_liveness_once(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        def resolve_once(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(running=False)
+
+        monkeypatch.setattr(web_server, "resolve_gateway_liveness", resolve_once)
+
+        resp = client.get("/api/messaging/platforms")
+
+        assert resp.status_code == 200
+        assert len(resp.json()["platforms"]) > 1
+        assert len(calls) == 1
+
     def test_scoped_read_does_not_show_root_credentials(
         self, client, isolated_profiles
     ):
@@ -108,11 +128,17 @@ class TestProfileScopedMessagingReads:
             yaml.safe_dump({"platforms": {"telegram": {"enabled": True}}}),
             encoding="utf-8",
         )
-        monkeypatch.setattr(web_server, "get_running_pid", lambda: None)
+        monkeypatch.setattr(web_server, "get_running_pid", lambda *a, **k: None)
+        monkeypatch.setattr(
+            web_server, "get_running_pid_cached", lambda *a, **k: None
+        )
         monkeypatch.setattr(
             web_server,
             "read_runtime_status",
-            lambda: {
+            # Accepts path= : the profile-scoped read now passes the
+            # profile's own gateway_state.json explicitly rather than
+            # relying on process-level HERMES_HOME resolution (#71211).
+            lambda *a, **k: {
                 "gateway_state": "startup_failed",
                 "exit_reason": "all configured messaging platforms failed to connect",
                 "platforms": {},

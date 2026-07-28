@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, cast
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
@@ -122,6 +122,42 @@ class RelayAdapter(BasePlatformAdapter):
     @property
     def message_len_fn(self) -> Callable[[str], int]:
         return _LEN_FNS.get(self.descriptor.len_unit, len)
+
+    # ── per-chat capability resolution (Phase 1.5 multi-platform) ─────────
+    def _descriptor_for_chat(self, chat_id: str) -> CapabilityDescriptor:
+        """The capability descriptor governing a specific chat.
+
+        A multi-platform gateway fronts N platforms on ONE adapter, but the
+        scalar `descriptor`/`MAX_MESSAGE_LENGTH` surface can only carry one
+        platform's profile (the primary identity's). Platform caps genuinely
+        differ — Discord 2000 / Telegram 4096 / Slack 39000 — so applying the
+        primary's cap to every chat either fragments needlessly (small primary)
+        or over-sends into a platform 400 (large primary; the live bug: 2,543
+        and 2,641-char sends rejected by Discord). Resolve the chat's platform
+        from what we saw inbound (`_platform_by_chat`, the same map per-frame
+        egress uses) and look up that platform's negotiated descriptor on the
+        transport. Falls back to the scalar descriptor when the chat's platform
+        is unknown (never saw inbound) or the transport predates the map.
+        """
+        platform = self._platform_by_chat.get(str(chat_id))
+        if platform and self._transport is not None:
+            resolve = getattr(self._transport, "descriptor_for_platform", None)
+            if callable(resolve):
+                try:
+                    per_platform = cast(
+                        Optional[CapabilityDescriptor], resolve(platform)
+                    )
+                except Exception:  # noqa: BLE001 - capability lookup must never break a send
+                    per_platform = None
+                if per_platform is not None:
+                    return per_platform
+        return self.descriptor
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        return self._descriptor_for_chat(chat_id).max_message_length
+
+    def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
+        return _LEN_FNS.get(self._descriptor_for_chat(chat_id).len_unit, len)
 
     def supports_draft_streaming(
         self,
@@ -1522,3 +1558,98 @@ class RelayAdapter(BasePlatformAdapter):
             await self._react(str(chat_id), str(message_id), "✅")
         elif outcome == ProcessingOutcome.FAILURE:
             await self._react(str(chat_id), str(message_id), "❌")
+
+    # ── Phase 4 thread lifecycle ──────────────────────────────────────────
+
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a thread/topic under ``parent_chat_id`` via the connector.
+
+        One `thread_create` op covers Discord (channel thread), Telegram
+        (forum topic), and Slack (named seed root message — threads there are
+        message-anchored). Op-gated on the descriptor advertising
+        `thread_create`; None on any failure/unavailability so the handoff
+        watcher falls back to the parent channel — the same contract as the
+        native adapters' create_handoff_thread.
+        """
+        if self._transport is None or not self.descriptor.supports_op("thread_create"):
+            return None
+        thread_name = (str(name or "").strip() or "handoff")[:100]
+        try:
+            result = await self._transport.send_outbound(
+                {
+                    "op": "thread_create",
+                    "chat_id": str(parent_chat_id),
+                    "thread_name": thread_name,
+                    "metadata": self._with_scope(str(parent_chat_id), None),
+                },
+                platform=self._platform_by_chat.get(str(parent_chat_id)),
+            )
+        except Exception:  # noqa: BLE001 - handoff falls back to the parent channel
+            logger.debug("relay thread_create transport failure", exc_info=True)
+            return None
+        if not result.get("success"):
+            logger.info(
+                "relay thread_create declined for %s: %s",
+                parent_chat_id,
+                result.get("error"),
+            )
+            return None
+        thread_id = result.get("thread_id") or result.get("message_id")
+        return str(thread_id) if thread_id else None
+
+    async def rename_thread(
+        self,
+        thread_id: str,
+        name: str,
+        *,
+        only_if_current_name: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
+    ) -> bool:
+        """Best-effort thread rename via the connector's `thread_rename` op.
+
+        The relay sibling of the native Discord adapter's rename_thread —
+        called by the SAME semantic-rename lane (run.py
+        _rename_discord_auto_thread_for_session_title), which fires only for
+        sources carrying the connector-stamped auto-thread markers.
+        ``only_if_current_name`` crosses the wire; the CONNECTOR enforces the
+        no-clobber guard (it owns the platform read), failing safe on
+        platforms that can't read the current name. ``parent_chat_id`` is
+        the containing chat where the caller knows it (Telegram needs it);
+        defaults to the thread id itself (Discord ignores chat_id).
+        """
+        if self._transport is None or not self.descriptor.supports_op("thread_rename"):
+            return False
+        cleaned = " ".join(str(name or "").split()).strip()
+        if not cleaned or not thread_id:
+            return False
+        chat_id = str(parent_chat_id or thread_id)
+        action: Dict[str, Any] = {
+            "op": "thread_rename",
+            "chat_id": chat_id,
+            "message_id": str(thread_id),
+            "thread_name": cleaned[:100],
+            "metadata": self._with_scope(chat_id, None),
+        }
+        if only_if_current_name is not None:
+            action["only_if_current_name"] = str(only_if_current_name)
+        try:
+            result = await self._transport.send_outbound(
+                action,
+                platform=self._platform_by_chat.get(chat_id)
+                or self._platform_by_chat.get(str(thread_id)),
+            )
+        except Exception:  # noqa: BLE001 - renames are cosmetic
+            logger.debug("relay thread_rename transport failure", exc_info=True)
+            return False
+        if not result.get("success"):
+            logger.info(
+                "relay thread_rename declined for %s: %s",
+                thread_id,
+                result.get("error"),
+            )
+            return False
+        return True

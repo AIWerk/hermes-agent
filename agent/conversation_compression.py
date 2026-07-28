@@ -671,7 +671,17 @@ class _CompressionLockLeaseRefresher:
         # by the TTL the acquirer set — the lock can never be held past its TTL
         # by a stuck refresher.
         consecutive_failures = 0
-        while not self._stop.wait(self._refresh_interval_seconds):
+        # First refresh happens immediately, not one interval late. Everything
+        # between try_acquire() and start() (the rotation-ownership lookup, the
+        # durable-breaker re-read, thread startup) is charged against the very
+        # first lease, so on a short TTL under load the lock could already be
+        # expired — and reclaimable by a competing path — before tick #1.
+        first = True
+        while first or not self._stop.wait(self._refresh_interval_seconds):
+            if first:
+                first = False
+                if self._stop.is_set():
+                    break
             try:
                 refreshed = self._db.refresh_compression_lock(
                     self._session_id,
@@ -1391,8 +1401,11 @@ def compress_context(
     # parent_session_id child, no
     # `name #N` renumber, no contextvar/env/logging re-sync, no memory/context-
     # engine session-switch. The conversation keeps one durable id for life,
-    # eliminating the session-rotation bug cluster. Default False during rollout.
-    in_place = bool(getattr(agent, "compression_in_place", False))
+    # eliminating the session-rotation bug cluster. Default True (2107b86024).
+    # Default True matches DEFAULT_CONFIG / #38763. A missing attribute must
+    # NOT fall back to rotation mode — that re-enables the pre-lease drift
+    # path and can wedge busy sessions that never set the flag.
+    in_place = bool(getattr(agent, "compression_in_place", True))
     # Set True once the in-place DB write actually completes (the DB block can
     # raise and skip it). Surfaced to the gateway via agent._last_compaction_in_place.
     compacted_in_place = False
@@ -1702,6 +1715,13 @@ def compress_context(
         # non-destructive — pre-compaction rows are soft-archived (active=0,
         # compacted=1), stay searchable and recoverable, so snapshot/durable
         # drift cannot lose data there and must not abort compaction.
+        #
+        # When durable DID grow, ADOPT it and continue rather than aborting.
+        # Aborting returned the stale snapshot unchanged, so busy sessions
+        # (memory review / shared session_id writers) stayed permanently
+        # behind the DB: every /compress and auto-compress saw
+        # "changed before lease acquisition", surfaced as the misleading
+        # "No changes from compression", and never reclaimed tokens.
         if not in_place and _lock_db is not None and _lock_sid:
             durable_loader = getattr(
                 type(_lock_db), "get_messages_as_conversation", None
@@ -1709,16 +1729,19 @@ def compress_context(
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    logger.warning(
-                        "compression aborted: session=%s changed before lease "
-                        "acquisition; preserving newer durable messages",
+                    logger.info(
+                        "compression: session=%s grew before lease "
+                        "(%d → %d msgs); adopting durable snapshot",
                         _lock_sid,
+                        len(messages),
+                        len(durable_parent),
                     )
-                    _release_lock()
-                    existing_prompt = getattr(agent, "_cached_system_prompt", None)
-                    if not existing_prompt:
-                        existing_prompt = agent._build_system_prompt(system_message)
-                    return messages, existing_prompt
+                    messages = durable_parent
+                    _pre_msg_count = len(messages)
+                    # Token estimate was for the stale snapshot; clear it so
+                    # the compressor re-derives from the adopted transcript
+                    # instead of under-counting the newly visible rows.
+                    approx_tokens = 0
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -2017,14 +2040,13 @@ def compress_context(
             # (same startswith gate as the restore path); otherwise the
             # request layer falls back to the legacy single-breakpoint
             # layout with the prompt bytes untouched.
-            try:
-                from agent.system_prompt import build_system_prompt_parts as _build_parts
+            from agent.system_prompt import reconstruct_static_prefix
 
-                _static = _build_parts(agent, system_message=system_message)["stable"]
-                if _static and cached_system_prompt.startswith(_static):
-                    agent._cached_system_prompt_static = _static
-            except Exception:
-                pass
+            reconstruct_static_prefix(
+                agent,
+                system_message=system_message,
+                log_label="compression keep-prompt",
+            )
         else:
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
