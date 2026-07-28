@@ -84,6 +84,24 @@ else
   exit 1
 fi
 
+PYTHON_EXECUTABLE="$("$PYTHON" -c 'import sys; print(sys.executable)')"
+read -r SQLITE_VERSION SQLITE_VULNERABLE < <(
+  "$PYTHON" -c '
+import sqlite3
+
+info = sqlite3.sqlite_version_info
+vulnerable = (
+    info >= (3, 7, 0)
+    and info < (3, 51, 3)
+    and not ((3, 50, 7) <= info < (3, 51, 0))
+    and not ((3, 44, 6) <= info < (3, 45, 0))
+)
+print(sqlite3.sqlite_version, "yes" if vulnerable else "no")
+'
+)
+echo "▶ selected python: $PYTHON_EXECUTABLE"
+echo "▶ linked SQLite: $SQLITE_VERSION (WAL-reset vulnerable: $SQLITE_VULNERABLE)"
+
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH=""
@@ -114,6 +132,7 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${LD_LIBRARY_PATH:+LD_LIBRARY_PATH="$LD_LIBRARY_PATH"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

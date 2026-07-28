@@ -23,7 +23,9 @@ import asyncio
 import os
 import sqlite3
 import sys
+from functools import wraps
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -31,6 +33,63 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── Live database safety guard ──────────────────────────────────────────────
+
+_REAL_HERMES_HOME = (Path.home() / ".hermes").resolve()
+
+
+def _resolve_sqlite_target_path(database) -> Path | None:
+    """Resolve a sqlite3 target to a filesystem path, including file: URIs."""
+    try:
+        target = os.fsdecode(os.fspath(database))
+    except TypeError:
+        return None
+
+    if not target or target == ":memory:":
+        return None
+    if target.startswith("file:"):
+        parsed = urlsplit(target)
+        if parsed.netloc not in ("", "localhost"):
+            return None
+        target = unquote(parsed.path)
+        if not target or target == ":memory:":
+            return None
+
+    return Path(target).expanduser().resolve()
+
+
+def _is_path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _make_guarded_sqlite_connect(real_connect, live_home: Path):
+    @wraps(real_connect)
+    def guarded_connect(database, *args, **kwargs):
+        target = _resolve_sqlite_target_path(database)
+        if target is not None and _is_path_within(target, live_home):
+            raise RuntimeError(
+                f"live Hermes database access blocked during tests: {target}"
+            )
+        return real_connect(database, *args, **kwargs)
+
+    return guarded_connect
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _block_live_hermes_database_access():
+    """Fail loudly if any test tries to open a SQLite DB under real ~/.hermes."""
+    real_connect = sqlite3.connect
+    sqlite3.connect = _make_guarded_sqlite_connect(real_connect, _REAL_HERMES_HOME)
+    try:
+        yield
+    finally:
+        sqlite3.connect = real_connect
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -378,6 +437,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # hermes_state computes this constant at import time. Redirect it even
+    # when the module was imported during collection before HERMES_HOME was
+    # replaced above.
+    import hermes_state as _hermes_state
+
+    monkeypatch.setattr(_hermes_state, "DEFAULT_DB_PATH", fake_hermes_home / "state.db")
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
