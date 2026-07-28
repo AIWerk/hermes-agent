@@ -6136,6 +6136,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        # Media bursts share one head event, so queue depth alone does not
+        # bound them. Cap attachments explicitly before merging; otherwise a
+        # long-running turn plus rapid voice/photo input can grow one event's
+        # media arrays without limit and exhaust memory/file descriptors.
+        if len(event.media_urls) > self._BUSY_QUEUE_MAX_PENDING:
+            event.media_urls = event.media_urls[: self._BUSY_QUEUE_MAX_PENDING]
+            event.media_types = event.media_types[: self._BUSY_QUEUE_MAX_PENDING]
+            logger.warning(
+                "Truncated busy-mode media burst for session %s at cap (%d).",
+                session_key,
+                self._BUSY_QUEUE_MAX_PENDING,
+            )
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -6143,6 +6155,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or bool(getattr(event, "media_urls", None))
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
+            remaining_media = max(
+                0,
+                self._BUSY_QUEUE_MAX_PENDING
+                - len(getattr(existing, "media_urls", None) or []),
+            )
+            if event.media_urls and remaining_media == 0:
+                logger.warning(
+                    "Dropping busy-mode media follow-up for session %s — media at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return
+            if len(event.media_urls) > remaining_media:
+                event.media_urls = event.media_urls[:remaining_media]
+                event.media_types = event.media_types[:remaining_media]
+                logger.warning(
+                    "Truncated busy-mode media follow-up for session %s at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
             merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,

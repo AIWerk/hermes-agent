@@ -12276,21 +12276,12 @@ def _(rid, params: dict) -> dict:
     assert session is not None
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    attachments = list(params.get("attachments") or []) if isinstance(params.get("attachments"), list) else []
-    attachments.extend(_shared_uri_prompt_attachments(text, sid))
-    uploaded_images, attachment_context = _process_prompt_attachments(attachments, sid)
-    if attachment_context:
-        text = f"{text}\n\n{attachment_context}" if str(text).strip() else attachment_context
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-    if params.get("interrupted"):
-        # Client-side barge-in (desktop VAD / typing over playback) — latch it
-        # so this turn's model message carries the interruption note.
-        from tools.tts_streaming import mark_speech_interrupted
-
-        mark_speech_interrupted()
-    auto_reset = _rotate_cui_session_if_expired(sid, session)
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # Claim the turn before mutating/resetting the session. A cap-rejected
+    # prompt must not close an expired transcript or materialize attachments.
+    auto_reset = _rotate_cui_session_if_expired(sid, session)
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -12299,6 +12290,17 @@ def _(rid, params: dict) -> dict:
         text = _expand_skill_invocation_for_replay(
             text, str(session.get("session_key") or "")
         )
+    attachments = list(params.get("attachments") or []) if isinstance(params.get("attachments"), list) else []
+    attachments.extend(_shared_uri_prompt_attachments(text, sid))
+    uploaded_images, attachment_context = _process_prompt_attachments(attachments, sid)
+    if attachment_context:
+        text = f"{text}\n\n{attachment_context}" if str(text).strip() else attachment_context
+    if params.get("interrupted"):
+        # Client-side barge-in (desktop VAD / typing over playback) — latch it
+        # so this turn's model message carries the interruption note.
+        from tools.tts_streaming import mark_speech_interrupted
+
+        mark_speech_interrupted()
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps

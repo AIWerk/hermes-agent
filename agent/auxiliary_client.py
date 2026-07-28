@@ -3971,6 +3971,9 @@ def _retry_same_provider_sync(
             retry_kwargs,
             provider=resolved_provider,
             api_mode=resolved_api_mode,
+            create=_sync_progress_create_for(
+                retry_client, task, resolved_provider, retry_base or resolved_base_url,
+            ),
         ),
         task,
     )
@@ -4042,6 +4045,9 @@ async def _retry_same_provider_async(
             retry_kwargs,
             provider=resolved_provider,
             api_mode=resolved_api_mode,
+            create=_async_progress_create_for(
+                retry_client, task, resolved_provider, retry_base or resolved_base_url,
+            ),
         ),
         task,
     )
@@ -4248,7 +4254,14 @@ def _call_fallback_candidate_sync(
         base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
-            _relay_sync_completion(fb_client, fb_kwargs, provider=fb_label), task)
+            _relay_sync_completion(
+                fb_client,
+                fb_kwargs,
+                provider=fb_label,
+                create=_sync_progress_create_for(fb_client, task, fb_label, fb_base),
+            ),
+            task,
+        )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -4269,6 +4282,9 @@ def _call_fallback_candidate_sync(
                             retry_client,
                             retry_kwargs,
                             provider=fb_provider,
+                            create=_sync_progress_create_for(
+                                retry_client, task, fb_provider, fb_base,
+                            ),
                         ),
                         task,
                     )
@@ -4324,6 +4340,9 @@ async def _call_fallback_candidate_async(
                 fb_client,
                 fb_kwargs,
                 provider=fb_label,
+                create=_async_progress_create_for(
+                    fb_client, task, fb_label, fb_base,
+                ),
             ),
             task,
         )
@@ -4348,6 +4367,9 @@ async def _call_fallback_candidate_async(
                             retry_client,
                             retry_kwargs,
                             provider=fb_provider,
+                            create=_async_progress_create_for(
+                                retry_client, task, fb_provider, fb_base,
+                            ),
                         ),
                         task,
                     )
@@ -8037,6 +8059,52 @@ async def _acreate_with_stream(
     )
 
 
+def _sync_progress_create_for(
+    client: Any,
+    task: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str] = None,
+) -> Callable[[Dict[str, Any]], Any]:
+    """Bind progress-aware creation to the client used by a retry/fallback."""
+    force_stream = _provider_requires_stream(
+        provider, base_url or str(getattr(client, "base_url", "") or "")
+    )
+
+    def _create(kwargs: Dict[str, Any]) -> Any:
+        return _create_with_progress(
+            client, kwargs, task, force_stream=force_stream,
+        )
+
+    return _create
+
+
+def _async_progress_create_for(
+    client: Any,
+    task: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str] = None,
+) -> Callable[[Dict[str, Any]], Any]:
+    """Async counterpart bound to the actual rebuilt/fallback client."""
+    force_stream = (
+        _provider_requires_stream(
+            provider, base_url or str(getattr(client, "base_url", "") or "")
+        )
+        and not isinstance(client, (
+            AsyncCodexAuxiliaryClient,
+            AsyncAnthropicAuxiliaryClient,
+            AsyncBedrockAuxiliaryClient,
+        ))
+    )
+
+    async def _create(kwargs: Dict[str, Any]) -> Any:
+        _notify_aux_progress()
+        if force_stream:
+            return await _acreate_with_stream(client, kwargs, task)
+        return await client.chat.completions.create(**kwargs)
+
+    return _create
+
+
 @_relay_auxiliary_call
 def call_llm(
     task: str = None,
@@ -8229,14 +8297,9 @@ def call_llm(
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
-    _force_stream = _provider_requires_stream(
-        resolved_provider, _base_info or resolved_base_url,
+    _create = _sync_progress_create_for(
+        client, task, resolved_provider, _base_info or resolved_base_url,
     )
-
-    def _create(_kwargs: Dict[str, Any]) -> Any:
-        return _create_with_progress(
-            client, _kwargs, task, force_stream=_force_stream,
-        )
 
     try:
         # Retry on the same provider for a transient transport blip
@@ -8445,6 +8508,12 @@ def call_llm(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_sync_progress_create_for(
+                                refreshed_client,
+                                task,
+                                resolved_provider,
+                                resolved_base_url,
+                            ),
                         ), task)
                 except Exception as retry_err:
                     if not (
@@ -8478,6 +8547,12 @@ def call_llm(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_sync_progress_create_for(
+                            refreshed_client,
+                            task,
+                            resolved_provider,
+                            resolved_base_url,
+                        ),
                     ), task)
 
         # ── Auth refresh retry ───────────────────────────────────────
@@ -8905,21 +8980,9 @@ async def async_call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
-    _force_stream_async = (
-        _provider_requires_stream(
-            resolved_provider, _client_base or resolved_base_url,
-        )
-        and not isinstance(client, (
-            AsyncCodexAuxiliaryClient,
-            AsyncAnthropicAuxiliaryClient,
-            AsyncBedrockAuxiliaryClient,
-        ))
+    _acreate = _async_progress_create_for(
+        client, task, resolved_provider, _client_base or resolved_base_url,
     )
-
-    async def _acreate(_kwargs: Dict[str, Any]) -> Any:
-        if _force_stream_async:
-            return await _acreate_with_stream(client, _kwargs, task)
-        return await client.chat.completions.create(**_kwargs)
 
     try:
         # Retry ONCE on the same provider for a transient transport blip
@@ -9091,6 +9154,12 @@ async def async_call_llm(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_async_progress_create_for(
+                                refreshed_client,
+                                task,
+                                resolved_provider,
+                                resolved_base_url,
+                            ),
                         ), task)
                 except Exception as retry_err:
                     if not (
@@ -9123,6 +9192,12 @@ async def async_call_llm(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_async_progress_create_for(
+                            refreshed_client,
+                            task,
+                            resolved_provider,
+                            resolved_base_url,
+                        ),
                     ), task)
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────

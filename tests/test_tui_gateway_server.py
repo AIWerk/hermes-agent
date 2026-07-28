@@ -3961,6 +3961,40 @@ def test_cui_expired_session_rotates_in_place_before_prompt(monkeypatch):
         server._sessions.pop("live-old", None)
 
 
+def test_cap_rejected_prompt_does_not_rotate_or_process_attachments(monkeypatch):
+    session = {}
+    touched = []
+    monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(
+        server,
+        "_ensure_active_session_slot",
+        lambda _sid, _session: "active session limit (1/1)",
+    )
+    monkeypatch.setattr(
+        server,
+        "_rotate_cui_session_if_expired",
+        lambda *_args: touched.append("rotate"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_shared_uri_prompt_attachments",
+        lambda *_args: touched.append("shared-uri") or [],
+    )
+    monkeypatch.setattr(
+        server,
+        "_process_prompt_attachments",
+        lambda *_args: touched.append("attachments") or ([], ""),
+    )
+
+    response = server._methods["prompt.submit"](
+        "r-cap",
+        {"session_id": "live-expired", "text": "hello", "attachments": [{}]},
+    )
+
+    assert response["error"]["code"] == 4090
+    assert touched == []
+
+
 def test_session_title_clears_pending_after_persist(monkeypatch):
     class _FakeDB:
         def __init__(self):

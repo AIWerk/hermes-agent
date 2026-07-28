@@ -2988,11 +2988,7 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
+    text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
 
@@ -3013,6 +3009,18 @@ def text_to_speech_tool(
     normalize_text = tts_config.get("normalize_text", True)
     if normalize_text is not False:
         text = _normalize_text_for_tts(text, _resolve_tts_language(tts_config, provider))
+
+    # Strip markdown and other non-spoken artifacts only after locale-aware
+    # normalization.  Running the generic cleanup first turns values such as
+    # ``23 °C`` into English (``23 degrees Celsius``), preventing the selected
+    # Hungarian/German normalizer from producing localized speech.
+    try:
+        from tools.tts_text_normalize import prepare_spoken_text
+        text = prepare_spoken_text(text, max_chars=None)
+    except Exception:
+        text = text.strip()
+    if not text:
+        return tool_error("Text is empty after TTS cleanup", success=False)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
