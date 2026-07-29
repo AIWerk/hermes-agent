@@ -324,6 +324,49 @@ function appendProfileParam(url: string, profile?: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}profile=${encodeURIComponent(profile)}`;
 }
 
+function appendQueryParam(url: string, key: string, value?: string): string {
+  if (!value) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}${key}=${encodeURIComponent(value)}`;
+}
+
+export interface SessionQueryOptions {
+  profile?: string;
+  order?: "created" | "recent";
+  source?: string | null;
+  sources?: string[];
+  excludeSources?: string[];
+  hideAutomated?: boolean;
+}
+
+function normalizeSessionQueryOptions(
+  profileOrOptions?: string | SessionQueryOptions,
+  order: "created" | "recent" = "created",
+): SessionQueryOptions {
+  if (typeof profileOrOptions === "string") {
+    return { profile: profileOrOptions, order };
+  }
+  return {
+    profile: getManagementProfile(),
+    order,
+    ...(profileOrOptions ?? {}),
+  };
+}
+
+function appendSessionFilters(url: string, options: SessionQueryOptions): string {
+  let next = url;
+  next = appendQueryParam(next, "source", options.source ?? undefined);
+  if (options.sources && options.sources.length > 0) {
+    next = appendQueryParam(next, "sources", options.sources.join(","));
+  }
+  if (options.excludeSources && options.excludeSources.length > 0) {
+    next = appendQueryParam(next, "exclude_sources", options.excludeSources.join(","));
+  }
+  if (options.hideAutomated) {
+    next = appendQueryParam(next, "hide_automated", "1");
+  }
+  return appendProfileParam(next, options.profile);
+}
+
 export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
@@ -362,19 +405,16 @@ export const api = {
   getSessions: (
     limit = 20,
     offset = 0,
-    options?: { excludeSources?: string[]; profile?: string; order?: "created" | "recent"; hideAutomated?: boolean } | string,
-    orderArg: "created" | "recent" = "created",
+    profileOrOptions: string | SessionQueryOptions = getManagementProfile(),
+    order: "created" | "recent" = "created",
   ) => {
-    const profile = typeof options === "string" ? options : options?.profile ?? getManagementProfile();
-    const order = typeof options === "string" ? orderArg : options?.order ?? orderArg;
-    const params = new URLSearchParams({ limit: String(limit), offset: String(offset), order });
-    if (typeof options !== "string" && options?.excludeSources?.length) {
-      params.set("exclude_sources", options.excludeSources.join(","));
-    }
-    if (typeof options !== "string" && options?.hideAutomated) {
-      params.set("hide_automated", "1");
-    }
-    return fetchJSON<PaginatedSessions>(appendProfileParam(`/api/sessions?${params.toString()}`, profile));
+    const options = normalizeSessionQueryOptions(profileOrOptions, order);
+    return fetchJSON<PaginatedSessions>(
+      appendSessionFilters(
+        `/api/sessions?limit=${limit}&offset=${offset}&order=${options.order ?? order}`,
+        options,
+      ),
+    );
   },
   uploadAssistantAttachments: async (files: File[], sessionId?: string) => {
     const form = new FormData();
@@ -878,10 +918,18 @@ export const api = {
     ),
 
   // Session search (FTS5)
-  searchSessions: (q: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionSearchResponse>(
-      appendProfileParam(`/api/sessions/search?q=${encodeURIComponent(q)}`, profile),
-    ),
+  searchSessions: (
+    q: string,
+    profileOrOptions: string | SessionQueryOptions = getManagementProfile(),
+  ) => {
+    const options = normalizeSessionQueryOptions(profileOrOptions);
+    return fetchJSON<SessionSearchResponse>(
+      appendSessionFilters(
+        `/api/sessions/search?q=${encodeURIComponent(q)}`,
+        options,
+      ),
+    );
+  },
 
   // OAuth provider management
   getOAuthProviders: () =>
@@ -2617,13 +2665,12 @@ export interface ToolsetEnvResult {
   is_set: Record<string, boolean>;
 }
 
-export interface SessionSearchResult {
+export interface SessionSearchResult extends SessionInfo {
   session_id: string;
   snippet: string;
   role: string | null;
-  source: string | null;
-  model: string | null;
   session_started: number | null;
+  lineage_root?: string;
 }
 
 export interface SessionSearchResponse {

@@ -25,15 +25,13 @@ Design:
 
 import json
 import logging
-import os
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
-from utils import atomic_replace
+from utils import atomic_replace, atomic_write_text
 from agent.memory_router import MemorySensitivity, should_write_builtin_memory
 from hermes_cli.config import cfg_get, load_config
 
@@ -876,23 +874,7 @@ class MemoryStore:
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
-            # Write to temp file in same directory (same filesystem for atomic rename)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(path.parent), suffix=".tmp", prefix=".mem_"
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                atomic_replace(tmp_path, path)
-            except BaseException:
-                # Clean up temp file on any failure
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
+            atomic_write_text(path, content, tmp_prefix=".mem_")
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
@@ -1146,9 +1128,15 @@ def memory_tool(
                 return tool_error("Each operation must be an object.", success=False)
             act = op.get("action")
             if act in {"add", "replace"}:
-                blocked = _router_block_response(op.get("content"), target, policy_block=False)
-                if blocked is not None:
-                    return blocked
+                op_content = op.get("content")
+                if isinstance(op_content, str):
+                    blocked = _router_block_response(
+                        op_content,
+                        target,
+                        policy_block=not write_approval_on,
+                    )
+                    if blocked is not None:
+                        return blocked
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result

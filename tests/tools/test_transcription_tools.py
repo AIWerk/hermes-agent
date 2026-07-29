@@ -11,6 +11,7 @@ import struct
 import subprocess
 import types
 import wave
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -500,6 +501,94 @@ class TestTranscribeOpenAIExtended:
 
 
 class TestTranscribeLocalCommand:
+    def test_command_provider_uses_sanitized_child_env(self, monkeypatch):
+        """Salvage of #56332: command STT must not inherit Hermes secrets."""
+        monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "sk-vision")
+        monkeypatch.setenv("GATEWAY_RELAY_SECRET", "relay-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setenv("MY_SAFE_STT_VAR", "keep")
+
+        captured = {}
+
+        class _Stream:
+            def read(self, size):
+                return ""
+
+        class Proc:
+            returncode = 0
+            stdout = _Stream()
+            stderr = _Stream()
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(command, **kwargs):
+            captured["env"] = kwargs["env"]
+            return Proc()
+
+        monkeypatch.setattr("tools.transcription_tools.subprocess.Popen", fake_popen)
+
+        from tools.transcription_tools import _run_command_stt
+
+        result = _run_command_stt("echo hi", timeout=1)
+
+        assert result.returncode == 0
+        env = captured["env"]
+        assert "AUXILIARY_VISION_API_KEY" not in env
+        assert "GATEWAY_RELAY_SECRET" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert env["MY_SAFE_STT_VAR"] == "keep"
+
+    def test_local_whisper_subprocess_uses_sanitized_env(
+        self, monkeypatch, sample_wav, tmp_path
+    ):
+        """Sibling path: local whisper subprocess.run also scrubbed (#56332 gap)."""
+        monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "sk-vision")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setenv("MY_SAFE_LOCAL_STT", "keep")
+        monkeypatch.setenv(
+            "HERMES_LOCAL_STT_COMMAND",
+            "whisper {input_path} --model {model} --output_dir {output_dir} --language {language}",
+        )
+
+        captured = {}
+        out_dir = tmp_path / "local-out"
+        out_dir.mkdir()
+        (out_dir / "transcript.txt").write_text("hello", encoding="utf-8")
+
+        def fake_tempdir(prefix=None):
+            class _TempDir:
+                def __enter__(self_inner):
+                    return str(out_dir)
+
+                def __exit__(self_inner, *exc):
+                    return False
+
+            return _TempDir()
+
+        def fake_run(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            class R:
+                returncode = 0
+            return R()
+
+        monkeypatch.setattr("tools.transcription_tools.tempfile.TemporaryDirectory", fake_tempdir)
+        monkeypatch.setattr("tools.transcription_tools.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "tools.transcription_tools._prepare_local_audio",
+            lambda *a, **k: (str(sample_wav), None),
+        )
+
+        from tools.transcription_tools import _transcribe_local_command
+
+        result = _transcribe_local_command(str(sample_wav), "base")
+        assert result["success"] is True
+        env = captured["env"]
+        assert env is not None
+        assert "AUXILIARY_VISION_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert env["MY_SAFE_LOCAL_STT"] == "keep"
+
     def test_auto_detects_local_whisper_binary(self, monkeypatch):
         monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
         monkeypatch.setattr("tools.transcription_tools._find_whisper_binary", lambda: "/opt/homebrew/bin/whisper")
@@ -534,12 +623,7 @@ class TestTranscribeLocalCommand:
             return _TempDir()
 
         def fake_run(cmd, *args, **kwargs):
-            if isinstance(cmd, list):
-                output_path = cmd[-1]
-                with open(output_path, "wb") as handle:
-                    handle.write(b"RIFF....WAVEfmt ")
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
+            assert isinstance(cmd, list)
             (out_dir / "test.txt").write_text("hello from local command\n", encoding="utf-8")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -983,6 +1067,70 @@ class TestModelAutoCorrection:
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args
         assert call_kwargs.kwargs["model"] == "gpt-4o-mini-transcribe"
+
+    def test_gpt_transcribe_model_not_overridden(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "test"
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_openai
+            _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        call_kwargs = mock_client.audio.transcriptions.create.call_args
+        assert call_kwargs.kwargs["model"] == "gpt-transcribe"
+        assert call_kwargs.kwargs["response_format"] == "json"
+
+    def test_gpt_transcribe_language_hint_uses_languages_list(self, monkeypatch, sample_wav):
+        """gpt-transcribe rejects the singular ``language`` field; the hint
+        must be sent as a ``languages`` list via extra_body instead."""
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "test"
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client), \
+             patch("tools.transcription_tools._resolve_stt_language", return_value="fr"):
+            from tools.transcription_tools import _transcribe_openai
+            _transcribe_openai(sample_wav, "gpt-transcribe")
+
+        call_kwargs = mock_client.audio.transcriptions.create.call_args
+        assert "language" not in call_kwargs.kwargs
+        assert call_kwargs.kwargs["extra_body"] == {"languages": ["fr"]}
+
+    def test_legacy_openai_model_language_hint_uses_singular_field(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "test"
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client), \
+             patch("tools.transcription_tools._resolve_stt_language", return_value="fr"):
+            from tools.transcription_tools import _transcribe_openai
+            _transcribe_openai(sample_wav, "gpt-4o-transcribe")
+
+        call_kwargs = mock_client.audio.transcriptions.create.call_args
+        assert call_kwargs.kwargs["language"] == "fr"
+        assert "extra_body" not in call_kwargs.kwargs
+
+    def test_gpt_transcribe_rejected_on_groq(self, monkeypatch, sample_wav):
+        """gpt-transcribe is OpenAI-only and must be auto-corrected on Groq."""
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "test"
+
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_groq, DEFAULT_GROQ_STT_MODEL
+            _transcribe_groq(sample_wav, "gpt-transcribe")
+
+        call_kwargs = mock_client.audio.transcriptions.create.call_args
+        assert call_kwargs.kwargs["model"] == DEFAULT_GROQ_STT_MODEL
 
     def test_unknown_model_passes_through_groq(self, monkeypatch, sample_wav):
         """A model not in either known set should not be overridden."""
@@ -2059,13 +2207,78 @@ class TestShellSafety:
         assert parts[0] == "/usr/bin/whisper"
         assert "/tmp/test.wav" in parts
 
-    def test_env_var_template_uses_shell_path(self, monkeypatch):
-        """When HERMES_LOCAL_STT_COMMAND is set, use_shell should be True."""
-        import os
-        from tools.transcription_tools import LOCAL_STT_COMMAND_ENV
-        monkeypatch.setenv(LOCAL_STT_COMMAND_ENV, "whisper {input_path} | tee log.txt")
-        use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-        assert use_shell is True
+    def test_env_var_template_metacharacters_are_literal_argv(
+        self, monkeypatch, sample_wav, tmp_path
+    ):
+        from tools.transcription_tools import (
+            LOCAL_STT_COMMAND_ENV,
+            _transcribe_local_command,
+            windows_hide_flags,
+        )
+
+        output_dir = tmp_path / "transcript-output"
+        output_dir.mkdir()
+        monkeypatch.setenv(
+            LOCAL_STT_COMMAND_ENV,
+            (
+                "whisper {input_path} ; printf injected | tee log.txt "
+                "&& echo $(id) `whoami` --output_dir {output_dir}"
+            ),
+        )
+
+        def fake_tempdir(prefix=None):
+            class _TempDir:
+                def __enter__(self):
+                    return str(output_dir)
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return _TempDir()
+
+        invocation = {}
+
+        def fake_run(command, **kwargs):
+            invocation["command"] = command
+            invocation["kwargs"] = kwargs
+            (output_dir / "transcript.txt").write_text("safe", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            "tools.transcription_tools.tempfile.TemporaryDirectory", fake_tempdir
+        )
+        monkeypatch.setattr("tools.transcription_tools.subprocess.run", fake_run)
+
+        result = _transcribe_local_command(sample_wav, "base")
+
+        assert result["transcript"] == "safe"
+        assert invocation["command"] == [
+            "whisper",
+            sample_wav,
+            ";",
+            "printf",
+            "injected",
+            "|",
+            "tee",
+            "log.txt",
+            "&&",
+            "echo",
+            "$(id)",
+            "`whoami`",
+            "--output_dir",
+            str(output_dir),
+        ]
+        assert invocation["kwargs"].pop("env") is not None
+        assert invocation["kwargs"] == {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 300,
+            "stdin": subprocess.DEVNULL,
+            "creationflags": windows_hide_flags(),
+        }
 
     def test_no_env_var_uses_list_mode(self, monkeypatch):
         """When no env var is set, use_shell should be False."""
@@ -2173,3 +2386,231 @@ class TestLocalBaseUrlNoApiKey:
         assert _is_local_or_private_url("http://stt.internal/v1")
         assert not _is_local_or_private_url("https://api.openai.com/v1")
         assert not _is_local_or_private_url("")
+
+
+# =====================================================================
+
+
+# CAF (iMessage voice note) conversion tests
+# ============================================================================
+
+class TestCafConversion:
+    """Tests for _convert_caf_to_wav and CAF dispatch in transcribe_audio."""
+
+    def test_convert_caf_with_ffmpeg(self, tmp_path, monkeypatch):
+        """_convert_caf_to_wav uses ffmpeg when available."""
+        caf_path = tmp_path / "voice.caf"
+        caf_path.write_bytes(b"caff\x00" * 20)
+        wav_path = str(tmp_path / "voice.wav")
+
+        def fake_run(cmd, **kwargs):
+            Path(wav_path).write_bytes(b"RIFF\x00\x00\x00\x00")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(
+            "tools.transcription_tools._find_ffmpeg_binary",
+            lambda: "/usr/bin/ffmpeg",
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        from tools.transcription_tools import _convert_caf_to_wav
+        result = _convert_caf_to_wav(str(caf_path))
+        assert result == wav_path
+        assert Path(result).exists()
+
+    def test_convert_caf_fallback_to_afconvert(self, tmp_path, monkeypatch):
+        """When ffmpeg is not found, falls back to afconvert (macOS)."""
+        caf_path = tmp_path / "voice.caf"
+        caf_path.write_bytes(b"caff\x00" * 20)
+        wav_path = str(tmp_path / "voice.wav")
+
+        call_count = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if cmd[0] == "/usr/bin/ffmpeg":
+                raise subprocess.CalledProcessError(1, cmd)
+            Path(wav_path).write_bytes(b"RIFF\x00\x00\x00\x00")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(
+            "tools.transcription_tools._find_ffmpeg_binary",
+            lambda: "/usr/bin/ffmpeg",
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            "tools.transcription_tools.shutil.which",
+            lambda name: "/usr/bin/afconvert" if name == "afconvert" else None,
+        )
+
+        from tools.transcription_tools import _convert_caf_to_wav
+        result = _convert_caf_to_wav(str(caf_path))
+        assert result == wav_path
+        assert call_count["n"] == 2
+
+    def test_convert_caf_all_converters_fail(self, tmp_path, monkeypatch):
+        """When both ffmpeg and afconvert are unavailable, returns None."""
+        caf_path = tmp_path / "voice.caf"
+        caf_path.write_bytes(b"caff\x00" * 20)
+
+        monkeypatch.setattr(
+            "tools.transcription_tools._find_ffmpeg_binary", lambda: None
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools.shutil.which", lambda name: None
+        )
+
+        from tools.transcription_tools import _convert_caf_to_wav
+        result = _convert_caf_to_wav(str(caf_path))
+        assert result is None
+
+    def test_transcribe_caf_converted_before_groq(self, tmp_path, monkeypatch):
+        """transcribe_audio converts .caf to .wav before dispatching to Groq."""
+        caf_path = tmp_path / "voice.caf"
+        caf_path.write_bytes(b"caff\x00" * 20)
+        wav_path = str(tmp_path / "voice.wav")
+
+        def fake_convert(file_path):
+            Path(wav_path).write_bytes(b"RIFF\x00\x00\x00\x00")
+            return wav_path
+
+        with patch("tools.transcription_tools._load_stt_config",
+                   return_value={"provider": "groq"}), \
+             patch("tools.transcription_tools._get_provider",
+                   return_value="groq"), \
+             patch("tools.transcription_tools._convert_caf_to_wav",
+                   side_effect=fake_convert) as mock_convert, \
+             patch("tools.transcription_tools._transcribe_groq",
+                   return_value={"success": True, "transcript": "hello",
+                                 "provider": "groq"}) as mock_groq:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(str(caf_path))
+
+        assert result["success"] is True
+        mock_convert.assert_called_once_with(str(caf_path))
+        mock_groq.assert_called_once()
+        call_args = mock_groq.call_args
+        sent_path = call_args[0][0] if call_args[0] else call_args[1].get("file_path")
+        assert sent_path == wav_path
+
+    def test_transcribe_caf_conversion_failure_returns_error(
+        self, tmp_path, monkeypatch
+    ):
+        """When CAF conversion fails, transcribe_audio returns an error."""
+        caf_path = tmp_path / "voice.caf"
+        caf_path.write_bytes(b"caff\x00" * 20)
+
+        with patch("tools.transcription_tools._load_stt_config",
+                   return_value={"provider": "groq"}), \
+             patch("tools.transcription_tools._get_provider",
+                   return_value="groq"), \
+             patch("tools.transcription_tools._convert_caf_to_wav",
+                   return_value=None):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(str(caf_path))
+
+        assert result["success"] is False
+        assert "could not be converted" in result["error"]
+
+    def test_transcribe_caf_not_converted_for_local(self, tmp_path, monkeypatch):
+        """CAF conversion is skipped for local provider (native handling)."""
+        caf_path = tmp_path / "voice.caf"
+        caf_path.write_bytes(b"caff\x00" * 20)
+
+        with patch("tools.transcription_tools._load_stt_config",
+                   return_value={"provider": "local"}), \
+             patch("tools.transcription_tools._get_provider",
+                   return_value="local"), \
+             patch("tools.transcription_tools._convert_caf_to_wav") as mock_convert, \
+             patch("tools.transcription_tools._transcribe_local",
+                   return_value={"success": True, "transcript": "hi"}):
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(str(caf_path))
+
+        assert result["success"] is True
+        mock_convert.assert_not_called()
+
+
+class TestTranscribeCredentialReadGuard:
+    """transcribe_audio must refuse credential/secret stores before dispatch."""
+
+    def test_transcribe_audio_blocks_credential_read(self, tmp_path):
+        """A ``.env`` (secret-bearing) file is refused up front, so its
+        plaintext is never shipped to an external STT provider — mirroring the
+        read guard added to image-gen (587be5b5b) and xAI video-gen
+        (104232979)."""
+        from tools.transcription_tools import transcribe_audio
+        from agent.file_safety import get_read_block_error
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("OPENAI_API_KEY=sk-secret\n")
+
+        expected = get_read_block_error(str(env_file))
+        assert expected, "test setup: a .env file should be read-blocked"
+
+        result = transcribe_audio(str(env_file))
+
+        assert result["success"] is False
+        # The error is the shared read-guard message, not an audio-validation
+        # or provider error — proving the guard fired before dispatch.
+        assert result["error"] == expected
+
+
+class TestRunCommandSttIdleTimeout:
+    """_run_command_stt uses a progress-based idle timeout (mirrors TTS runner)."""
+
+    @staticmethod
+    def _shell_command(*args):
+        import shlex
+        if os.name == "nt":
+            return subprocess.list2cmdline(list(args))
+        return " ".join(shlex.quote(str(arg)) for arg in args)
+
+    def test_stderr_progress_extends_beyond_timeout(self, tmp_path):
+        """A slow-but-alive command that keeps emitting output survives an
+        idle timeout shorter than its total runtime."""
+        from tools.transcription_tools import _run_command_stt
+
+        script = tmp_path / "progress_then_exit.py"
+        script.write_text(
+            "\n".join([
+                "import sys, time",
+                "for idx in range(4):",
+                "    print(f'tick {idx}', file=sys.stderr, flush=True)",
+                "    time.sleep(0.15)",
+                "print('done', flush=True)",
+            ]),
+            encoding="utf-8",
+        )
+
+        result = _run_command_stt(
+            self._shell_command(sys.executable, "-u", str(script)),
+            timeout=0.25,
+        )
+
+        assert result.returncode == 0
+        assert "tick 3" in result.stderr
+        assert "done" in result.stdout
+
+    def test_silent_stall_still_times_out(self, tmp_path):
+        """A silently stalled command is killed once the idle window elapses,
+        and pre-stall output is preserved on the TimeoutExpired."""
+        from tools.transcription_tools import _run_command_stt
+
+        script = tmp_path / "progress_then_hang.py"
+        script.write_text(
+            "\n".join([
+                "import sys, time",
+                "print('starting pass 1', file=sys.stderr, flush=True)",
+                "time.sleep(1.0)",
+            ]),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+            _run_command_stt(
+                self._shell_command(sys.executable, "-u", str(script)),
+                timeout=0.2,
+            )
+
+        assert "starting pass 1" in (excinfo.value.stderr or "")
