@@ -107,6 +107,51 @@ def test_memory_gate_on_then_apply(hermes_home):
     assert "approved entry" in store.user_entries[0]
 
 
+def test_memory_batch_gate_on_stages_and_applies_atomically(hermes_home):
+    from tools.memory_tool import memory_tool, MemoryStore, apply_memory_pending
+    from tools import write_approval as wa
+
+    _set_approval("memory", True)
+    store = MemoryStore(); store.load_from_disk()
+    operations = [
+        {"action": "add", "content": "AIWerk architecture uses isolated tenant runtimes."},
+        {"action": "add", "content": "Project uses pytest with xdist."},
+    ]
+
+    staged = json.loads(memory_tool(target="memory", operations=operations, store=store))
+    assert staged.get("staged") is True
+    assert store.memory_entries == []
+
+    pending = wa.get_pending("memory", staged["pending_id"])
+    assert pending is not None
+    applied = apply_memory_pending(pending["payload"], store)
+    assert applied["success"] is True
+    assert store.memory_entries == [op["content"] for op in operations]
+
+
+def test_memory_batch_gate_on_still_rejects_credentials_before_staging(hermes_home):
+    from tools.memory_tool import memory_tool, MemoryStore
+    from tools import write_approval as wa
+
+    _set_approval("memory", True)
+    store = MemoryStore(); store.load_from_disk()
+    result = json.loads(
+        memory_tool(
+            target="memory",
+            operations=[
+                {"action": "add", "content": "Project uses pytest."},
+                {"action": "add", "content": "postgresql://admin:secret@example.invalid/db"},
+            ],
+            store=store,
+        )
+    )
+
+    assert result["success"] is False
+    assert "credential" in result["error"].lower()
+    assert store.memory_entries == []
+    assert wa.pending_count("memory") == 0
+
+
 def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, capsys):
     """#46783: ``/memory approve`` from a context with no live agent (e.g. the
     Desktop GUI) passed ``memory_store=None`` into the shared handler, which

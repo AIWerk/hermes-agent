@@ -49,6 +49,67 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api session filters", () => {
+  it("combines AIWerk visibility filters with upstream source filters", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ sessions: [], total: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessions(10, 5, {
+      profile: "tenant-a",
+      order: "recent",
+      source: "tui",
+      excludeSources: ["cron", "api_server"],
+      hideAutomated: true,
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/sessions?limit=10&offset=5&order=recent&source=tui&exclude_sources=cron%2Capi_server&hide_automated=1&profile=tenant-a",
+    );
+  });
+
+  it("serializes multi-source session filters", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ sessions: [], total: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessions(7, 2, { profile: "default", sources: ["cron", "api_server"] });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/sessions?limit=7&offset=2&order=created&sources=cron%2Capi_server&profile=default",
+    );
+  });
+
+  it("preserves legacy positional profile and order arguments", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ sessions: [], total: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessions(7, 2, "default", "recent");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/sessions?limit=7&offset=2&order=recent&profile=default",
+    );
+  });
+
+  it("applies source filters and profile scoping to session search", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ results: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.searchSessions("hello world", {
+      profile: "tenant-a",
+      source: "tui",
+      sources: ["tui", "cli"],
+      excludeSources: ["cron"],
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/sessions/search?q=hello%20world&source=tui&sources=tui%2Ccli&exclude_sources=cron&profile=tenant-a",
+    );
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

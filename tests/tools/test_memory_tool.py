@@ -682,13 +682,13 @@ class TestMemoryBatch:
             operations=[
                 {"action": "remove", "old_text": "stale one"},
                 {"action": "remove", "old_text": "stale two"},
-                {"action": "add", "content": "fresh durable fact"},
+                {"action": "add", "content": "Project uses Ruff for linting."},
             ],
             store=store,
         ))
         assert result["success"] is True
         assert result["done"] is True
-        assert "fresh durable fact" in store.memory_entries
+        assert "Project uses Ruff for linting." in store.memory_entries
         assert "stale one" not in store.memory_entries
         assert "stale two" not in store.memory_entries
         assert "usage" in result
@@ -698,9 +698,10 @@ class TestMemoryBatch:
         # overflow — but a batch that removes first lands in ONE call.
         store.add("memory", "x" * 240)
         store.add("memory", "y" * 240)  # ~485 chars, near the 500 limit
-        big_add = {"action": "add", "content": "z" * 200}
+        big_content = "Project uses " + ("z" * 200)
+        big_add = {"action": "add", "content": big_content}
         # single add overflows
-        single = json.loads(memory_tool(action="add", target="memory", content="z" * 200, store=store))
+        single = json.loads(memory_tool(action="add", target="memory", content=big_content, store=store))
         assert single["success"] is False
         # batch that removes one big entry + adds succeeds atomically
         result = json.loads(memory_tool(
@@ -709,28 +710,28 @@ class TestMemoryBatch:
             store=store,
         ))
         assert result["success"] is True
-        assert ("z" * 200) in store.memory_entries
+        assert big_content in store.memory_entries
 
     def test_batch_all_or_nothing_on_bad_op(self, store):
         store.add("memory", "keep me")
         result = json.loads(memory_tool(
             target="memory",
             operations=[
-                {"action": "add", "content": "should not persist"},
+                {"action": "add", "content": "Project uses Black for formatting."},
                 {"action": "remove", "old_text": "NONEXISTENT"},
             ],
             store=store,
         ))
         assert result["success"] is False
         # Nothing applied — neither the add nor anything else.
-        assert "should not persist" not in store.memory_entries
+        assert "Project uses Black for formatting." not in store.memory_entries
         assert "keep me" in store.memory_entries
         assert "current_entries" in result
 
     def test_batch_final_budget_overflow_rejected(self, store):
         result = json.loads(memory_tool(
             target="memory",
-            operations=[{"action": "add", "content": "q" * 600}],
+            operations=[{"action": "add", "content": "Project uses " + ("q" * 600)}],
             store=store,
         ))
         assert result["success"] is False
@@ -738,18 +739,18 @@ class TestMemoryBatch:
         assert len(store.memory_entries) == 0
 
     def test_batch_duplicate_add_is_noop_not_failure(self, store):
-        store.add("memory", "already here")
+        store.add("memory", "Project uses pytest.")
         result = json.loads(memory_tool(
             target="memory",
             operations=[
-                {"action": "add", "content": "already here"},
-                {"action": "add", "content": "brand new"},
+                {"action": "add", "content": "Project uses pytest."},
+                {"action": "add", "content": "Project uses xdist."},
             ],
             store=store,
         ))
         assert result["success"] is True
-        assert store.memory_entries.count("already here") == 1
-        assert "brand new" in store.memory_entries
+        assert store.memory_entries.count("Project uses pytest.") == 1
+        assert "Project uses xdist." in store.memory_entries
 
     def test_batch_injection_blocked_rejects_whole_batch(self, store):
         result = json.loads(memory_tool(
@@ -762,6 +763,23 @@ class TestMemoryBatch:
         ))
         assert result["success"] is False
         assert "legit fact" not in store.memory_entries
+
+    def test_batch_router_blocks_wiki_candidate_from_injected_memory(self, store):
+        result = json.loads(memory_tool(
+            target="memory",
+            operations=[
+                {"action": "add", "content": "Project uses pytest with xdist."},
+                {
+                    "action": "add",
+                    "content": "AIWerk architecture: Smart Website is the customer-facing surface.",
+                },
+            ],
+            store=store,
+        ))
+
+        assert result["success"] is False
+        assert result["route"]["target_hint"] == "wiki_candidate"
+        assert store.memory_entries == []
 
 
 # =========================================================================
