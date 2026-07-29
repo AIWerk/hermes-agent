@@ -382,7 +382,10 @@ def test_eager_resume_race_rechecks_live_owner_before_touch(monkeypatch):
     assert response["error"]["code"] == 4007
     assert touched == []
     assert closed == [True]
-    assert released == [True]
+    # Resume is intentionally lease-lazy after the upstream active-session
+    # refactor; only the first real prompt claims a slot, so there is no lease
+    # to release on this eager-build ownership race.
+    assert released == []
     assert foreign["transport"] == "ORIGINAL"
     assert foreign["last_active"] == 100.0
 

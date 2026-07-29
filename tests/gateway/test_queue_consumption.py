@@ -454,3 +454,28 @@ class TestBusyInputModeQueueFifo:
         head = adapter._pending_messages[session_key]
         assert head.message_type == MessageType.PHOTO
         assert len(head.media_urls) == 3
+
+    def test_media_burst_respects_bounded_cap(self):
+        """Merged voice/photo heads cannot bypass the per-session queue cap."""
+        from gateway.run import GatewayRunner
+
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:media-cap"
+        source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
+
+        for i in range(GatewayRunner._BUSY_QUEUE_MAX_PENDING + 5):
+            runner._queue_or_replace_pending_event(
+                session_key,
+                MessageEvent(
+                    text=f"voice-{i}",
+                    message_type=MessageType.VOICE,
+                    source=source,
+                    message_id=f"v-{i}",
+                    media_urls=[f"/tmp/{i}.ogg"],
+                    media_types=["audio/ogg"],
+                ),
+            )
+
+        head = adapter._pending_messages[session_key]
+        assert len(head.media_urls) == GatewayRunner._BUSY_QUEUE_MAX_PENDING
+        assert len(head.media_types) == GatewayRunner._BUSY_QUEUE_MAX_PENDING

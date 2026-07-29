@@ -33,7 +33,7 @@ def test_pending_photo_media_merges_album_burst():
     assert "b" in event.text
 
 
-def test_pending_voice_followup_replaces_stale_voice_instead_of_merging():
+def test_pending_voice_followup_preserves_both_user_turns():
     pending = {}
 
     merge_pending_message_event(pending, "s", _event(MessageType.VOICE, "/tmp/old.ogg", "old"))
@@ -41,6 +41,7 @@ def test_pending_voice_followup_replaces_stale_voice_instead_of_merging():
 
     event = pending["s"]
     assert event.message_type == MessageType.VOICE
-    assert event.media_urls == ["/tmp/new.ogg"]
-    assert event.media_types == ["audio/ogg"]
-    assert event.text == "new"
+    assert event.media_urls == ["/tmp/old.ogg", "/tmp/new.ogg"]
+    assert event.media_types == ["audio/ogg", "audio/ogg"]
+    assert "old" in event.text
+    assert "new" in event.text

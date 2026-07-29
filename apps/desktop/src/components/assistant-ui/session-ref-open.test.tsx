@@ -6,12 +6,11 @@ import { __resetSessionLinkTitleCache } from '@/lib/session-link-title'
 import { DirectiveContent } from './directive-text'
 import { MarkdownTextContent } from './markdown-text'
 
-const openSessionTile = vi.fn()
 const ensureGatewayProfile = vi.fn(async (_profile?: string) => {})
+const openSession = vi.fn()
 
-vi.mock('@/store/session-states', async importOriginal => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  openSessionTile: (...args: unknown[]) => openSessionTile(...args)
+vi.mock('@/app/open-session', () => ({
+  openSession: (...args: unknown[]) => openSession(...args)
 }))
 
 vi.mock('@/store/profile', async importOriginal => ({
@@ -21,15 +20,15 @@ vi.mock('@/store/profile', async importOriginal => ({
 
 afterEach(() => {
   cleanup()
-  openSessionTile.mockClear()
   ensureGatewayProfile.mockReset()
   ensureGatewayProfile.mockResolvedValue(undefined)
+  openSession.mockClear()
   __resetSessionLinkTitleCache()
 })
 
 // Both surfaces render a session ref differently — an inline link in agent
 // prose, a chip in the user's own message — but either one opens the session
-// it names, the way its sidebar row would.
+// it names via the shared door (focus if on screen, else a stacked tab).
 describe('session refs open the session', () => {
   it('opens the session from an agent-written link', async () => {
     let finishProfileSwitch!: () => void
@@ -40,11 +39,11 @@ describe('session refs open the session', () => {
     fireEvent.click(await screen.findByTitle('work/20260101_abc123'))
 
     await vi.waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith('work'))
-    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(openSession).not.toHaveBeenCalled()
 
     finishProfileSwitch()
 
-    await vi.waitFor(() => expect(openSessionTile).toHaveBeenCalledWith('20260101_abc123', 'center'))
+    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
   })
 
   it('opens the session from a chip in the user transcript', async () => {
@@ -56,7 +55,7 @@ describe('session refs open the session', () => {
     fireEvent.click(chip)
 
     await vi.waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith('work'))
-    await vi.waitFor(() => expect(openSessionTile).toHaveBeenCalledWith('20260101_abc123', 'center'))
+    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
   })
 
   it('waits for an in-flight profile switch before opening a profileless ref', async () => {
@@ -68,10 +67,10 @@ describe('session refs open the session', () => {
     fireEvent.click(await screen.findByTitle('20260101_abc123'))
 
     await vi.waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith(undefined))
-    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(openSession).not.toHaveBeenCalled()
 
     finishProfileSwitch()
 
-    await vi.waitFor(() => expect(openSessionTile).toHaveBeenCalledWith('20260101_abc123', 'center'))
+    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
   })
 })
