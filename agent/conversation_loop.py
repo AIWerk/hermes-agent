@@ -22,9 +22,7 @@ import os
 import random
 import re
 import ssl
-import threading
 import time
-import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -40,7 +38,6 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
-from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -73,8 +70,9 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
-    apply_anthropic_cache_control,
+    build_prompt_cache_plan,
     strip_anthropic_cache_control,
+    strip_anthropic_tool_cache_control,
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
@@ -263,6 +261,54 @@ def _record_incremental_session_notes(
                 logger.debug("mid-session retitle scheduling failed", exc_info=True)
     except Exception as exc:
         logger.debug("incremental session note capture failed: %s", exc, exc_info=True)
+
+
+def _is_copilot_provider(agent: Any) -> bool:
+    """Delegate to ``AIAgent._is_copilot_provider`` (single owner of the check).
+
+    ``agent.provider`` is not always the normalized ``copilot`` slug —
+    ``/model`` and profile configs can leave the alias ``github-copilot`` (or
+    ``github``) in place, and a bare ``provider == "copilot"`` gate silently
+    skips credential recovery for those spellings.
+    """
+    try:
+        return bool(agent._is_copilot_provider())
+    except Exception:
+        return (getattr(agent, "provider", "") or "").strip().lower() in {
+            "copilot",
+            "github-copilot",
+            "github",
+        }
+
+
+def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
+    """Detect a Copilot 400 that is really a STALE / DEGRADED credential.
+
+    Copilot surfaces a stale or degraded credential as an HTTP 400 rather than a
+    clean 401. Two body markers indicate this class:
+
+    - ``model_not_available_for_integrator`` — the request reached the
+      restricted ``copilot-language-server`` integrator (the server's fallback
+      when it receives a raw OAuth token instead of an exchanged API token),
+      whose model allowlist omits enterprise-only models.
+    - ``model_not_supported`` / "the requested model is not supported" — the
+      cached bearer's Copilot entitlement rotated out from under a long-lived
+      process.
+
+    Matched narrowly (status 400 AND a specific marker) so a genuinely wrong
+    model name — a real 400 — never triggers the single-shot re-exchange. The
+    caller enforces copilot-provider scoping and the single-shot guard.
+    """
+    lowered = (error_message or "").lower()
+    is_400 = status_code == 400 or "error code: 400" in lowered
+    if not is_400:
+        return False
+    return (
+        "model_not_available_for_integrator" in lowered
+        or "not available for integrator" in lowered
+        or "model_not_supported" in lowered
+        or "the requested model is not supported" in lowered
+    )
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -965,7 +1011,8 @@ def _redecorate_prompt_cache_for_provider(
     *,
     system_message=None,
     moa_prepared: Optional[Dict[str, Any]] = None,
-) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    tools_for_api: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]] | tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Strip and re-apply cache_control for the *current* provider policy.
 
     Decoration runs once per call block before the retry loop for the primary
@@ -975,10 +1022,9 @@ def _redecorate_prompt_cache_for_provider(
     by reshaping at the top of each retry attempt.
 
     The source list is the mutated in-flight request (image shrink / ASCII /
-    reasoning_details recoveries already applied) — never a pristine
-    pre-decoration snapshot. MoA guidance is peeled, the base is redecorated,
-    then ``rebase_prepared_request`` re-attaches guidance outside the cached
-    span.
+    reasoning_details recoveries already applied), never a pristine
+    pre-decoration snapshot. MoA guidance is peeled and rebased without
+    decoration; the acting aggregator plans its resolved destination later.
     """
     messages: List[Dict[str, Any]] = [
         dict(m) if isinstance(m, dict) else m for m in (api_messages or [])
@@ -989,6 +1035,21 @@ def _redecorate_prompt_cache_for_provider(
         messages = _peel_moa_guidance(messages, guidance)
 
     strip_anthropic_cache_control(messages)
+    planned_tools = strip_anthropic_tool_cache_control(
+        tools_for_api if tools_for_api is not None else getattr(agent, "tools", [])
+    )
+
+    if prepared is not None and getattr(agent, "provider", None) == "moa":
+        # Prepared MoA state is canonical: the synchronous acting-aggregator
+        # sender owns its destination-local cache plan after it resolves the slot.
+        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+        rebase = getattr(completions, "rebase_prepared_request", None)
+        if callable(rebase):
+            prepared = rebase(prepared, messages)
+            messages = prepared["messages"]
+        if tools_for_api is None:
+            return messages, prepared
+        return messages, prepared, planned_tools
 
     # Direct attribute access matches the call-block decoration site — the
     # flags are unconditionally initialized on AIAgent, and a getattr
@@ -996,31 +1057,25 @@ def _redecorate_prompt_cache_for_provider(
     if agent._use_prompt_caching:
         _ensure_cached_system_prompt_static(agent, system_message=system_message)
         static = getattr(agent, "_cached_system_prompt_static", None)
-        messages = apply_anthropic_cache_control(
+        direct_tool_cache = getattr(
+            agent,
+            "_direct_native_anthropic_tool_cache_capability",
+            lambda: False,
+        )()
+        plan = build_prompt_cache_plan(
             messages,
+            planned_tools,
             cache_ttl=agent._cache_ttl,
             native_anthropic=agent._use_native_cache_layout,
             static_system_prefix=static if isinstance(static, str) else None,
+            direct_native_tool_cache=direct_tool_cache,
         )
+        messages = plan.messages
+        planned_tools = plan.tools
 
-    if (
-        prepared is not None
-        and getattr(agent, "provider", None) == "moa"
-    ):
-        # No `and guidance` here: guidance=None is a real prepared shape
-        # (all-references-failed / silent degraded policy builds the
-        # prepared request without attaching guidance), and the MoA facade
-        # sends prepared["messages"] — not api_kwargs["messages"] — so the
-        # rebase must refresh the prepared object even when there is no
-        # guidance to re-attach. rebase_prepared_request handles falsy
-        # guidance by copying the messages and skipping the attach.
-        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
-        rebase = getattr(completions, "rebase_prepared_request", None)
-        if callable(rebase):
-            prepared = rebase(prepared, messages)
-            messages = prepared["messages"]
-
-    return messages, prepared
+    if tools_for_api is None:
+        return messages, prepared
+    return messages, prepared, planned_tools
 
 
 def _apply_context_engine_selection(
@@ -1460,10 +1515,23 @@ def run_conversation(
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
+        # Per-agent validation cursor: skips re-json.loads-ing tool_call
+        # arguments on history messages already validated in a previous
+        # iteration. Identity-keyed (strong refs) — compression/undo/repair
+        # rewriting the list breaks the prefix match and forces a re-scan
+        # from the divergence point. See sanitize_tool_call_arguments.
+        _sanitize_cursor = getattr(agent, "_sanitize_args_cursor", None)
+        if _sanitize_cursor is None:
+            _sanitize_cursor = {}
+            try:
+                agent._sanitize_args_cursor = _sanitize_cursor
+            except Exception:
+                pass
         repaired_tool_calls = agent._sanitize_tool_call_arguments(
             messages,
             logger=request_logger,
             session_id=agent.session_id,
+            cursor=_sanitize_cursor,
         )
         if repaired_tool_calls > 0:
             request_logger.info(
@@ -1508,6 +1576,12 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+
+            # Durable row identity stamped by _rows_to_conversation so the
+            # desktop can address a specific persisted message (reactions).
+            # Bookkeeping, never a provider field — only the chat-completions
+            # transport strips underscore keys, so drop it centrally here.
+            api_msg.pop("_row_id", None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -1758,12 +1832,8 @@ def run_conversation(
         # regardless of ordering (a single-space pad here previously had to
         # be sequenced after normalization to survive, forking the concept).
 
-        # Apply Anthropic prompt caching for Claude models on native
-        # Anthropic, OpenRouter, and third-party Anthropic-compatible
-        # gateways. Auto-detected: if ``_use_prompt_caching`` is set, inject
-        # cache_control breakpoints for the static system prefix, full system
-        # prompt, and last two messages (or the legacy system-and-3 layout
-        # when no static prefix is available).
+        # Build the request-local cache sections only after every transcript
+        # mutation. The canonical tool registry stays undecorated.
         #
         # Runs LAST, after every message mutation above. Marking earlier
         # defeats the prefix stability the mutations exist to create:
@@ -1778,10 +1848,12 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        if agent._use_prompt_caching:
+        tools_for_api = agent.tools
+        if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
-            api_messages = apply_anthropic_cache_control(
+            _initial_cache_plan = build_prompt_cache_plan(
                 api_messages,
+                tools_for_api,
                 cache_ttl=agent._cache_ttl,
                 native_anthropic=agent._use_native_cache_layout,
                 static_system_prefix=(
@@ -1789,7 +1861,10 @@ def run_conversation(
                     if isinstance(_static_system_prefix, str)
                     else None
                 ),
+                direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
             )
+            api_messages = _initial_cache_plan.messages
+            tools_for_api = _initial_cache_plan.tools
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2125,15 +2200,22 @@ def run_conversation(
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
                 # re-render for the current provider before building kwargs.
-                api_messages, _moa_prepared_request = (
+                api_messages, _moa_prepared_request, tools_for_api = (
                     _redecorate_prompt_cache_for_provider(
                         agent,
                         api_messages,
                         system_message=system_message,
                         moa_prepared=_moa_prepared_request,
+                        tools_for_api=tools_for_api,
                     )
                 )
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                if tools_for_api == agent.tools:
+                    api_kwargs = agent._build_api_kwargs(api_messages)
+                else:
+                    api_kwargs = agent._build_api_kwargs(
+                        api_messages,
+                        tools_for_api=tools_for_api,
+                    )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2141,6 +2223,7 @@ def run_conversation(
                         api_kwargs,
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
+                        sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2300,6 +2383,7 @@ def run_conversation(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
+                            sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -3916,7 +4000,7 @@ def run_conversation(
                     print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
                     print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
                 if (
-                    agent.provider == "copilot"
+                    _is_copilot_provider(agent)
                     and status_code == 401
                     and not _retry.copilot_auth_retry_attempted
                 ):
@@ -4755,6 +4839,13 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
+                        # Persist an explicit provider-reported limit before
+                        # compression/retry. The next request can be rate
+                        # limited, omit usage, or the process can restart; none
+                        # of those should discard metadata the provider already
+                        # confirmed. Keep the probe flags as a best-effort
+                        # post-success retry if this write cannot complete.
+                        save_context_length(agent.model, agent.base_url, new_ctx)
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This
                         # value came from the provider, so it is safe to cache.
@@ -4922,6 +5013,32 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    # Copilot self-heal BEFORE fallback: a stale/degraded
+                    # credential surfaces as a 400
+                    # ``model_not_available_for_integrator`` /
+                    # ``model_not_supported`` (not a clean 401), so the 401
+                    # refresh path above never fired. Force a fresh token
+                    # exchange + client rebuild and retry once on the SAME
+                    # provider — a fresh 437-char API token routes to the
+                    # correct integrator and the model becomes available again.
+                    # Single-shot guard prevents looping on a genuinely
+                    # unavailable model. Copilot-scoped so other providers'
+                    # real 400s are untouched.
+                    if (
+                        _is_copilot_provider(agent)
+                        and not _retry.copilot_stale_cred_retry_attempted
+                        and _is_stale_copilot_credential_error(
+                            status_code, str(getattr(api_error, "message", "") or api_error)
+                        )
+                    ):
+                        _retry.copilot_stale_cred_retry_attempted = True
+                        if agent._try_recover_stale_copilot_credential():
+                            agent._buffer_vprint(
+                                "🔐 Copilot credential re-exchanged after "
+                                "model_not_available 400. Retrying request..."
+                            )
+                            retry_count = 0
+                            continue
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
                     # announce the attempt when a fallback chain actually

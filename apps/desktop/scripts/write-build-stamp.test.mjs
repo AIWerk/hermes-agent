@@ -42,6 +42,23 @@ test('fromLocalGit reads HEAD + branch + dirty status', () => {
   assert.ok(calls.includes('git rev-parse HEAD'))
 })
 
+test('fromLocalGit keeps the commit and falls back to the default branch for detached HEAD', () => {
+  for (const unresolvedBranch of ['HEAD', null, '']) {
+    const stamp = fromLocalGit('/repo', (cmd) => {
+      if (cmd === 'git rev-parse HEAD') return 'e'.repeat(40)
+      if (cmd === 'git rev-parse --abbrev-ref HEAD') return unresolvedBranch
+      if (cmd === 'git status --porcelain -uno') return ''
+      return null
+    })
+    assert.deepEqual(stamp, {
+      commit: 'e'.repeat(40),
+      branch: FALLBACK_BRANCH,
+      dirty: false,
+      source: 'local'
+    })
+  }
+})
+
 test('fromFallback uses the all-zero placeholder commit', () => {
   assert.deepEqual(fromFallback(), {
     commit: FALLBACK_COMMIT,

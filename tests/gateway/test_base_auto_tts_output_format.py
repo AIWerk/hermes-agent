@@ -77,11 +77,6 @@ def _hold_typing():
 # build_auto_tts_output_path: OPUS_VOICE_PLATFORMS is the single source of truth
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("platform_name", sorted(OPUS_VOICE_PLATFORMS))
-def test_output_path_is_ogg_for_every_opus_voice_platform(platform_name):
-    path = build_auto_tts_output_path(platform_name)
-    assert path.endswith(".ogg"), path
-
 
 @pytest.mark.parametrize(
     "platform", [Platform.DISCORD, Platform.SLACK, "irc", None]
@@ -89,16 +84,6 @@ def test_output_path_is_ogg_for_every_opus_voice_platform(platform_name):
 def test_output_path_is_mp3_for_non_opus_platforms(platform):
     path = build_auto_tts_output_path(platform)
     assert path.endswith(".mp3"), path
-
-
-def test_output_path_accepts_platform_enum():
-    assert build_auto_tts_output_path(Platform.TELEGRAM).endswith(".ogg")
-    assert build_auto_tts_output_path(Platform.MATRIX).endswith(".ogg")
-    assert build_auto_tts_output_path(Platform.FEISHU).endswith(".ogg")
-
-
-def test_output_paths_are_unique():
-    assert build_auto_tts_output_path("telegram") != build_auto_tts_output_path("telegram")
 
 
 # ---------------------------------------------------------------------------

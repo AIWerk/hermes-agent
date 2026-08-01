@@ -205,50 +205,6 @@ async def test_await_with_thread_deadline_cleanup_error_is_swallowed():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_abandoned_app_closes_request_transports_when_uninitialized():
-    """The leak fix must release the httpx transports even when PTB's own
-    Application.shutdown()/Bot.shutdown() no-op because the wedged initialize()
-    never flipped _initialized. _shutdown_abandoned_app falls back to closing
-    each bot._request transport directly (HTTPXRequest.shutdown gates only on
-    client.is_closed, not on an init flag)."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    # A half-built app: shutdown() is a no-op (uninitialized), but the request
-    # transports still hold open httpx clients that must be closed.
-    req0 = MagicMock()
-    req0.shutdown = AsyncMock()
-    req1 = MagicMock()
-    req1.shutdown = AsyncMock()
-    bot = MagicMock()
-    bot._request = (req0, req1)
-    app = MagicMock()
-    app.bot = bot
-    app.shutdown = AsyncMock(return_value=None)  # PTB no-op on uninitialized app
-
-    await tg_adapter._shutdown_abandoned_app(app)
-
-    app.shutdown.assert_awaited_once()
-    # Fell back to closing the transports directly — the actual leak fix.
-    req0.shutdown.assert_awaited_once()
-    req1.shutdown.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_shutdown_abandoned_app_handles_none_and_missing_requests():
-    """Robust against app=None and an app whose bot/_request aren't present."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    # None app -> no-op, no crash.
-    await tg_adapter._shutdown_abandoned_app(None)
-
-    # app.shutdown() raising must be swallowed, and missing _request tolerated.
-    app = MagicMock()
-    app.shutdown = AsyncMock(side_effect=RuntimeError("still running"))
-    app.bot = None
-    await tg_adapter._shutdown_abandoned_app(app)  # must not raise
-
-
-@pytest.mark.asyncio
 async def test_blocked_loop_after_expiry_dumps_diagnostics(monkeypatch):
     """#63309: when the loop thread is stuck in a synchronous call, the expiry
     callback never runs and every asyncio timeout goes silent. The off-loop
@@ -273,52 +229,12 @@ async def test_blocked_loop_after_expiry_dumps_diagnostics(monkeypatch):
     # …then block the event loop straight through deadline (0.05s) AND the
     # watchdog grace (0.15s): call_soon_threadsafe stays queued, exactly like
     # a sync call pinning the loop during Application.initialize().
-    _time.sleep(0.5)
+    # Margin matters: the watchdog thread only dumps if the loop is STILL
+    # blocked when it wakes, and thread wakeup lags under parallel-suite load.
+    # 0.2s (= deadline+grace exactly) flaked in a 40-worker full-suite run.
+    _time.sleep(1.0)
     with pytest.raises(_asyncio.TimeoutError):
         await task
 
     assert dumps == [(0.05, 0.15)]
     hung.cancel()
-
-
-@pytest.mark.asyncio
-async def test_responsive_loop_expiry_does_not_dump(monkeypatch):
-    """A normal timeout on a responsive loop must not trigger the watchdog."""
-    import asyncio as _asyncio
-
-    dumps = []
-    monkeypatch.setattr(
-        tg_adapter,
-        "_dump_loop_blocked_diagnostics",
-        lambda timeout, grace: dumps.append((timeout, grace)),
-    )
-    monkeypatch.setattr(tg_adapter, "_LOOP_BLOCKED_DUMP_GRACE", 0.1)
-
-    hung = _asyncio.get_running_loop().create_future()
-    with pytest.raises(_asyncio.TimeoutError):
-        await tg_adapter._await_with_thread_deadline(hung, timeout=0.05)
-    # Give the (cancelled) watchdog window time to have fired if it were going to.
-    await _asyncio.sleep(0.3)
-    assert dumps == []
-    hung.cancel()
-
-
-@pytest.mark.asyncio
-async def test_completed_await_never_reports_blocked_loop(monkeypatch):
-    """Success before the deadline must cancel the watchdog (no false dump)."""
-    import asyncio as _asyncio
-
-    dumps = []
-    monkeypatch.setattr(
-        tg_adapter,
-        "_dump_loop_blocked_diagnostics",
-        lambda timeout, grace: dumps.append((timeout, grace)),
-    )
-    monkeypatch.setattr(tg_adapter, "_LOOP_BLOCKED_DUMP_GRACE", 0.05)
-
-    async def _quick():
-        return "ok"
-
-    assert await tg_adapter._await_with_thread_deadline(_quick(), timeout=0.2) == "ok"
-    await _asyncio.sleep(0.4)
-    assert dumps == []

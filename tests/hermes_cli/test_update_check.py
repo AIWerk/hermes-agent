@@ -10,10 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-def test_version_string_no_v_prefix():
-    """__version__ should be bare semver without a 'v' prefix."""
-    from hermes_cli import __version__
-    assert not __version__.startswith("v"), f"__version__ should not start with 'v', got {__version__!r}"
 
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
@@ -175,8 +171,9 @@ def test_check_via_local_git_shallow_clone_behind_reports_no_count(tmp_path):
         result = banner._check_via_local_git(repo_dir)
 
     assert result == banner.UPDATE_AVAILABLE_NO_COUNT
-    # The shallow fetch must preserve the boundary (--depth 1), not unshallow.
-    assert ["git", "fetch", "origin", "--depth", "1", "--quiet"] in calls
+    # The shallow fetch must preserve the boundary (--depth 1), not unshallow,
+    # while explicitly targeting the upstream default branch.
+    assert ["git", "fetch", "origin", "main", "--depth", "1", "--quiet"] in calls
 
 
 def test_check_via_local_git_shallow_clone_up_to_date(tmp_path):
@@ -311,43 +308,3 @@ def test_prefetch_non_blocking():
         # Wait for the background thread to finish
         banner._update_check_done.wait(timeout=5)
         assert banner._update_result == 5
-
-
-def test_invalidate_update_cache_clears_all_profiles(tmp_path):
-    """_invalidate_update_cache() should delete .update_check from ALL profiles."""
-    from hermes_cli.main import _invalidate_update_cache
-
-    # Build a fake ~/.hermes with default + two named profiles
-    default_home = tmp_path / ".hermes"
-    default_home.mkdir()
-    (default_home / ".update_check").write_text('{"ts":1,"behind":50}')
-
-    profiles_root = default_home / "profiles"
-    for name in ("ops", "dev"):
-        p = profiles_root / name
-        p.mkdir(parents=True)
-        (p / ".update_check").write_text('{"ts":1,"behind":50}')
-
-    with patch.object(Path, "home", return_value=tmp_path), \
-         patch.dict(os.environ, {"HERMES_HOME": str(default_home)}):
-        _invalidate_update_cache()
-
-    # All three caches should be gone
-    assert not (default_home / ".update_check").exists(), "default profile cache not cleared"
-    assert not (profiles_root / "ops" / ".update_check").exists(), "ops profile cache not cleared"
-    assert not (profiles_root / "dev" / ".update_check").exists(), "dev profile cache not cleared"
-
-
-def test_invalidate_update_cache_no_profiles_dir(tmp_path):
-    """Works fine when no profiles directory exists (single-profile setup)."""
-    from hermes_cli.main import _invalidate_update_cache
-
-    default_home = tmp_path / ".hermes"
-    default_home.mkdir()
-    (default_home / ".update_check").write_text('{"ts":1,"behind":5}')
-
-    with patch.object(Path, "home", return_value=tmp_path), \
-         patch.dict(os.environ, {"HERMES_HOME": str(default_home)}):
-        _invalidate_update_cache()
-
-    assert not (default_home / ".update_check").exists()

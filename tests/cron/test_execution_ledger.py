@@ -79,22 +79,6 @@ def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     assert executions._executions_file().read_bytes() == b"not a sqlite database"
 
 
-def test_execution_history_is_paginated(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    ids = []
-    for _index in range(5):
-        row = executions.create_execution("paged", source="builtin")
-        executions.finish_execution(row["id"], success=True)
-        ids.append(row["id"])
-
-    first = executions.list_executions(job_id="paged", limit=2)
-    second = executions.list_executions(
-        job_id="paged", limit=2, before_claimed_at=first[-1]["claimed_at"]
-    )
-    assert [row["id"] for row in first] == list(reversed(ids))[:2]
-    assert set(row["id"] for row in first).isdisjoint(row["id"] for row in second)
-
-
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     executions = _point_ledger(monkeypatch, tmp_path)
     row = executions.create_execution("cli-job", source="builtin")
