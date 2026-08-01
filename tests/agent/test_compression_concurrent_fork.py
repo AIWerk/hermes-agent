@@ -287,7 +287,7 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
 
     def _slow_summary(*_args, **_kwargs):
         summary_started.set()
-        assert release_summary.wait(timeout=5)
+        assert release_summary.wait(timeout=15)
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
@@ -308,7 +308,10 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
 
     worker = threading.Thread(target=_run_compression, name="fenced-hygiene")
     worker.start()
-    assert summary_started.wait(timeout=2)
+    # A fully provisioned test environment may still be completing plugin
+    # discovery in background threads; this test covers lock release, not
+    # compressor startup latency.
+    assert summary_started.wait(timeout=10)
     assert fence.cancel_before_commit() is True
     release_summary.set()
     worker.join(timeout=5)

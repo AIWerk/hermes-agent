@@ -1724,10 +1724,10 @@ def run_doctor(args):
         # Inside our container the Docker terminal backend is not
         # configured by default (Docker-in-Docker isn't set up); the
         # local backend is the intended one. Skip the noisy "docker
-        # not found" warning. If the user has explicitly chosen
-        # TERMINAL_ENV=docker inside the container they likely mounted
-        # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
+        # not found" warning only when local is actually selected. Explicit
+        # remote/cloud backends (ssh, daytona, vercel_sandbox, …) must still
+        # run their own diagnostics even when Hermes itself is containerized.
+        if terminal_env == "local":
             check_info(
                 "Running inside a container — using local terminal backend "
                 "(docker-in-docker is not configured by default)"

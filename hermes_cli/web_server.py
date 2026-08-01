@@ -3649,7 +3649,12 @@ def _vault_url_from_config(config: dict[str, Any]) -> str:
 
 
 def _run_json_command(command: list[str], *, timeout: int = 8) -> Any:
-    env = os.environ.copy()
+    # This local helper intentionally preserves the caller's credentials and
+    # HOME semantics; use the canonical subprocess environment builder so new
+    # process-launch sites remain centrally auditable.
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     env["BW_NOINTERACTION"] = "true"
     completed = subprocess.run(
         command,

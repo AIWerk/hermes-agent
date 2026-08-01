@@ -158,8 +158,6 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
         finally:
             conn.close()
 
-    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
-    executions.EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     cron_conn = executions._connect()
     try:
         executions._initialize_schema(cron_conn)

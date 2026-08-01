@@ -3475,9 +3475,24 @@ def _normalize_managed_eol(git_cmd, repo_root):
         return {p for p in out.stdout.split("\0") if p}
 
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
-        if all_dirty is None or real_dirty is None:
+        all_dirty = _dirty()
+        # ``git diff --name-only --ignore-cr-at-eol`` still reports paths
+        # whose actual patch is empty (Git retains the raw worktree-change
+        # record). ``--numstat`` suppresses those empty patches, so it is the
+        # reliable source for paths with a genuine content change.
+        real = subprocess.run(
+            probe + ["diff", "--numstat", "-z", "--ignore-cr-at-eol"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if all_dirty is None or real.returncode != 0:
             return None
+        real_dirty = set()
+        for record in real.stdout.split("\0"):
+            parts = record.split("\t", 2)
+            if len(parts) == 3 and parts[2]:
+                real_dirty.add(parts[2])
         return all_dirty - real_dirty
 
     try:
@@ -3500,9 +3515,14 @@ def _normalize_managed_eol(git_cmd, repo_root):
             # thousands of paths, well past the Windows command-line limit.
             subprocess.run(
                 probe
-                + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
+                + [
+                    "--literal-pathspecs",
+                    "checkout",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ],
                 cwd=repo_root,
-                input="\0".join(sorted(eol_only)),
+                input="\0".join(sorted(eol_only)) + "\0",
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 check=False,

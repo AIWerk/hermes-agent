@@ -1122,6 +1122,11 @@ class TestEventBridgePollE2E:
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+        # Keep the no-change premise true: the production DB index loader opens
+        # SessionDB, whose first-time schema setup can itself advance state.db's
+        # mtime. This test exercises the legacy JSON fallback and the poll gate,
+        # not SessionDB initialization.
+        monkeypatch.setattr(mcp_serve, "_load_sessions_index_from_db", lambda: {})
 
         session_id = "20260329_150000_skip_test"
         db_path = tmp_path / "state.db"
@@ -1335,7 +1340,8 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        baseline_mtime = db_path.stat().st_mtime
+        os.utime(db_path, (baseline_mtime + 1, baseline_mtime + 1))  # open poll gate
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1373,7 +1379,8 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        baseline_mtime = db_path.stat().st_mtime
+        os.utime(db_path, (baseline_mtime + 1, baseline_mtime + 1))
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

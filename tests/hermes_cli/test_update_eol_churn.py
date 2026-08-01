@@ -193,6 +193,36 @@ def test_churn_across_more_files_than_fit_in_one_argv(tmp_path: Path) -> None:
     assert _autocrlf(repo) == "false"
 
 
+def test_literal_pathspec_magic_filename_cannot_expand_to_real_edits(tmp_path: Path) -> None:
+    """A tracked filename is data, never a Git pathspec expression."""
+    repo = _managed_repo(
+        tmp_path,
+        {
+            ":(glob)*.py": b"magic = 1\n",
+            "victim.py": b"value = 1\n",
+        },
+    )
+    genuine_edit = b"value = 1\r\nvalue += 1\r\n"
+    (repo / "victim.py").write_bytes(genuine_edit)
+
+    _normalize_managed_eol(GIT_CMD, repo)
+
+    assert (repo / "victim.py").read_bytes() == genuine_edit
+    assert _dirty(repo) == {"victim.py"}
+    assert b"\r\n" not in (repo / ":(glob)*.py").read_bytes()
+    assert _autocrlf(repo) == "false"
+
+
+def test_literal_pathspec_prefix_filename_is_normalized(tmp_path: Path) -> None:
+    repo = _managed_repo(tmp_path, {":(literal)magic.py": b"magic = 1\n"})
+
+    _normalize_managed_eol(GIT_CMD, repo)
+
+    assert _dirty(repo) == set()
+    assert b"\r\n" not in (repo / ":(literal)magic.py").read_bytes()
+    assert _autocrlf(repo) == "false"
+
+
 def test_non_repo_is_ignored(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     _normalize_managed_eol(GIT_CMD, tmp_path)
 

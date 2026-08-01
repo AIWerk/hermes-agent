@@ -219,6 +219,9 @@ class TestBusyInputModeQueueFifo:
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
 
+    def test_queue_respects_bounded_cap(self):
+        """Beyond the per-session cap, follow-ups are dropped (with a warning)."""
+        from gateway.run import GatewayRunner
 
         runner, adapter = self._make_runner_and_adapter()
         session_key = "telegram:user:cap"

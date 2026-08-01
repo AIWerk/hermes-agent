@@ -955,7 +955,9 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
         "  hygiene_failure_cooldown_seconds: 120\n",
     )
     runner._hygiene_compression_failure_cooldowns = {}
-    runner._session_db = SimpleNamespace(_db=MagicMock())
+    db = MagicMock()
+    db.get_compression_failure_cooldown.return_value = None
+    runner._session_db = SimpleNamespace(_db=db)
 
     wait_timeouts = []
     real_wait_for = asyncio.wait_for
@@ -986,7 +988,10 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
         s for s in adapter.sent if "Context compression timed out" in s["content"]
     ]
     assert len(timeout_warnings) == 1
-    assert runner._hygiene_compression_failure_cooldowns["sess-progress"] > time.time()
+    db.record_compression_failure_cooldown.assert_called_once()
+    cooldown_session_id, cooldown_until = db.record_compression_failure_cooldown.call_args.args
+    assert cooldown_session_id == "sess-progress"
+    assert cooldown_until > time.time()
 
 @pytest.mark.asyncio
 async def test_session_hygiene_does_not_repoint_when_rotated_transcript_write_fails(

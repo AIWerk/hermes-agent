@@ -136,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            pass
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -1161,6 +1164,10 @@ class TestInit:
                 "hermes_cli.config.load_config",
                 return_value={"prompt_caching": {"cache_ttl": "1h"}},
             ),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"prompt_caching": {"cache_ttl": "1h"}},
+            ),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -1180,6 +1187,10 @@ class TestInit:
             patch("run_agent.OpenAI"),
             patch(
                 "hermes_cli.config.load_config",
+                return_value={"model": {"max_tokens": 4096}},
+            ),
+            patch(
+                "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
             ),
         ):
