@@ -10,12 +10,14 @@ import re
 import secrets
 import shlex
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -518,6 +520,7 @@ _BROKER_SOCKET_ENV = "HERMES_OPERATOR_VERIFIER_BROKER_SOCKET"
 _BROKER_PID_ENV = "HERMES_OPERATOR_VERIFIER_BROKER_PID"
 _BROKER_PARENT_PID_ENV = "HERMES_OPERATOR_VERIFIER_BROKER_PARENT_PID"
 _BROKER_CAPABILITY_ENV = "HERMES_OPERATOR_VERIFIER_CAPABILITY"
+_UNIX_SOCKET_PATH_MAX = 107
 
 
 def _get_operator_verification_callback():
@@ -545,16 +548,66 @@ def _broker_runtime_dir() -> Path:
     return Path(base) / "hov"
 
 
+def _path_has_symlink_component(path: Path) -> bool:
+    """Reject a runtime path whose existing prefix traverses a symlink."""
+    for candidate in (path, *path.parents):
+        try:
+            if candidate.is_symlink():
+                return True
+            if candidate.exists():
+                return candidate.resolve() != candidate.absolute()
+        except Exception:
+            return True
+    return True
+
+
 def _runtime_dir_is_private(path: Path) -> bool:
+    if _path_has_symlink_component(path):
+        return False
     try:
-        st = path.stat()
+        st = path.lstat()
     except FileNotFoundError:
         return True
     except Exception:
         return False
     if not hasattr(os, "getuid"):
         return False
-    return st.st_uid == os.getuid() and (st.st_mode & 0o077) == 0  # windows-footgun: ok
+    return (
+        stat.S_ISDIR(st.st_mode)
+        and st.st_uid == os.getuid()
+        and (st.st_mode & 0o077) == 0
+    )  # windows-footgun: ok
+
+
+def _prepare_private_runtime_dir(path: Path) -> bool:
+    if _path_has_symlink_component(path):
+        return False
+    try:
+        existed = path.exists()
+        if existed:
+            return _runtime_dir_is_private(path)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        st = path.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return False
+    except Exception:
+        return False
+    return _runtime_dir_is_private(path)
+
+
+def _broker_socket_path(runtime_dir: Path) -> Path | None:
+    socket_path = runtime_dir / f"b-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    path_length = len(os.fsencode(socket_path))
+    if path_length > _UNIX_SOCKET_PATH_MAX:
+        warnings.warn(
+            "Operator verification broker disabled: "
+            f"AF_UNIX socket path is {path_length} bytes; "
+            f"limit is {_UNIX_SOCKET_PATH_MAX} bytes: {socket_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return socket_path
 
 
 def _parent_pid(pid: int) -> int | None:
@@ -613,14 +666,11 @@ def _start_operator_verification_broker(result: OperatorVerificationResult, *, s
         _broker_proc = None
         _clear_broker_env()
         runtime_dir = _broker_runtime_dir()
-        if not _runtime_dir_is_private(runtime_dir):
+        if not _prepare_private_runtime_dir(runtime_dir):
             return
-        try:
-            runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(runtime_dir, 0o700)
-        except Exception:
+        socket_path = _broker_socket_path(runtime_dir)
+        if socket_path is None:
             return
-        socket_path = runtime_dir / f"b-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
         capability = secrets.token_urlsafe(32)
         payload = json.dumps(
             {"key": _cache_key(session_id), "capability": capability, "parent_pid": os.getpid(), "result": asdict(result)},

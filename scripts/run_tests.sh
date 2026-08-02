@@ -158,11 +158,13 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-# TMPDIR is a POSIX location variable, not a credential; preserve it when set.
+# TMPDIR and HERMES_PYTHON are non-credential location variables; preserve
+# them when set so nested canonical runners keep the selected test interpreter.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
   ${TMPDIR:+TMPDIR="$TMPDIR"} \
+  ${HERMES_PYTHON:+HERMES_PYTHON="$HERMES_PYTHON"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${LD_LIBRARY_PATH:+LD_LIBRARY_PATH="$LD_LIBRARY_PATH"} \
   TZ=UTC \

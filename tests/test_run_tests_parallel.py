@@ -241,15 +241,17 @@ def test_shell_runner_forwards_caller_tmpdir(tmp_path: Path) -> None:
     requested_tmp.mkdir()
     probe = tmp_path / "test_tmpdir_probe.py"
     probe.write_text(
-        "import os, tempfile\n\n"
+        "import os, sys, tempfile\n\n"
         "def test_tmpdir_is_preserved():\n"
         f"    expected = {str(requested_tmp)!r}\n"
         "    assert os.environ.get('TMPDIR') == expected\n"
-        "    assert tempfile.gettempdir() == expected\n",
+        "    assert tempfile.gettempdir() == expected\n"
+        "    assert os.environ.get('HERMES_PYTHON') == sys.executable\n",
         encoding="utf-8",
     )
     env = os.environ.copy()
     env["TMPDIR"] = str(requested_tmp)
+    env["HERMES_PYTHON"] = sys.executable
 
     proc = subprocess.run(
         [

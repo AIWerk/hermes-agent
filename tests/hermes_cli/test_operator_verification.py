@@ -33,6 +33,21 @@ def clear_operator_cache_after_test():
     clear_operator_verification_cache()
 
 
+@pytest.fixture
+def short_broker_runtime_dir():
+    """Keep AF_UNIX broker paths short without changing product path policy."""
+    if os.name == "nt":
+        short_root = tempfile.gettempdir()
+        identity = os.getpid()
+    else:
+        short_root = "/private/tmp" if sys.platform == "darwin" else "/tmp"
+        identity = os.getuid()
+    with tempfile.TemporaryDirectory(prefix=f"hov-{identity}-", dir=short_root) as directory:
+        path = Path(directory)
+        path.chmod(0o700)
+        yield path
+
+
 def test_default_config_enables_operator_verification_gate():
     section = DEFAULT_CONFIG["security"]["operator_verification"]
 
@@ -346,8 +361,57 @@ def test_operator_verification_cache_is_in_memory_and_expires():
     assert get_cached_operator_verification(session_id="s1", now=250) is None
 
 
-def test_operator_verification_broker_survives_process_local_cache_clear(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+def test_operator_verification_broker_rejects_overlong_socket_path(monkeypatch, tmp_path):
+    runtime = tmp_path / ("long-runtime-component-" * 5)
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    clear_operator_verification_cache()
+    now = int(time.time())
+    valid = OperatorVerificationResult(
+        ok=True,
+        actor_id="operator",
+        role="operator",
+        verified_at=now,
+        expires_at=now + 100,
+    )
+
+    with pytest.warns(RuntimeWarning, match=r"AF_UNIX socket path is \d+ bytes; limit is 107 bytes"):
+        cache_operator_verification(valid, session_id="s1")
+
+    from hermes_cli import operator_verification as ov
+
+    assert ov._BROKER_SOCKET_ENV not in os.environ
+    ov._cache.clear()
+    assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
+
+
+def test_operator_verification_broker_rejects_symlinked_runtime_root(monkeypatch, tmp_path):
+    """A shortened socket path must not weaken runtime-directory provenance."""
+    real_runtime = tmp_path / "real-runtime"
+    real_runtime.mkdir(mode=0o700)
+    linked_runtime = tmp_path / "linked-runtime"
+    linked_runtime.symlink_to(real_runtime, target_is_directory=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(linked_runtime))
+    clear_operator_verification_cache()
+    now = int(time.time())
+    valid = OperatorVerificationResult(
+        ok=True,
+        actor_id="operator",
+        role="operator",
+        verified_at=now,
+        expires_at=now + 100,
+    )
+
+    cache_operator_verification(valid, session_id="s1")
+    from hermes_cli import operator_verification as ov
+
+    assert ov._BROKER_SOCKET_ENV not in os.environ
+    ov._cache.clear()
+    assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
+
+
+def test_operator_verification_broker_survives_process_local_cache_clear(monkeypatch, short_broker_runtime_dir):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     now = int(time.time())
     valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
@@ -362,8 +426,8 @@ def test_operator_verification_broker_survives_process_local_cache_clear(monkeyp
     assert get_cached_operator_verification(session_id="s1", now=now + 150) is None
 
 
-def test_operator_verification_broker_env_is_not_trusted_by_child_process(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+def test_operator_verification_broker_env_is_not_trusted_by_child_process(monkeypatch, short_broker_runtime_dir):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     now = int(time.time())
     valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
@@ -440,8 +504,8 @@ finally:
     assert completed.stdout.strip() == "None"
 
 
-def test_broker_rejects_child_raw_socket_even_with_inherited_capability(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+def test_broker_rejects_child_raw_socket_even_with_inherited_capability(monkeypatch, short_broker_runtime_dir):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     now = int(time.time())
     valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
@@ -464,8 +528,8 @@ except BrokenPipeError:
     assert json.loads(completed.stdout) == {}
 
 
-def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeypatch, short_broker_runtime_dir):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
     now = int(time.time())
@@ -539,8 +603,8 @@ def test_operator_verification_rejects_insecure_broker_runtime_dir(monkeypatch, 
     assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
 
 
-def test_broker_rejects_client_without_capability(tmp_path):
-    socket_path = tmp_path / "broker.sock"
+def test_broker_rejects_client_without_capability(short_broker_runtime_dir):
+    socket_path = short_broker_runtime_dir / "broker.sock"
     now = int(time.time())
     payload = {
         "key": "s1",
