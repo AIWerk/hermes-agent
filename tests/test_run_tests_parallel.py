@@ -233,25 +233,27 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX TMPDIR contract")
-def test_shell_runner_forwards_caller_tmpdir(tmp_path: Path) -> None:
-    """The env -i boundary preserves a caller-selected non-credential TMPDIR."""
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX runtime-location contract")
+def test_shell_runner_forwards_caller_runtime_locations(tmp_path: Path) -> None:
+    """The env -i boundary preserves caller-selected runtime locations."""
     repo_root = Path(__file__).resolve().parent.parent
     requested_tmp = tmp_path / "caller-tmp"
     requested_tmp.mkdir()
-    probe = tmp_path / "test_tmpdir_probe.py"
+    probe = tmp_path / "test_runtime_location_probe.py"
     probe.write_text(
         "import os, sys, tempfile\n\n"
-        "def test_tmpdir_is_preserved():\n"
+        "def test_runtime_locations_are_preserved():\n"
         f"    expected = {str(requested_tmp)!r}\n"
         "    assert os.environ.get('TMPDIR') == expected\n"
         "    assert tempfile.gettempdir() == expected\n"
-        "    assert os.environ.get('HERMES_PYTHON') == sys.executable\n",
+        "    assert os.environ.get('HERMES_PYTHON') == sys.executable\n"
+        "    assert os.environ.get('LD_LIBRARY_PATH') == '/opt/hermes-test-sqlite'\n",
         encoding="utf-8",
     )
     env = os.environ.copy()
     env["TMPDIR"] = str(requested_tmp)
     env["HERMES_PYTHON"] = sys.executable
+    env["LD_LIBRARY_PATH"] = "/opt/hermes-test-sqlite"
 
     proc = subprocess.run(
         [
@@ -272,6 +274,28 @@ def test_shell_runner_forwards_caller_tmpdir(tmp_path: Path) -> None:
     )
 
     assert proc.returncode == 0, proc.stdout
+
+
+def test_default_worker_count_matches_cpu_count(tmp_path: Path) -> None:
+    """Default parallelism follows host CPU count without oversubscription."""
+    probe_dir = _make_probe_dir(tmp_path)
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    env = os.environ.copy()
+    env.pop("HERMES_TEST_WORKERS", None)
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--paths", str(probe_dir)],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert f"running with -j {os.cpu_count() or 4}" in proc.stdout, proc.stdout
 
 
 
