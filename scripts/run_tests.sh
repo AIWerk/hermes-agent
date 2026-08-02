@@ -158,9 +158,11 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
+# TMPDIR is a POSIX location variable, not a credential; preserve it when set.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${TMPDIR:+TMPDIR="$TMPDIR"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${LD_LIBRARY_PATH:+LD_LIBRARY_PATH="$LD_LIBRARY_PATH"} \
   TZ=UTC \

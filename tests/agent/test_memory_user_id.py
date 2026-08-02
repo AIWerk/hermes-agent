@@ -4,8 +4,10 @@ Verifies that gateway user_id flows from AIAgent -> MemoryManager -> plugins,
 so each gateway user gets their own memory bucket instead of sharing a static one.
 """
 
+import ast
 import json
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from agent.memory_provider import MemoryProvider
@@ -262,20 +264,31 @@ class TestHonchoUserIdScoping:
 class TestAIAgentUserIdPropagation:
     """Verify AIAgent stores user_id and passes it to memory init kwargs."""
 
-    def test_user_id_stored_on_agent(self):
+    def test_user_id_stored_on_agent(self, tmp_path: Path):
         """AIAgent should store user_id as instance attribute."""
-        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/test_hermes"}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / "hermes-home")}):
             from run_agent import AIAgent
             agent = object.__new__(AIAgent)
             # Manually set the attribute as __init__ does
             agent._user_id = "test_user_42"
             assert agent._user_id == "test_user_42"
 
-    def test_user_id_none_by_default(self):
+    def test_user_id_none_by_default(self, tmp_path: Path):
         """AIAgent should have None user_id when not provided (CLI mode)."""
-        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/test_hermes"}):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path / "hermes-home")}):
             from run_agent import AIAgent
             agent = object.__new__(AIAgent)
             agent._user_id = None
             assert agent._user_id is None
+
+
+def test_memory_user_id_tests_do_not_use_shared_fixed_hermes_home():
+    """This test module must not create cross-tenant state in a fixed /tmp path."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    fixed_paths = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert ("/tmp" + "/test_hermes") not in fixed_paths
 

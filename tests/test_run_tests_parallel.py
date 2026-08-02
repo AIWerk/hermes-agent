@@ -233,6 +233,44 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX TMPDIR contract")
+def test_shell_runner_forwards_caller_tmpdir(tmp_path: Path) -> None:
+    """The env -i boundary preserves a caller-selected non-credential TMPDIR."""
+    repo_root = Path(__file__).resolve().parent.parent
+    requested_tmp = tmp_path / "caller-tmp"
+    requested_tmp.mkdir()
+    probe = tmp_path / "test_tmpdir_probe.py"
+    probe.write_text(
+        "import os, tempfile\n\n"
+        "def test_tmpdir_is_preserved():\n"
+        f"    expected = {str(requested_tmp)!r}\n"
+        "    assert os.environ.get('TMPDIR') == expected\n"
+        "    assert tempfile.gettempdir() == expected\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["TMPDIR"] = str(requested_tmp)
+
+    proc = subprocess.run(
+        [
+            "bash",
+            str(repo_root / "scripts" / "run_tests.sh"),
+            str(probe),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=90,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+
 
 
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
