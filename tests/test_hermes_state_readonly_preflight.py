@@ -57,12 +57,12 @@ def _make_wal_db(path: Path) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE t (x)")
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    # Keep a READ-ONLY second connection open so neither close can
-    # checkpoint: the writer skips checkpoint-on-close because another
-    # connection exists, and the ro holder cannot checkpoint at all.
-    # The committed row therefore lives only in the -wal file.
+    # Keep an explicit READ transaction open on the database so the holder
+    # actually acquires a WAL read lock. ``SELECT 1`` never touches the pager,
+    # so SQLite may checkpoint and remove the WAL when the writer closes.
     holder = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    holder.execute("SELECT 1").fetchone()
+    holder.execute("BEGIN")
+    holder.execute("SELECT count(*) FROM t").fetchone()
     conn.execute("INSERT INTO t VALUES (42)")
     conn.commit()
     conn.close()
