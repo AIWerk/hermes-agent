@@ -448,6 +448,8 @@ cli:
     version_carried_one: "{count} التزام مُرحّل"
     version_carried_many: "{count} التزامات مُرحّلة"
     context_label: "سياق {tokens}"
+    no_model_configured: "لم يتم إعداد نموذج"
+    run_model_or_setup: "شغّل /model أو hermes setup"
     yolo_mode: "وضع YOLO"
     approvals_bypassed: "تم تجاوز كل طلبات الموافقة"
     session_label: "الجلسة: {session_id}"

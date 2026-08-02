@@ -446,6 +446,8 @@ cli:
     version_carried_one: "{count} megtartott commit"
     version_carried_many: "{count} megtartott commit"
     context_label: "{tokens} kontextus"
+    no_model_configured: "nincs modell beállítva"
+    run_model_or_setup: "futtasd a /model parancsot vagy a hermes setupot"
     yolo_mode: "YOLO mód"
     approvals_bypassed: "minden jóváhagyási kérdés kihagyva"
     session_label: "Munkamenet: {session_id}"

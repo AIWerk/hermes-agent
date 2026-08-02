@@ -446,6 +446,8 @@ cli:
     version_carried_one: "{count} übernommener Commit"
     version_carried_many: "{count} übernommene Commits"
     context_label: "{tokens} Kontext"
+    no_model_configured: "kein Modell konfiguriert"
+    run_model_or_setup: "führe /model oder hermes setup aus"
     yolo_mode: "YOLO-Modus"
     approvals_bypassed: "alle Genehmigungsabfragen übersprungen"
     session_label: "Sitzung: {session_id}"

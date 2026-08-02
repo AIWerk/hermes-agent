@@ -726,8 +726,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             # slug — this is the single clearest place to tell the user what
             # is wrong and how to fix it.
             left_lines.append(
-                f"[bold red]no model configured[/] "
-                f"[dim {dim}]— run /model or hermes setup[/]"
+                f"[bold red]{t('cli.banner.no_model_configured')}[/] "
+                f"[dim {dim}]— {t('cli.banner.run_model_or_setup')}[/]"
             )
         else:
             model_short = model.split("/")[-1] if "/" in model else model

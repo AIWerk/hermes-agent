@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from rich.console import Console
+import pytest
 
 import hermes_cli.banner as banner
 import model_tools
@@ -52,6 +53,38 @@ def test_build_welcome_banner_uses_active_language_for_static_labels(monkeypatch
         assert "128K kontextus" in output
         assert "/help a parancsokhoz" in output
         assert "Available Tools" not in output
+    finally:
+        reset_language_cache()
+
+
+@pytest.mark.parametrize("model", ["", "unknown", " Unknown "])
+def test_build_welcome_banner_localizes_missing_model_warning(monkeypatch, model):
+    """Blank/unknown models must not punch hard-coded English through i18n."""
+    from agent.i18n import reset_language_cache
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "hu")
+    reset_language_cache()
+    try:
+        with (
+            patch.object(model_tools, "check_tool_availability", return_value=([], [])),
+            patch.object(banner, "get_available_skills", return_value={}),
+            patch.object(banner, "get_update_result", return_value=None),
+            patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+            patch.object(banner, "get_latest_release_tag", return_value=None),
+        ):
+            console = Console(record=True, force_terminal=False, color_system=None, width=160)
+            banner.build_welcome_banner(
+                console=console,
+                model=model,
+                cwd="/tmp/project",
+                tools=[],
+                enabled_toolsets=[],
+            )
+
+        output = console.export_text()
+        assert "nincs modell beállítva" in output
+        assert "futtasd a /model parancsot vagy a hermes setupot" in output
+        assert "no model configured" not in output
     finally:
         reset_language_cache()
 
