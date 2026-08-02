@@ -3474,25 +3474,38 @@ def _normalize_managed_eol(git_cmd, repo_root):
             return None
         return {p for p in out.stdout.split("\0") if p}
 
-    def _eol_only():
-        all_dirty = _dirty()
-        # ``git diff --name-only --ignore-cr-at-eol`` still reports paths
-        # whose actual patch is empty (Git retains the raw worktree-change
-        # record). ``--numstat`` suppresses those empty patches, so it is the
-        # reliable source for paths with a genuine content change.
-        real = subprocess.run(
-            probe + ["diff", "--numstat", "-z", "--ignore-cr-at-eol"],
+    def _real_dirty():
+        # Files with a *content* change once CRLF differences are ignored.
+        # NOTE: ``diff --name-only --ignore-cr-at-eol`` still LISTS CR-only
+        # files (the name list is computed from blob/stat differences before
+        # the CR filter is applied), so it cannot be used to isolate real
+        # edits. ``--numstat`` does honor the filter: a CR-only file produces
+        # no numstat record, while a genuinely-edited file does. Parse the
+        # paths out of numstat instead.
+        out = subprocess.run(
+            probe + ["-c", "core.quotepath=false",
+                     "diff", "--numstat", "-z", "--ignore-cr-at-eol"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
-        if all_dirty is None or real.returncode != 0:
+        if out.returncode != 0:
             return None
-        real_dirty = set()
-        for record in real.stdout.split("\0"):
+        paths = set()
+        for record in out.stdout.split("\0"):
+            if not record:
+                continue
+            # Format: "<added>\t<deleted>\t<path>". Rename detection is off in
+            # plain diff, so there is exactly one path field per record.
             parts = record.split("\t", 2)
             if len(parts) == 3 and parts[2]:
-                real_dirty.add(parts[2])
+                paths.add(parts[2])
+        return paths
+
+    def _eol_only():
+        all_dirty, real_dirty = _dirty(), _real_dirty()
+        if all_dirty is None or real_dirty is None:
+            return None
         return all_dirty - real_dirty
 
     try:

@@ -18,11 +18,14 @@ vi.mock('@/store/profile', async importOriginal => ({
   ensureGatewayProfile: (profile?: string) => ensureGatewayProfile(profile)
 }))
 
+const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
+
 afterEach(() => {
   cleanup()
   ensureGatewayProfile.mockReset()
   ensureGatewayProfile.mockResolvedValue(undefined)
   openSession.mockClear()
+  delete desktopWindow.hermesDesktop
   __resetSessionLinkTitleCache()
 })
 
@@ -72,5 +75,25 @@ describe('session refs open the session', () => {
     finishProfileSwitch()
 
     await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
+  })
+})
+
+// A url the user sent renders as a chip too, and it opens in the browser — the
+// same door the composer's hover pill uses, so a link behaves the same before
+// and after send.
+describe('url refs open externally', () => {
+  it('opens a url chip in the user transcript', () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+
+    desktopWindow.hermesDesktop = { openExternal } as unknown as Window['hermesDesktop']
+
+    render(<DirectiveContent text="see @url:`https://example.com/docs` when you can" />)
+
+    const chip = screen.getByTitle('https://example.com/docs')
+
+    expect(chip.tagName).toBe('BUTTON')
+    fireEvent.click(chip)
+
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/docs')
   })
 })
