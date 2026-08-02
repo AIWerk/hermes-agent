@@ -574,7 +574,7 @@ def _runtime_dir_is_private(path: Path) -> bool:
         return False
     return (
         stat.S_ISDIR(st.st_mode)
-        and st.st_uid == os.getuid()
+        and st.st_uid == os.getuid()  # windows-footgun: ok
         and (st.st_mode & 0o077) == 0
     )  # windows-footgun: ok
 
@@ -588,7 +588,7 @@ def _prepare_private_runtime_dir(path: Path) -> bool:
             return _runtime_dir_is_private(path)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         st = path.lstat()
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():  # windows-footgun: ok
             return False
     except Exception:
         return False
