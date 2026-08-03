@@ -42,6 +42,7 @@ from gateway.restart import (
 from hermes_cli.config import (
     get_env_value,
     get_hermes_home,
+    get_process_hermes_home,
     is_managed,
     managed_error,
     read_raw_config,
@@ -2657,18 +2658,23 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
-def _stable_service_project_root(home_dir: str | Path | None = None) -> Path:
+def _stable_service_project_root(hermes_home: str | Path | None = None) -> Path:
     """Prefer the stable install symlink only when it targets this release.
 
     Service definitions survive release cutovers, so baking the resolved
     ``releases/<sha>`` checkout into PATH leaves them one generation behind.
-    The stable ``~/.hermes/hermes-agent`` spelling avoids that rot, but it is
+    The stable ``$HERMES_HOME/hermes-agent`` spelling avoids that rot, but it is
     safe only when its real path is exactly the checkout running this code.
     Otherwise keep the physical root rather than point the service at a
     different release.
     """
-    home = Path(home_dir) if home_dir is not None else Path.home()
-    stable_root = home / ".hermes" / "hermes-agent"
+    # Service installation is process-scoped, so ignore transient context-local
+    # profile overrides here. System units pass the already-remapped target
+    # HERMES_HOME explicitly.
+    service_home = (
+        Path(hermes_home) if hermes_home is not None else get_process_hermes_home()
+    )
+    stable_root = service_home / "hermes-agent"
     try:
         if stable_root.resolve(strict=True) == PROJECT_ROOT:
             return stable_root
@@ -2778,7 +2784,10 @@ def _systemd_watchdog_service_fields(
 
 
 def _append_node_dir_for_service(
-    path_entries: list[str], hermes_root: Path | None = None
+    path_entries: list[str],
+    hermes_root: Path | None = None,
+    *,
+    include_path_fallback: bool = True,
 ) -> None:
     """Add the Node directory a generated service unit should use to *path_entries*.
 
@@ -2798,6 +2807,8 @@ def _append_node_dir_for_service(
     generator".
 
     PATH lookup remains the fallback rung for installs with no managed Node.
+    Cross-user system units disable that fallback so the caller's shell PATH
+    cannot inject a caller-owned binary directory into the target service.
     """
     from hermes_constants import iter_hermes_node_dirs
 
@@ -2809,6 +2820,9 @@ def _append_node_dir_for_service(
             present = False
         if present and entry not in path_entries:
             path_entries.append(entry)
+
+    if not include_path_fallback:
+        return
 
     resolved_node = shutil.which("node")
     if not resolved_node:
@@ -2834,9 +2848,12 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
 
     system_identity = _system_service_identity(run_as_user) if system else None
-    service_project_root = _stable_service_project_root(
-        system_identity[2] if system_identity is not None else None
+    service_hermes_home = (
+        _hermes_home_for_target_user(system_identity[2])
+        if system_identity is not None
+        else get_process_hermes_home()
     )
+    service_project_root = _stable_service_project_root(service_hermes_home)
     path_entries = _build_service_path_dirs(service_project_root)
     if not system:
         # System units append the managed Node dirs later, once the TARGET
@@ -2862,7 +2879,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     if system:
         assert system_identity is not None
         username, group_name, home_dir = system_identity
-        hermes_home = _hermes_home_for_target_user(home_dir)
+        hermes_home = str(service_hermes_home)
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
@@ -2876,27 +2893,37 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         # _stable_service_working_dir() for the full rationale.
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         venv_dir = _remap_path_for_user(venv_dir, home_dir)
-        # Keep project-owned PATH entries on the root whose identity was just
-        # verified above. In particular, when the target user's stable symlink
-        # points at another release, remapping PROJECT_ROOT into that user's
-        # home would invent an unverified third path instead of retaining the
-        # required physical-release fallback.
+        # Keep project-owned PATH entries only when the target user's stable
+        # symlink was verified above. If verification fell back to the caller's
+        # physical PROJECT_ROOT, omit those entries: remapping would invent an
+        # unverified path, while retaining them would cross a user trust boundary
+        # by executing binaries from the caller's home. ExecStart is absolute,
+        # so omission degrades safely.
         project_path_entries = {
             entry
             for entry in path_entries
             if Path(entry).is_relative_to(service_project_root)
         }
-        path_entries = [
-            p if p in project_path_entries else _remap_path_for_user(p, home_dir)
-            for p in path_entries
-        ]
+        if service_project_root == PROJECT_ROOT:
+            path_entries = [
+                _remap_path_for_user(p, home_dir)
+                for p in path_entries
+                if p not in project_path_entries
+            ]
+        else:
+            path_entries = [
+                p if p in project_path_entries else _remap_path_for_user(p, home_dir)
+                for p in path_entries
+            ]
         # Managed Node for the TARGET user's tree (see the skip above): probe
         # the remapped hermes_home, not the calling user's. Prepend — the
         # managed Node must outrank remapped shell-PATH entries, matching the
         # user-unit ordering where it's appended before PATH capture.
         _target_node_entries: list[str] = []
         _append_node_dir_for_service(
-            _target_node_entries, Path(hermes_home) if hermes_home else None
+            _target_node_entries,
+            Path(hermes_home) if hermes_home else None,
+            include_path_fallback=False,
         )
         path_entries = [
             e for e in _target_node_entries if e not in path_entries
