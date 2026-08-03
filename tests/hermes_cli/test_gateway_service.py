@@ -187,7 +187,7 @@ class TestStableServiceProjectPath:
     @staticmethod
     def _release_layout(tmp_path: Path, monkeypatch, *, link_matches: bool):
         home = tmp_path / "home"
-        hermes_home = home / ".hermes"
+        hermes_home = tmp_path / "custom-hermes-home"
         running_release = hermes_home / "releases" / "running"
         other_release = hermes_home / "releases" / "other"
         for release in (running_release, other_release):
@@ -197,6 +197,9 @@ class TestStableServiceProjectPath:
 
         monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(
+            gateway_cli, "get_process_hermes_home", lambda: hermes_home
+        )
         monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
         monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
@@ -265,7 +268,7 @@ class TestStableServiceProjectPath:
         assert str(physical_node_bin) in definition
         assert str(stable_root / "node_modules" / ".bin") not in definition
 
-    def test_system_unit_keeps_physical_release_when_target_symlink_mismatches(
+    def test_system_unit_omits_project_paths_when_target_symlink_mismatches(
         self, tmp_path, monkeypatch
     ):
         caller_home = tmp_path / "root"
@@ -274,6 +277,10 @@ class TestStableServiceProjectPath:
         other_release = target_home / ".hermes" / "releases" / "other"
         for release in (running_release, other_release):
             (release / "node_modules" / ".bin").mkdir(parents=True)
+        caller_node_dir = caller_home / ".local" / "bin"
+        caller_node_dir.mkdir(parents=True)
+        caller_node = caller_node_dir / "node"
+        caller_node.write_text("#!/bin/sh\n")
         target_stable_root = target_home / ".hermes" / "hermes-agent"
         target_stable_root.symlink_to(other_release)
 
@@ -281,6 +288,55 @@ class TestStableServiceProjectPath:
         monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
         monkeypatch.setattr(
             gateway_cli, "get_hermes_home", lambda: caller_home / ".hermes"
+        )
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda command: str(caller_node) if command == "node" else None,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda home_path, existing: []
+        )
+        monkeypatch.setattr(gateway_cli, "_build_wsl_interop_paths", lambda existing: [])
+
+        definition = gateway_cli.generate_systemd_unit(system=True)
+
+        physical_node_bin = running_release / "node_modules" / ".bin"
+        remapped_node_bin = (
+            target_home / ".hermes" / "releases" / "running" / "node_modules" / ".bin"
+        )
+        assert str(physical_node_bin) not in definition
+        assert str(remapped_node_bin) not in definition
+        assert str(target_stable_root / "node_modules" / ".bin") not in definition
+        assert str(caller_node_dir) not in definition
+        assert "/usr/bin" in definition
+
+    def test_system_unit_uses_verified_target_project_path(
+        self, tmp_path, monkeypatch
+    ):
+        caller_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        running_release = caller_home / ".hermes" / "releases" / "running"
+        (running_release / "node_modules" / ".bin").mkdir(parents=True)
+        target_stable_root = target_home / ".hermes" / "hermes-agent"
+        target_stable_root.parent.mkdir(parents=True)
+        target_stable_root.symlink_to(running_release)
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
+        monkeypatch.setattr(
+            gateway_cli, "get_hermes_home", lambda: caller_home / ".hermes"
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_process_hermes_home", lambda: caller_home / ".hermes"
         )
         monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
         monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
@@ -298,13 +354,10 @@ class TestStableServiceProjectPath:
 
         definition = gateway_cli.generate_systemd_unit(system=True)
 
+        target_node_bin = target_stable_root / "node_modules" / ".bin"
         physical_node_bin = running_release / "node_modules" / ".bin"
-        remapped_node_bin = (
-            target_home / ".hermes" / "releases" / "running" / "node_modules" / ".bin"
-        )
-        assert str(physical_node_bin) in definition
-        assert str(remapped_node_bin) not in definition
-        assert str(target_stable_root / "node_modules" / ".bin") not in definition
+        assert str(target_node_bin) in definition
+        assert str(physical_node_bin) not in definition
 
 
 class TestGeneratedSystemdUnits:
@@ -1149,7 +1202,7 @@ class TestRemapPathForUser:
 class TestSystemUnitPathRemapping:
     """System units remap user state, but never invent an unverified project PATH."""
 
-    def test_system_unit_keeps_unverified_project_path_physical(
+    def test_system_unit_omits_unverified_project_path(
         self, monkeypatch, tmp_path
     ):
         root_home = tmp_path / "root"
@@ -1180,9 +1233,9 @@ class TestSystemUnitPathRemapping:
         assert "Environment=\"VIRTUAL_ENV=/home/alice/.hermes/hermes-agent/venv\"" in unit
         assert "Environment=\"HERMES_HOME=/home/alice/.hermes\"" in unit
         assert "WorkingDirectory=/home/alice/.hermes" in unit
-        # PATH is stricter: without a matching target symlink, retain the
-        # physical project entry rather than invent an unverified target path.
-        assert str(venv_bin) in unit
+        # PATH is stricter: without a matching target symlink, neither retain
+        # the caller-owned project entry nor invent an unverified target path.
+        assert str(venv_bin) not in unit
         assert "/home/alice/.hermes/hermes-agent/venv/bin" not in unit.split(
             'Environment="PATH=', 1
         )[1].split('"', 1)[0]
