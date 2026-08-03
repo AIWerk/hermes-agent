@@ -183,6 +183,130 @@ class TestRequireServiceInstalled:
         gateway_cli._require_service_installed("start")
 
 
+class TestStableServiceProjectPath:
+    @staticmethod
+    def _release_layout(tmp_path: Path, monkeypatch, *, link_matches: bool):
+        home = tmp_path / "home"
+        hermes_home = home / ".hermes"
+        running_release = hermes_home / "releases" / "running"
+        other_release = hermes_home / "releases" / "other"
+        for release in (running_release, other_release):
+            (release / "node_modules" / ".bin").mkdir(parents=True)
+        stable_root = hermes_home / "hermes-agent"
+        stable_root.symlink_to(running_release if link_matches else other_release)
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda command: None)
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda home_path, existing: []
+        )
+        monkeypatch.setattr(gateway_cli, "_build_wsl_interop_paths", lambda existing: [])
+        return stable_root, running_release
+
+    @pytest.mark.parametrize(
+        "generate_definition",
+        [gateway_cli.generate_systemd_unit, gateway_cli.generate_launchd_plist],
+        ids=["systemd", "launchd"],
+    )
+    def test_generated_service_path_uses_matching_stable_release_symlink(
+        self, tmp_path, monkeypatch, generate_definition
+    ):
+        stable_root, running_release = self._release_layout(
+            tmp_path, monkeypatch, link_matches=True
+        )
+
+        definition = generate_definition()
+
+        stable_node_bin = stable_root / "node_modules" / ".bin"
+        physical_node_bin = running_release / "node_modules" / ".bin"
+        assert str(stable_node_bin) in definition
+        assert str(physical_node_bin) not in definition
+
+    @pytest.mark.parametrize(
+        "generate_definition",
+        [gateway_cli.generate_systemd_unit, gateway_cli.generate_launchd_plist],
+        ids=["systemd", "launchd"],
+    )
+    def test_generated_service_path_keeps_physical_release_when_symlink_mismatches(
+        self, tmp_path, monkeypatch, generate_definition
+    ):
+        stable_root, running_release = self._release_layout(
+            tmp_path, monkeypatch, link_matches=False
+        )
+
+        definition = generate_definition()
+
+        stable_node_bin = stable_root / "node_modules" / ".bin"
+        physical_node_bin = running_release / "node_modules" / ".bin"
+        assert str(physical_node_bin) in definition
+        assert str(stable_node_bin) not in definition
+
+    @pytest.mark.parametrize(
+        "generate_definition",
+        [gateway_cli.generate_systemd_unit, gateway_cli.generate_launchd_plist],
+        ids=["systemd", "launchd"],
+    )
+    def test_generated_service_path_keeps_physical_release_for_symlink_loop(
+        self, tmp_path, monkeypatch, generate_definition
+    ):
+        stable_root, running_release = self._release_layout(
+            tmp_path, monkeypatch, link_matches=False
+        )
+        stable_root.unlink()
+        stable_root.symlink_to(stable_root)
+
+        definition = generate_definition()
+
+        physical_node_bin = running_release / "node_modules" / ".bin"
+        assert str(physical_node_bin) in definition
+        assert str(stable_root / "node_modules" / ".bin") not in definition
+
+    def test_system_unit_keeps_physical_release_when_target_symlink_mismatches(
+        self, tmp_path, monkeypatch
+    ):
+        caller_home = tmp_path / "root"
+        target_home = tmp_path / "alice"
+        running_release = caller_home / ".hermes" / "releases" / "running"
+        other_release = target_home / ".hermes" / "releases" / "other"
+        for release in (running_release, other_release):
+            (release / "node_modules" / ".bin").mkdir(parents=True)
+        target_stable_root = target_home / ".hermes" / "hermes-agent"
+        target_stable_root.symlink_to(other_release)
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
+        monkeypatch.setattr(
+            gateway_cli, "get_hermes_home", lambda: caller_home / ".hermes"
+        )
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda command: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda home_path, existing: []
+        )
+        monkeypatch.setattr(gateway_cli, "_build_wsl_interop_paths", lambda existing: [])
+
+        definition = gateway_cli.generate_systemd_unit(system=True)
+
+        physical_node_bin = running_release / "node_modules" / ".bin"
+        remapped_node_bin = (
+            target_home / ".hermes" / "releases" / "running" / "node_modules" / ".bin"
+        )
+        assert str(physical_node_bin) in definition
+        assert str(remapped_node_bin) not in definition
+        assert str(target_stable_root / "node_modules" / ".bin") not in definition
+
+
 class TestGeneratedSystemdUnits:
     def _expected_timeout_stop_sec(self) -> str:
         timeout = int(max(60, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30))
@@ -1023,9 +1147,11 @@ class TestRemapPathForUser:
 
 
 class TestSystemUnitPathRemapping:
-    """System units must remap ALL paths from the caller's home to the target user."""
+    """System units remap user state, but never invent an unverified project PATH."""
 
-    def test_system_unit_has_no_root_paths(self, monkeypatch, tmp_path):
+    def test_system_unit_keeps_unverified_project_path_physical(
+        self, monkeypatch, tmp_path
+    ):
         root_home = tmp_path / "root"
         root_home.mkdir()
         project = root_home / ".hermes" / "hermes-agent"
@@ -1049,15 +1175,17 @@ class TestSystemUnitPathRemapping:
 
         unit = gateway_cli.generate_systemd_unit(system=True)
 
-        # No root paths should leak into the unit
-        assert str(root_home) not in unit
-        # Target user paths should be present
-        assert "/home/alice" in unit
-        # WorkingDirectory is anchored at the target user's HERMES_HOME (stable,
-        # always exists) — NOT the source checkout under it. Pinning cwd to the
-        # checkout is the rot bug fixed alongside this: a relocated/removed
-        # checkout would crash-loop the unit on CHDIR (status=200).
+        # ExecStart, VIRTUAL_ENV, state, and cwd still remap to the target user.
+        assert "ExecStart=/home/alice/.hermes/hermes-agent/venv/bin/python" in unit
+        assert "Environment=\"VIRTUAL_ENV=/home/alice/.hermes/hermes-agent/venv\"" in unit
+        assert "Environment=\"HERMES_HOME=/home/alice/.hermes\"" in unit
         assert "WorkingDirectory=/home/alice/.hermes" in unit
+        # PATH is stricter: without a matching target symlink, retain the
+        # physical project entry rather than invent an unverified target path.
+        assert str(venv_bin) in unit
+        assert "/home/alice/.hermes/hermes-agent/venv/bin" not in unit.split(
+            'Environment="PATH=', 1
+        )[1].split('"', 1)[0]
         assert "WorkingDirectory=/home/alice/.hermes/hermes-agent" not in unit
 
 
