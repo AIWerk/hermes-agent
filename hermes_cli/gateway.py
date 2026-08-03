@@ -2657,10 +2657,30 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _stable_service_project_root(home_dir: str | Path | None = None) -> Path:
+    """Prefer the stable install symlink only when it targets this release.
+
+    Service definitions survive release cutovers, so baking the resolved
+    ``releases/<sha>`` checkout into PATH leaves them one generation behind.
+    The stable ``~/.hermes/hermes-agent`` spelling avoids that rot, but it is
+    safe only when its real path is exactly the checkout running this code.
+    Otherwise keep the physical root rather than point the service at a
+    different release.
+    """
+    home = Path(home_dir) if home_dir is not None else Path.home()
+    stable_root = home / ".hermes" / "hermes-agent"
+    try:
+        if stable_root.resolve(strict=True) == PROJECT_ROOT:
+            return stable_root
+    except (OSError, RuntimeError):
+        pass
+    return PROJECT_ROOT
+
+
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
-        project_root = PROJECT_ROOT
+        project_root = _stable_service_project_root()
 
     def _is_dir(path: Path) -> bool:
         try:
@@ -2813,7 +2833,11 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
 
-    path_entries = _build_service_path_dirs()
+    system_identity = _system_service_identity(run_as_user) if system else None
+    service_project_root = _stable_service_project_root(
+        system_identity[2] if system_identity is not None else None
+    )
+    path_entries = _build_service_path_dirs(service_project_root)
     if not system:
         # System units append the managed Node dirs later, once the TARGET
         # user's Hermes home is known — probing here would stat the calling
@@ -2836,7 +2860,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     restart_timeout = max(60, _drain_timeout + 30)
 
     if system:
-        username, group_name, home_dir = _system_service_identity(run_as_user)
+        assert system_identity is not None
+        username, group_name, home_dir = system_identity
         hermes_home = _hermes_home_for_target_user(home_dir)
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
@@ -2851,7 +2876,20 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         # _stable_service_working_dir() for the full rationale.
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         venv_dir = _remap_path_for_user(venv_dir, home_dir)
-        path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
+        # Keep project-owned PATH entries on the root whose identity was just
+        # verified above. In particular, when the target user's stable symlink
+        # points at another release, remapping PROJECT_ROOT into that user's
+        # home would invent an unverified third path instead of retaining the
+        # required physical-release fallback.
+        project_path_entries = {
+            entry
+            for entry in path_entries
+            if Path(entry).is_relative_to(service_project_root)
+        }
+        path_entries = [
+            p if p in project_path_entries else _remap_path_for_user(p, home_dir)
+            for p in path_entries
+        ]
         # Managed Node for the TARGET user's tree (see the skip above): probe
         # the remapped hermes_home, not the calling user's. Prepend — the
         # managed Node must outrank remapped shell-PATH entries, matching the
