@@ -2490,20 +2490,48 @@ def get_launchd_plist_path() -> Path:
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
-def _detect_venv_dir() -> Path | None:
+def _canonical_relative_to(
+    path: Path, root: Path, *, strict: bool = True
+) -> Path | None:
+    """Return canonical *path* relative to canonical *root*, or ``None``."""
+    try:
+        return path.resolve(strict=strict).relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _stable_service_runtime_path(
+    path: Path, hermes_home: str | Path | None = None
+) -> Path:
+    """Return the stable spelling of a project-owned runtime path when proven.
+
+    Keep external interpreters and virtualenvs unchanged.  Project-owned paths
+    are rewritten only when the same strict stable-root check used for service
+    PATH entries proves that ``HERMES_HOME/hermes-agent`` resolves to the
+    running ``PROJECT_ROOT``.
+    """
+    stable_root = _stable_service_project_root(hermes_home)
+    relative = _canonical_relative_to(path, PROJECT_ROOT, strict=False)
+    if relative is None:
+        return path
+    return stable_root / relative
+
+
+def _detect_venv_dir(hermes_home: str | Path | None = None) -> Path | None:
     """Detect the active virtualenv directory.
 
     Checks ``sys.prefix`` first (works regardless of the directory name),
     then ``VIRTUAL_ENV`` env var (covers uv-managed environments where
     sys.prefix == sys.base_prefix), then falls back to probing common
-    directory names under PROJECT_ROOT.
+    directory names under PROJECT_ROOT. Project-owned environments use the
+    proven stable service root when available.
     Returns ``None`` when no virtualenv can be found.
     """
     # If we're running inside a virtualenv, sys.prefix points to it.
     if sys.prefix != sys.base_prefix:
         venv = Path(sys.prefix)
         if venv.is_dir():
-            return venv
+            return _stable_service_runtime_path(venv, hermes_home)
 
     # uv and some other tools set VIRTUAL_ENV without changing sys.prefix.
     # This catches `uv run` where sys.prefix == sys.base_prefix but the
@@ -2512,19 +2540,19 @@ def _detect_venv_dir() -> Path | None:
     if _virtual_env:
         venv = Path(_virtual_env)
         if venv.is_dir():
-            return venv
+            return _stable_service_runtime_path(venv, hermes_home)
 
     # Fallback: check common virtualenv directory names under the project root.
     for candidate in (".venv", "venv"):
         venv = PROJECT_ROOT / candidate
         if venv.is_dir():
-            return venv
+            return _stable_service_runtime_path(venv, hermes_home)
 
     return None
 
 
-def get_python_path() -> str:
-    venv = _detect_venv_dir()
+def get_python_path(hermes_home: str | Path | None = None) -> str:
+    venv = _detect_venv_dir(hermes_home)
     if venv is not None:
         try:
             from hermes_constants import venv_python_path
@@ -2539,7 +2567,7 @@ def get_python_path() -> str:
         venv_python = venv_python_path(venv, windows=is_windows())
         if venv_python.exists():
             return str(venv_python)
-    return sys.executable
+    return str(_stable_service_runtime_path(Path(sys.executable), hermes_home))
 
 
 # =============================================================================
@@ -2683,10 +2711,13 @@ def _stable_service_project_root(hermes_home: str | Path | None = None) -> Path:
     return PROJECT_ROOT
 
 
-def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
+def _build_service_path_dirs(
+    project_root: Path | None = None,
+    service_hermes_home: str | Path | None = None,
+) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
-        project_root = _stable_service_project_root()
+        project_root = _stable_service_project_root(service_hermes_home)
 
     def _is_dir(path: Path) -> bool:
         try:
@@ -2699,18 +2730,24 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     venv_bin = project_root / "venv" / "bin"
     if _is_dir(venv_bin):
         candidates.append(str(venv_bin))
-    elif sys.prefix != sys.base_prefix:
-        candidates.append(str(Path(sys.prefix) / "bin"))
+    else:
+        detected_venv = _detect_venv_dir(service_hermes_home)
+        if detected_venv is not None:
+            candidates.append(str(detected_venv / "bin"))
 
     node_bin = project_root / "node_modules" / ".bin"
     if _is_dir(node_bin):
         candidates.append(str(node_bin))
 
-    hermes_home = get_hermes_home()
-    hermes_node = hermes_home / "node" / "bin"
+    managed_hermes_home = (
+        Path(service_hermes_home)
+        if service_hermes_home is not None
+        else get_hermes_home()
+    )
+    hermes_node = managed_hermes_home / "node" / "bin"
     if _is_dir(hermes_node):
         candidates.append(str(hermes_node))
-    hermes_nm = hermes_home / "node_modules" / ".bin"
+    hermes_nm = managed_hermes_home / "node_modules" / ".bin"
     if _is_dir(hermes_nm):
         candidates.append(str(hermes_nm))
 
@@ -2842,19 +2879,27 @@ def _append_node_dir_for_service(
 
 
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
-    python_path = get_python_path()
-    working_dir = _stable_service_working_dir()
-    detected_venv = _detect_venv_dir()
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
-
     system_identity = _system_service_identity(run_as_user) if system else None
     service_hermes_home = (
         _hermes_home_for_target_user(system_identity[2])
         if system_identity is not None
         else get_process_hermes_home()
     )
+    python_path = get_python_path(service_hermes_home)
+    working_dir = _stable_service_working_dir()
+    detected_venv = _detect_venv_dir(service_hermes_home)
+    venv_dir = str(
+        detected_venv
+        if detected_venv
+        else _stable_service_runtime_path(
+            PROJECT_ROOT / "venv", service_hermes_home
+        )
+    )
+
     service_project_root = _stable_service_project_root(service_hermes_home)
-    path_entries = _build_service_path_dirs(service_project_root)
+    path_entries = _build_service_path_dirs(
+        service_project_root, service_hermes_home
+    )
     if not system:
         # System units append the managed Node dirs later, once the TARGET
         # user's Hermes home is known — probing here would stat the calling
@@ -2902,7 +2947,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         project_path_entries = {
             entry
             for entry in path_entries
-            if Path(entry).is_relative_to(service_project_root)
+            if _canonical_relative_to(Path(entry), service_project_root) is not None
         }
         if service_project_root == PROJECT_ROOT:
             path_entries = [
@@ -4067,7 +4112,8 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
 
 
 def generate_launchd_plist() -> str:
-    python_path = get_python_path()
+    service_hermes_home = get_process_hermes_home()
+    python_path = get_python_path(service_hermes_home)
     # Stable cwd anchor — never the volatile source checkout. See
     # _stable_service_working_dir() for the rationale (same rot risk applies
     # to launchd's WorkingDirectory as to systemd's).
@@ -4082,11 +4128,19 @@ def generate_launchd_plist() -> str:
     # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
     # the systemd unit), then capture the user's full shell PATH so every
     # user-installed tool (node, ffmpeg, …) is reachable.
-    detected_venv = _detect_venv_dir()
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    detected_venv = _detect_venv_dir(service_hermes_home)
+    venv_dir = str(
+        detected_venv
+        if detected_venv
+        else _stable_service_runtime_path(
+            PROJECT_ROOT / "venv", service_hermes_home
+        )
+    )
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = _build_service_path_dirs()
+    priority_dirs = _build_service_path_dirs(
+        service_hermes_home=service_hermes_home
+    )
     _append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(
         dict.fromkeys(
