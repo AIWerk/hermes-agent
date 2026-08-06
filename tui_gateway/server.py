@@ -3,6 +3,8 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import ctypes
+import errno
 import hashlib
 import inspect
 import json
@@ -12,6 +14,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1679,7 +1682,158 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
+_OUTBOUND_DELTA_PROJECTION_LOCK = threading.Lock()
+_OUTBOUND_DELTA_PROJECTION_BUFFERS: dict[tuple[str, str], tuple[str, bool]] = {}
+_OUTBOUND_CUSTOMER_TEXT_FIELDS = {
+    "text",
+    "error",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "rendered",
+}
+
+
+def _sanitize_outbound_customer_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_outbound_text_references(value)
+    if isinstance(value, list):
+        return [_sanitize_outbound_customer_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_outbound_customer_value(item) for key, item in value.items()}
+    return value
+
+
+_OUTBOUND_ENCODED_SEPARATOR_TARGETS = (
+    "%2f",
+    "%5c",
+    "%252f",
+    "%255c",
+    "%25252f",
+    "%25255c",
+)
+_OUTBOUND_SAFE_URI_SCHEMES = ("http://", "https://", "shared://")
+
+
+def _outbound_encoded_prefix_suffix(text: str) -> str:
+    percent = text.rfind("%")
+    if percent < 0:
+        return ""
+    suffix = text[percent:]
+    lowered = suffix.lower()
+    if any(target.startswith(lowered) for target in _OUTBOUND_ENCODED_SEPARATOR_TARGETS):
+        return suffix
+    return ""
+
+
+def _outbound_has_partial_safe_uri_scheme(text: str) -> bool:
+    lowered = text.lower()
+    for scheme in _OUTBOUND_SAFE_URI_SCHEMES:
+        for length in range(1, len(scheme) + 1):
+            if not lowered.endswith(scheme[:length]):
+                continue
+            start = len(text) - length
+            if start == 0 or not (text[start - 1].isalnum() or text[start - 1] == "_"):
+                return True
+    return False
+
+
+def _outbound_fragment_has_path_risk(text: str) -> bool:
+    cursor = 0
+    fragments: list[str] = []
+    for match in _OUTBOUND_SAFE_URI_RE.finditer(text):
+        fragments.append(text[cursor:match.start()])
+        cursor = match.end()
+    fragments.append(text[cursor:])
+    risk_re = re.compile(
+        r"(?i)(?<![\w:/])(?:"
+        r"(?:MEDIA:|file://)?/(?:$|[A-Za-z_.~])"
+        r"|\\(?:$|\\|[A-Za-z_.~])"
+        r"|[A-Za-z]:[\\/]"
+        r"|%(?:25)*(?:2f|5c)"
+        r")"
+    )
+    for fragment in fragments:
+        if risk_re.search(fragment) or _outbound_encoded_prefix_suffix(fragment):
+            return True
+    return False
+
+
+def _project_outbound_stream_fragment(
+    state: tuple[str, bool], incoming: str
+) -> tuple[str, tuple[str, bool]]:
+    buffer, in_safe_uri = state
+    if in_safe_uri:
+        delimiter = re.search(r"[\s<>'\"]", incoming)
+        if delimiter is None:
+            return incoming, ("", True)
+        boundary = delimiter.start()
+        preserved = incoming[:boundary]
+        projected, next_state = _project_outbound_stream_fragment(
+            ("", False), incoming[boundary:]
+        )
+        return f"{preserved}{projected}", next_state
+
+    candidate = f"{buffer}{incoming}"
+    projected = ""
+    while "\n" in candidate:
+        line, candidate = candidate.split("\n", 1)
+        projected += _sanitize_outbound_text_references(f"{line}\n")
+
+    safe_uri_matches = list(_OUTBOUND_SAFE_URI_RE.finditer(candidate))
+    if safe_uri_matches and safe_uri_matches[-1].end() == len(candidate):
+        match = safe_uri_matches[-1]
+        projected += _sanitize_outbound_text_references(candidate[:match.start()])
+        projected += match.group(0)
+        return projected, ("", True)
+
+    if _outbound_has_partial_safe_uri_scheme(candidate):
+        return projected, (candidate, False)
+
+    if len(candidate) > 65536:
+        carry = _outbound_encoded_prefix_suffix(candidate)
+        head = candidate[:-len(carry)] if carry else candidate
+        return f"{projected}{_sanitize_outbound_text_references(head)}", (carry, False)
+    if candidate and _outbound_fragment_has_path_risk(candidate):
+        return projected, (candidate, False)
+    return f"{projected}{_sanitize_outbound_text_references(candidate)}", ("", False)
+
+
 def _emit(event: str, sid: str, payload: dict | None = None):
+    text_already_projected = False
+    if event == "message.start":
+        with _OUTBOUND_DELTA_PROJECTION_LOCK:
+            stale_keys = [key for key in _OUTBOUND_DELTA_PROJECTION_BUFFERS if key[1] == sid]
+            for key in stale_keys:
+                _OUTBOUND_DELTA_PROJECTION_BUFFERS.pop(key, None)
+    if event in {"message.delta", "reasoning.delta"} and isinstance(payload, dict):
+        incoming = str(payload.get("text") or "")
+        buffer_key = (event, sid)
+        with _OUTBOUND_DELTA_PROJECTION_LOCK:
+            pending = _OUTBOUND_DELTA_PROJECTION_BUFFERS.get(buffer_key, ("", False))
+            projected, pending = _project_outbound_stream_fragment(pending, incoming)
+            if pending != ("", False):
+                _OUTBOUND_DELTA_PROJECTION_BUFFERS[buffer_key] = pending
+            else:
+                _OUTBOUND_DELTA_PROJECTION_BUFFERS.pop(buffer_key, None)
+            if not projected:
+                return
+            payload = dict(payload)
+            payload["text"] = projected
+            text_already_projected = True
+    elif event == "message.complete":
+        with _OUTBOUND_DELTA_PROJECTION_LOCK:
+            stale_keys = [key for key in _OUTBOUND_DELTA_PROJECTION_BUFFERS if key[1] == sid]
+            for key in stale_keys:
+                _OUTBOUND_DELTA_PROJECTION_BUFFERS.pop(key, None)
+    if event in {"message.delta", "message.interim", "message.complete", "reasoning.delta"} and isinstance(payload, dict):
+        sanitized_payload = dict(payload)
+        for field in _OUTBOUND_CUSTOMER_TEXT_FIELDS:
+            if field == "text" and text_already_projected:
+                continue
+            if field in sanitized_payload:
+                sanitized_payload[field] = _sanitize_outbound_customer_value(sanitized_payload[field])
+        payload = sanitized_payload
     write_json(_event_frame(event, sid, payload))
 
 
@@ -7052,8 +7206,19 @@ _OUTBOUND_ATTACHMENT_EXTENSIONS = _IMAGE_ATTACHMENT_EXTENSIONS | frozenset({
 }) | _TEXT_ATTACHMENT_EXTENSIONS | _AUDIO_ATTACHMENT_EXTENSIONS | _VIDEO_ATTACHMENT_EXTENSIONS | _ACTIVE_ATTACHMENT_EXTENSIONS
 _OUTBOUND_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 _OUTBOUND_ATTACHMENT_RE = re.compile(
-    r"(?:MEDIA:|file://)?(/[^\s)\]>'\"]+\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|xlsx?|pptx?|zip|tar|gz|tgz|7z|rar|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))",
+    r"(?<![\w:/])(?:MEDIA:|file://)?(/(?:(?!\s+(?:and|or|und|oder)\s+)[^\n)\]>'\"])+?\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|xlsx?|pptx?|zip|tar|gz|tgz|7z|rar|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))(?=$|[\s)\]>'\";,])",
     re.IGNORECASE,
+)
+_OUTBOUND_SAFE_URI_RE = re.compile(r"\b(?:https?://|shared://)[^\s<>'\"]+", re.IGNORECASE)
+_OUTBOUND_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w:/])((?:(?:MEDIA:|file://)?/(?!/)[^\n)\]>'\";,]+?)"
+    r"|(?:(?:MEDIA:)?[A-Za-z]:[\\/][^\n)\]>'\";,]+?)"
+    r"|(?:\\\\[^\n)\]>'\";,]+?|//[^/\s]+/[^\n)\]>'\";,]+?))"
+    r"(?=$|\s+(?:and|or|und|oder)\s+|[\n)\]>'\";,])",
+    re.IGNORECASE,
+)
+_OUTBOUND_ENCODED_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w%])((?:%(?:25)*(?:2f|5c)){1,2}[^\s)\]>'\";,]+)", re.IGNORECASE
 )
 _INBOUND_SHARED_URI_RE = re.compile(r"\bshared://[^\s)\]>'\"]+", re.IGNORECASE)
 _SHARED_OUTBOUND_FOLDER_NAME = "Agent-Downloads"
@@ -7218,47 +7383,198 @@ def _shared_folder_relative_path(root: Path, path: Path) -> str | None:
         return None
 
 
-def _materialize_non_renderable_outbound_artifact(path: Path) -> tuple[Path | None, str | None]:
-    """Copy a non-previewable outbound file into the CUI shared folder."""
+def _file_sha256_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _shared_candidate_matches(path: Path, *, size: int, digest: str) -> bool:
+    try:
+        return (
+            not path.is_symlink()
+            and path.is_file()
+            and path.stat().st_size == size
+            and _file_sha256_digest(path) == digest
+        )
+    except Exception:
+        return False
+
+
+def _copy_outbound_source_to_snapshot(source: Path, snapshot: Path) -> int | None:
+    """Securely snapshot an allowlisted source on the Linux AIWerk runtime."""
+    def reject() -> None:
+        snapshot.unlink(missing_ok=True)
+
+    if sys.platform != "linux" or not _outbound_source_allowed(source):
+        reject()
+        return None
+    source_absolute = Path(os.path.abspath(source))
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    for root in _outbound_source_roots():
+        try:
+            root_resolved = root.expanduser().resolve()
+            relative = source_absolute.relative_to(root_resolved)
+            if not relative.parts or any(
+                part in {".", ".."} or part in _OUTBOUND_FORBIDDEN_DIR_NAMES
+                for part in relative.parts
+            ):
+                continue
+            directory_fd = os.open(root_resolved, directory_flags)
+            try:
+                for part in relative.parts[:-1]:
+                    next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+                    os.close(directory_fd)
+                    directory_fd = next_fd
+                source_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
+            try:
+                before = os.fstat(source_fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+                    reject()
+                    return None
+                copied = 0
+                with os.fdopen(source_fd, "rb", closefd=False) as input_handle, snapshot.open("wb") as output_handle:
+                    while chunk := input_handle.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+                            reject()
+                            return None
+                        output_handle.write(chunk)
+                    output_handle.flush()
+                    os.fsync(output_handle.fileno())
+                after = os.fstat(source_fd)
+                stable_fields_before = (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                stable_fields_after = (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+                if stable_fields_before != stable_fields_after or copied != before.st_size:
+                    reject()
+                    return None
+                snapshot.chmod(0o600)
+                return copied
+            finally:
+                os.close(source_fd)
+        except Exception:
+            continue
+    reject()
+    return None
+
+
+def _rename_snapshot_noreplace(snapshot: Path, target: Path) -> bool:
+    """Atomically publish on Linux; unsupported runtimes fail closed."""
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic outbound publication requires Linux")
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(snapshot),
+        -100,
+        os.fsencode(target),
+        1,
+    )
+    if result == 0:
+        return True
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        return False
+    raise OSError(error_number, os.strerror(error_number), target)
+
+
+def _materialize_outbound_shared_artifact(path: Path) -> tuple[Path | None, str | None, int | None]:
+    """Copy or upload an outbound file into Shared Ordner/Agent-Downloads."""
     root = _resolve_outbound_shared_folder_root()
     try:
-        source = path.resolve()
-        if not source.is_file() or source.stat().st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
-            return None, None
+        source = Path(os.path.abspath(path))
         if not _outbound_source_allowed(source):
-            return None, None
+            return None, None, None
+        stem = source.stem or "file"
+        suffix = source.suffix
         if not root:
             try:
                 from hermes_cli import web_server
 
-                rel = f"{_SHARED_OUTBOUND_FOLDER_NAME}/{source.name}"
-                uploaded_rel = web_server._upload_shared_file_to_cloud(web_server.load_config(), source, rel)
-                return (source, uploaded_rel) if uploaded_rel else (None, None)
+                with tempfile.TemporaryDirectory(prefix="hermes-outbound-shared-") as temp_dir:
+                    snapshot = Path(temp_dir) / source.name
+                    snapshot_size = _copy_outbound_source_to_snapshot(source, snapshot)
+                    if snapshot_size is None:
+                        return None, None, None
+                    digest = _file_sha256_digest(snapshot)
+                    rel = f"{_SHARED_OUTBOUND_FOLDER_NAME}/{stem}-{digest}{suffix}"
+                    uploaded_rel = web_server._upload_shared_file_to_cloud(
+                        web_server.load_config(), snapshot, rel
+                    )
+                    return (
+                        (None, uploaded_rel, snapshot_size)
+                        if uploaded_rel
+                        else (None, None, None)
+                    )
             except Exception:
-                return None, None
+                return None, None, None
         rel_existing = _shared_folder_relative_path(root, source)
-        if rel_existing and rel_existing.split("/", 1)[0] == _SHARED_OUTBOUND_FOLDER_NAME:
-            return source, rel_existing
-        stat = source.stat()
-        digest = hashlib.sha256(
-            f"{source}\0{stat.st_mtime_ns}\0{stat.st_size}".encode("utf-8", errors="surrogatepass")
-        ).hexdigest()[:12]
+        source_is_agent_download = bool(
+            rel_existing and rel_existing.split("/", 1)[0] == _SHARED_OUTBOUND_FOLDER_NAME
+        )
         target_dir = (root / _SHARED_OUTBOUND_FOLDER_NAME).resolve()
         root_resolved = root.resolve()
         if target_dir != root_resolved and root_resolved not in target_dir.parents:
-            return None, None
+            return None, None, None
         target_dir.mkdir(parents=True, exist_ok=True)
-        stem = source.stem or "file"
-        suffix = source.suffix
-        target = target_dir / source.name
-        if target.exists() and target.read_bytes() != source.read_bytes():
-            target = target_dir / f"{stem}-{digest}{suffix}"
-        if not target.exists() or target.stat().st_size != stat.st_size:
-            shutil.copy2(source, target)
-        rel = _shared_folder_relative_path(root, target)
-        return target.resolve(), rel
+
+        temp_target = target_dir / f".{source.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            snapshot_size = _copy_outbound_source_to_snapshot(source, temp_target)
+            if snapshot_size is None:
+                return None, None, None
+            digest = _file_sha256_digest(temp_target)
+            hashed_candidates = (
+                target_dir / f"{stem}-{digest[:12]}{suffix}",
+                target_dir / f"{stem}-{digest}{suffix}",
+            )
+            candidates = (
+                hashed_candidates
+                if source_is_agent_download
+                else (target_dir / source.name, *hashed_candidates)
+            )
+            target: Path | None = None
+            for candidate in candidates:
+                if _shared_candidate_matches(candidate, size=snapshot_size, digest=digest):
+                    target = candidate
+                    break
+                if _rename_snapshot_noreplace(temp_target, candidate):
+                    target = candidate
+                    break
+                if _shared_candidate_matches(candidate, size=snapshot_size, digest=digest):
+                    target = candidate
+                    break
+            while target is None:
+                candidate = target_dir / f"{stem}-{digest}-{uuid.uuid4().hex}{suffix}"
+                if _rename_snapshot_noreplace(temp_target, candidate):
+                    target = candidate
+            rel = _shared_folder_relative_path(root, target)
+            return target.resolve(), rel, snapshot_size
+        finally:
+            temp_target.unlink(missing_ok=True)
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _attachment_text_block(name: str, path: Path, text: str, note: str = "") -> str:
@@ -7352,6 +7668,51 @@ def _shared_uri_prompt_attachments(text: Any, session_id: Any) -> list[dict[str,
     return out
 
 
+def _outbound_local_path_filename(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    for prefix in ("MEDIA:", "file://"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    return normalized.rstrip().rsplit("/", 1)[-1] or "file"
+
+
+def _decode_outbound_path_reference(value: str) -> str:
+    decoded = value
+    for _ in range(3):
+        expanded = urllib.parse.unquote(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    return decoded
+
+
+def _sanitize_outbound_text_references(text: str) -> str:
+    """Hide local host paths while preserving complete customer-safe URI spans."""
+    def sanitize_unprotected(fragment: str) -> str:
+        fragment = _OUTBOUND_ATTACHMENT_RE.sub(
+            lambda match: _outbound_local_path_filename(match.group(0)), fragment
+        )
+        fragment = _OUTBOUND_LOCAL_PATH_RE.sub(
+            lambda match: _outbound_local_path_filename(match.group(1)), fragment
+        )
+        return _OUTBOUND_ENCODED_LOCAL_PATH_RE.sub(
+            lambda match: _outbound_local_path_filename(
+                _decode_outbound_path_reference(match.group(1))
+            ),
+            fragment,
+        )
+
+    pieces: list[str] = []
+    cursor = 0
+    for match in _OUTBOUND_SAFE_URI_RE.finditer(text):
+        pieces.append(sanitize_unprotected(text[cursor:match.start()]))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(sanitize_unprotected(text[cursor:]))
+    return "".join(pieces)
+
+
 def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
     """Extract local artifacts from assistant text for native CUI attachment cards."""
     return _outbound_attachment_payloads_and_text(text)[0]
@@ -7360,13 +7721,17 @@ def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
 def _outbound_attachment_payloads_and_text(
     text: Any, *, append_shared_links: bool = False
 ) -> tuple[list[dict[str, Any]], str]:
-    """Extract local artifacts and optionally append shared-folder links for unsafe previews."""
+    """Extract local artifacts and optionally append stable Shared Ordner links."""
     if not isinstance(text, str) or not text:
         return [], "" if text is None else str(text)
     attachments: list[dict[str, Any]] = []
     appended_links: list[str] = []
+    delivery_errors: list[str] = []
+    safe_uri_spans = [match.span() for match in _OUTBOUND_SAFE_URI_RE.finditer(text)]
     seen: set[str] = set()
     for match in _OUTBOUND_ATTACHMENT_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in safe_uri_spans):
+            continue
         raw_path = match.group(1)
         try:
             source_path = Path(raw_path).expanduser().resolve()
@@ -7387,59 +7752,58 @@ def _outbound_attachment_payloads_and_text(
             continue
         if source_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
             continue
-        materialized = _materialize_outbound_artifact(source_path)
-        if not materialized or not materialized.is_file():
-            continue
-        path = materialized
-        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        try:
-            size = path.stat().st_size
-        except Exception:
-            size = 0
-        preview_kind = _attachment_preview_kind(path, media_type)
+        media_type = mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
+        preview_kind = _attachment_preview_kind(source_path, media_type)
         is_image = preview_kind == "image"
         safe_renderable = preview_kind in {"image", "pdf", "text", "audio", "video"}
-        payload_path = path
-        shared_rel_path: str | None = None
-        public_link: dict[str, str] | None = None
-        if safe_renderable:
-            open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
-        else:
-            shared_path, shared_rel_path = _materialize_non_renderable_outbound_artifact(source_path)
-            if shared_path and shared_rel_path:
-                payload_path = shared_path
-                open_url = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(shared_rel_path, safe='')}"
-                if append_shared_links and open_url not in text:
-                    line = f"{source_path.name}: {open_url}"
-                    try:
-                        from hermes_cli import web_server
+        shared_path, shared_rel_path, shared_size = _materialize_outbound_shared_artifact(source_path)
+        if not shared_rel_path:
+            delivery_errors.append(
+                f"Die Datei {source_path.name} konnte nicht unter Agent-Downloads bereitgestellt werden."
+            )
+            continue
 
-                        public_link = web_server._create_shared_file_public_link(
-                            web_server.load_config(),
-                            shared_rel_path,
-                            name=source_path.stem or source_path.name,
-                        )
-                    except Exception:
-                        public_link = None
-                    if public_link:
-                        line = (
-                            f"{source_path.name}: {open_url}\n"
-                            f"  Web-Link: {public_link.get('url')}\n"
-                            f"  Download: {public_link.get('download_url')}"
-                        )
-                    appended_links.append(line)
-            else:
-                open_url = f"/api/assistant/artifacts/open?path={urllib.parse.quote(str(path), safe='')}"
+        payload_path = f"shared://{urllib.parse.quote(shared_rel_path, safe='/')}"
+        shared_open_url = (
+            f"/api/assistant/shared-folder/open?path={urllib.parse.quote(shared_rel_path, safe='')}"
+        )
+        open_url = shared_open_url
+        download_url = shared_open_url
+        public_link: dict[str, str] | None = None
+        if append_shared_links:
+            try:
+                from hermes_cli import web_server
+
+                public_link = web_server._create_shared_file_public_link(
+                    web_server.load_config(),
+                    shared_rel_path,
+                    name=source_path.stem or source_path.name,
+                )
+            except Exception:
+                public_link = None
+            if public_link:
+                open_url = public_link.get("url") or shared_open_url
+                download_url = public_link.get("download_url") or open_url
+            if shared_open_url not in text:
+                line = f"{source_path.name}: {shared_open_url}"
+                if public_link:
+                    line = (
+                        f"{source_path.name}: {shared_open_url}\n"
+                        f"  Web-Link: {public_link.get('url')}\n"
+                        f"  Download: {public_link.get('download_url')}"
+                    )
+                appended_links.append(line)
+        preview_url = open_url if safe_renderable else None
         payload = {
-            "name": payload_path.name,
+            "name": source_path.name,
             "kind": "file",
             "path": str(payload_path),
             "type": media_type,
-            "size": size,
+            "size": shared_size if shared_size is not None else source_size,
             "is_image": is_image,
             "open_url": open_url,
-            "download_url": open_url,
-            "preview_url": open_url if safe_renderable else None,
+            "download_url": download_url,
+            "preview_url": preview_url,
             "preview_kind": preview_kind,
             "safe_renderable": safe_renderable,
         }
@@ -7449,9 +7813,12 @@ def _outbound_attachment_payloads_and_text(
             payload["public_url"] = public_link.get("url")
             payload["public_download_url"] = public_link.get("download_url")
         attachments.append(payload)
+    text = _sanitize_outbound_text_references(text)
     if append_shared_links and appended_links:
         suffix = "\n".join(f"- {line}" for line in appended_links)
         text = f"{text.rstrip()}\n\nIm Shared-Ordner unter Agent-Downloads abgelegt:\n{suffix}"
+    if delivery_errors:
+        text = f"{text.rstrip()}\n\n" + "\n".join(delivery_errors)
     return attachments, text
 
 
@@ -7853,12 +8220,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 msg["text"] = invocation
                 msg["display_kind"] = "skill_invocation"
         if role == "assistant":
-            attachments = _outbound_image_attachment_payloads(content_text)
+            attachments, sanitized_text = _outbound_attachment_payloads_and_text(content_text)
+            msg["text"] = sanitized_text
             if attachments:
                 msg["attachments"] = attachments
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
-                    msg[key] = m.get(key)
+                    msg[key] = _sanitize_outbound_customer_value(m.get(key))
         # Forward display-only timeline metadata so the TUI can render
         # model switches and delegation completions as events instead of
         # opaque user messages, and hide compaction handoffs entirely.
@@ -8409,9 +8777,9 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not isinstance(turn, dict):
         return None
     user = str(turn.get("user") or "").strip()
-    assistant = str(turn.get("assistant") or "")
+    assistant = _sanitize_outbound_text_references(str(turn.get("assistant") or ""))
     streaming = bool(turn.get("streaming"))
-    error = str(turn.get("error") or "").strip()
+    error = _sanitize_outbound_text_references(str(turn.get("error") or "").strip())
     if not user and not assistant and not streaming and not error:
         return None
     snapshot = {
@@ -8446,10 +8814,10 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     with session["history_lock"]:
         _fail_inflight_turn(session, error)
         turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
+        message = _sanitize_outbound_text_references(str(turn.get("error") or "turn failed"))
         partial = str(turn.get("assistant") or "")
         cols = int(session.get("cols", 80))
-    text = partial or f"Error: {message}"
+    text = _sanitize_outbound_text_references(partial) if partial else f"Error: {message}"
     agent = session.get("agent")
     payload = {
         "text": text,
@@ -10281,6 +10649,7 @@ def _run_prompt_submit(
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
+        stream_projection_buffer = ("", False)  # pending text + safe-URI continuation
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
@@ -10503,13 +10872,20 @@ def _run_prompt_submit(
                     run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
             def _stream(delta):
+                nonlocal stream_projection_buffer
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
+                incoming = str(delta or "")
+                projected, stream_projection_buffer = _project_outbound_stream_fragment(
+                    stream_projection_buffer, incoming
+                )
+                if not projected:
+                    return
+                payload = {"text": projected}
+                if streamer and (r := streamer.feed(projected)) is not None:
                     payload["rendered"] = r
-                if tts_queue is not None and isinstance(delta, str):
-                    tts_queue.put(delta)
+                if tts_queue is not None:
+                    tts_queue.put(projected)
                 _emit("message.delta", sid, payload)
 
             # Surface interim assistant text (commentary emitted alongside
@@ -10520,7 +10896,7 @@ def _run_prompt_submit(
             if _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                     _emit("message.interim", sid, {
-                        "text": text,
+                        "text": _sanitize_outbound_text_references(text),
                         "already_streamed": already_streamed,
                     })
 
@@ -10914,6 +11290,12 @@ def _run_prompt_submit(
                 except Exception:
                     pass
             if tts_queue is not None:
+                pending_text, _in_safe_uri = stream_projection_buffer
+                if pending_text:
+                    spoken_tail = _sanitize_outbound_text_references(pending_text)
+                    if spoken_tail.strip():
+                        tts_queue.put(spoken_tail)
+                    stream_projection_buffer = ("", False)
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:
                 try:
