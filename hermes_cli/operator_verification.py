@@ -219,11 +219,121 @@ def _normalize_short_flag_chars(args: list[str]) -> set[str]:
 
 
 def _is_remote_path(arg: str) -> bool:
-    return bool(re.match(r"^[^/@\s:]+@?[^\s:]+:.+", arg))
+    return bool(
+        re.match(r"^(?:scp|rsync)://[^\s/]+(?:/.*)?$", arg, re.IGNORECASE)
+        or re.match(r"^(?:\[[^\]]+\]|[^/:]+):{1,2}[\s\S]*$", arg)
+    )
 
 
-def _copy_args(args: list[str]) -> list[str]:
-    return [arg for arg in args if not arg.startswith("-")]
+_SCP_VALUE_OPTIONS = {"-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"}
+_RSYNC_VALUE_OPTIONS = {
+    "-B", "-e", "-f", "-T",
+    "--address", "--backup-dir", "--block-size", "--bwlimit", "--checksum-choice",
+    "--compare-dest", "--compress-choice", "--compress-level", "--contimeout",
+    "--copy-dest", "--exclude", "--exclude-from", "--files-from", "--filter",
+    "--include", "--include-from", "--link-dest", "--log-file", "--log-file-format",
+    "--max-alloc", "--max-size", "--min-size", "--out-format", "--partial-dir",
+    "--password-file", "--port", "--remote-option", "--rsync-path", "--rsh",
+    "--skip-compress", "--sockopts", "--suffix", "--temp-dir", "--timeout",
+}
+
+
+def _copy_destination(cmd: str, args: list[str]) -> str | None:
+    """Return an unambiguous final copy operand, otherwise fail closed.
+
+    The common safe form keeps options before source/destination. An option
+    after the first operand may itself consume a following value, so treating
+    the last non-option token as the destination can hide an earlier remote
+    target (for example `rsync SRC HOST:DEST --exclude PATTERN`).
+    """
+    operands: list[str] = []
+    value_options = _SCP_VALUE_OPTIONS if cmd == "scp" else _RSYNC_VALUE_OPTIONS
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            if operands:
+                return None
+            operands.extend(args[index + 1 :])
+            break
+        if arg.startswith("-"):
+            if operands:
+                return None
+            if arg in value_options:
+                index += 1
+                if index >= len(args):
+                    return None
+            index += 1
+            continue
+        operands.append(arg)
+        index += 1
+    return operands[-1] if len(operands) >= 2 else None
+
+
+def _has_unquoted_shell_syntax(command: str) -> bool:
+    """Detect shell control/expansion syntax while allowing quoted filenames."""
+    quote = ""
+    escaped = False
+    at_word_start = True
+    for char in command:
+        if escaped:
+            if char == "\n":
+                return True
+            escaped = False
+            at_word_start = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = ""
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = ""
+            elif char in {"$", "`"}:
+                return True
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            at_word_start = False
+        elif char.isspace():
+            if char == "\n":
+                return True
+            at_word_start = True
+        elif char in ";&|<>$`*?[{}" or (char == "#" and at_word_start) or (char == "~" and at_word_start):
+            return True
+        else:
+            at_word_start = False
+    return False
+
+
+def _rsync_sensitive_options(args: list[str]) -> bool:
+    """Gate local rsync modes that delete data or alter privilege metadata."""
+    sensitive_long = {
+        "--remove-source-files",
+        "--devices",
+        "--write-devices",
+        "--copy-devices",
+        "--copy-as",
+        "--fake-super",
+        "--specials",
+        "--super",
+        "--chown",
+        "--usermap",
+        "--groupmap",
+    }
+    for arg in args:
+        if arg == "--":
+            break
+        lowered = arg.lower()
+        option = lowered.split("=", 1)[0]
+        if option.startswith("--delete") or option == "--del" or option in sensitive_long:
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and "D" in arg[1:]:
+            return True
+    return False
 
 
 def _matches_allowed_secret_read(command: str, patterns: list[str] | None) -> bool:
@@ -334,6 +444,10 @@ def _structured_segment_verdict(
     backstop regex must NOT override this for the segment), or None (leading
     command not recognized — fall through to the regex backstop).
     """
+    trusted_copy_paths = {"/bin/scp", "/bin/rsync", "/usr/bin/scp", "/usr/bin/rsync"}
+    if tokens and tokens[0] in trusted_copy_paths:
+        tokens[0] = Path(tokens[0]).name.lower()
+    original_cmd = tokens[0].lower() if tokens else ""
     cmd, args = _base_command(tokens)
     verb = _first_non_option(args)
 
@@ -382,11 +496,12 @@ def _structured_segment_verdict(
         return verb in {"restart", "stop", "kill", "rm", "rmi"}
 
     if cmd in {"scp", "rsync"}:
-        paths = _copy_args(args)
-        if len(paths) >= 2:
-            src, dest = paths[-2], paths[-1]
-            return not (_is_remote_path(src) and not _is_remote_path(dest))
-        return True
+        if original_cmd != cmd or _has_unquoted_shell_syntax(command):
+            return True
+        if cmd == "rsync" and _rsync_sensitive_options(args):
+            return True
+        dest = _copy_destination(cmd, args)
+        return True if dest is None else _is_remote_path(dest)
 
     if cmd == "ansible-playbook":
         return True
@@ -469,6 +584,7 @@ def _requires_operator_verification(command: str, config: OperatorVerificationCo
     tokens = raw_tokens
     if not tokens:
         return bool(_SENSITIVE_COMMAND_RE.search(command or ""))
+
     # OR semantics: structured parse, eval payloads, AND the raw-string regex are
     # ALL consulted. No branch (especially an eval token) may reduce coverage by
     # short-circuiting before the fallback. Each compound segment is judged on
