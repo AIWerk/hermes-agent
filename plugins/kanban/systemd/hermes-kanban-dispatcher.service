@@ -20,6 +20,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment="PYTHONDONTWRITEBYTECODE=1"
 ExecStart=/usr/bin/env hermes kanban daemon --force --interval 60 --pidfile %t/hermes-kanban-dispatcher.pid
 Restart=on-failure
 RestartSec=5
