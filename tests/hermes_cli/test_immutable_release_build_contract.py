@@ -34,8 +34,16 @@ def test_release_build_contract_requires_full_locked_build_without_pruning() -> 
     contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
     build = contract["build"]
 
-    assert contract["build"]["python"] == ["uv", "sync", "--locked", "--all-groups", "--all-extras"]
-    assert build["node"] == ["npm", "ci"]
+    assert contract["build"]["python"] == [
+        "uv",
+        "sync",
+        "--locked",
+        "--no-build",
+        "--no-install-project",
+        "--all-groups",
+        "--all-extras",
+    ]
+    assert build["node"] == ["npm", "ci", "--ignore-scripts"]
     assert "--workspace" not in build["node"]
     assert build["web"] == ["npm", "run", "build", "--workspace", "web"]
     assert build["web_artifact"] == "hermes_cli/web_dist/index.html"

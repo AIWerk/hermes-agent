@@ -40,12 +40,15 @@
       "uv",
       "sync",
       "--locked",
+      "--no-build",
+      "--no-install-project",
       "--all-groups",
       "--all-extras"
     ],
     "node": [
       "npm",
-      "ci"
+      "ci",
+      "--ignore-scripts"
     ],
     "web": [
       "npm",
