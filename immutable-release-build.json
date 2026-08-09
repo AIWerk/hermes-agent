@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "release_namespace": "releases-v2",
+  "python": {
+    "package_roots": [
+      "acp_adapter",
+      "agent",
+      "cron",
+      "gateway",
+      "hermes_cli",
+      "plugins",
+      "providers",
+      "tools",
+      "tui_gateway"
+    ],
+    "module_files": [
+      "run_agent.py",
+      "model_tools.py",
+      "toolsets.py",
+      "batch_runner.py",
+      "trajectory_compressor.py",
+      "toolset_distributions.py",
+      "cli.py",
+      "hermes_bootstrap.py",
+      "hermes_constants.py",
+      "hermes_state.py",
+      "hermes_state_common.py",
+      "hermes_state_portability.py",
+      "hermes_state_schema.py",
+      "hermes_state_search.py",
+      "hermes_time.py",
+      "hermes_logging.py",
+      "utils.py",
+      "mcp_serve.py"
+    ],
+    "include_venv_site_packages": true
+  },
+  "build": {
+    "python": [
+      "uv",
+      "sync",
+      "--locked",
+      "--all-groups",
+      "--all-extras"
+    ],
+    "node": [
+      "npm",
+      "ci"
+    ],
+    "web": [
+      "npm",
+      "run",
+      "build",
+      "--workspace",
+      "web"
+    ],
+    "web_artifact": "hermes_cli/web_dist/index.html",
+    "preserve_complete_repository": true,
+    "preserve_complete_npm_workspace_graph": true,
+    "python_environment": {
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "UV_COMPILE_BYTECODE": "0",
+      "UV_PYTHON_DOWNLOADS": "never"
+    },
+    "node_environment": {
+      "NPM_CONFIG_OMIT": "",
+      "NPM_CONFIG_PRODUCTION": "false"
+    }
+  },
+  "closing_gate": {
+    "mandatory": true,
+    "scenarios": [
+      {
+        "name": "cli-entry",
+        "startup_modules": [
+          "hermes_constants"
+        ],
+        "late_modules": [
+          "hermes_cli.main"
+        ]
+      },
+      {
+        "name": "dashboard-entry",
+        "startup_modules": [
+          "hermes_cli.config"
+        ],
+        "late_modules": [
+          "hermes_cli.web_server"
+        ]
+      },
+      {
+        "name": "gateway-entry",
+        "startup_modules": [
+          "gateway.status"
+        ],
+        "late_modules": [
+          "gateway.run"
+        ]
+      }
+    ]
+  }
+}
