@@ -502,20 +502,21 @@ def _allow_lazy_installs() -> bool:
        redirected there (a path that structurally cannot break the sealed
        venv) and are therefore allowed.
 
-    Defaults to True. If config is unreadable we fail open (allow), because
-    refusing to install would lock people out of their own backends; the
-    decision to block is an explicit user opt-in.
+    Config loading and policy extraction fail closed. Only an actual boolean
+    policy value from a mapping-shaped config can authorize installation.
     """
     # (1) Config kill switch wins in every mode.
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-    except Exception:
-        cfg = None
-    if cfg is not None:
-        sec = cfg.get("security") or {}
-        if not bool(sec.get("allow_lazy_installs", True)):
+        from hermes_cli.config import load_security_policy_bool_strict
+
+        policy = load_security_policy_bool_strict(
+            "allow_lazy_installs",
+            default=True,
+        )
+        if policy is False:
             return False
+    except Exception:
+        return False
 
     # (2) Sealed-venv env var: blocks ONLY when there is no safe durable
     # target to redirect into. With a target set, the install goes to the
