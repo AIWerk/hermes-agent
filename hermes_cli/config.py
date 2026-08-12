@@ -713,6 +713,53 @@ def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
 
+
+def load_security_policy_bool_strict(key: str, *, default: bool) -> bool:
+    """Resolve one boolean security policy from exact, strict source snapshots.
+
+    This path deliberately does not call ``load_config()``: that loader's
+    last-known-good/default fallback is suitable for normal configuration but
+    cannot authorize side effects after a parse failure. User config is applied
+    over ``default`` and managed config then wins at the same leaf.
+    """
+
+    def _read_mapping(path: Path) -> Dict[str, Any]:
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return {}
+        parsed = fast_safe_load(raw.decode("utf-8"))
+        if parsed is None:
+            raise TypeError(f"{path} must contain a YAML mapping")
+        if not isinstance(parsed, dict):
+            raise TypeError(f"{path} must contain a YAML mapping")
+        return parsed
+
+    def _apply(source: Dict[str, Any], current: bool, path: Path) -> bool:
+        if "security" not in source:
+            return current
+        security = source["security"]
+        if not isinstance(security, dict):
+            raise TypeError(f"security in {path} must be a YAML mapping")
+        if key not in security:
+            return current
+        value = security[key]
+        if not isinstance(value, bool):
+            raise TypeError(f"security.{key} in {path} must be a boolean")
+        return value
+
+    user_path = get_config_path()
+    resolved = _apply(_read_mapping(user_path), default, user_path)
+
+    from hermes_cli import managed_scope
+
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir is not None:
+        managed_path = managed_dir / "config.yaml"
+        resolved = _apply(_read_mapping(managed_path), resolved, managed_path)
+    return resolved
+
+
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_hermes_home() / ".env"

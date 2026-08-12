@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "release_namespace": "releases-v2",
   "python": {
     "package_roots": [
@@ -36,15 +36,93 @@
     "include_venv_site_packages": true
   },
   "build": {
-    "python": [
-      "uv",
-      "sync",
-      "--locked",
-      "--no-build",
-      "--no-install-project",
-      "--all-groups",
-      "--all-extras"
-    ],
+    "python": {
+      "selected_extras": [
+        "messaging",
+        "honcho",
+        "tts-premium",
+        "mcp",
+        "firecrawl"
+      ],
+      "target": {
+        "python": "3.12",
+        "platform": "x86_64-linux-gnu"
+      },
+      "dependency_sync": [
+        "uv",
+        "sync",
+        "--locked",
+        "--no-build",
+        "--no-install-project",
+        "--no-default-groups",
+        "--extra",
+        "messaging",
+        "--extra",
+        "honcho",
+        "--extra",
+        "tts-premium",
+        "--extra",
+        "mcp",
+        "--extra",
+        "firecrawl"
+      ],
+      "root_build_requirements": [
+        {
+          "name": "setuptools",
+          "version": "83.0.0",
+          "source": "uv.lock",
+          "wheel_only": true,
+          "hash_required": true
+        }
+      ],
+      "root_build_requirement_install": [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        ".venv/bin/python",
+        "--no-deps",
+        "--only-binary",
+        ":all:",
+        "--require-hashes",
+        "--requirements",
+        ".aiwerk-root-build-requirements.txt"
+      ],
+      "root_install": [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        ".venv/bin/python",
+        "--offline",
+        "--no-deps",
+        "--no-build-isolation",
+        "."
+      ],
+      "root_build_requirement_remove": [
+        "uv",
+        "pip",
+        "uninstall",
+        "--python",
+        ".venv/bin/python",
+        "setuptools"
+      ],
+      "root_project": {
+        "name": "hermes-agent",
+        "version": "0.19.1",
+        "source": ".",
+        "source_kind": "exact-candidate-tree",
+        "required_evidence": [
+          "candidate_commit",
+          "candidate_tree",
+          "METADATA",
+          "entry_points.txt",
+          "direct_url.json",
+          "RECORD",
+          "installed_artifact_hashes"
+        ]
+      }
+    },
     "node": [
       "npm",
       "ci",
