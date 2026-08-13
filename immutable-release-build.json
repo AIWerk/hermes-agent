@@ -98,6 +98,7 @@
         "--offline",
         "--no-deps",
         "--no-build-isolation",
+        "--editable",
         "."
       ],
       "root_build_requirement_remove": [
