@@ -90,6 +90,7 @@ def test_release_build_contract_requires_canonical_two_phase_python_build() -> N
         "uv",
         "pip",
         "install",
+        "--no-config",
         "--python",
         ".venv/bin/python",
         "--no-deps",
@@ -145,6 +146,7 @@ def test_release_build_contract_requires_canonical_two_phase_python_build() -> N
     assert "--no-install-project" not in python_build["root_install"]
     assert "--offline" in python_build["root_install"]
     assert "--no-deps" in python_build["root_install"]
+    assert "--no-config" not in python_build["dependency_sync"]
 
     assert build["node"] == ["npm", "ci", "--ignore-scripts"]
     assert "--workspace" not in build["node"]

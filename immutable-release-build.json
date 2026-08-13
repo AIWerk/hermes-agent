@@ -79,6 +79,7 @@
         "uv",
         "pip",
         "install",
+        "--no-config",
         "--python",
         ".venv/bin/python",
         "--no-deps",
