@@ -26,6 +26,7 @@ from hermes_cli.config import (
 from hermes_cli.colors import Colors, color
 from hermes_cli.nous_subscription import (
     MANAGED_FEATURE_COVERAGE_CATEGORY,
+    NousSubscriptionFeatures,
     apply_nous_managed_defaults,
     get_nous_subscription_features,
 )
@@ -152,7 +153,7 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
@@ -189,7 +190,11 @@ def _xai_credentials_present() -> bool:
             return True
     except Exception:
         pass
-    return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:  # pragma: no cover — secret_scope is in-repo
+        return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
+    return bool(str(get_secret("XAI_API_KEY") or "").strip())
 
 
 def _homeassistant_credentials_present() -> bool:
@@ -266,9 +271,12 @@ def _get_effective_configurable_toolsets():
 def _get_plugin_toolset_keys() -> set:
     """Return the set of toolset keys provided by plugins."""
     try:
-        from hermes_cli.plugins import discover_plugins, get_plugin_toolsets
-        discover_plugins()  # idempotent — ensures plugins are loaded
-        return {ts_key for ts_key, _, _ in get_plugin_toolsets()}
+        from hermes_cli.plugins import get_plugin_toolset_keys_nowait
+        # Non-blocking on the CLI startup path: while background plugin
+        # discovery is still importing modules, this serves last launch's
+        # persisted key set (used only to exclude plugin toolsets from
+        # composite expansion) instead of joining the discovery thread.
+        return get_plugin_toolset_keys_nowait()
     except Exception:
         return set()
 
@@ -614,6 +622,7 @@ TOOL_CATEGORIES = {
         #     underlying backend but has a distinct setup UX.
         #   - "Camofox" — anti-detection local Firefox; short-circuits the
         #     cloud-provider dispatch path via _is_camofox_mode().
+        #   - "Browser Use" — the Browser Use CLI 3.0
         "providers": [
             {
                 "name": "Local Browser",
@@ -649,6 +658,14 @@ TOOL_CATEGORIES = {
                 ],
                 "browser_provider": "camofox",
                 "post_setup": "camofox",
+            },
+            {
+                "name": "Browser Use",
+                "badge": "free · local · cloud",
+                "tag": "New SOTA web harness (CLI 3.0)",
+                "env_vars": [],
+                "browser_backend": "browser-use",
+                "post_setup": "browser_use_cli",
             },
         ],
     },
@@ -1336,6 +1353,8 @@ def _repair_cua_driver_autostart_windows(driver_cmd: str, *, verbose: bool) -> b
             [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
             env=_cua_driver_env(),
         )
@@ -1623,71 +1642,98 @@ def _run_cua_driver_installer(
                 pass
 
 
+def _ensure_browser_use_cli(*, verbose_hints: bool = False) -> None:
+    """Install the Browser Use CLI if it isn't already runnable.
+
+    The Browser Use CLI 3.0 is the primary driver engine for EVERY browser
+    backend except Camofox (which is Firefox-based with no CDP surface, so
+    the CDP-only browser-use harness cannot drive it). Local, Browserbase,
+    Firecrawl, and the Nous-managed cloud rows all execute through
+    ``browser_exec`` when the CLI is runnable — so every one of those
+    picker selections must attempt this install, not just the explicit
+    "Browser Use" row. Failure is non-fatal: ``browser_exec`` can still run
+    zero-install via ``uvx browser-use``, and the built-in browser tools
+    remain the final fallback.
+
+    MANAGED-FIRST: a browser-use on the user's PATH does NOT satisfy this
+    check — only the Hermes-managed ``$HERMES_HOME/bin`` copy does.
+    ``install_cli()`` short-circuits on the managed copy and otherwise
+    provisions it, so resolution always lands on a binary Hermes installs
+    and updates rather than a user-level side install.
+    """
+    _print_info("    Ensuring browser-use CLI (managed install)...")
+    try:
+        from tools.browser_use_cli import install_cli
+
+        ok, message = install_cli()
+    except Exception as exc:  # pragma: no cover — defensive
+        ok, message = False, f"install failed: {exc}"
+    if ok:
+        _print_success(f"    {message}")
+    else:
+        for line in str(message).splitlines():
+            _print_warning(f"    {line[:200]}")
+        if shutil.which("uvx"):
+            _print_info("    Falling back to zero-install runs via `uvx browser-use`")
+        else:
+            _print_info("    Install manually: uv tool install browser-use  (https://docs.astral.sh/uv/)")
+    if verbose_hints:
+        _print_info("    Local Chrome needs remote debugging: chrome://inspect/#remote-debugging")
+        _print_info("    Cloud browsers: browser-use auth login  (or set BROWSER_USE_API_KEY)")
+
+
 def _run_post_setup(post_setup_key: str):
     """Run post-setup hooks for tools that need extra installation steps."""
-    import shutil
     from hermes_constants import find_node_executable
 
     if post_setup_key in {"agent_browser", "browserbase"}:
-        node_modules = PROJECT_ROOT / "node_modules" / "agent-browser"
-        # Managed Node first — $HERMES_HOME/node is not on PATH, so a bare
-        # which() reports "no npm" on installs whose only Node is the one
-        # Hermes installed for exactly this toolchain.
-        npm_bin = find_node_executable("npm")
-        npx_bin = find_node_executable("npx")
-        # Step 1: install the agent-browser npm package into node_modules/
-        if not node_modules.exists() and npm_bin:
-            _print_info("    Installing Node.js dependencies for browser tools...")
-            import subprocess
-            # Use the resolved npm_bin absolute path so subprocess.Popen can
-            # execute npm.cmd on Windows (CreateProcessW otherwise rejects
-            # batch shims).  On POSIX npm_bin is the plain path — same
-            # behaviour as before.
-            result = subprocess.run(
-                # --workspaces=false restricts the install to the repo root
-                # only, avoiding the apps/* glob which would pull in
-                # apps/desktop (Electron + node-pty) unnecessarily. See #38772.
-                [npm_bin, "install", "--silent", "--workspaces=false"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT),
-                creationflags=_post_setup_no_window_flags(),
-            )
-            if result.returncode == 0:
-                _print_success("    Node.js dependencies installed")
-            else:
-                from hermes_constants import display_hermes_home
-                _print_warning(f"    npm install failed - run manually: cd {display_hermes_home()}/hermes-agent && npm install --workspaces=false")
-                if result.stderr:
-                    _print_info(f"      {result.stderr.strip()[:200]}")
-        elif node_modules.exists():
-            # Distinct message for the re-run case so the GUI action log tells
-            # the truth ("nothing to do") instead of implying a fresh install.
-            _print_success("    agent-browser already installed, nothing to do")
-        else:
-            _print_warning("    Node.js not found - browser tools require: npm install (in hermes-agent directory)")
-            return
-
-        # Step 2: only the local browser provider actually needs Chromium on
-        # disk. Cloud providers (Browserbase, Browser Use, Firecrawl) host
-        # their own Chromium and don't need the local install.
-        if post_setup_key != "agent_browser":
-            return
-
-        # Step 3: ensure the Chromium / headless-shell build agent-browser
-        # drives is actually installed. Without it the CLI hangs on first
-        # use until the command timeout fires. Skip inside Docker — the
-        # image bakes Chromium in at build time, and runtime users usually
-        # can't write to PLAYWRIGHT_BROWSERS_PATH anyway.
+        # Every non-Camofox browser backend drives through the Browser Use
+        # CLI when it's runnable — install it here too, not only on the
+        # explicit "Browser Use" picker row.
+        _ensure_browser_use_cli()
+        # agent-browser is no longer a root package.json dependency (#43564)
+        # — it resolves lazily via npx (or a global/Hermes-managed install)
+        # instead of a local `npm install`, so there's no node_modules/
+        # population step here anymore.
         try:
             # Import lazily so the tools_config UI doesn't pull in the full
             # browser_tool module at import time.
             from tools.browser_tool import (
                 _chromium_installed,
                 _running_in_docker,
+                _find_agent_browser,
+                _resolve_npx_bin,
+                _is_npx_agent_browser_sentinel,
+                AGENT_BROWSER_NPX_SPEC,
             )
         except Exception as exc:  # pragma: no cover — defensive
             _print_warning(f"    Could not check Chromium status: {exc}")
             return
 
+        # Reuse the same resolution cascade browser tools use at runtime
+        # (PATH -> Homebrew/Hermes-managed node -> npx) rather than a bare
+        # shutil.which — Hermes-managed-Node-only setups resolve agent-browser
+        # / npx only through the extended fallback path, which a bare
+        # shutil.which("npx") lookup misses.
+        try:
+            browser_cmd = _find_agent_browser(validate=False)
+        except FileNotFoundError:
+            _print_warning(
+                "    npx not found - browser tools require Node.js: https://nodejs.org"
+            )
+            return
+
+        # Step 1: only the local browser provider actually needs Chromium on
+        # disk. Cloud providers (Browserbase, Browser Use, Firecrawl) host
+        # their own Chromium and don't need the local install.
+        if post_setup_key != "agent_browser":
+            return
+
+        # Step 2: ensure the Chromium / headless-shell build agent-browser
+        # drives is actually installed. Without it the CLI hangs on first
+        # use until the command timeout fires. Skip inside Docker — the
+        # image bakes Chromium in at build time, and runtime users usually
+        # can't write to PLAYWRIGHT_BROWSERS_PATH anyway.
         if _chromium_installed():
             _print_success("    Chromium browser already installed, nothing to do")
             return
@@ -1704,27 +1750,27 @@ def _run_post_setup(post_setup_key: str):
             )
             return
 
-        if not npx_bin:
-            _print_warning(
-                "    npx not found - install Chromium manually: npx agent-browser install --with-deps"
-            )
-            return
+        # browser_cmd was already resolved above (same PATH -> Homebrew ->
+        # Hermes-managed-node -> npx cascade _find_agent_browser uses at
+        # runtime), so this can't diverge from what actually gets invoked.
+        if _is_npx_agent_browser_sentinel(browser_cmd):
+            # Re-resolve via the same PATH + extended-PATH cascade
+            # _find_agent_browser used, rather than a bare shutil.which("npx")
+            # — Hermes-managed-Node-only setups resolve npx only through the
+            # extended fallback path, and a bare lookup here would silently
+            # diverge and hand subprocess.run a None argument.
+            npx_bin = _resolve_npx_bin()
+            if not npx_bin:
+                _print_warning(
+                    "    npx not found - install Chromium manually: npx agent-browser install --with-deps"
+                )
+                return
+            install_cmd = [npx_bin, "--ignore-scripts", "-y", AGENT_BROWSER_NPX_SPEC, "install", "--with-deps"]
+        else:
+            install_cmd = [browser_cmd, "install", "--with-deps"]
 
         _print_info("    Installing Chromium (~170MB one-time download)...")
         import subprocess
-        # Prefer the bundled agent-browser install subcommand so the
-        # version of Chromium matches the CLI. Fall back to npx shim on
-        # setups where the local bin stub isn't present.
-        local_ab = PROJECT_ROOT / "node_modules" / ".bin" / "agent-browser"
-        if sys.platform == "win32":
-            local_ab_win = local_ab.with_suffix(".cmd")
-            if local_ab_win.exists():
-                local_ab = local_ab_win
-        install_cmd = (
-            [str(local_ab), "install", "--with-deps"]
-            if local_ab.exists()
-            else [npx_bin, "-y", "agent-browser", "install", "--with-deps"]
-        )
         try:
             result = subprocess.run(
                 install_cmd,
@@ -1749,6 +1795,9 @@ def _run_post_setup(post_setup_key: str):
         except Exception as exc:
             _print_warning(f"    Chromium install failed: {exc}")
             _print_info("    Run manually: npx agent-browser install --with-deps")
+
+    elif post_setup_key == "browser_use_cli":
+        _ensure_browser_use_cli(verbose_hints=True)
 
     elif post_setup_key == "camofox":
         camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser"
@@ -2116,21 +2165,40 @@ def _parse_enabled_flag(value, default: bool = True) -> bool:
 
 
 def enabled_mcp_server_names(config: dict) -> Set[str]:
-    """Names of MCP servers globally enabled in config.yaml.
+    """Names of MCP servers globally enabled in config.yaml or by a plugin.
 
     Shared by the gateway/CLI platform resolver (``_get_platform_tools``) and
     the cron per-job toolset resolver (``cron.scheduler``) so every path agrees
     on MCP membership. A server is enabled unless its config sets an explicitly
     falsey ``enabled`` (per ``_parse_enabled_flag``: false/0/no/off) — a missing
     flag or an unrecognized value is treated as enabled.
+
+    Portable Agent Plugins contribute MCP servers in-memory rather than via
+    ``config.yaml`` (see ``PluginManager.get_portable_mcp_servers``). Those are
+    included here so their tools fold into platform toolsets like native
+    servers do — the user's opt-in is enabling the plugin itself. Without this,
+    a portable server registers with the MCP runtime but its tools never reach
+    the model's schema.
     """
     mcp_servers = (config or {}).get("mcp_servers") or {}
-    return {
+    names = {
         str(name)
         for name, server_cfg in mcp_servers.items()
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
+    try:
+        from hermes_cli.plugins import (
+            get_plugin_manager,
+            get_portable_mcp_server_names_nowait,
+        )
+
+        portable = get_portable_mcp_server_names_nowait()
+        # Native config wins on a name collision (mirrors _load_mcp_config).
+        names |= portable - set(mcp_servers)
+    except Exception:
+        logger.debug("Failed to include portable MCP servers", exc_info=True)
+    return names
 
 
 def _exempt_explicit_platform_native(
@@ -2248,18 +2316,22 @@ def _get_platform_tools(
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
     platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    # Plugin-provided toolsets are first-class on a platform-toolsets list —
+    # explicit config like ``[hermes-cli, a2a]`` must survive filtering just
+    # like a built-in configurable toolset would. See issue #81163.
+    explicit_known_keys = configurable_keys | plugin_ts_keys
 
     # If the saved list contains any configurable keys directly, the user
     # has explicitly configured this platform — use direct membership.
     # This avoids the subset-inference bug where composite toolsets like
     # "hermes-cli" (which include all _HERMES_CORE_TOOLS) cause disabled
     # toolsets to re-appear as enabled.
-    has_explicit_config = any(ts in configurable_keys for ts in toolset_names)
+    has_explicit_config = any(ts in explicit_known_keys for ts in toolset_names)
 
     if has_explicit_config:
         enabled_toolsets = {
             ts for ts in toolset_names
-            if ts in configurable_keys and _toolset_allowed_for_platform(ts, platform)
+            if ts in explicit_known_keys and _toolset_allowed_for_platform(ts, platform)
         }
         # Mixed config: composite toolset alongside configurables (e.g.
         # ``[hermes-cli, spotify]`` after enabling Spotify via ``hermes
@@ -2614,6 +2686,7 @@ def _toolset_has_keys(
     config: dict = None,
     *,
     force_fresh: bool = False,
+    features: Optional[NousSubscriptionFeatures] = None,
 ) -> bool:
     """Check if a toolset's required API keys are configured."""
     if config is None:
@@ -2629,7 +2702,10 @@ def _toolset_has_keys(
             return False
 
     if ts_key in {"web", "image_gen", "video_gen", "tts", "stt", "browser"}:
-        features = get_nous_subscription_features(config, force_fresh=force_fresh)
+        if features is None:
+            features = get_nous_subscription_features(
+                config, force_fresh=force_fresh
+            )
         feature = features.features.get(ts_key)
         if feature and (feature.available or feature.managed_by_nous):
             return True
@@ -2637,7 +2713,12 @@ def _toolset_has_keys(
     # Check TOOL_CATEGORIES first (provider-aware)
     cat = TOOL_CATEGORIES.get(ts_key)
     if cat:
-        for provider in _visible_providers(cat, config, force_fresh=force_fresh):
+        for provider in _visible_providers(
+            cat,
+            config,
+            force_fresh=force_fresh,
+            features=features,
+        ):
             env_vars = provider.get("env_vars", [])
             if not env_vars:
                 return True  # No-key provider (e.g. Local Browser, Edge TTS)
@@ -2662,8 +2743,8 @@ def _prompt_choice(question: str, choices: list, default: int = 0) -> int:
 
 # ─── Token Estimation ────────────────────────────────────────────────────────
 
-# Module-level cache so discovery + tokenization runs at most once per process.
-_tool_token_cache: Optional[Dict[str, int]] = None
+# Profile-keyed cache so one process can serve distinct plugin tool catalogs.
+_tool_token_cache: Optional[Dict[tuple[str, int], Dict[str, int]]] = None
 
 
 def _estimate_tool_tokens() -> Dict[str, int]:
@@ -2676,25 +2757,33 @@ def _estimate_tool_tokens() -> Dict[str, int]:
     Returns an empty dict when tiktoken or the registry is unavailable.
     """
     global _tool_token_cache
-    if _tool_token_cache is not None:
-        return _tool_token_cache
+    from hermes_constants import hermes_home_key
+
+    scope = hermes_home_key()
+
+    try:
+        # Trigger full tool discovery (imports all tool modules).
+        import model_tools  # noqa: F401
+        from tools.registry import registry
+        cache_key = (scope, registry._generation)
+    except Exception:
+        logger.debug("Tool registry unavailable; skipping token estimation")
+        cache_key = (scope, -1)
+        _tool_token_cache = _tool_token_cache or {}
+        _tool_token_cache[cache_key] = {}
+        return _tool_token_cache[cache_key]
+
+    if _tool_token_cache is not None and cache_key in _tool_token_cache:
+        return _tool_token_cache[cache_key]
 
     try:
         import tiktoken
         enc = tiktoken.get_encoding("cl100k_base")
     except Exception:
         logger.debug("tiktoken unavailable; skipping tool token estimation")
-        _tool_token_cache = {}
-        return _tool_token_cache
-
-    try:
-        # Trigger full tool discovery (imports all tool modules).
-        import model_tools  # noqa: F401
-        from tools.registry import registry
-    except Exception:
-        logger.debug("Tool registry unavailable; skipping token estimation")
-        _tool_token_cache = {}
-        return _tool_token_cache
+        _tool_token_cache = _tool_token_cache or {}
+        _tool_token_cache[cache_key] = {}
+        return _tool_token_cache[cache_key]
 
     counts: Dict[str, int] = {}
     for name in registry.get_all_tool_names():
@@ -2704,8 +2793,9 @@ def _estimate_tool_tokens() -> Dict[str, int]:
             # {"type": "function", "function": <schema>}
             text = _json.dumps({"type": "function", "function": schema})
             counts[name] = len(enc.encode(text))
-    _tool_token_cache = counts
-    return _tool_token_cache
+    _tool_token_cache = _tool_token_cache or {}
+    _tool_token_cache[cache_key] = counts
+    return counts
 
 
 def _prompt_toolset_checklist(
@@ -3072,6 +3162,7 @@ def _visible_providers(
     config: dict,
     *,
     force_fresh: bool = False,
+    features: Optional[NousSubscriptionFeatures] = None,
 ) -> list[dict]:
     """Return provider entries visible for the current auth/config state.
 
@@ -3081,7 +3172,8 @@ def _visible_providers(
     login + entitlement check (see ``_configure_provider``); the row only
     *activates* the gateway once paid access is confirmed.
     """
-    features = get_nous_subscription_features(config, force_fresh=force_fresh)
+    if features is None:
+        features = get_nous_subscription_features(config, force_fresh=force_fresh)
     acct = features.account_info
     # Pool-only users (entitled to managed tools via the free tool pool but with
     # no paid access) get image gen but NOT video gen — the pool doesn't fund
@@ -3209,6 +3301,46 @@ def _module_installed(module_name: str) -> bool:
         return importlib.util.find_spec(module_name) is not None
     except Exception:
         return False
+
+
+# Python dependencies installed explicitly through ``hermes tools`` are not
+# part of the managed runtime's locked ``all`` sync. A runtime replacement
+# therefore needs a small, static allowlist that can be snapshotted before the
+# old site-packages disappears and restored afterward. Keep these install
+# arguments in sync with the corresponding ``_run_post_setup`` branches.
+_RESTORABLE_PYTHON_TOOL_DEPENDENCIES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "faster_whisper": ("faster_whisper", ("-U", "faster-whisper")),
+    "kittentts": (
+        "kittentts",
+        (
+            "-U",
+            "https://github.com/KittenML/KittenTTS/releases/download/"
+            "0.8.1/kittentts-0.8.1-py3-none-any.whl",
+            "soundfile",
+        ),
+    ),
+    "piper": ("piper", ("-U", "piper-tts")),
+    "ddgs": ("ddgs", ("-U", "ddgs")),
+    "langfuse": ("langfuse", ("langfuse",)),
+}
+
+
+def active_restorable_python_tool_dependencies() -> list[str]:
+    """Return ``hermes tools`` Python dependencies present in this runtime."""
+    return [
+        name
+        for name, (module_name, _install_args) in (
+            _RESTORABLE_PYTHON_TOOL_DEPENDENCIES.items()
+        )
+        if _module_installed(module_name)
+    ]
+
+
+def restorable_python_tool_dependency(
+    name: str,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Return the import probe and pip arguments for an allowlisted tool."""
+    return _RESTORABLE_PYTHON_TOOL_DEPENDENCIES.get(name)
 
 
 def _agent_browser_installed() -> bool:
@@ -3583,6 +3715,9 @@ def _is_provider_active(
                 and cfg_get(config, "stt", "provider") == provider["stt_provider"]
             )
         if "browser_provider" in provider:
+            # Browser Use mode is a driver on top of the provider (it attaches
+            # to the provider's CDP endpoint), so the provider row stays
+            # active alongside the Browser Use row.
             current = cfg_get(config, "browser", "cloud_provider")
             return feature.managed_by_nous and provider["browser_provider"] == current
         if provider.get("web_backend"):
@@ -3597,8 +3732,42 @@ def _is_provider_active(
         current = cfg_get(config, "stt", "provider") or "local"
         return current == provider["stt_provider"]
     if "browser_provider" in provider:
+        # Browser Use mode composes with the provider (driver over the
+        # provider's CDP endpoint) — don't deactivate the provider row.
         current = cfg_get(config, "browser", "cloud_provider")
         return provider["browser_provider"] == current
+    if provider.get("browser_backend"):
+        backend = cfg_get(config, "browser", "backend")
+        if backend is False:
+            backend = "off"  # YAML 1.1: unquoted `off` parses as boolean False
+        if backend == provider["browser_backend"]:
+            return True
+        if backend:
+            return False  # explicit other choice ("off", …) wins
+        if provider["browser_backend"] != "browser-use":
+            return False
+        # Backend unset: Browser Use mode is the default — the row is active
+        # whenever the effective mode resolves on (legacy direct-API cloud
+        # config, or CLI runnable and no Camofox).
+        browser_cfg = config.get("browser") if isinstance(config, dict) else None
+        try:
+            from tools.browser_use_cli import (
+                _find_cli,
+                is_legacy_browser_use_cloud_config,
+            )
+
+            if is_legacy_browser_use_cloud_config(browser_cfg or {}):
+                return True
+            try:
+                from tools.browser_camofox import is_camofox_mode
+
+                if is_camofox_mode():
+                    return False
+            except Exception:
+                pass
+            return _find_cli() is not None
+        except Exception:
+            return False
     if provider.get("web_backend"):
         current = cfg_get(config, "web", "backend")
         return current == provider["web_backend"]
@@ -4044,7 +4213,13 @@ def _write_provider_config(provider: dict, config: dict, *, managed_feature) -> 
         browser_cfg = config.setdefault("browser", {})
         if bp:
             browser_cfg["cloud_provider"] = bp
+        # Browser Use mode (browser.backend) composes with the provider —
+        # switching providers keeps the driver choice intact.
         browser_cfg["use_gateway"] = bool(managed_feature)
+
+    if provider.get("browser_backend"):
+        browser_cfg = config.setdefault("browser", {})
+        browser_cfg["backend"] = provider["browser_backend"]
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
@@ -4188,6 +4363,9 @@ def _configure_provider(
             _print_success("  Browser set to local mode")
         elif bp:
             _print_success(f"  Browser cloud provider set to: {bp}")
+
+    if provider.get("browser_backend"):
+        _print_success("  Browser set to Browser Use (browser_exec via CLI 3.0)")
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
@@ -4701,7 +4879,14 @@ def _reconfigure_provider(
         elif bp:
             browser_cfg["cloud_provider"] = bp
             _print_success(f"  Browser cloud provider set to: {bp}")
+        # Browser Use mode (browser.backend) composes with the provider —
+        # switching providers keeps the driver choice intact.
         browser_cfg["use_gateway"] = bool(managed_feature)
+
+    if provider.get("browser_backend"):
+        browser_cfg = config.setdefault("browser", {})
+        browser_cfg["backend"] = provider["browser_backend"]
+        _print_success("  Browser set to Browser Use (browser_exec via CLI 3.0)")
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
@@ -5370,6 +5555,27 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
                 _print_info(f"{srv_name}  {color('all tools enabled', Colors.DIM)}")
 
 
+def _known_tool_platforms() -> set[str]:
+    """Return built-in plus discovered plugin platform names.
+
+    Plugin platforms are registered at runtime rather than in the static CLI
+    display registry. Tool introspection/configuration must recognize those
+    names too, otherwise an active plugin platform cannot audit its authority.
+    """
+    known = set(PLATFORMS)
+    try:
+        from hermes_cli.plugins import discover_plugins
+        from gateway.platform_registry import platform_registry
+
+        discover_plugins()  # idempotent
+        known.update(platform_registry.registered_names())
+    except Exception:
+        # Plugin discovery is optional. Preserve the built-in CLI path when a
+        # third-party plugin is malformed or its dependencies are unavailable.
+        pass
+    return known
+
+
 def tools_disable_enable_command(args):
     """Enable, disable, or list tools for a platform.
 
@@ -5380,8 +5586,9 @@ def tools_disable_enable_command(args):
     platform = getattr(args, "platform", "cli")
     config = load_config()
 
-    if platform not in PLATFORMS:
-        _print_error(f"Unknown platform '{platform}'. Valid: {', '.join(PLATFORMS)}")
+    valid_platforms = _known_tool_platforms()
+    if platform not in valid_platforms:
+        _print_error(f"Unknown platform '{platform}'. Valid: {', '.join(sorted(valid_platforms))}")
         return
 
     if action == "list":

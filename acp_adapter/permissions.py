@@ -81,17 +81,25 @@ def _build_permission_tool_call(command: str, description: str):
     gets a unique ``perm-check-N`` id so concurrent requests don't collide.
     """
     import acp as _acp
+    from agent.tool_argument_projection import (
+        project_tool_args_for_display,
+        sanitize_tool_display_text,
+    )
 
     tool_call_id = f"perm-check-{next(_PERMISSION_REQUEST_IDS)}"
-    title = f"{description}: {command}" if description else command
-    content_text = f"{description}\n$ {command}" if description else f"$ {command}"
+    display_command = project_tool_args_for_display(
+        "terminal", {"command": command}
+    ).get("command", "")
+    display_description = sanitize_tool_display_text(description)
+    title = f"{display_description}: {display_command}" if display_description else display_command
+    content_text = f"{display_description}\n$ {display_command}" if display_description else f"$ {display_command}"
     return _acp.update_tool_call(
         tool_call_id,
         title=title,
         kind="execute",
         status="pending",
         content=[_acp.tool_content(_acp.text_block(content_text))],
-        raw_input={"command": command, "description": description},
+        raw_input={"command": display_command, "description": display_description},
     )
 
 
@@ -158,9 +166,16 @@ def make_approval_callback(
 
         try:
             response = future.result(timeout=timeout)
-        except (FutureTimeout, Exception) as exc:
+        except FutureTimeout:
             future.cancel()
-            logger.warning("Permission request timed out or failed: %s", exc)
+            logger.warning("Permission request timed out after %ss", timeout)
+            # Distinct from an explicit deny: the client never answered.
+            # tools.approval callers report this as "timed out without user
+            # response" instead of a user denial.
+            return "timeout"
+        except Exception as exc:
+            future.cancel()
+            logger.warning("Permission request failed: %s", exc)
             return "deny"
 
         if response is None:

@@ -35,6 +35,8 @@ class FakeAgent:
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
+        self.atomic_correction_close_called = False
+        self.atomic_correction = None
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -73,6 +75,10 @@ class FakeAgent:
 
     def _drain_pending_steer(self):
         return None
+
+    def _take_text_commit_correction_and_close_admission(self):
+        self.atomic_correction_close_called = True
+        return self.atomic_correction
 
     def clear_interrupt(self):
         pass
@@ -123,9 +129,82 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
         _turn_exit_reason="fallback_prior_turn_content",
     )
 
-    assert result["messages"][-1] == {"role": "assistant", "content": "Done."}
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == "Done."
+    assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
-    assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
+    assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_non_text_finalization_atomically_closes_and_preserves_late_correction(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent.atomic_correction = "late correction"
+
+    result = finalize_turn(
+        agent,
+        final_response=None,
+        api_call_count=1,
+        interrupted=True,
+        failed=False,
+        messages=[{"role": "user", "content": "do it"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted",
+    )
+
+    assert agent.atomic_correction_close_called is True
+    assert result["pending_steer"] == "late correction"
+
+
+def test_fallback_timestamp_survives_delayed_sqlite_persistence(
+    monkeypatch, tmp_path
+):
+    """The durable row records message creation, not the later DB flush."""
+    from hermes_state import SessionDB
+
+    created_at = 1_781_976_577.25
+    persisted_at = created_at + 600
+    monkeypatch.setattr("agent.message_metadata.wall_time", lambda: created_at)
+    monkeypatch.setattr("hermes_state.time.time", lambda: persisted_at)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("sess-test", source="cli")
+    agent = FakeAgent()
+
+    def persist_to_sqlite(messages, _conversation_history):
+        db.replace_messages(agent.session_id, messages)
+        agent.persisted_messages = db.get_messages_as_conversation(agent.session_id)
+
+    agent._persist_session = persist_to_sqlite
+    messages = [
+        {"role": "user", "content": "do it", "timestamp": created_at - 1},
+        {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="fallback_prior_turn_content",
+    )
+
+    assert agent.persisted_messages[-1]["timestamp"] == created_at
+    assert agent.persisted_messages[-1]["timestamp"] != persisted_at
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):

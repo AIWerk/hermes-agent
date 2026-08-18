@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -72,6 +72,7 @@ def test_codex_success_flushes_and_reports_persisted():
         effective_task_id="task-1",
     )
     assert result["completed"] is True
+    assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
 
@@ -102,6 +103,41 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert result["interrupt_message"] == "new correction"
     agent.clear_interrupt.assert_called_once_with()
     assert agent._interrupt_requested is False
+
+
+def test_codex_terminal_boundary_retries_admitted_correction_same_turn():
+    agent = _make_agent(session_db=None)
+    interrupted = _make_turn()
+    interrupted.interrupted = True
+    interrupted.final_text = "discarded partial"
+    completed = _make_turn()
+    agent._codex_session.run_turn.side_effect = [interrupted, completed]
+    agent._take_text_commit_correction_and_close_admission.side_effect = [
+        "use the corrected requirement",
+        None,
+    ]
+    messages = [{"role": "user", "content": "hello"}]
+
+    def apply_redirect(_agent, target, text):
+        target.append({"role": "user", "content": text})
+
+    with patch(
+        "agent.conversation_loop._apply_active_turn_redirect",
+        side_effect=apply_redirect,
+    ):
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+    assert result["completed"] is True
+    assert agent._codex_session.run_turn.call_count == 2
+    retry_input = agent._codex_session.run_turn.call_args_list[1].kwargs["user_input"]
+    assert "use the corrected requirement" in retry_input
+    agent._open_turn_correction_admission.assert_called_once_with()
 
 
 def test_codex_turn_persists_each_message_exactly_once():
@@ -152,6 +188,10 @@ def test_codex_turn_persists_each_message_exactly_once():
         # Exactly one user turn, exactly one assistant turn — no duplicates.
         assert contents.count("USER_TURN") == 1, contents
         assert contents.count("CODEX_ASSISTANT") == 1, contents
+        assistant_row = next(
+            row for row in rows if row["content"] == "CODEX_ASSISTANT"
+        )
+        assert isinstance(assistant_row["timestamp"], float)
         # session_search can now see the codex conversation.
         hits = {r["session_id"] for r in db.search_messages("CODEX_ASSISTANT")}
         assert sid in hits

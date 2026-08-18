@@ -57,6 +57,71 @@ def agent(mock_manager):
     return HermesACPAgent(session_manager=mock_manager)
 
 
+def test_history_free_text_updates_redact_credentials():
+    secret = "abcdefghijklmnopqrstuvwxyz123456"
+    message = HermesACPAgent._history_message_update(
+        role="assistant", text=f"Authorization: Bearer {secret}"
+    )
+    thought = HermesACPAgent._history_thought_update(f"token={secret}")
+
+    assert secret not in repr(message)
+    assert secret not in repr(thought)
+
+
+def test_prompt_slash_and_terminal_text_use_outbound_sanitizer():
+    import inspect
+
+    source = inspect.getsource(HermesACPAgent.prompt)
+    sanitizer = "sanitize_tool_display_text"
+    for marker in (
+        "response_text = self._handle_slash_command",
+        'and (not streamed_message or result.get("response_transformed"))',
+    ):
+        start = source.index(marker)
+        emit = source.index("session_update", start)
+        assert sanitizer in source[start:emit], marker
+
+    queued = source.index("next_prompt = state.queued_prompts.pop(0)")
+    outbound = source.index("acp.update_user_message_text", queued)
+    recursive = source.index("await self.prompt(", outbound)
+    assert sanitizer in source[outbound:recursive]
+    assert source.count("_flush_buffered_customer_streams()") >= 3
+    assert "except BaseException:" in source
+    cancelled = source.index("except asyncio.CancelledError as cancellation:")
+    executor_error = source.index("except Exception:", cancelled)
+    cancellation_cleanup = source[cancelled:executor_error]
+    assert "while not worker_future.done():" in cancellation_cleanup
+    assert "task.uncancel()" in cancellation_cleanup
+    assert "await asyncio.shield(worker_future)" in cancellation_cleanup
+    assert "_flush_buffered_customer_streams()" in cancellation_cleanup
+    assert "_release_turn(schedule_queue=True)" in cancellation_cleanup
+    assert "state.queued_prompts.insert(0, next_prompt)" in source
+    assert "if state.is_running and not queued_drain_turn:" in source
+    assert "state.current_prompt_text = next_prompt" in source
+    assert "reserve_for_drain = schedule_queue and has_queued" in source
+    assert "loop.create_task(_drain_queued_prompts(owns_turn=True))" in source
+    assert "_queued_drain=True" in source
+    assert "await _finish_completed_queued_turn()" in cancellation_cleanup
+    assert "while not drain_task.done():" in source
+    assert "await asyncio.shield(drain_task)" in source
+    assert 'pending_steer = result.get("pending_steer")' in source
+    assert "state.queued_prompts.insert(0, pending_steer)" in source
+    usage_update = source.rindex("await self._send_usage_update(state)")
+    usage_tail = source[usage_update:]
+    assert "except BaseException:" in usage_tail
+    assert 'if queued_drain_turn:' in usage_tail
+    executor_exception = source[executor_error:source.index("except BaseException:", executor_error)]
+    assert "_release_turn(schedule_queue=True)" in executor_exception
+    provider_done = source.index("# The provider turn is complete here.")
+    provenance_await = source.index("await self._send_session_info_update(", provider_done)
+    assert "_flush_buffered_customer_streams()" in source[provider_done:provenance_await]
+
+    title_source = inspect.getsource(HermesACPAgent._send_session_info_update)
+    title = title_source.index("update = SessionInfoUpdate(")
+    title_emit = title_source.index("await self._conn.session_update(", title)
+    assert sanitizer in title_source[title:title_emit]
+
+
 @pytest.mark.asyncio
 async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(agent):
     resp = await agent.new_session(cwd="/tmp")
@@ -339,6 +404,7 @@ class TestListAndFork:
 
     @pytest.mark.asyncio
     async def test_list_sessions_includes_title_and_updated_at(self, agent):
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
         with patch.object(
             agent.session_manager,
             "list_sessions",
@@ -346,7 +412,7 @@ class TestListAndFork:
                 {
                     "session_id": "session-1",
                     "cwd": "/tmp/project",
-                    "title": "Fix Zed session history",
+                    "title": f"Fix Authorization: Bearer {secret}",
                     "updated_at": 123.0,
                 }
             ],
@@ -354,7 +420,8 @@ class TestListAndFork:
             resp = await agent.list_sessions(cwd="/tmp/project")
 
         assert isinstance(resp.sessions[0], SessionInfo)
-        assert resp.sessions[0].title == "Fix Zed session history"
+        assert secret not in resp.sessions[0].title
+        assert resp.sessions[0].title.startswith("Fix Authorization: Bearer ")
         assert resp.sessions[0].updated_at == "123.0"
 
 

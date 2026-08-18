@@ -11,6 +11,17 @@ from agent.error_classifier import (
     _classify_402,
 )
 
+from agent.error_classifier import (
+    ClassifiedError,
+    FailoverReason,
+    PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+    classify_api_error,
+    _extract_status_code,
+    _extract_error_body,
+    _extract_error_code,
+    _classify_402,
+)
+
 
 # ── Helper: mock API errors ────────────────────────────────────────────
 
@@ -616,6 +627,151 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.message == "Internal server error occurred"
 
+    def test_404_requires_available_credits_is_billing(self):
+        e = MockAPIError(
+            "Not Found",
+            status_code=404,
+            body={
+                "status": 404,
+                "message": (
+                    "Model 'openai/gpt-5.5-pro' requires available credits. "
+                    "Your account balance is too low to use paid models — "
+                    "add credits at https://portal.nousresearch.com or pick a free model."
+                ),
+            },
+        )
+        result = classify_api_error(e, provider="nous", model="openai/gpt-5.5-pro")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
+    def test_wrapped_402_uses_nested_body_message(self):
+        inner = MockAPIError(
+            "inner",
+            status_code=402,
+            body={"error": {"message": "Usage limit reached, try again in 5 minutes"}},
+        )
+        outer = Exception("outer")
+        outer.__cause__ = inner
+
+        result = classify_api_error(outer)
+
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.message == "Usage limit reached, try again in 5 minutes"
+    def test_non_json_stream_validation_error_is_non_retryable(self):
+        e = MockAPIError(
+            "Provider stream returned non-JSON SSE data",
+            body={
+                "error": {
+                    "code": PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+                    "message": (
+                        "request validation failed: unsupported reasoning_effort"
+                    ),
+                }
+            },
+        )
+
+        result = classify_api_error(e)
+
+        assert result.status_code is None
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+    def test_non_json_stream_unknown_error_remains_retryable(self):
+        e = MockAPIError(
+            "Provider stream returned non-JSON SSE data",
+            body={
+                "error": {
+                    "code": PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+                    "message": "upstream sent opaque plain-text stream data",
+                }
+            },
+        )
+
+        result = classify_api_error(e)
+
+        assert result.status_code is None
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+        assert result.should_fallback is False
+    def test_404_bare_model_id_missing_prefix_is_model_not_found(self):
+        """A bare id the provider only serves as ``vendor/id`` is malformed.
+
+        Regression for #78796: NVIDIA NIM answers a prefix-less
+        ``nemotron-3-ultra-550b-a55b`` with a naked ``404 page not found``.
+        Without the catalogue check this fell into the generic branch and
+        burned three retries on a deterministic failure, reporting what
+        looked like an outage.
+        """
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(
+            e, provider="nvidia", model="nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+    def test_404_correctly_prefixed_model_stays_generic(self):
+        """A properly prefixed id hitting a 404 is a real endpoint problem —
+        it must keep the retryable generic classification."""
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(
+            e, provider="nvidia", model="nvidia/nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+    def test_404_unknown_bare_model_stays_generic(self):
+        """A local NIM container isn't in the catalogue — no verdict invented."""
+        e = MockAPIError("404 page not found", status_code=404)
+        result = classify_api_error(e, provider="nvidia", model="my-local-nim")
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+    def test_llama_cpp_unable_to_generate_parser_template(self):
+        e = MockAPIError(
+            "Unable to generate parser for this template. "
+            "Automatic parser generation failed: error parsing grammar",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="custom", model="local-llama")
+        assert result.reason == FailoverReason.llama_cpp_grammar_pattern
+        assert result.retryable is True
+        assert result.should_compress is False
+    def test_qwen_apply_prompt_template_no_user_query_not_llama_cpp_grammar(self):
+        """Local engines wrap Qwen raise_exception as applyPromptTemplate 400.
+
+        Must NOT classify as llama_cpp_grammar_pattern (which strips tool
+        schema keywords and retries). Fail fast as format_error so the user
+        sees a request-shape failure instead of a misleading template/parser
+        loop — typical after context overflow + failed compression.
+        """
+        e = MockAPIError(
+            "Engine protocol applyPromptTemplate request returned 400: "
+            '{"error":{"code":400,"message":"Unable to generate parser for '
+            "this template. Automatic parser generation failed: "
+            "While executing CallExpression ... multi_step_tool %} "
+            "{{- raise_exception('No user query found in messages')",
+            status_code=400,
+        )
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="qwen/qwen3.6-35b-a3b",
+            approx_tokens=226_000,
+            context_length=100_864,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_fallback is True
+    def test_bare_no_user_query_found_is_format_error_even_on_large_session(self):
+        e = MockAPIError("No user query found in messages", status_code=400)
+        result = classify_api_error(
+            e,
+            approx_tokens=226_000,
+            context_length=100_864,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
+
 
 # ── Test: Adversarial / edge cases (from live testing) ─────────────────
 
@@ -710,6 +866,30 @@ class TestAdversarialEdgeCases:
         e = MockAPIError("余额不足", status_code=402)
         result = classify_api_error(e, provider="deepseek")
         assert result.reason == FailoverReason.billing
+
+    def test_400_unambiguous_billing_body_is_not_marked_unverified(self):
+        """A 400 whose billing evidence is NOT the ambiguous 'out of extra
+        usage' body keeps a confirmed verdict (#82154)."""
+        e = MockAPIError(
+            "Your credit balance is too low to access the Anthropic API.",
+            status_code=400,
+            body={"error": {
+                "type": "invalid_request_error",
+                "message": "Your credit balance is too low to access the Anthropic API.",
+            }},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.billing
+        assert result.billing_unverified is False
+    def test_statusless_extra_usage_is_marked_unverified(self):
+        """Adapters can strip the HTTP status from the Anthropic 400; the
+        message-only path must carry the same ambiguity marking (#82154)."""
+        e = Exception(
+            "You're out of extra usage. Add more at claude.ai/settings/usage and keep going."
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.billing
+        assert result.billing_unverified is True
 
 
 

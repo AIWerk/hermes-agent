@@ -112,7 +112,7 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
 
     agent._flush_messages_to_session_db([{"role": "user", "content": api_content}], [])
 
-    db_write = agent._session_db.append_message.call_args.kwargs
+    db_write = agent._session_db.append_messages_batch.call_args.kwargs["messages"][0]
     assert db_write["content"] == "Describe this screenshot\n[screenshot]"
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
@@ -127,14 +127,14 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
             self.calls = 0
             self._lock = threading.Lock()
 
-        def append_message(self, **kwargs):
+        def append_messages_batch(self, *, messages, **_kwargs):
             with self._lock:
                 self.calls += 1
                 first = self.calls == 1
             if first:
                 self.entered.set()
                 assert self.release.wait(timeout=5)
-            self.rows.append(kwargs["content"])
+            self.rows.extend(row["content"] for row in messages)
 
         def flush_token_counts(self):
             pass
@@ -613,6 +613,24 @@ class TestStripThinkBlocks:
         assert "let me plan" not in result
         assert "<tool_call>" not in result
         assert "final answer" in result
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (
+                "before <tool_call>{x}</function_call> after",
+                "before <tool_call>{x}after",
+            ),
+            (
+                "before <function_calls>{x}</tool_calls> after",
+                "before <function_calls>{x}after",
+            ),
+        ],
+    )
+    def test_mismatched_generic_tool_tags_preserve_opener_and_payload(
+        self, agent, text, expected
+    ):
+        assert agent._strip_think_blocks(text) == expected
 
 
     # ─── Tool-call XML block stripping (openclaw/openclaw#67318) ─────────
@@ -2829,6 +2847,28 @@ class TestExecuteToolCalls:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
 
+    def test_concurrent_invalid_json_args_emit_terminal_hook(self, agent, monkeypatch):
+        tc = _mock_tool_call(
+            name="web_search", arguments="not valid json", call_id="c1"
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        hook_calls = []
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+
+        agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        [post_call] = [
+            kwargs for name, kwargs in hook_calls if name == "post_tool_call"
+        ]
+        assert post_call["tool_call_id"] == "c1"
+        assert post_call["status"] == "error"
+        assert post_call["error_type"] == "invalid_tool_arguments"
+
 
 
 class TestRetryAfterCap:
@@ -3619,7 +3659,10 @@ class TestConcurrentToolExecution:
         messages = []
 
         def authorize(*_args, **_kwargs):
-            time.sleep(0.15)
+            from tools.approval import human_wait_window
+
+            with human_wait_window():
+                time.sleep(0.15)
             return None
 
         monkeypatch.setattr(
@@ -4077,6 +4120,55 @@ class TestConcurrentToolExecution:
         # Second (allowed) write must checkpoint even though first was blocked.
         cp_mock.assert_called_once()
 
+    @pytest.mark.parametrize("concurrent", [False, True])
+    def test_tool_execution_middleware_replacement_emits_one_terminal_hook(
+        self,
+        agent,
+        monkeypatch,
+        concurrent,
+    ):
+        """A middleware replacement owns the result but not lifecycle closure."""
+        tool_call = _mock_tool_call(
+            name="terminal",
+            arguments='{"command":"must-not-run"}',
+            call_id="terminal-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        hook_calls = []
+
+        def execution_middleware(**kwargs):
+            return '{"intercepted":true}'
+
+        manager = SimpleNamespace(_middleware={
+            "tool_request": [],
+            "tool_execution": [execution_middleware],
+        })
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("middleware replacement must not dispatch"),
+        ):
+            if concurrent:
+                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+            else:
+                agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        post_calls = [
+            payload for name, payload in hook_calls if name == "post_tool_call"
+        ]
+        assert len(post_calls) == 1
+        assert post_calls[0]["tool_name"] == "terminal"
+        assert post_calls[0]["tool_call_id"] == "terminal-1"
+        assert post_calls[0]["status"] == "ok"
+        assert post_calls[0]["result"] == '{"intercepted":true}'
+
 
 
 class TestAgentRuntimePostHookOwnershipSync:
@@ -4088,6 +4180,9 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
+        ("read_preview", {}),
+        ("read_window_below", {}),
+        ("setup_mcp", {"server": "example"}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
 
@@ -4125,6 +4220,18 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.read_terminal_tool.read_terminal_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.read_preview_tool.read_preview_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.read_window_tool.read_window_below_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.setup_mcp_tool.setup_mcp_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
@@ -4672,6 +4779,13 @@ class TestHandleMaxIterations:
         assert result == "Summary"
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert "sort" not in kwargs.get("extra_body", {}).get("provider", {})
+
+    def test_summary_notice_uses_safe_print(self, agent):
+        agent._print_fn = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("closed"))
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        assert agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60) == "Summary"
 
 
 
@@ -5372,10 +5486,10 @@ class TestRunConversation:
         # Partial reply is surfaced and persisted as an assistant turn so the
         # next turn remembers what the model said.
         assert result["final_response"] == "Sure, here's how to do it: first"
-        assert result["messages"][-1] == {
-            "role": "assistant",
-            "content": "Sure, here's how to do it: first",
-        }
+        partial = result["messages"][-1]
+        assert partial["role"] == "assistant"
+        assert partial["content"] == "Sure, here's how to do it: first"
+        assert isinstance(partial["timestamp"], float)
 
     def test_redirect_during_thinking_retries_same_turn_with_context(self, agent):
         """A corrective follow-up does not end the turn, and displayed reasoning
@@ -5419,17 +5533,21 @@ class TestRunConversation:
             "assistant",
             "user",
         ]
-        checkpoint = replay[-2]["content"]
+        # Provider replay receives the scaffolded api_content on the correction,
+        # while the persisted transcript keeps only the user's own words visible.
+        checkpoint = replay[-1]["content"]
         assert "interrupted by a user correction" in checkpoint
         # Displayed chain-of-thought must NOT be replayed: an assistant turn
         # inlining its own reasoning trips Anthropic's output classifier and
         # bricks the session with deterministic empty responses (July 2026).
         assert "I should implement this with SQLite." not in checkpoint
         assert "Reasoning shown before the interruption" not in checkpoint
-        assert replay[-1]["content"] == "No, use Postgres instead."
+        assert replay[-2]["content"] == "[response interrupted]"
+        assert checkpoint.endswith("No, use Postgres instead.")
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."
+            and "interrupted by a user correction" in snapshot[-1].get("api_content", "")
             and snapshot[-2].get("role") == "assistant"
             for snapshot in persisted
             if len(snapshot) >= 2
@@ -5464,6 +5582,126 @@ class TestRunConversation:
             message.get("content") != "Using SQLite."
             for message in result["messages"]
         )
+        corrections = [
+            message
+            for message in result["messages"]
+            if message.get("role") == "user"
+            and message.get("content") == "Use Postgres instead."
+        ]
+        assert len(corrections) == 1
+        assert "interrupted by a user correction" in corrections[0]["api_content"]
+        assert calls == 2  # same logical turn retried, not a queued third turn
+
+    def test_redirect_after_provider_return_before_commit_retries_same_turn(self, agent):
+        """A correction at the response boundary must not become a queued turn."""
+        self._setup_agent(agent)
+        stale = _mock_response(content="Using SQLite.", finish_reason="stop")
+        corrected = _mock_response(content="Using Postgres.", finish_reason="stop")
+        requests = []
+        normalize_entered = threading.Event()
+        correction_done = threading.Event()
+        correction_outcome = {}
+        transport = agent._get_transport()
+        original_normalize = transport.normalize_response
+        normalize_calls = 0
+
+        def _fake_api_call(api_kwargs):
+            requests.append(api_kwargs)
+            return stale if len(requests) == 1 else corrected
+
+        def _normalize(response, **kwargs):
+            nonlocal normalize_calls
+            normalize_calls += 1
+            if normalize_calls == 1:
+                normalize_entered.set()
+                assert correction_done.wait(timeout=2)
+            return original_normalize(response, **kwargs)
+
+        def _correct_at_boundary():
+            assert normalize_entered.wait(timeout=2)
+            assert agent._model_request_active.is_set() is False
+            correction_outcome["accepted"] = agent.redirect("Use Postgres instead.")
+            correction_done.set()
+
+        corrector = threading.Thread(target=_correct_at_boundary)
+        corrector.start()
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_get_transport", return_value=transport),
+            patch.object(transport, "normalize_response", side_effect=_normalize),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Choose a database.")
+        corrector.join(timeout=2)
+
+        assert corrector.is_alive() is False
+        assert correction_outcome == {"accepted": True}
+        assert len(requests) == 2
+        assert result["final_response"] == "Using Postgres."
+        assert all(m.get("content") != "Using SQLite." for m in result["messages"])
+        corrections = [
+            m
+            for m in result["messages"]
+            if m.get("role") == "user" and m.get("content") == "Use Postgres instead."
+        ]
+        assert len(corrections) == 1
+        assert "interrupted by a user correction" in corrections[0]["api_content"]
+
+    def test_steer_after_provider_return_before_commit_retries_same_turn(self, agent):
+        """Late busy-mode steer is a correction, not a post-answer queued task."""
+        self._setup_agent(agent)
+        stale = _mock_response(content="Using SQLite.", finish_reason="stop")
+        corrected = _mock_response(content="Using Postgres.", finish_reason="stop")
+        requests = []
+        normalize_entered = threading.Event()
+        steer_done = threading.Event()
+        transport = agent._get_transport()
+        original_normalize = transport.normalize_response
+        normalize_calls = 0
+
+        def _fake_api_call(api_kwargs):
+            requests.append(api_kwargs)
+            return stale if len(requests) == 1 else corrected
+
+        def _normalize(response, **kwargs):
+            nonlocal normalize_calls
+            normalize_calls += 1
+            if normalize_calls == 1:
+                normalize_entered.set()
+                assert steer_done.wait(timeout=2)
+            return original_normalize(response, **kwargs)
+
+        def _steer_at_boundary():
+            assert normalize_entered.wait(timeout=2)
+            assert agent.steer("Use Postgres instead.") is True
+            steer_done.set()
+
+        steerer = threading.Thread(target=_steer_at_boundary)
+        steerer.start()
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_get_transport", return_value=transport),
+            patch.object(transport, "normalize_response", side_effect=_normalize),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Choose a database.")
+        steerer.join(timeout=2)
+
+        assert steerer.is_alive() is False
+        assert len(requests) == 2
+        assert result["final_response"] == "Using Postgres."
+        assert agent._pending_steer is None
+        assert all(m.get("content") != "Using SQLite." for m in result["messages"])
+        correction = next(
+            m
+            for m in result["messages"]
+            if m.get("role") == "user" and m.get("content") == "Use Postgres instead."
+        )
+        assert "interrupted by a user correction" in correction["api_content"]
 
     def test_redirect_from_input_thread_cancels_live_model_request(self, agent):
         """Exercise the real cross-thread path used by CLI and gateways."""
@@ -5506,14 +5744,13 @@ class TestRunConversation:
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
-        checkpoint = results["result"]["messages"][-3]
-        assert "interrupted by a user correction" in checkpoint["content"]
+        checkpoint = results["result"]["messages"][-2]
+        assert checkpoint["content"] == "Use the corrected approach."
+        assert "interrupted by a user correction" in checkpoint["api_content"]
         # Displayed reasoning is display-only — replaying it as assistant
         # content trips Anthropic's output classifier (July 2026 brickings).
-        assert "Following the original approach." not in checkpoint["content"]
-        assert results["result"]["messages"][-2]["content"] == (
-            "Use the corrected approach."
-        )
+        assert "Following the original approach." not in checkpoint["api_content"]
+        assert results["result"]["messages"][-3].get("display_kind") == "hidden"
 
 
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
@@ -6928,6 +7165,302 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 131_072
         mock_compress.assert_not_called()
 
+    def test_empty_response_retry_backoff_interrupted(self, agent, monkeypatch):
+        """If an interrupt is requested during the empty response retry wait, we abort."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp, empty_resp]
+
+        from agent import conversation_loop as _conv_loop
+
+        # Make backoff return 10.0 seconds
+        monkeypatch.setattr(_conv_loop, "jittered_backoff", lambda *a, **k: 10.0)
+
+        # Trigger the interrupt on the first sleep call inside the wait loop
+        original_sleep = time.sleep
+        sleep_called = []
+
+        def _mock_sleep(seconds):
+            sleep_called.append(seconds)
+            if seconds == 0.2:
+                agent._interrupt_requested = True
+            else:
+                original_sleep(seconds)
+
+        monkeypatch.setattr(time, "sleep", _mock_sleep)
+
+        with (
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert result["interrupted"] is True
+        assert "Operation interrupted: retrying empty response from model" in result["final_response"]
+        assert agent._empty_content_retries == 1
+        assert 0.2 in sleep_called
+        assert mock_persist.call_count == 2
+    def test_empty_response_retry_backoff_status(self, agent, monkeypatch):
+        """Empty response retry wait updates the agent's status with wait time and sleeps."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+
+        # Two responses: first empty, second succeeds so it doesn't run forever
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        ok_resp = _mock_response(content="Final ok response.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp, ok_resp]
+
+        from agent import conversation_loop as _conv_loop
+
+        monkeypatch.setattr(_conv_loop, "jittered_backoff", lambda *a, **k: 7.5)
+
+        # Fake clock: the retry loop gates on real time.time() < sleep_end, so
+        # a no-op sleep alone busy-spins 7.5 wall-clock seconds. Advance a fake
+        # clock by each sleep amount instead (established pattern:
+        # test_session_activity_persist.py patches run_agent.time.time).
+        clock = {"t": time.time()}
+        monkeypatch.setattr(_conv_loop.time, "time", lambda: clock["t"])
+
+        sleep_calls = []
+
+        def _fake_sleep(secs):
+            sleep_calls.append(secs)
+            clock["t"] += secs
+
+        monkeypatch.setattr(time, "sleep", _fake_sleep)
+        monkeypatch.setattr(_conv_loop.time, "sleep", _fake_sleep)
+
+        status_messages = []
+        monkeypatch.setattr(agent, "_buffer_status", lambda status: status_messages.append(status))
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Final ok response."
+
+        # 7.5s wait, slept in 0.2s increments -> 37.5 -> at least 37 calls
+        assert len([c for c in sleep_calls if c == 0.2]) >= 37
+
+        retry_status = [m for m in status_messages if "Empty response from model — retrying (1/3) in 8s" in m]
+        assert len(retry_status) == 1
+    def test_legacy_interrupt_scaffold_ghost_dropped_from_api_replay(self, agent):
+        """Pre-#81841 hidden assistant rows with the interrupt scaffold must
+        not be replayed to the provider — that is what made the model echo
+        them into a self-replicating ghost loop."""
+        self._setup_agent(agent)
+        scaffold = "[This response was interrupted by a user correction.]"
+        history = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": scaffold,
+                "api_content": scaffold,
+                "display_kind": "hidden",
+            },
+            {"role": "user", "content": "real follow-up"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        requests = []
+
+        def _fake_api_call(api_kwargs):
+            requests.append(api_kwargs)
+            return _mock_response(content="done", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "next turn", conversation_history=history
+            )
+
+        assert result["completed"] is True
+        assert len(requests) == 1
+        replayed = requests[0]["messages"]
+        assert not any(
+            isinstance(m.get("content"), str) and m["content"].strip() == scaffold
+            for m in replayed
+            if m.get("role") == "assistant"
+        )
+        # Real history around the ghost still reaches the provider.
+        # The two consecutive user messages ("first" + "real follow-up")
+        # may be merged by repair_message_sequence, so check for the
+        # content as a substring rather than exact match.
+        assert any(
+            m.get("role") == "user"
+            and "real follow-up" in str(m.get("content", ""))
+            for m in replayed
+        )
+        assert any(
+            m.get("role") == "assistant" and m.get("content") == "ok"
+            for m in replayed
+        )
+    def test_zero_byte_tool_args_stub_recovers_within_retries(self, agent):
+        """#80498: a stream that dies before a single argument byte arrives
+        (name-only tool call) produces a stub with tool_calls=None and
+        _dropped_tool_names set — the real shape _build_partial_stream_stub
+        returns, distinct from the truncated-JSON stub above (which still
+        carries a tool_calls list). Confirms the zero-byte trigger is wired
+        end-to-end through the retry loop, not just detected at the
+        chat_completion_helpers unit level."""
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+
+        stall = _mock_response(content="", finish_reason="length", tool_calls=None)
+        stall.id = PARTIAL_STREAM_STUB_ID
+        stall._dropped_tool_names = ["write_file"]
+
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(content="", finish_reason="stop", tool_calls=[good_tc])
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.client.chat.completions.create.side_effect = [
+                stall, good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        # The zero-byte stub must trigger a retry, not silently execute
+        # write_file with coerced empty arguments (the #80498 regression).
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+    def test_output_cap_retry_triggers_compression_and_recovers(self, agent):
+        """Regression for the output-cap death-loop (#55546 / #61761).
+
+        When the provider reports an output-cap error on a near-full context
+        window, the retry must NOT just shrink max_tokens by a tiny amount and
+        spin forever. It must fire _compress_context() to actually free tokens
+        so the session recovers instead of exhausting compression_attempts.
+
+        This locks in the fix: previously the output-cap path set
+        restart_with_compressed_messages without ever calling the compressor.
+        """
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "openrouter"
+        agent.model = "some/model"
+        agent.max_tokens = 65_536
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        # Context is essentially full -> compressor would want to run.
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+
+        error_msg = (
+            "max_tokens: 65536 > context_window: 200000 "
+            "- input_tokens: 199000 = available_tokens: 1000"
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 400
+        exc.code = 400
+
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        # Compress drops the huge history (15 msgs -> 1), freeing tokens.
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", mock_compress),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Compression fired exactly once, on the output-cap retry.
+        mock_compress.assert_called_once()
+        # The compressed messages were re-sent and the call succeeded.
+        assert result["completed"] is True
+        assert result["final_response"] == "done"
+        # The retry honored the reduced max_tokens (available_out - 64).
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert second_call["max_tokens"] <= 936
+        # LOCK IN THE FIX: the retry must actually SEND the compressed history
+        # (the 1-message payload from _compress_context + its new system
+        # prompt), not the original multi-message window. Without this, the
+        # output-cap retry would call the compressor but re-transmit the same
+        # oversized request forever.
+        second_messages = second_call.get("messages", [])
+        assert second_messages[-1].get("content") == "hello"
+        assert len(second_messages) == 2
+        assert second_messages[0]["role"] == "system"
+        # context_length was NOT mutated by an output-cap error.
+        assert agent.context_compressor.context_length == 200_000
+    def test_output_cap_retry_compression_no_progress_terminates_bounded(self, agent):
+        """Regression: when the compressor cannot reduce the request (zero
+        progress AND no images to strip), the output-cap retry must terminate
+        via the max-attempts guard instead of spinning forever.
+
+        The compressor is injected to return the input unchanged (same list
+        object, no lock-defer — just zero progress), and the provider keeps
+        rejecting, so the only correct outcome is a bounded
+        ``compression_exhausted`` failure, not an unbounded loop.
+        """
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "openrouter"
+        agent.model = "some/model"
+        agent.max_tokens = 65_536
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+
+        error_msg = (
+            "max_tokens: 65536 > context_window: 200000 "
+            "- input_tokens: 199000 = available_tokens: 1000"
+        )
+
+        def _rejecting(*args, **kwargs):
+            exc = Exception(error_msg)
+            exc.status_code = 400
+            exc.code = 400
+            raise exc
+
+        # The provider never recovers (side effect raises on every call).
+        agent.client.chat.completions.create.side_effect = _rejecting
+
+        def _no_progress(messages, system_message, **kwargs):
+            # Compressor runs but cannot shrink the request: no-op, same list.
+            return messages, system_message
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", side_effect=_no_progress),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result.get("compression_exhausted") is True
+        # Terminated in a bounded number of API calls (default max attempts=3
+        # => ~4 create calls), NOT an unbounded retry loop.
+        assert agent.client.chat.completions.create.call_count <= 6
+
 
 
 
@@ -7354,10 +7887,12 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 402
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "billing"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -7384,11 +7919,13 @@ class TestCredentialPoolRecovery:
                 return []
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None
             ):
                 assert status_code == 429
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "rate_limit"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -7461,10 +7998,12 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "billing"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -7562,11 +8101,13 @@ class TestCredentialPoolRecovery:
                 return None  # refresh failed
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None
             ):
                 assert status_code == 401
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "auth"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -7589,9 +8130,11 @@ class TestCredentialPoolRecovery:
                 return None
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None
             ):
                 assert error_context is None
+                assert failure_reason == "auth"
                 return None  # no more credentials
 
         agent._credential_pool = _Pool()
@@ -7636,11 +8179,13 @@ class TestCredentialPoolRecovery:
                 return []
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None
             ):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
                 captured["api_key_hint"] = api_key_hint
+                captured["failure_reason"] = failure_reason
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -7656,6 +8201,7 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         assert captured["status_code"] == 429
         assert captured["error_context"]["reason"] == "device_code_exhausted"
+        assert captured["failure_reason"] == "rate_limit"
 
 
 
@@ -8776,6 +9322,276 @@ class TestStreamingApiCall:
         assert resp.choices[0].message.content == "Hello"
         assert resp.model == "gpt-4"
 
+    def test_error_finish_http_status_429_stream_raises_rate_limit(self, agent):
+        error_text = _provider_sse_429_text()
+        chunks = [
+            _make_chunk(content=error_text[:5]),
+            _make_chunk(content=error_text[5:]),
+            _make_chunk(finish_reason="error_finish"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        with pytest.raises(Exception) as exc_info:
+            agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert getattr(exc, "status_code", None) == 429
+        assert "Throttling.AllocationQuota" in str(exc)
+        assert getattr(exc, "body", {})["error"]["code"] == "Throttling.AllocationQuota"
+        agent.stream_delta_callback.assert_not_called()
+    def test_error_finish_sse_data_status_raises_provider_status(self, agent):
+        chunks = [
+            _make_chunk(content=_provider_sse_error_text()),
+            _make_chunk(finish_reason="error_finish"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        with pytest.raises(Exception) as exc_info:
+            agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert getattr(exc, "status_code", None) == 503
+        assert getattr(exc, "body", {})["error"]["code"] == "ServiceUnavailable"
+        assert "Busy" in str(exc)
+        agent.stream_delta_callback.assert_not_called()
+    def test_error_finish_bare_sse_error_payload_raises_provider_error(self, agent):
+        chunks = [
+            _make_chunk(content=_provider_bare_sse_error_text()),
+            _make_chunk(finish_reason="error_finish"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        with pytest.raises(Exception) as exc_info:
+            agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert getattr(exc, "status_code", None) is None
+        assert getattr(exc, "body", {})["error"]["code"] == "rate_limit_exceeded"
+        assert "Rate limit exceeded" in str(exc)
+        agent.stream_delta_callback.assert_not_called()
+    def test_choiceless_error_chunk_raises_provider_stream_error(self, agent):
+        """DeepInfra-style in-stream error: choices=None + error_type/error_message.
+
+        Regression for #65631: the choiceless-chunk skip silently dropped
+        error-bearing chunks, the stream ended empty, and the caller got a
+        misleading EmptyStreamError plus pointless retries of the same bad
+        request. The chunk must instead surface as ProviderStreamError so
+        the classifier sees the real provider error.
+        """
+        err_chunk = SimpleNamespace(
+            model="test/model",
+            choices=None,
+            error_type="400 BadRequestError",
+            error_message="context length exceeded",
+        )
+        agent.client.chat.completions.create.return_value = iter([err_chunk])
+        agent.stream_delta_callback = MagicMock()
+
+        with pytest.raises(Exception) as exc_info:
+            agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert type(exc).__name__ == "ProviderStreamError"
+        assert getattr(exc, "status_code", None) == 400
+        assert "context length exceeded" in str(exc)
+        agent.stream_delta_callback.assert_not_called()
+    def test_choiceless_usage_only_chunk_still_skipped(self, agent):
+        """Usage-only final chunks (choices empty, no error fields) keep flowing."""
+        usage = SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)
+        chunks = [
+            _make_chunk(content="Hi"),
+            _make_chunk(finish_reason="stop"),
+            SimpleNamespace(model="test/model", choices=[], usage=usage),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == "Hi"
+        assert resp.choices[0].finish_reason == "stop"
+    def test_named_non_json_sse_error_preserves_provider_message(self, agent):
+        """SDK-level plain-text SSE errors retain their actionable message."""
+        import httpx
+        from openai import OpenAI, Stream
+        from openai.types.chat import ChatCompletionChunk
+        from agent.chat_completion_helpers import ProviderStreamError
+        from agent.error_classifier import PROVIDER_STREAM_NON_JSON_ERROR_CODE
+
+        provider_message = (
+            "request validation failed: unsupported reasoning_effort"
+        )
+        request = httpx.Request(
+            "POST",
+            "https://provider.example/v1/chat/completions",
+        )
+        response = httpx.Response(
+            200,
+            request=request,
+            headers={"x-request-id": "req-plain-text"},
+            content=(
+                f"event: error\ndata: {provider_message}\n\n"
+            ).encode("utf-8"),
+        )
+        agent.stream_delta_callback = MagicMock()
+
+        with OpenAI(api_key="test-key", max_retries=0) as sdk_client:
+            stream = Stream(
+                cast_to=ChatCompletionChunk,
+                response=response,
+                client=sdk_client,
+            )
+            agent.client.chat.completions.create.return_value = stream
+
+            with pytest.raises(ProviderStreamError) as exc_info:
+                agent._interruptible_streaming_api_call({"messages": []})
+
+        exc = exc_info.value
+        assert exc.status_code is None
+        assert exc.body["error"]["code"] == PROVIDER_STREAM_NON_JSON_ERROR_CODE
+        assert exc.body["error"]["message"] == provider_message
+        assert exc.raw_text == provider_message
+        assert exc.response.headers["x-request-id"] == "req-plain-text"
+        assert isinstance(exc.__cause__, json.JSONDecodeError)
+        agent.stream_delta_callback.assert_not_called()
+    def test_named_non_json_sse_error_force_redacts_secrets(self, agent):
+        """SDK-level SSE errors cannot expose credentials in exceptions."""
+        import httpx
+        from openai import OpenAI, Stream
+        from openai.types.chat import ChatCompletionChunk
+        from agent.chat_completion_helpers import ProviderStreamError
+
+        secret = "sk-" + ("a" * 48)
+        request = httpx.Request(
+            "POST",
+            "https://provider.example/v1/chat/completions",
+        )
+        response = httpx.Response(
+            200,
+            request=request,
+            content=(
+                "event: error\n"
+                f"data: request validation failed: token={secret}\n\n"
+            ).encode("utf-8"),
+        )
+        agent.stream_delta_callback = MagicMock()
+
+        with patch("agent.redact._REDACT_ENABLED", False):
+            with OpenAI(api_key="test-key", max_retries=0) as sdk_client:
+                stream = Stream(
+                    cast_to=ChatCompletionChunk,
+                    response=response,
+                    client=sdk_client,
+                )
+                agent.client.chat.completions.create.return_value = stream
+
+                with pytest.raises(ProviderStreamError) as exc_info:
+                    agent._interruptible_streaming_api_call({"messages": []})
+
+        assert secret not in str(exc_info.value)
+        assert secret not in exc_info.value.raw_text
+        assert secret not in exc_info.value.body["error"]["message"]
+        assert "sk-" in exc_info.value.body["error"]["message"]
+        agent.stream_delta_callback.assert_not_called()
+    def test_provider_error_prefix_like_normal_text_flushes_to_callback(self, agent):
+        chunks = [
+            _make_chunk(content="id: product-42\n"),
+            _make_chunk(content="is ready"),
+            _make_chunk(finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == "id: product-42\nis ready"
+        assert [
+            call.args[0] for call in agent.stream_delta_callback.call_args_list
+        ] == ["id: product-42\n", "is ready"]
+    def test_full_bailian_sse_error_example_with_stop_is_literal_text(self, agent):
+        error_text = _provider_sse_429_text(message="Example error payload.")
+        split_at = len(error_text) // 2
+        chunks = [
+            _make_chunk(content=error_text[:split_at]),
+            _make_chunk(content=error_text[split_at:]),
+            _make_chunk(finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == error_text
+        assert [
+            call.args[0] for call in agent.stream_delta_callback.call_args_list
+        ] == [error_text[:split_at], error_text[split_at:]]
+    def test_bare_sse_error_payload_with_stop_is_literal_text(self, agent):
+        error_text = _provider_bare_sse_error_text(message="Example error payload.")
+        chunks = [
+            _make_chunk(content=error_text),
+            _make_chunk(finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == error_text
+        assert [
+            call.args[0] for call in agent.stream_delta_callback.call_args_list
+        ] == [error_text]
+    def test_bare_sse_error_payload_without_finish_reason_is_literal_text(self, agent):
+        error_text = _provider_bare_sse_error_text(message="Example error payload.")
+        chunks = [_make_chunk(content=error_text)]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+        agent.stream_delta_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content == error_text
+        # Current main treats every text-only stream without a terminal finish
+        # signal as a partial response. The SSE-shaped text remains literal,
+        # but is withheld from the callback so the retry path can own delivery.
+        assert resp.choices[0].finish_reason == "length"
+        agent.stream_delta_callback.assert_not_called()
+    def test_run_conversation_retries_stream_error_finish_rate_limit(self, agent):
+        first_attempt = iter([
+            _make_chunk(content=_provider_sse_429_text()),
+            _make_chunk(finish_reason="error_finish"),
+        ])
+        second_attempt = iter([
+            _make_chunk(content="Recovered"),
+            _make_chunk(finish_reason="stop"),
+        ])
+        agent.client.chat.completions.create.side_effect = [first_attempt, second_attempt]
+        agent.stream_delta_callback = MagicMock()
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        import agent.conversation_loop as _conversation_loop
+
+        with (
+            patch.object(_conversation_loop, "jittered_backoff", return_value=0.0),
+            patch.object(
+                _conversation_loop,
+                "adaptive_rate_limit_backoff",
+                return_value=(0.0, None),
+            ),
+            patch.object(_conversation_loop.time, "sleep", return_value=None),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert agent.client.chat.completions.create.call_count == 2
+        assert not any(
+            "HTTP_STATUS/429" in str(call.args[0])
+            for call in agent.stream_delta_callback.call_args_list
+        )
+
 
 
 
@@ -8995,7 +9811,10 @@ class TestPersistUserMessageOverride:
             "2-3 sentences max. No code blocks or markdown.] Hello there"
         )
         # But the DB write must get the override.
-        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
+        first_db_write = (
+            agent._session_db.append_messages_batch.call_args_list[0]
+            .kwargs["messages"][0]
+        )
         assert first_db_write["content"] == "Hello there"
 
 
@@ -9575,3 +10394,28 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+def _provider_sse_429_text(
+    code="Throttling.AllocationQuota",
+    message="Allocated quota exceeded.",
+):
+    return (
+        "id:1\n"
+        "event:error\n"
+        ":HTTP_STATUS/429\n"
+        f'data:{{"request_id":"req-123","code":"{code}","message":"{message}"}}'
+    )
+
+def _provider_sse_error_text(status=503, code="ServiceUnavailable", message="Busy"):
+    return (
+        "event: error\n"
+        f'data:{{"status":{status},"request_id":"req-456","code":"{code}",'
+        f'"message":"{message}"}}'
+    )
+
+def _provider_bare_sse_error_text(
+    code="rate_limit_exceeded",
+    message="Rate limit exceeded.",
+):
+    return f'data: {{"error":{{"code":"{code}","message":"{message}"}}}}\n'

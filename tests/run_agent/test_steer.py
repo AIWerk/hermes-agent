@@ -26,6 +26,8 @@ def _bare_agent() -> AIAgent:
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
     agent._model_request_active = threading.Event()
+    agent._response_commit_pending = threading.Event()
+    agent._steer_admission_open = True
     agent._executing_tools = False
     agent._execution_thread_id = None
     agent._interrupt_thread_signal_pending = False
@@ -48,6 +50,62 @@ class TestSteerAcceptance:
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
+
+    def test_rejects_after_turn_commit_closes_admission(self):
+        agent = _bare_agent()
+        agent._steer_admission_open = False
+
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+    def test_text_commit_atomically_closes_and_drains_redirect_and_steer(self):
+        agent = _bare_agent()
+        agent._response_commit_pending.set()
+        agent._pending_redirect = "redirect correction"
+        agent._pending_steer = "steer correction"
+
+        correction = agent._take_text_commit_correction_and_close_admission()
+
+        assert correction == (
+            "redirect correction\n\n"
+            "[Additional user correction]\n"
+            "steer correction"
+        )
+        assert agent._response_commit_pending.is_set() is False
+        assert agent._steer_admission_open is False
+        assert agent._pending_redirect is None
+        assert agent._pending_steer is None
+        assert agent.steer("later turn") is False
+
+    def test_outer_turn_cleanup_clears_stale_fence_and_pending_corrections(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        agent._response_commit_pending.set()
+        agent._pending_redirect = "stale redirect"
+        agent._pending_steer = "stale steer"
+
+        agent._close_turn_correction_admission()
+
+        assert agent._model_request_active.is_set() is False
+        assert agent._response_commit_pending.is_set() is False
+        assert agent._steer_admission_open is False
+        assert agent._pending_redirect is None
+        assert agent._pending_steer is None
+        assert agent.redirect("next turn") is False
+        assert agent.steer("next turn") is False
+
+    def test_outer_turn_cleanup_can_preserve_exception_correction(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        agent._response_commit_pending.set()
+        agent._pending_steer = "accepted correction"
+
+        agent._close_turn_correction_admission(preserve_pending=True)
+
+        assert agent._model_request_active.is_set() is False
+        assert agent._response_commit_pending.is_set() is False
+        assert agent._steer_admission_open is False
+        assert agent._pending_steer == "accepted correction"
 
 
 
@@ -114,7 +172,7 @@ class TestActiveTurnRedirect:
         assert seen == ["visible provider thinking"]
         assert not getattr(agent, "_current_streamed_reasoning_text", "")
 
-    def test_response_completion_before_redirect_lock_rejects_correction(self):
+    def test_response_completion_before_redirect_lock_accepts_until_commit_fence(self):
         agent = _bare_agent()
         agent._model_request_active.set()
         started = threading.Event()
@@ -129,11 +187,20 @@ class TestActiveTurnRedirect:
             worker.start()
             assert started.wait(timeout=1)
             # Mirrors conversation_loop clearing the request-active marker
-            # under this same lock before redirect can commit its slot.
+            # and opening the response-commit window under the same lock.
             agent._model_request_active.clear()
+            agent._response_commit_pending.set()
         worker.join(timeout=1)
 
-        assert outcome["accepted"] is False
+        assert outcome["accepted"] is True
+        assert agent._pending_redirect == "late correction"
+
+    def test_redirect_rejects_after_response_commit_fence_closes(self):
+        agent = _bare_agent()
+        agent._model_request_active.clear()
+        agent._response_commit_pending.clear()
+
+        assert agent.redirect("new turn now") is False
         assert agent._pending_redirect is None
 
     def test_hard_stop_wins_concurrent_redirect(self):
@@ -217,10 +284,10 @@ class TestActiveTurnRedirectCheckpoint:
         """The checkpoint machinery is for the MODEL, not the transcript.
 
         Persisting ``[This response was interrupted by a user correction.]``
-        into ``content`` painted raw scaffolding as an assistant bubble on
-        every reload. It must ride in ``api_content`` (replayed to the
-        provider) while ``content`` stays clean, or be marked
-        ``display_kind="hidden"`` when there is no clean form at all.
+        into an assistant row's ``content`` or ``api_content`` painted raw
+        scaffolding as the model's own prior reply (#81841). Scaffold bytes
+        ride only in the *user correction's* ``api_content``; assistant
+        placeholders stay clean (or ``display_kind="hidden"`` when empty).
         """
         from agent.conversation_loop import _apply_active_turn_redirect
 
@@ -248,6 +315,20 @@ class TestActiveTurnRedirectCheckpoint:
                 _apply_active_turn_redirect(agent, messages, "New direction.")
 
                 for msg in messages:
+                    if msg.get("role") == "assistant":
+                        # Scaffold must never live on an assistant row at all
+                        # — content OR api_content (API replay substitutes the
+                        # sidecar back into content).
+                        blob = (
+                            str(msg.get("content") or "")
+                            + str(msg.get("api_content") or "")
+                        )
+                        for marker in scaffolding:
+                            assert marker not in blob, (
+                                f"scaffolding leaked into assistant row "
+                                f"(tail={tail_role}, streamed={bool(streamed)}): "
+                                f"{blob!r}"
+                            )
                     if msg.get("display_kind") == "hidden":
                         continue  # dropped by every transcript surface
                     content = str(msg.get("content", ""))
@@ -259,10 +340,9 @@ class TestActiveTurnRedirectCheckpoint:
 
                 # The user's correction is always shown verbatim.
                 assert messages[-1]["content"] == "New direction."
-                # ...and the model still receives the interrupted context.
-                replayed = "".join(
-                    str(m.get("api_content") or m.get("content", "")) for m in messages
-                )
+                # ...and the model still receives the interrupted context,
+                # but only via the user correction's api_content sidecar.
+                replayed = messages[-1].get("api_content") or ""
                 assert "[This response was interrupted by a user correction.]" in replayed
                 if streamed:
                     assert streamed in replayed
@@ -307,15 +387,46 @@ class TestActiveTurnRedirectCheckpoint:
 
         _apply_active_turn_redirect(agent, messages, "New direction.")
 
-        checkpoint_row = messages[-2]
-        # Nothing was on screen, so the row exists only for the model: hidden
-        # from every transcript surface, scaffolding replayed via the sidecar.
-        assert checkpoint_row["display_kind"] == "hidden"
+        placeholder = messages[-2]
+        correction = messages[-1]
+        # Nothing was on screen: empty hidden placeholder for alternation;
+        # scaffold rides only on the user correction's api_content.
+        assert placeholder["role"] == "assistant"
+        assert placeholder["display_kind"] == "hidden"
+        assert placeholder.get("content") == ""
+        assert not placeholder.get("api_content")
+        assert correction["content"] == "New direction."
         assert (
-            checkpoint_row["api_content"]
-            == "[This response was interrupted by a user correction.]"
+            "[This response was interrupted by a user correction.]"
+            in correction["api_content"]
         )
-        assert messages[-1]["content"] == "New direction."
+
+    def test_tool_tail_scaffold_never_on_assistant_api_content(self):
+        """#81841: mid-tool steer must not put the interrupt scaffold on the
+        placeholder assistant row (that is what the model echoed)."""
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+
+        _apply_active_turn_redirect(agent, messages, "Stop and do X instead.")
+
+        placeholder = messages[-2]
+        correction = messages[-1]
+        assert placeholder["role"] == "assistant"
+        assert placeholder.get("display_kind") == "hidden"
+        assert placeholder.get("content") == ""
+        assert not placeholder.get("api_content")
+        assert correction["role"] == "user"
+        assert correction["content"] == "Stop and do X instead."
+        assert correction["api_content"].startswith(
+            "[Context from the interrupted assistant response]\n"
+            "[This response was interrupted by a user correction.]"
+        )
 
 
 class TestSteerInjection:
@@ -492,6 +603,24 @@ class TestSteerMarkerContract:
         emitted = format_steer_marker("hi")
         assert STEER_MARKER_OPEN in emitted and STEER_MARKER_CLOSE in emitted
         assert STEER_MARKER_OPEN in STEER_CHANNEL_NOTE and STEER_MARKER_CLOSE in STEER_CHANNEL_NOTE
+
+    def test_system_prompt_scopes_freshness_to_unanswered_marker(self):
+        """A delivered marker remains in immutable history on later API calls.
+
+        The prompt contract must distinguish the unanswered tail occurrence
+        from one followed by an assistant response, or a model can interpret a
+        historical steer as newly delivered and repeat non-idempotent work.
+        """
+        from agent.prompt_builder import STEER_CHANNEL_NOTE
+
+        assert "latest tool-result batch" in STEER_CHANNEL_NOTE
+        assert "no later assistant message follows it" in STEER_CHANNEL_NOTE
+        assert "do not treat it as a new message" in STEER_CHANNEL_NOTE
+        assert "repeat completed work" in STEER_CHANNEL_NOTE
+
+        emitted = format_steer_marker("deploy once")
+        assert "delivered once at this position" in emitted
+        assert "not a new delivery when replayed" in emitted
 
     def test_marker_no_longer_uses_the_distrusted_label(self):
         """Regression: the bare 'User guidance:' line read as tool content and

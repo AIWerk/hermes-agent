@@ -1,6 +1,7 @@
 """Tests for the Microsoft Teams platform adapter plugin."""
 
 import json
+from importlib import metadata
 import sys
 import types
 from types import SimpleNamespace
@@ -8,6 +9,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+
+try:
+    metadata.version("microsoft-teams-apps")
+except metadata.PackageNotFoundError:
+    pytest.skip(
+        "Microsoft Teams SDK not installed; install the 'teams' extra to run this module",
+        allow_module_level=True,
+    )
 
 from gateway.config import Platform, PlatformConfig, HomeChannel
 from plugins.teams_pipeline.models import TeamsMeetingRef, TeamsMeetingSummaryPayload
@@ -298,6 +307,16 @@ class TestTeamsPluginRegistration:
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
         assert kwargs["name"] == "teams"
+
+    def test_register_splits_passive_probe_from_active_installer(self):
+        # check_fn is the PASSIVE probe (status displays call it freely);
+        # the ACTIVE lazy-installer rides on ensure_deps_fn, which
+        # create_adapter() invokes when the passive probe fails (#79812).
+        ctx = MagicMock()
+        register(ctx)
+        kwargs = ctx.register_platform.call_args[1]
+        assert kwargs["check_fn"] is check_requirements
+        assert kwargs["ensure_deps_fn"] is check_teams_requirements
 
     def test_register_auth_env_vars(self):
         ctx = MagicMock()

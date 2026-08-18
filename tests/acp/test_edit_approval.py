@@ -33,12 +33,29 @@ def test_acp_permission_tool_call_uses_edit_kind_and_diff_content():
 
     assert tool_call.kind == "edit"
     assert tool_call.status == "pending"
-    assert tool_call.rawInput == {"tool": "write_file", "arguments": proposal.arguments}
+    assert tool_call.rawInput == {"tool": "write_file", "arguments": {"path": "demo.txt"}}
     assert len(tool_call.content) == 1
     diff = tool_call.content[0]
     assert diff.path == "demo.txt"
     assert diff.oldText == "old\n"
     assert diff.newText == "new\n"
+
+
+def test_acp_permission_tool_call_redacts_credentials_from_diff_and_raw_input():
+    credential = "Bearer sk-abcdefghijklmnopqrstuvwxyz123456"
+    proposal = EditProposal(
+        tool_name="write_file",
+        path="demo.txt",
+        old_text=f"Authorization: {credential}\n",
+        new_text=f"Authorization: {credential}\nupdated=true\n",
+        arguments={"path": "demo.txt", "content": f"Authorization: {credential}\n"},
+    )
+
+    tool_call = build_acp_edit_tool_call(proposal)
+
+    rendered = repr(tool_call)
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in rendered
+    assert tool_call.rawInput == {"tool": "write_file", "arguments": {"path": "demo.txt"}}
 
 
 

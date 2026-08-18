@@ -15,8 +15,8 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         executions,
-        "_executions_file",
-        lambda: tmp_path / "cron" / "executions.db",
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
     )
     return executions
 
@@ -41,6 +41,24 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     persisted = executions.list_executions(job_id="job-1")
     assert persisted == [completed]
+
+
+def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
+    import cron.executions as executions
+
+    current_home = {"path": tmp_path / "default"}
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
+    monkeypatch.setattr(executions, "get_hermes_home", lambda: current_home["path"])
+
+    default_row = executions.create_execution("default-job", source="builtin")
+    current_home["path"] = tmp_path / "worker"
+    worker_row = executions.create_execution("worker-job", source="builtin")
+
+    assert executions.list_executions() == [worker_row]
+    current_home["path"] = tmp_path / "default"
+    assert executions.list_executions() == [default_row]
+    assert (tmp_path / "default" / "cron" / "executions.db").is_file()
+    assert (tmp_path / "worker" / "cron" / "executions.db").is_file()
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
@@ -71,12 +89,12 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    executions._executions_file().parent.mkdir(parents=True)
-    executions._executions_file().write_bytes(b"not a sqlite database")
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    executions.EXECUTIONS_FILE.write_bytes(b"not a sqlite database")
 
     with __import__("pytest").raises(sqlite3.DatabaseError):
         executions.create_execution("new", source="builtin")
-    assert executions._executions_file().read_bytes() == b"not a sqlite database"
+    assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
 
 
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
@@ -121,7 +139,7 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("other-live", source="builtin")
-    with sqlite3.connect(executions._executions_file()) as conn:
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
         conn.execute(
             "UPDATE executions SET process_id=?, pid=? WHERE id=?",
             ("another-import", os.getpid(), record["id"]),
@@ -134,7 +152,7 @@ def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
 def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("recycled", source="builtin")
-    with sqlite3.connect(executions._executions_file()) as conn:
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
         conn.execute(
             "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
             ("old-import", -1, record["id"]),
@@ -212,7 +230,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
-    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id: True)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
@@ -245,7 +263,7 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)

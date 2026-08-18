@@ -12,11 +12,16 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
+# Optional test override. Production resolves the path at transaction time so
+# dashboard operations that temporarily enter another profile cannot leak that
+# profile's execution records into the import-time home.
+EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -29,9 +34,9 @@ def _executions_file() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    executions_file = _executions_file()
-    executions_file.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(executions_file, timeout=5)
+    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

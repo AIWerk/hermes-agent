@@ -714,6 +714,259 @@ class TestWebServerEndpoints:
         assert "admin-chat" in admin_ids
         assert "user-chat" not in admin_ids
 
+    def test_cui_actor_full_sessions_still_emit_public_projection(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_state import SessionDB
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+        model_config = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": actor["actor_id"],
+            "_cui_tenant_id": actor["tenant_id"],
+            "private_note": "must-not-cross",
+        }
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="actor-full-row",
+                source="cli",
+                system_prompt="private system prompt",
+                model_config=model_config,
+            )
+            db.append_message("actor-full-row", role="user", content="customer question")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+        resp = self.client.get("/api/sessions?limit=20&offset=0&full=1")
+
+        assert resp.status_code == 200
+        row = next(s for s in resp.json()["sessions"] if s["id"] == "actor-full-row")
+        internal_or_secret = {
+            key
+            for key, visibility in SessionDB._SESSION_COLUMN_VISIBILITY.items()
+            if visibility != "public"
+        }
+        assert internal_or_secret.isdisjoint(row)
+
+    def test_customer_session_detail_history_and_export_are_public_projected(self, monkeypatch):
+        import asyncio
+
+        import hermes_cli.web_server as ws
+        from hermes_cli.web_routers.sessions import (
+            get_session_detail as extracted_detail,
+            get_session_messages as extracted_messages,
+        )
+        from hermes_state import SessionDB
+        from starlette.requests import Request
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        model_config = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": actor["actor_id"],
+            "_cui_tenant_id": actor["tenant_id"],
+            "private_note": secret,
+        }
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="actor-detail-row",
+                source="cli",
+                system_prompt=f"private {secret}",
+                model_config=model_config,
+            )
+            db.append_message(
+                "actor-detail-row",
+                role="assistant",
+                content=f"Authorization: Bearer {secret}",
+            )
+        finally:
+            db.close()
+
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+        internal_or_secret = {
+            key
+            for key, visibility in SessionDB._SESSION_COLUMN_VISIBILITY.items()
+            if visibility != "public"
+        }
+
+        detail = self.client.get("/api/sessions/actor-detail-row")
+        history = self.client.get("/api/sessions/actor-detail-row/messages")
+        export = self.client.get("/api/sessions/actor-detail-row/export")
+        assert detail.status_code == history.status_code == export.status_code == 200
+        assert internal_or_secret.isdisjoint(detail.json())
+        assert secret not in repr(history.json())
+        assert secret not in export.text
+        assert internal_or_secret.isdisjoint(export.json())
+
+        request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+        extracted_row = asyncio.run(extracted_detail("actor-detail-row", request))
+        extracted_history = asyncio.run(
+            extracted_messages(
+                "actor-detail-row",
+                request,
+                profile=None,
+                limit=None,
+                offset=0,
+                order=None,
+                include_compacted=False,
+            )
+        )
+        assert internal_or_secret.isdisjoint(extracted_row)
+        assert secret not in repr(extracted_history)
+
+    def test_exhaustive_rich_paging_disables_per_page_pinned_backfill(self):
+        from hermes_cli import web_server as runtime_web_server
+
+        class FakeDB:
+            def __init__(self):
+                self.calls = []
+
+            def list_sessions_rich(self, *, limit, offset, include_pinned, **kwargs):
+                self.calls.append((limit, offset, include_pinned))
+                if offset == 0:
+                    return [{"id": str(i)} for i in range(1000)]
+                if offset == 1000:
+                    return [{"id": "last"}]
+                return []
+
+        db = FakeDB()
+        rows = runtime_web_server._list_sessions_rich_all(
+            db, include_pinned=True, compact_rows=False
+        )
+        assert len(rows) == 1001
+        assert db.calls == [
+            (1000, 0, False),
+            (1000, 1000, False),
+        ]
+
+    def test_extracted_profile_lists_require_actor_filter_and_public_projection(self):
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parents[2] / "hermes_cli" / "web_routers" / "profiles.py"
+        ).read_text()
+        profile_list = source[source.index("def get_profiles_sessions("):source.index("def get_profiles_sessions_sidebar(")]
+        sidebar = source[source.index("def get_profiles_sessions_sidebar("):]
+        for section in (profile_list, sidebar):
+            assert "request: Request" in section
+            assert '_cui_actor_context_from_request' in section
+            assert '_session_visible_to_cui_actor' in section
+            assert '_project_session_list_rows_public' in section
+            assert '_list_sessions_rich_all' in section
+            assert 'compact_rows": False if actor else' in section
+        assert "limit=None if actor" not in profile_list
+        assert "min(max(limit + offset, limit), 500)" not in profile_list
+
+    def test_extracted_session_search_and_bulk_admin_routes_are_actor_safe(self):
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parents[2] / "hermes_cli" / "web_routers" / "sessions.py"
+        ).read_text()
+        search = source[source.index("async def search_sessions("):source.index("async def bulk_delete_sessions_endpoint(")]
+        assert "request: Request" in search
+        assert "_session_visible_to_cui_actor" in search
+        assert "_project_session_list_rows_public" in search
+        assert "_sanitize_public_message_value" in search
+        assert "raw_session = db.get_session(raw_sid)" in search
+        assert "while len(seen) < safe_limit:" in search
+        assert "fetch_limit *= 2" in search
+        assert "id_fetch_limit *= 2" in search
+
+        main_source = (
+            Path(__file__).parents[2] / "hermes_cli" / "web_server.py"
+        ).read_text()
+        main_search = main_source[
+            main_source.index("def add_lineage_result(raw_sid: str, payload: dict) -> None:", main_source.index('@app.get("/api/sessions/search")')):
+            main_source.index('return {"results": list(seen.values())}', main_source.index('@app.get("/api/sessions/search")'))
+        ]
+        assert "_project_session_list_rows_public([row])" in main_search
+        assert "_project_session_list_rows([row])" not in main_search
+        assert "_sanitize_public_message_value" in main_search
+        assert "raw_session = db.get_session(raw_sid)" in main_search
+        assert "while len(seen) < safe_limit:" in main_search
+        assert "fetch_limit *= 2" in main_search
+        assert "id_fetch_limit *= 2" in main_search
+        assert '"lineage_root"' not in main_search[main_search.index("if actor:", main_search.index("else:\n                    payload")):]
+
+        from hermes_cli import web_server as runtime_web_server
+        from hermes_cli.web_deps import late
+
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        sanitizer = runtime_web_server._sanitize_public_message_value
+        extracted_sanitizer = late("_sanitize_public_message_value")
+        assert callable(extracted_sanitizer)
+        for active_sanitizer in (sanitizer, extracted_sanitizer):
+            assert secret not in repr(
+                active_sanitizer({"snippet": f"Authorization: Bearer {secret}"})
+            )
+
+        bulk = source[source.index("async def bulk_delete_sessions_endpoint("):source.index("async def import_sessions_endpoint(")]
+        assert "request: Request" in bulk
+        assert "_enforce_cui_session_visible" in bulk
+        for name in (
+            "import_sessions_endpoint",
+            "count_empty_sessions_endpoint",
+            "delete_empty_sessions_endpoint",
+            "get_session_stats",
+        ):
+            section = source[source.index(f"async def {name}("):]
+            assert "request: Request" in section.split("async def ", 1)[0] or "request: Request" in section[:300]
+            assert "_cui_actor_context_from_request" in section[:1400]
+
+    def test_extracted_sessions_router_full_is_public_for_customer_actor(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.web_routers.sessions import get_sessions as extracted_get_sessions
+        from starlette.requests import Request
+
+        actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
+        raw = {
+            "id": "owned",
+            "source": "cli",
+            "title": "Owned",
+            "system_prompt": "secret prompt",
+            "model_config": {
+                "_cui_visibility_scope": "customer",
+                "_cui_actor_role": "user",
+                "_cui_actor_id": "user-1",
+                "_cui_tenant_id": "tenant-1",
+            },
+        }
+
+        class FakeDB:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(ws, "_maybe_auto_archive_for_profile", lambda profile: None)
+        monkeypatch.setattr(ws, "_open_session_db_for_profile", lambda profile, read_only=True: FakeDB())
+        monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+        monkeypatch.setattr(ws, "_list_sessions_rich_all", lambda db, **kwargs: [raw])
+        monkeypatch.setattr(ws, "_cron_default_profile", lambda: "default")
+
+        request = Request({"type": "http", "method": "GET", "path": "/api/sessions", "headers": []})
+        data = extracted_get_sessions(
+            request=request,
+            limit=20,
+            offset=0,
+            min_messages=0,
+            archived="exclude",
+            order="created",
+            source=None,
+            sources=None,
+            exclude_sources=None,
+            cwd_prefix=None,
+            full=True,
+            profile=None,
+        )
+        row = data["sessions"][0]
+        assert row["id"] == "owned"
+        assert "system_prompt" not in row
+        assert "model_config" not in row
+
     def _create_session_with_heavy_fields(self, session_id: str) -> None:
         from hermes_state import SessionDB
 
@@ -797,6 +1050,11 @@ class TestWebServerEndpoints:
             db.close()
 
         monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
+        internal_or_secret = {
+            key
+            for key, visibility in SessionDB._SESSION_COLUMN_VISIBILITY.items()
+            if visibility != "public"
+        }
         for suffix in ("", "&full=1"):
             resp = self.client.get(f"/api/profiles/sessions?limit=1&offset=0{suffix}")
             assert resp.status_code == 200
@@ -804,6 +1062,7 @@ class TestWebServerEndpoints:
             assert data["total"] == 1
             assert data["profile_totals"]["default"] == 1
             assert [row["id"] for row in data["sessions"]] == ["profiles-owned"]
+            assert all(internal_or_secret.isdisjoint(row) for row in data["sessions"])
 
         db = SessionDB()
         try:
@@ -866,6 +1125,16 @@ class TestWebServerEndpoints:
         actor = {"tenant_id": "tenant-1", "actor_id": "user-1", "role": "user"}
         monkeypatch.setattr(ws, "_cui_actor_context_from_request", lambda request: actor)
         data = self.client.get("/api/profiles/sessions/sidebar").json()
+        internal_or_secret = {
+            key
+            for key, visibility in SessionDB._SESSION_COLUMN_VISIBILITY.items()
+            if visibility != "public"
+        }
+        assert all(
+            internal_or_secret.isdisjoint(row)
+            for section in ("recents", "cron", "messaging")
+            for row in data[section]["sessions"]
+        )
         all_ids = {
             row["id"]
             for section in ("recents", "cron", "messaging")
@@ -880,6 +1149,34 @@ class TestWebServerEndpoints:
         restricted = self.client.get("/api/profiles/sessions/sidebar").json()
         assert all(not restricted[name]["sessions"] for name in ("recents", "cron", "messaging"))
         assert restricted["recents"]["total"] == 0
+
+    def test_profiles_project_tree_fails_closed_for_customer_actor(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli.web_routers.profiles import get_profiles_projects_tree
+        from starlette.requests import Request
+
+        monkeypatch.setattr(
+            ws,
+            "_cui_actor_context_from_request",
+            lambda request: {
+                "tenant_id": "tenant-1",
+                "actor_id": "user-1",
+                "role": "user",
+            },
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/profiles/projects/tree",
+                "headers": [],
+            }
+        )
+        assert get_profiles_projects_tree(request) == {
+            "projects": [],
+            "scoped_session_ids": [],
+            "errors": [],
+        }
 
     def test_session_mutations_hide_foreign_targets_and_bulk_delete_is_atomic(self, monkeypatch):
         import hermes_cli.web_server as ws
@@ -1690,8 +1987,9 @@ class TestWebServerEndpoints:
 
         captured = {}
 
-        def fake_transcribe_audio(path, model=None):
+        def fake_transcribe_audio(path, model=None, source=None):
             captured["path"] = path
+            captured["source"] = source
             return {
                 "success": True,
                 "transcript": "hello from voice mode",
@@ -1715,6 +2013,7 @@ class TestWebServerEndpoints:
             "provider": "test",
         }
         assert captured["path"].endswith(".webm")
+        assert captured["source"] == "voice_mode"
         assert not Path(captured["path"]).exists()
 
     def test_audio_transcription_no_speech_is_not_an_error(self, monkeypatch):
@@ -1727,7 +2026,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr(
             transcription_tools,
             "transcribe_audio",
-            lambda path, model=None: {
+            lambda path, model=None, source=None: {
                 "success": False,
                 "transcript": "",
                 "error": "ElevenLabs STT returned empty transcript",
@@ -1952,8 +2251,8 @@ class TestWebServerEndpoints:
 
         calls = []
 
-        def fake_spawn(subcommand, name):
-            calls.append((subcommand, name))
+        def fake_spawn(subcommand, name, *, env_overrides=None):
+            calls.append((subcommand, name, env_overrides))
             return Proc()
 
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
@@ -1965,8 +2264,18 @@ class TestWebServerEndpoints:
         resp = self.client.post("/api/hermes/update")
 
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
-        assert calls == [(["update"], "hermes-update")]
+        payload = resp.json()
+        assert payload["ok"] is True
+        assert payload["pid"] == 12345
+        assert payload["name"] == "hermes-update"
+        assert payload["action_id"]
+        assert calls == [
+            (
+                ["update"],
+                "hermes-update",
+                {"HERMES_ACTION_ID": payload["action_id"]},
+            )
+        ]
 
     def test_action_status_reaps_completed_process(self, monkeypatch):
         import hermes_cli.web_server as web_server
@@ -5702,6 +6011,738 @@ Web Link: https://mail.google.com/mail/u/0/#all/gmail-1
         assert resp.status_code == 200
         assert resp.json()["pagination"]["limit"] == 500
 
+    @pytest.mark.requires_wal
+    def test_get_sessions_poll_preserves_pending_wal(self):
+        """Repeated GET-only polls must not checkpoint another writer's WAL."""
+        import sqlite3
+
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        web_server._last_auto_archive_check.clear()
+        db_path = get_hermes_home() / "state.db"
+        wal_path = Path(f"{db_path}-wal")
+        writer = SessionDB(db_path=db_path)
+        monitor = None
+        try:
+            writer._conn.execute("PRAGMA wal_autocheckpoint=0")
+            writer.create_session("poll-wal", source="cli")
+            writer.append_message(
+                "poll-wal",
+                role="user",
+                content="pending writer frame " + ("x" * 65_536),
+            )
+
+            monitor = sqlite3.connect(str(db_path), isolation_level=None)
+            wal_bytes_before = wal_path.stat().st_size
+            data_version_before = monitor.execute(
+                "PRAGMA data_version"
+            ).fetchone()[0]
+            counts_before = monitor.execute(
+                "SELECT (SELECT COUNT(*) FROM sessions), "
+                "(SELECT COUNT(*) FROM messages)"
+            ).fetchone()
+
+            responses = [
+                self.client.get(
+                    "/api/sessions?limit=50&offset=0&order=created"
+                )
+                for _ in range(3)
+            ]
+
+            wal_bytes_after = wal_path.stat().st_size
+            data_version_after = monitor.execute(
+                "PRAGMA data_version"
+            ).fetchone()[0]
+            counts_after = monitor.execute(
+                "SELECT (SELECT COUNT(*) FROM sessions), "
+                "(SELECT COUNT(*) FROM messages)"
+            ).fetchone()
+
+            assert all(response.status_code == 200 for response in responses)
+            assert all(response.json()["total"] == 1 for response in responses)
+            assert wal_bytes_before > 0
+            assert wal_bytes_after == wal_bytes_before
+            assert data_version_after == data_version_before
+            assert counts_after == counts_before == (1, 1)
+        finally:
+            if monitor is not None:
+                monitor.close()
+            writer.close()
+    def test_get_status_loads_gateway_config_off_event_loop(self, monkeypatch):
+        """Cold gateway config loading must not block the WebSocket loop.
+
+        On Windows the first ``load_gateway_config()`` call imports and
+        discovers platform adapters and can take longer than Desktop's 15s
+        WebSocket timeout.  Running it inline makes a concurrent /api/ws
+        handshake time out before ``gateway.ready`` can be sent.
+        """
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as web_server
+
+        seen = {}
+
+        class _Config:
+            @staticmethod
+            def get_connected_platforms():
+                return []
+
+        def _load():
+            seen["thread"] = threading.get_ident()
+            return _Config()
+
+        monkeypatch.setattr(gateway_config, "load_gateway_config", _load)
+
+        async def _run():
+            event_loop_thread = threading.get_ident()
+            await web_server.get_status()
+            return event_loop_thread
+
+        event_loop_thread = asyncio.run(_run())
+
+        assert seen["thread"] != event_loop_thread
+    def test_get_sessions_auto_archive_uses_maintenance_writer(self):
+        from hermes_cli import web_server
+        from hermes_cli.config import load_config, save_config
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("stale", source="cli")
+            seed.create_session("fresh", source="cli")
+            seed._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - 30 * 86400, "stale"),
+            )
+        finally:
+            seed.close()
+
+        config = load_config()
+        config.setdefault("sessions", {}).update(
+            {
+                "auto_archive": True,
+                "auto_archive_days": 3,
+                "min_interval_hours": 0,
+            }
+        )
+        save_config(config)
+        web_server._last_auto_archive_check.clear()
+
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["sessions"]] == ["fresh"]
+        verify = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert verify.get_session("stale")["archived"] == 1
+            assert verify.get_meta("last_auto_archive")
+        finally:
+            verify.close()
+    def test_get_sessions_fresh_store_returns_empty_list(self):
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        assert response.json()["sessions"] == []
+        assert response.json()["total"] == 0
+    @pytest.mark.parametrize(
+        "missing_column", ["archived", "pinned", "last_activity_at"]
+    )
+    def test_get_sessions_heals_stale_schema_store(self, missing_column):
+        import sqlite3
+
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("stale-schema", source="cli")
+        finally:
+            seed.close()
+
+        legacy = sqlite3.connect(str(db_path))
+        try:
+            legacy.execute(f"ALTER TABLE sessions DROP COLUMN {missing_column}")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["sessions"]] == [
+            "stale-schema"
+        ]
+        healed = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                row[1] for row in healed.execute("PRAGMA table_info(sessions)")
+            }
+        finally:
+            healed.close()
+        assert missing_column in columns
+    def test_profiles_sidebar_heals_stale_schema_store(self):
+        """The desktop's batched sidebar route must heal a stale store too.
+
+        The shipped regression (#72424 aftermath): a store predating
+        ``sessions.last_activity_at`` made every per-profile read raise
+        "no such column", which this endpoint swallowed into its ``errors``
+        array — the desktop rendered "No sessions yet" after `hermes update`
+        until the user's first message forced a writable open elsewhere.
+        """
+        import sqlite3
+
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("sidebar-stale", source="cli")
+            seed.append_message(
+                session_id="sidebar-stale", role="user", content="hi"
+            )
+        finally:
+            seed.close()
+
+        legacy = sqlite3.connect(str(db_path))
+        try:
+            legacy.execute("ALTER TABLE sessions DROP COLUMN last_activity_at")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        response = self.client.get("/api/profiles/sessions/sidebar")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["errors"] == []
+        assert [row["id"] for row in payload["recents"]["sessions"]] == [
+            "sidebar-stale"
+        ]
+    def test_startup_eager_reconcile_heals_stale_store(self):
+        """The lifespan's eager reconcile brings a stale store current.
+
+        #79531/#80037: after `hermes update` an old-schema state.db used to
+        stay stale until the first NEW session forced a writable open —
+        every /api/sessions poll 500ed with "no such column" in between.
+        The lifespan now schedules one writable open at startup; this
+        exercises that worker directly against a store missing
+        sessions.last_read_at and asserts the schema is brought current.
+        """
+        import sqlite3
+
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("eager-stale", source="cli")
+        finally:
+            seed.close()
+
+        legacy = sqlite3.connect(str(db_path))
+        try:
+            legacy.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        web_server._eager_reconcile_own_session_db()
+
+        healed = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                row[1] for row in healed.execute("PRAGMA table_info(sessions)")
+            }
+        finally:
+            healed.close()
+        assert "last_read_at" in columns
+
+        # The healed store serves the full rich listing.
+        db = SessionDB(db_path=db_path, read_only=True)
+        try:
+            rows = db.list_sessions_rich(limit=10, compact_rows=True)
+        finally:
+            db.close()
+        assert [r["id"] for r in rows] == ["eager-stale"]
+    def test_startup_eager_reconcile_never_raises(self, monkeypatch):
+        """A store the eager reconcile cannot open must not break startup."""
+        import sqlite3 as sqlite3_module
+
+        import hermes_state
+
+        from hermes_cli import web_server
+
+        def boom(*args, **kwargs):
+            raise sqlite3_module.OperationalError("database is locked")
+
+        monkeypatch.setattr(hermes_state, "SessionDB", boom)
+        # Must swallow — reads fall back to the per-poll probe heal.
+        web_server._eager_reconcile_own_session_db()
+    def test_heal_gives_up_when_reconcile_cannot_fix_the_store(self, monkeypatch):
+        """A probe failure reconciliation can't cure must not retry forever.
+
+        The writable heal is a full SessionDB init against a possibly-live
+        DB. If the store is STILL behind the probe afterwards (schema problem
+        ADD COLUMN can't express), retrying that init on every sidebar poll
+        would hammer the DB for nothing: serve reads probe-less instead, warn
+        once, and never pay the writable open for that store again.
+        """
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("unfixable", source="cli")
+        finally:
+            seed.close()
+
+        # A column no SCHEMA_SQL declares: the heal's writable reconcile
+        # cannot add it, so the re-probe keeps failing.
+        monkeypatch.setattr(
+            web_server,
+            "_session_db_read_probe_statements",
+            lambda: ('SELECT "sessions"."not_a_real_column" FROM "sessions" LIMIT 0',),
+        )
+        monkeypatch.setattr(web_server, "_session_db_heal_exhausted", set())
+        monkeypatch.setattr(web_server, "_session_db_heal_warned", set())
+
+        writable_opens = []
+
+        import hermes_state
+
+        original_init = hermes_state.SessionDB.__init__
+
+        def counting_init(self, *args, **kwargs):
+            if not kwargs.get("read_only", False):
+                writable_opens.append(1)
+            return original_init(self, *args, **kwargs)
+
+        # web_server imports SessionDB inside the function body, so patching
+        # the class on hermes_state covers every open the helper makes.
+        monkeypatch.setattr(hermes_state.SessionDB, "__init__", counting_init)
+
+        # First open: probe fails -> one writable heal -> re-probe fails ->
+        # exhausted. Still returns a usable read-only handle.
+        db = web_server._open_session_db_for_profile(None, read_only=True)
+        try:
+            assert db.list_sessions_rich(limit=10, compact_rows=True)
+        finally:
+            db.close()
+        assert len(writable_opens) == 1
+        assert str(db_path) in web_server._session_db_heal_exhausted
+
+        # Second open: probe skipped, NO further writable opens.
+        db = web_server._open_session_db_for_profile(None, read_only=True)
+        try:
+            assert db.list_sessions_rich(limit=10, compact_rows=True)
+        finally:
+            db.close()
+        assert len(writable_opens) == 1
+    def test_get_sessions_zero_byte_store_returns_empty_list(self):
+        from hermes_constants import get_hermes_home
+
+        db_path = get_hermes_home() / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.touch()
+
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        assert response.json()["sessions"] == []
+        assert response.json()["total"] == 0
+    def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        paths = [
+            "/api/sessions?limit=50&offset=0",
+            "/api/sessions/stats",
+            "/api/sessions/empty/count",
+            "/api/sessions?limit=10&offset=0&order=recent",
+        ] * 2
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            responses = list(pool.map(self.client.get, paths))
+
+        assert [response.status_code for response in responses] == [
+            200
+        ] * len(paths)
+    def test_openviking_recall_fields_are_numeric_dashboard_controls(self):
+        resp = self.client.get("/api/memory/providers/openviking/config")
+
+        assert resp.status_code == 200
+        fields = self._provider_field_map(resp.json())
+        assert fields["recall_limit"]["kind"] == "integer"
+        assert fields["recall_limit"]["minimum"] == 1
+        assert fields["recall_limit"]["maximum"] == 100
+        assert fields["recall_score_threshold"]["kind"] == "number"
+        assert fields["recall_score_threshold"]["step"] == 0.01
+        assert fields["recall_resources"]["kind"] == "boolean"
+    def test_openviking_dashboard_persists_typed_recall_values(self):
+        from hermes_cli.config import load_config
+
+        resp = self.client.put(
+            "/api/memory/providers/openviking/config",
+            json={
+                "values": {
+                    "endpoint": "http://127.0.0.1:1933",
+                    "recall_limit": "12",
+                    "recall_score_threshold": "0.42",
+                    "recall_max_injected_chars": "8000",
+                    "profile_token_budget": "7000",
+                    "recall_timeout_seconds": "2.5",
+                    "recall_request_timeout_seconds": "1.5",
+                    "recall_full_read_limit": "5",
+                    "recall_prefer_abstract": True,
+                    "recall_resources": False,
+                }
+            },
+        )
+
+        assert resp.status_code == 200
+        config = load_config()["memory"]["openviking"]
+        assert config["recall_limit"] == 12
+        assert config["recall_score_threshold"] == 0.42
+        assert config["profile_token_budget"] == 7000
+        assert config["recall_prefer_abstract"] is True
+        assert config["recall_resources"] is False
+    def test_openviking_dashboard_rejects_out_of_range_recall_value(self):
+        resp = self.client.put(
+            "/api/memory/providers/openviking/config",
+            json={
+                "values": {
+                    "endpoint": "http://127.0.0.1:1933",
+                    "recall_limit": 101,
+                }
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "must be at most 100" in resp.json()["detail"]
+    def test_openviking_dashboard_rejects_blocked_endpoint_before_saving(self):
+        from hermes_cli.config import load_config
+
+        resp = self.client.put(
+            "/api/memory/providers/openviking/config",
+            json={
+                "values": {
+                    "endpoint": "http://169.254.169.254/latest/meta-data/credential",
+                }
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "blocked metadata address" in resp.json()["detail"]
+        assert "credential" not in resp.json()["detail"]
+        memory_config = load_config().get("memory", {})
+        assert "openviking" not in memory_config
+    def test_update_hermes_spawns_with_action_id(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 12345
+
+        calls = []
+
+        def fake_spawn(subcommand, name, *, env_overrides=None):
+            calls.append((subcommand, name, env_overrides))
+            return Proc()
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "a" * 32)
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "pid": 12345,
+            "name": "hermes-update",
+            "action_id": "a" * 32,
+        }
+        assert calls == [
+            (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
+        ]
+    def test_update_hermes_reuses_running_action(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 24680
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda *_args, **_kwargs: pytest.fail("must not spawn a duplicate update"),
+        )
+        web_server._ACTION_PROCS["hermes-update"] = Proc()
+        web_server._ACTION_IDS["hermes-update"] = "b" * 32
+
+        try:
+            resp = self.client.post("/api/hermes/update")
+        finally:
+            web_server._ACTION_PROCS.pop("hermes-update", None)
+            web_server._ACTION_IDS.pop("hermes-update", None)
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "pid": 24680,
+            "name": "hermes-update",
+            "already_running": True,
+            "action_id": "b" * 32,
+        }
+    def test_custom_endpoint_save_scopes_to_the_requested_profile(self):
+        """``?profile=<name>`` must write into that profile's config.yaml.
+
+        The desktop settings UI targets the active profile, so a custom
+        endpoint saved while a non-default profile is selected has to land in
+        that profile's config — not the dashboard process's default home.
+        Before this fix the handlers ran bare ``load_config``/``save_config``,
+        so every custom provider silently landed in the default profile and
+        never appeared for the profile the user was actually configuring.
+        """
+        from hermes_cli import profiles as profiles_mod
+        from hermes_cli.config import custom_endpoint_key_env
+        from hermes_constants import get_hermes_home
+
+        default_home = get_hermes_home()
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+
+        assert self.client.post(
+            "/api/providers/custom-endpoints?profile=worker",
+            json={
+                "id": "worker-proxy",
+                "name": "Worker Proxy",
+                "base_url": "https://llm.worker.example/v1",
+                "model": "worker/model-1",
+                "api_key": "sk-worker-secret",
+            },
+        ).status_code == 200
+
+        # Assert against the files on disk rather than load_config()/
+        # get_env_value(): save_env_value also mirrors the key into the shared
+        # os.environ, so a reader-based check can't tell WHICH profile's store
+        # actually received the write.
+        env_var = custom_endpoint_key_env("worker-proxy")
+
+        worker_cfg = (worker_home / "config.yaml").read_text()
+        assert "worker-proxy" in worker_cfg
+        assert env_var in worker_cfg
+        assert "sk-worker-secret" in (worker_home / ".env").read_text()
+
+        for leaked in (default_home / "config.yaml", default_home / ".env"):
+            text = leaked.read_text() if leaked.exists() else ""
+            assert "worker-proxy" not in text, f"endpoint leaked into default profile ({leaked.name})"
+            assert "sk-worker-secret" not in text, f"credential leaked into default profile ({leaked.name})"
+
+        # And it comes back through the scoped GET, not the unscoped one.
+        scoped = self.client.get("/api/providers/custom-endpoints?profile=worker").json()
+        assert any(e["id"] == "worker-proxy" for e in scoped["endpoints"])
+        default_list = self.client.get("/api/providers/custom-endpoints").json()
+        assert not any(e["id"] == "worker-proxy" for e in default_list["endpoints"])
+    def test_get_session_messages_default_hides_compacted_rows(self):
+        """The endpoint default matches get_messages: active rows only.
+
+        Guards the #80680 contract — display reads opt into compacted history
+        explicitly; the dashboard default view stays as it was.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="compacted-default", source="cli")
+            db.append_messages_batch(
+                "compacted-default",
+                [
+                    {"role": "user", "content": "old q"},
+                    {"role": "assistant", "content": "old a"},
+                ],
+            )
+            db.archive_and_compact(
+                "compacted-default",
+                [
+                    {"role": "assistant", "content": "summary"},
+                    {"role": "user", "content": "live q"},
+                    {"role": "assistant", "content": "live a"},
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/compacted-default/messages")
+        assert resp.status_code == 200
+        contents = [m["content"] for m in resp.json()["messages"]]
+        assert contents == ["summary", "live q", "live a"]
+    def test_get_session_messages_include_compacted_surfaces_archived_rows(self):
+        """include_compacted=true returns the full display history: archived
+        (active=0, compacted=1) rows plus live rows, in insertion order.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="compacted-visible", source="cli")
+            db.append_messages_batch(
+                "compacted-visible",
+                [
+                    {"role": "user", "content": "old q"},
+                    {"role": "assistant", "content": "old a"},
+                ],
+            )
+            db.archive_and_compact(
+                "compacted-visible",
+                [
+                    {"role": "assistant", "content": "summary"},
+                    {"role": "user", "content": "live q"},
+                    {"role": "assistant", "content": "live a"},
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/compacted-visible/messages?include_compacted=true"
+        )
+        assert resp.status_code == 200
+        contents = [m["content"] for m in resp.json()["messages"]]
+        assert contents == ["old q", "old a", "summary", "live q", "live a"]
+    def test_get_session_messages_latest_page_with_compacted_rows(self):
+        """The desktop's real read path (getLatestSessionMessages: limit +
+        order=latest + include_compacted=true) pages back from the newest
+        message and returns the window in chronological order.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="compacted-latest", source="cli")
+            db.append_messages_batch(
+                "compacted-latest",
+                [
+                    {"role": "user", "content": "old q"},
+                    {"role": "assistant", "content": "old a"},
+                ],
+            )
+            db.archive_and_compact(
+                "compacted-latest",
+                [
+                    {"role": "assistant", "content": "summary"},
+                    {"role": "user", "content": "live q"},
+                    {"role": "assistant", "content": "live a"},
+                ],
+            )
+        finally:
+            db.close()
+
+        # Display history: old q, old a, summary, live q, live a (5 rows).
+        resp = self.client.get(
+            "/api/sessions/compacted-latest/messages"
+            "?include_compacted=true&limit=2&offset=1&order=latest"
+        )
+        assert resp.status_code == 200
+        contents = [m["content"] for m in resp.json()["messages"]]
+        # Newest-first window of 2, skipping the newest (live a):
+        # summary, live q — chronological order, matching the non-compacted path.
+        assert contents == ["summary", "live q"]
+    def test_get_session_messages_omitted_limit_defaults_to_500(self):
+        """The dashboard must never load an entire unbounded transcript."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="default-limit-messages", source="cli")
+            db.append_messages_batch(
+                "default-limit-messages",
+                [
+                    {"role": "user", "content": f"msg {i}"}
+                    for i in range(501)
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/default-limit-messages/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["pagination"] == {
+            "limit": 500,
+            "offset": 0,
+            "order": "latest",
+            "returned": 500,
+        }
+        assert len(payload["messages"]) == 500
+        assert payload["messages"][0]["content"] == "msg 1"
+        assert payload["messages"][-1]["content"] == "msg 500"
+
+        explicit = self.client.get(
+            "/api/sessions/default-limit-messages/messages?limit=2&offset=1"
+        ).json()
+        assert explicit["pagination"]["order"] == "oldest"
+        assert [message["content"] for message in explicit["messages"]] == [
+            "msg 1",
+            "msg 2",
+        ]
+
+        latest = self.client.get(
+            "/api/sessions/default-limit-messages/messages"
+            "?limit=2&offset=1&order=latest"
+        ).json()
+        assert latest["pagination"]["order"] == "latest"
+        assert [message["content"] for message in latest["messages"]] == [
+            "msg 498",
+            "msg 499",
+        ]
+    def test_export_session_streams_bounded_message_pages(self, monkeypatch):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="stream-export", source="cli")
+            db.append_messages_batch(
+                "stream-export",
+                [
+                    {"role": "user", "content": f"msg {i}"}
+                    for i in range(501)
+                ],
+            )
+        finally:
+            db.close()
+
+        calls = []
+        original_get_messages = SessionDB.get_messages
+
+        def tracked_get_messages(self, session_id, *args, **kwargs):
+            calls.append((kwargs.get("limit"), kwargs.get("after_id")))
+            return original_get_messages(self, session_id, *args, **kwargs)
+
+        monkeypatch.setattr(SessionDB, "get_messages", tracked_get_messages)
+        response = self.client.get("/api/sessions/stream-export/export")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["id"] == "stream-export"
+        assert len(payload["messages"]) == 501
+        assert payload["messages"][0]["content"] == "msg 0"
+        assert payload["messages"][-1]["content"] == "msg 500"
+        assert calls == [(500, 0), (500, 500)]
+
 
 
 
@@ -6070,6 +7111,7 @@ class TestNewEndpoints:
             "name": "discord",
             "platform": "discord",
             "enabled": True,
+            "post_setup_started": None,
         }
 
         config = load_config()
@@ -6332,6 +7374,68 @@ class TestNewEndpoints:
         assert top_skill["manage_count"] == 0
         assert top_skill["total_count"] == 1
         assert top_skill["last_used_at"] is not None
+
+    def test_toolsets_resolve_subscription_features_once(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config
+        from hermes_cli.nous_subscription import NousSubscriptionFeatures
+
+        calls = 0
+        features = NousSubscriptionFeatures(
+            subscribed=False,
+            nous_auth_present=False,
+            provider_is_nous=False,
+            features={},
+            account_info=None,
+        )
+
+        def resolve_features(config, *, force_fresh=False):
+            nonlocal calls
+            calls += 1
+            return features
+
+        monkeypatch.setattr(
+            tools_config,
+            "get_nous_subscription_features",
+            resolve_features,
+        )
+
+        resp = self.client.get("/api/tools/toolsets")
+
+        assert resp.status_code == 200
+        assert resp.json()
+        assert calls == 1
+    def test_analytics_usage_skips_full_insights_generate(self):
+        """get_usage_analytics must call get_usage_breakdown, not generate()."""
+        from unittest.mock import patch
+        from agent.insights import InsightsEngine
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="usage-tools-test",
+                source="cli",
+                model="anthropic/claude-sonnet-4",
+            )
+            db.update_token_counts(
+                "usage-tools-test",
+                input_tokens=10,
+                output_tokens=5,
+            )
+            db.append_message(
+                "usage-tools-test",
+                role="tool",
+                content="read output",
+                tool_name="read_file",
+            )
+        finally:
+            db.close()
+
+        with patch.object(InsightsEngine, "generate") as mock_generate:
+            resp = self.client.get("/api/analytics/usage?days=7")
+        assert resp.status_code == 200
+        mock_generate.assert_not_called()
+        assert any(tool["tool"] == "read_file" for tool in resp.json()["tools"])
 
 
 # ---------------------------------------------------------------------------
@@ -8240,7 +9344,7 @@ class TestValidateProviderCredential:
 
 
     def test_network_error_is_unreachable_not_blocking(self, monkeypatch):
-        monkeypatch.setattr("httpx.Client", _fake_httpx_client(raise_exc=True))
+        monkeypatch.setattr("httpx.AsyncClient", _fake_httpx_async_client(raise_exc=True))
         data = self._post("OPENROUTER_API_KEY", "sk-real").json()
         assert data["ok"] is False and data["reachable"] is False
 
@@ -8263,18 +9367,18 @@ class TestValidateProviderCredential:
             def __init__(self, *a, **k):
                 pass
 
-            def __enter__(self):
+            async def __aenter__(self):
                 return self
 
-            def __exit__(self, *a):
+            async def __aexit__(self, *a):
                 return False
 
-            def get(self, url, *a, headers=None, **k):
+            async def get(self, url, *a, headers=None, **k):
                 captured["url"] = url
                 captured["headers"] = headers
                 return _Resp()
 
-        monkeypatch.setattr("httpx.Client", _Client)
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
 
         resp = self.client.post(
             "/api/providers/validate",
@@ -8289,6 +9393,102 @@ class TestValidateProviderCredential:
         assert data["models"] == ["gpt-oss-120b"]
         assert captured["url"] == "https://text.example.com/v1/models"
         assert captured["headers"] == {"Authorization": "Bearer sk-secret"}
+
+    def test_rejected_key_blocks(self, monkeypatch):
+        monkeypatch.setattr("httpx.AsyncClient", _fake_httpx_async_client(status=401))
+        data = self._post("OPENROUTER_API_KEY", "sk-bogus").json()
+        assert data["ok"] is False and data["reachable"] is True
+    def test_valid_key_passes(self, monkeypatch):
+        monkeypatch.setattr("httpx.AsyncClient", _fake_httpx_async_client(status=200))
+        data = self._post("OPENAI_API_KEY", "sk-real").json()
+        assert data["ok"] is True and data["reachable"] is True
+    def test_rate_limited_counts_as_valid(self, monkeypatch):
+        monkeypatch.setattr("httpx.AsyncClient", _fake_httpx_async_client(status=429))
+        data = self._post("XAI_API_KEY", "xai-real").json()
+        assert data["ok"] is True
+    def test_local_endpoint_without_key_sends_no_auth_header(self, monkeypatch):
+        """No key → no Authorization header (keyless local servers unaffected)."""
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": []}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, *a, headers=None, **k):
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+        self.client.post(
+            "/api/providers/validate",
+            json={"key": "OPENAI_BASE_URL", "value": "http://127.0.0.1:8000/v1"},
+        )
+        assert captured["headers"] is None
+    def test_named_custom_endpoint_probe_is_async(self, monkeypatch):
+        """Custom endpoint validation must not block the dashboard event loop."""
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "local-model"}]}
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, *args, headers=None, **kwargs):
+                captured["url"] = url
+                captured["headers"] = headers
+                return _Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Local",
+                "base_url": "http://localhost:8000/v1",
+                "model": "local-model",
+                "api_key": "local-secret",
+            },
+        )
+
+        assert response.json() == {
+            "ok": True,
+            "reachable": True,
+            "message": "",
+            "models": ["local-model"],
+        }
+        assert captured == {
+            "url": "http://localhost:8000/v1/models",
+            "headers": {
+                "Accept": "application/json",
+                "Authorization": "Bearer local-secret",
+            },
+        }
 
 
 class TestDocxExtractionHardening:
@@ -8380,7 +9580,7 @@ def test_todo_summary_does_not_leak_agent_metadata_into_cui(tmp_path, monkeypatc
     summary = web_server._todo_summary({})
     texts = [item["text"] for item in summary["items"]]
 
-    assert texts == ["Angebot prüfen", "Rechnung senden"]
+    assert texts == ["Rechnung senden", "Angebot prüfen"]
     assert all("<!--" not in t and "hermes:id" not in t and "status=" not in t for t in texts)
 
 
@@ -8889,3 +10089,221 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.selftest_status == "failing"
         assert self.ws.DASHBOARD_HEALTH.selftest_http_status == 500
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
+
+
+class TestStatusMemoryBlock:
+    """NS-656: /api/status must always carry a `memory` block."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    def test_memory_block_present_with_pressure_field(self):
+        data = self.client.get("/api/status").json()
+        assert "memory" in data
+        assert data["memory"]["pressure"] in {
+            "ok", "elevated", "critical", "unknown",
+        }
+
+    def test_memory_block_degrades_when_collector_raises(self, monkeypatch):
+        """A broken collector must never take down the status endpoint —
+        the block degrades to pressure=unknown."""
+        import gateway.memory_status as ms
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("collector exploded")
+
+        monkeypatch.setattr(ms, "collect_memory_status", _boom)
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        assert resp.json()["memory"] == {"pressure": "unknown"}
+
+    def test_disk_block_present_with_pressure_field(self):
+        data = self.client.get("/api/status").json()
+        assert "disk" in data
+        assert data["disk"]["pressure"] in {
+            "ok", "elevated", "critical", "unknown",
+        }
+
+    def test_disk_block_degrades_when_collector_raises(self, monkeypatch):
+        """Same contract as the memory block: a broken collector must never
+        take down the status endpoint."""
+        import gateway.disk_status as ds
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("collector exploded")
+
+        monkeypatch.setattr(ds, "collect_disk_status", _boom)
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        assert resp.json()["disk"] == {"pressure": "unknown"}
+
+def _fake_httpx_async_client(*, status: int | None = None, raise_exc: bool = False):
+    """Build a drop-in for httpx.AsyncClient with a canned GET response."""
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+        @property
+        def is_success(self):
+            return 200 <= self.status_code < 300
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            if raise_exc:
+                raise RuntimeError("connection refused")
+            return _Resp(status)
+
+    return _Client
+
+class TestHashedAssetCacheHeaders:
+    """Hashed /assets/* responses must be immutable-cacheable; index.html
+    must stay no-store so it always references the current hashes
+    (salvaged from PR #28543)."""
+
+    _IMMUTABLE = "public, max-age=31536000, immutable"
+
+    @staticmethod
+    def _client(tmp_path, monkeypatch):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        dist = tmp_path / "web_dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(
+            "<html><head></head><body>SPA</body></html>", encoding="utf-8"
+        )
+        (dist / "assets" / "index-abc123.js").write_text(
+            "console.log('bundle');", encoding="utf-8"
+        )
+        (dist / "assets" / "index-abc123.css").write_text(
+            "body{background:url(/ds-assets/bg.png);"
+            "font-family:url(/fonts-terminal/x.woff2)}",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ws, "WEB_DIST", dist)
+        monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
+        spa_app = FastAPI()
+        ws.mount_spa(spa_app)
+        return TestClient(spa_app)
+
+    def test_hashed_js_asset_is_immutable(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/assets/index-abc123.js")
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == self._IMMUTABLE
+
+    def test_serve_css_is_immutable_and_keeps_prefix_rewrites(
+        self, tmp_path, monkeypatch
+    ):
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/assets/index-abc123.css")
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == self._IMMUTABLE
+
+        # The proxy-prefix rewrite path (main's ds-assets/fonts-terminal
+        # handling) must survive the header change.
+        prefixed = client.get(
+            "/assets/index-abc123.css",
+            headers={"X-Forwarded-Prefix": "/hermes"},
+        )
+        assert prefixed.status_code == 200
+        assert prefixed.headers["cache-control"] == self._IMMUTABLE
+        assert "url(/hermes/ds-assets/bg.png)" in prefixed.text
+        assert "url(/hermes/fonts-terminal/x.woff2)" in prefixed.text
+
+    def test_index_html_stays_no_store(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        for route in ("/", "/chat"):
+            resp = client.get(route)
+            assert resp.status_code == 200
+            cache_control = resp.headers["cache-control"]
+            assert "no-store" in cache_control
+            assert "immutable" not in cache_control
+
+    def test_missing_asset_is_not_marked_immutable(self, tmp_path, monkeypatch):
+        """A 404 must never be cached for a year — a later rebuild can
+        legitimately create the file."""
+        client = self._client(tmp_path, monkeypatch)
+        resp = client.get("/assets/nope-000000.js")
+        assert resp.status_code == 404
+        assert "immutable" not in resp.headers.get("cache-control", "")
+
+class TestSessionPatchUnread:
+    """PATCH /api/sessions/{id} with {"unread": bool} marks the session
+    read/unread, and GET /api/sessions surfaces the derived flag."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        monkeypatch.setattr(
+            hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
+        )
+
+        self.client = TestClient(app)
+        self.auth_client = TestClient(app)
+        self.auth_client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message(session_id="s1", role="user", content="hi")
+            db.set_session_read("s1")  # start read, like a conversation you opened
+        finally:
+            db.close()
+
+    def test_patch_unread_true_marks_row_unread(self):
+        resp = self.auth_client.patch("/api/sessions/s1", json={"unread": True})
+        assert resp.status_code == 200
+        assert resp.json()["unread"] is True
+
+        rows = self.auth_client.get("/api/sessions?limit=100").json()["sessions"]
+        assert next(s for s in rows if s["id"] == "s1")["unread"] is True
+
+    def test_patch_unread_false_marks_row_read(self):
+        self.auth_client.patch("/api/sessions/s1", json={"unread": True})
+        resp = self.auth_client.patch("/api/sessions/s1", json={"unread": False})
+        assert resp.status_code == 200
+        assert resp.json()["unread"] is False
+
+        rows = self.auth_client.get("/api/sessions?limit=100").json()["sessions"]
+        assert next(s for s in rows if s["id"] == "s1")["unread"] is False
+
+    def test_patch_unread_alone_is_accepted(self):
+        # The route's "Nothing to update" guard must not reject a bare unread.
+        resp = self.auth_client.patch("/api/sessions/s1", json={"unread": True})
+        assert resp.status_code == 200
+
+    def test_patch_unread_rejects_non_bool(self):
+        # NB: pydantic v2 coerces "yes"/"no"/"1"/"0"/"on"/"off" to bool, so use
+        # a string outside the accepted set to prove validation rejects it.
+        resp = self.auth_client.patch("/api/sessions/s1", json={"unread": "maybe"})
+        assert resp.status_code == 422  # pydantic validation

@@ -112,6 +112,9 @@ def _install_fake_tools_package():
     sys.modules["agent.credential_persistence"] = types.SimpleNamespace(
         sanitize_borrowed_credential_payload=lambda entry, provider_id=None: entry,
     )
+    sys.modules["agent.secret_scope"] = types.SimpleNamespace(
+        get_secret=lambda name, default=None: os.environ.get(name, default),
+    )
 
     # Stubs for the browser-provider plugin layer introduced in PR #25214.
     # The fake `agent` package has an empty __path__ so real submodules
@@ -192,7 +195,16 @@ def _install_fake_tools_package():
         def cleanup(self):
             return None
 
-    sys.modules["tools.environments.base"] = types.SimpleNamespace(BaseEnvironment=_DummyEnvironment)
+    class _DummyConnectionError(Exception):
+        def __init__(self, message="", backend="", detail="", *args):
+            super().__init__(message, *args)
+            self.backend = backend
+            self.detail = detail
+
+    sys.modules["tools.environments.base"] = types.SimpleNamespace(
+        BaseEnvironment=_DummyEnvironment,
+        EnvironmentConnectionError=_DummyConnectionError,
+    )
     sys.modules["tools.environments.local"] = types.SimpleNamespace(LocalEnvironment=_DummyEnvironment)
     sys.modules["tools.environments.singularity"] = types.SimpleNamespace(
         _get_scratch_dir=lambda: Path(tempfile.gettempdir()),

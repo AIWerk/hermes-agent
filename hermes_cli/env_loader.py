@@ -341,9 +341,17 @@ def _sanitize_loaded_credentials() -> None:
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        # utf-8-sig strips a leading UTF-8 BOM if present (PowerShell 5.1
+        # Set-Content -Encoding UTF8 / Notepad) and is a no-op for BOM-less
+        # UTF-8. Plain "utf-8" would keep U+FEFF on the first key name and
+        # silently drop it from os.environ under its canonical name.
+        load_dotenv(dotenv_path=path, override=override, encoding="utf-8-sig")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        # utf-8-sig can't strip a BOM once we fall back to latin-1 decode.
+        raw = path.read_bytes()
+        if raw.startswith(codecs.BOM_UTF8):
+            raw = raw[len(codecs.BOM_UTF8) :]
+        load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=override)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
@@ -509,10 +517,59 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
-    _apply_external_secret_sources(home_path)
+    # A fresh ``hermes update`` retry may have completed a deferred dependency
+    # install before importing this module.  Do not remap native secret-source
+    # dependencies in that same updater process or the self-lock preflight will
+    # recreate the marker and exit 2 again.  Dotenv and managed env still load;
+    # only external source resolution is unnecessary for the updater.
+    from hermes_cli import _early_recovery
+
+    if not _early_recovery._should_skip_external_secret_sources():
+        _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
+    # config.yaml is the documented source of truth for terminal.* settings,
+    # but the dotenv loads above run with override=True — so a stale
+    # TERMINAL_ENV=docker left in ~/.hermes/.env (e.g. written by an older
+    # `hermes setup` before the user switched terminal.backend in config.yaml)
+    # silently wins again on every reload. Startup launchers bridge
+    # config→env once, but long-lived processes (gateway per-turn reload,
+    # cron standalone runs) call load_hermes_dotenv() repeatedly and used to
+    # flip the effective backend back to the stale .env value mid-session
+    # (#29186, #67323). Re-apply config.yaml's explicit terminal keys last so
+    # the documented config path always wins. Runs after _apply_managed_env()
+    # so the merged config (which already carries the managed overlay) is
+    # what lands in the env.
+    _reapply_terminal_config_bridge(home_path)
+
     return loaded
+
+
+def _reapply_terminal_config_bridge(home_path: Path) -> None:
+    """Re-assert config.yaml's explicit ``terminal.*`` keys over reloaded .env.
+
+    Delegates to ``hermes_cli.config.apply_terminal_config_to_env`` — the
+    single shared bridge (same one terminal_tool's fallback and the TUI/
+    dashboard launchers use) — so key coverage, explicit-keys-only override
+    semantics, cwd placeholder handling, and the managed-scope overlay can't
+    drift from the other bridge sites. Only keys the user actually wrote in
+    config.yaml's ``terminal`` section override env values; a config.yaml
+    without a terminal section leaves .env/shell selections untouched.
+
+    Scoped to the process HERMES_HOME: the shared bridge reads the
+    process-global config, so re-applying it for a *different* profile's
+    ``load_hermes_dotenv(hermes_home=...)`` call would bridge the wrong
+    profile's config. Fail-open — a config problem must never break dotenv
+    loading (the historical env-driven behavior still applies).
+    """
+    try:
+        if Path(home_path).resolve() != _process_hermes_home().resolve():
+            return
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        apply_terminal_config_to_env(env=None)
+    except Exception:  # noqa: BLE001 — early bootstrap / malformed config
+        pass
 
 
 def _apply_managed_env() -> None:
@@ -588,6 +645,23 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         # on its next load_hermes_dotenv() call instead of never.
         return
 
+    # Defer the registry import until we know a secrets source is enabled —
+    # agent.secret_sources.bitwarden eagerly loads cryptography._rust.pyd,
+    # which causes the Windows updater to self-lock before its preflight
+    # (the updater itself maps the .pyd before the dependency sync runs).
+    # A config with no enabled sources costs one dict scan; a config with
+    # enabled sources pays the crypto load exactly once, on demand.
+    # NOTE: only keys that smell like a real secret source trigger the import —
+    # a generic dict entry must not force crypto load on every hermes launch.
+    # We whitelist by *shape* (source dict with enabled flag) rather than
+    # hardcoding names, so plugin/test sources pass through unknown keys.
+    any_enabled = any(
+        isinstance(v, dict) and v.get("enabled") is True
+        for v in cfg.values()
+    )
+    if not any_enabled:
+        return
+
     try:
         from agent.secret_sources.registry import apply_all
     except ImportError:
@@ -636,7 +710,9 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             )
         if src.result.error:
             print(f"  {src.label}: {src.result.error}", file=sys.stderr)
-            hint = _remediation_hint(src.name, src.result.error_kind, cfg)
+            hint = _remediation_hint(
+                src.name, src.result.error_kind, cfg, scope=home_key
+            )
             if hint:
                 print(f"  {src.label}: → {hint}", file=sys.stderr)
         for warn in src.result.warnings:
@@ -645,7 +721,13 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         print(f"  Secret sources: {conflict}", file=sys.stderr)
 
 
-def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:
+def _remediation_hint(
+    source_name: str,
+    error_kind,
+    secrets_cfg: dict,
+    *,
+    scope: str | None = None,
+) -> str:
     """Ask the failed source for its one-line fix-it hint.
 
     Defensive wrapper: remediation() is a pure mapping and shouldn't
@@ -655,7 +737,7 @@ def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:
     try:
         from agent.secret_sources.registry import get_source
 
-        source = get_source(source_name)
+        source = get_source(source_name, scope=scope)
         if source is None:
             return ""
         src_cfg = secrets_cfg.get(source_name)

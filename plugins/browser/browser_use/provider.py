@@ -37,6 +37,7 @@ from typing import Any, Dict, Optional
 import requests
 
 from agent.browser_provider import BrowserProvider
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
 
         # Direct API key wins unless the user has explicitly opted into the
         # managed Nous gateway via ``tool_gateway.browser: gateway``.
-        api_key = os.environ.get("BROWSER_USE_API_KEY")
+        api_key = get_secret("BROWSER_USE_API_KEY")
         if api_key and not prefers_gateway("browser"):
             return {
                 "api_key": api_key,
@@ -305,19 +306,9 @@ class BrowserUseBrowserProvider(BrowserProvider):
                 "Emergency cleanup failed for Browser Use session %s: %s", session_id, e
             )
 
-    def get_setup_schema(self) -> Dict[str, Any]:
-        return {
-            "name": "Browser Use",
-            "badge": "paid",
-            "tag": "Cloud browser with remote execution",
-            "env_vars": [
-                {
-                    "key": "BROWSER_USE_API_KEY",
-                    "prompt": "Browser Use API key",
-                    "url": "https://browser-use.com",
-                },
-            ],
-            # Cloud-scoped hook: installs the agent-browser CLI only (no
-            # local Chromium — Browser Use hosts the browser).
-            "post_setup": "browserbase",
-        }
+    def get_setup_schema(self) -> Optional[Dict[str, Any]]:
+        # Hidden from the hermes tools picker: the "Browser Use" row now
+        # activates the CLI-based backend (tools/browser_use_cli.py). This
+        # provider stays registered for the Nous gateway path and un-migrated
+        # legacy cloud_provider configs.
+        return None

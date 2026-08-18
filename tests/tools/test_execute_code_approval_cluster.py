@@ -25,6 +25,8 @@ import pytest
 from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
 
+from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+
 
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
@@ -535,3 +537,31 @@ def test_env_scrub_no_log_when_nothing_dropped(caplog):
             is_windows=False,
         )
     assert "dropped" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    tokens = set_session_vars(cron_session="")
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+    finally:
+        clear_session_vars(tokens)
+        reset_session_vars()
+    assert res["approved"] is True
+
+def test_guard_legacy_env_cron_still_blocks(monkeypatch):
+    reset_session_vars()
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"

@@ -104,7 +104,9 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
     async def _fake_deadline(awaitable, timeout, *, on_abandon=None):
         nonlocal deadline_calls
         deadline_calls += 1
-        if deadline_calls == 1:
+        # The first bounded await is fallback-IP discovery. Timeout the first
+        # initialize attempt (second bounded await), then let retry succeed.
+        if deadline_calls == 2:
             awaitable.close()
             raise tg_adapter.asyncio.TimeoutError()
         return await awaitable
@@ -123,7 +125,7 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
 
     assert fake_app.initialize.call_count == 2
     assert fake_app.initialize.await_count == 1
-    assert deadline_calls == 2
+    assert deadline_calls == 3
     tg_adapter.asyncio.sleep.assert_awaited_once_with(1)
     fake_app.start.assert_awaited_once()
 

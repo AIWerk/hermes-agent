@@ -27,6 +27,65 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
+    """Return the serialized request size and exception class chain.
+
+    OpenAI connection exceptions retain the final ``httpx.Request``. Reading
+    its already-buffered content gives us the exact byte count handed to the
+    transport without logging any request content. The class-only chain keeps
+    the underlying transport failure visible without exposing URLs or payloads
+    from exception messages.
+    """
+    request_body_bytes: int | None = None
+    exception_classes: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+
+    while current is not None and id(current) not in seen and len(seen) < 8:
+        seen.add(id(current))
+        exception_classes.append(type(current).__name__)
+
+        if request_body_bytes is None:
+            try:
+                request = getattr(current, "request", None)
+            except Exception:
+                request = None
+            if request is not None:
+                try:
+                    content = request.content
+                except Exception:
+                    content = None
+                if isinstance(content, str):
+                    request_body_bytes = len(content.encode("utf-8"))
+                elif isinstance(content, (bytes, bytearray, memoryview)):
+                    request_body_bytes = len(content)
+
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        current = cause
+
+    return request_body_bytes, " <- ".join(exception_classes)
+
+
+def _log_codex_request_failure(
+    agent: Any,
+    error: BaseException,
+    *,
+    stream_opened: bool,
+) -> None:
+    request_body_bytes, exception_chain = _codex_request_failure_details(error)
+    logger.warning(
+        "Codex Responses request failed: "
+        "serialized_request_body_bytes=%s stream_opened=%s "
+        "exception_chain=%s model=%s",
+        request_body_bytes if request_body_bytes is not None else "unknown",
+        str(stream_opened).lower(),
+        exception_chain,
+        getattr(agent, "model", "unknown"),
+    )
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -694,6 +753,54 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    def _retry_admitted_correction() -> Optional[Dict[str, Any]]:
+        """Atomically drain a response-boundary correction and retry this turn."""
+        take = getattr(agent, "_take_text_commit_correction_and_close_admission", None)
+        if callable(take):
+            correction = take()
+        else:
+            legacy_take = getattr(
+                agent, "_take_pending_redirect_and_close_response_window", None
+            )
+            correction = legacy_take() if callable(legacy_take) else None
+        if not isinstance(correction, str) or not correction.strip():
+            return None
+        correction = correction.strip()
+
+        # A normal stop-and-send correction leaves the app-server session
+        # reusable; ``turn.should_retire`` remains the authority for wedged
+        # protocol state. Exception paths have already nulled the session.
+
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        _apply_active_turn_redirect(agent, messages, correction)
+        corrected_input = (
+            f"{user_message}\n\nUser correction during the turn: {correction}"
+        )
+        corrected_original = original_user_message
+        if isinstance(corrected_original, str):
+            corrected_original = (
+                f"{corrected_original}\n\n"
+                f"User correction during the turn: {correction}"
+            )
+        agent._persist_session(messages, getattr(agent, "conversation_history", None))
+        try:
+            agent.clear_interrupt()
+        except Exception:
+            agent._interrupt_requested = False
+            agent._interrupt_message = None
+        reopen = getattr(agent, "_open_turn_correction_admission", None)
+        if callable(reopen):
+            reopen()
+        return run_codex_app_server_turn(
+            agent,
+            user_message=corrected_input,
+            original_user_message=corrected_original,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
+
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -713,6 +820,9 @@ def run_codex_app_server_turn(
             if _user_interrupted
             else None
         )
+        retried = _retry_admitted_correction()
+        if retried is not None:
+            return retried
         if _user_interrupted:
             agent.clear_interrupt()
         return {
@@ -732,6 +842,10 @@ def run_codex_app_server_turn(
             ),
             "error": str(exc),
         }
+
+    retried = _retry_admitted_correction()
+    if retried is not None:
+        return retried
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
@@ -765,7 +879,10 @@ def run_codex_app_server_turn(
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
     if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+        from agent.message_metadata import append_message
+
+        for projected_message in turn.projected_messages:
+            append_message(messages, projected_message)
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
@@ -1027,6 +1144,10 @@ def _consume_codex_event_stream(
     first_delta_fired = False
     active_message_phase: str | None = None
     commentary_text_deltas: List[str] = []
+    # Last reasoning summary_index seen. The Responses stream delimits summary
+    # parts by this index and gives each part no separator of its own, so a
+    # change of index is where the blank line belongs.
+    active_summary_index: Any = None
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
@@ -1120,6 +1241,17 @@ def _consume_codex_event_stream(
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
             if reasoning_text and on_reasoning_delta is not None:
+                # Summary parts stream one after another with no separator of
+                # their own; summary_index is the boundary the wire gives us.
+                summary_index = _event_field(event, "summary_index")
+                if (
+                    summary_index is not None
+                    and active_summary_index is not None
+                    and summary_index != active_summary_index
+                ):
+                    reasoning_text = f"\n\n{reasoning_text}"
+                if summary_index is not None:
+                    active_summary_index = summary_index
                 try:
                     on_reasoning_delta(reasoning_text)
                 except Exception:
@@ -1238,6 +1370,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     the terminal event's ``output`` field.
     """
     import httpx as _httpx
+    from openai import APIConnectionError as _APIConnectionError
 
     from agent import relay_llm
 
@@ -1341,6 +1474,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     exc,
                 )
                 continue
+            _log_codex_request_failure(
+                agent,
+                exc,
+                stream_opened=writer_token["value"] is not None,
+            )
+            raise
+        except _APIConnectionError as exc:
+            _log_codex_request_failure(
+                agent,
+                exc,
+                stream_opened=writer_token["value"] is not None,
+            )
             raise
 
         def _interrupt_or_superseded() -> bool:
@@ -1374,10 +1519,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
                     continue
+                _log_codex_request_failure(
+                    agent,
+                    exc,
+                    stream_opened=writer_token["value"] is not None,
+                )
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:
                     return event_stream.final_response
+                raise
+            except _APIConnectionError as exc:
+                _log_codex_request_failure(
+                    agent,
+                    exc,
+                    stream_opened=writer_token["value"] is not None,
+                )
                 raise
 
             # A terminal response has already been assembled at this point
@@ -1390,7 +1547,25 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 try:
                     for _ignored in event_stream:
                         pass
-                except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                except (
+                    _httpx.RemoteProtocolError,
+                    _httpx.ReadTimeout,
+                    _httpx.ConnectError,
+                    ConnectionError,
+                ) as exc:
+                    logger.warning(
+                        "Codex Responses stream transport finalization failed "
+                        "after a terminal response was already received; "
+                        "returning the completed response instead of "
+                        "retrying. %s error=%s",
+                        agent._client_log_context(), exc,
+                    )
+                except _APIConnectionError as exc:
+                    _log_codex_request_failure(
+                        agent,
+                        exc,
+                        stream_opened=writer_token["value"] is not None,
+                    )
                     logger.warning(
                         "Codex Responses stream transport finalization failed "
                         "after a terminal response was already received; "

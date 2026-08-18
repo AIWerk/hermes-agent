@@ -1,6 +1,6 @@
 ---
 name: clearvoice
-description: Use when rewriting or reviewing prose for clarity, credibility, and natural voice without inventing facts. Good for emails, website copy, docs, proposals, explanations, and founder or product writing.
+description: Rewrite prose clearly and naturally without inventing facts.
 version: 1.0.0
 author: Hermes Agent
 license: MIT

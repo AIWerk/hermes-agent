@@ -18,7 +18,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.base import (
+    BaseEnvironment,
+    EnvironmentConnectionError,
+    _popen_bash,
+)
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
@@ -778,9 +782,13 @@ def _ensure_docker_available() -> None:
             "or known install locations. Install Docker Desktop and ensure the "
             "CLI is available."
         )
-        raise RuntimeError(
+        raise EnvironmentConnectionError(
             "Docker executable not found in PATH or known install locations. "
-            "Install Docker and ensure the 'docker' command is available."
+            "Install Docker and ensure the 'docker' command is available.",
+            retry_hint=(
+                "Install Docker (or fix PATH) and retry, or switch "
+                "terminal.backend to 'local'."
+            ),
         )
 
     try:
@@ -798,8 +806,9 @@ def _ensure_docker_available() -> None:
             docker_exe,
             exc_info=True,
         )
-        raise RuntimeError(
-            "Docker executable could not be executed. Check your Docker installation."
+        raise EnvironmentConnectionError(
+            "Docker executable could not be executed. Check your Docker installation.",
+            retry_hint="Repair the Docker installation and retry.",
         )
     except subprocess.TimeoutExpired:
         logger.error(
@@ -808,8 +817,12 @@ def _ensure_docker_available() -> None:
             docker_exe,
             exc_info=True,
         )
-        raise RuntimeError(
-            "Docker daemon is not responding. Ensure Docker is running and try again."
+        raise EnvironmentConnectionError(
+            "Docker daemon is not responding. Ensure Docker is running and try again.",
+            retry_hint=(
+                "Start the Docker daemon (e.g. `systemctl start docker` or "
+                "launch Docker Desktop), then retry the same command."
+            ),
         )
     except Exception:
         logger.error(
@@ -826,9 +839,13 @@ def _ensure_docker_available() -> None:
                 result.returncode,
                 result.stderr.strip(),
             )
-            raise RuntimeError(
+            raise EnvironmentConnectionError(
                 "Docker command is available but 'docker version' failed. "
-                "Check your Docker installation."
+                "Check your Docker installation.",
+                retry_hint=(
+                    "The Docker daemon may be down or the current user lacks "
+                    "permission (docker group). Fix and retry."
+                ),
             )
 
 
@@ -864,7 +881,7 @@ class DockerEnvironment(BaseEnvironment):
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
-        host_cwd: str = None,
+        host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
         extra_args: list = None,
@@ -876,6 +893,10 @@ class DockerEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout)
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes
+        # Set by terminal_tool._create_environment when this container is
+        # scoped to a single session (docker + container_persistent: false):
+        # survives between turns, removed at session close / idle timeout.
+        self._session_scoped = False
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
@@ -886,10 +907,10 @@ class DockerEnvironment(BaseEnvironment):
         self._container_name: str = ""
         self._image_uses_s6_init: bool = False
         self._all_run_args: list[str] = []
-        logger.info(f"DockerEnvironment volumes: {volumes}")
+        logger.info("DockerEnvironment volumes: %s", volumes)
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
-            logger.warning(f"docker_volumes config is not a list: {volumes!r}")
+            logger.warning("docker_volumes config is not a list: %r", volumes)
             volumes = []
 
         # Fail fast if Docker is not available.
@@ -933,7 +954,7 @@ class DockerEnvironment(BaseEnvironment):
         workspace_explicitly_mounted = False
         for vol in (volumes or []):
             if not isinstance(vol, str):
-                logger.warning(f"Docker volume entry is not a string: {vol!r}")
+                logger.warning("Docker volume entry is not a string: %r", vol)
                 continue
             vol = vol.strip()
             if not vol:
@@ -943,7 +964,7 @@ class DockerEnvironment(BaseEnvironment):
                 if ":/workspace" in vol:
                     workspace_explicitly_mounted = True
             else:
-                logger.warning(f"Docker volume '{vol}' missing colon, skipping")
+                logger.warning("Docker volume '%s' missing colon, skipping", vol)
 
         host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
         bind_host_cwd = (
@@ -953,7 +974,7 @@ class DockerEnvironment(BaseEnvironment):
             and not workspace_explicitly_mounted
         )
         if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
-            logger.debug(f"Skipping docker cwd mount: host_cwd is not a valid directory: {host_cwd}")
+            logger.debug("Skipping docker cwd mount: host_cwd is not a valid directory: %s", host_cwd)
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
@@ -982,7 +1003,7 @@ class DockerEnvironment(BaseEnvironment):
             ])
 
         if bind_host_cwd:
-            logger.info(f"Mounting configured host cwd to /workspace: {host_cwd_abs}")
+            logger.info("Mounting configured host cwd to /workspace: %s", host_cwd_abs)
             volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
@@ -1298,7 +1319,7 @@ class DockerEnvironment(BaseEnvironment):
             run_exec=image_uses_s6_init,
         )
 
-        logger.info(f"Docker volume_args: {volume_args}")
+        logger.info("Docker volume_args: %s", volume_args)
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
         # Appended last so they can override defaults if needed.
         validated_extra = []
@@ -1336,7 +1357,7 @@ class DockerEnvironment(BaseEnvironment):
             + env_args
             + validated_extra
         )
-        logger.info(f"Docker run_args: {all_run_args}")
+        logger.info("Docker run_args: %s", all_run_args)
 
         # Start the container directly via `docker run -d`.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
@@ -1465,7 +1486,7 @@ class DockerEnvironment(BaseEnvironment):
                 image,
                 "sleep", "infinity",  # no fixed lifetime — idle reaper handles cleanup
             ]
-            logger.debug(f"Starting container: {' '.join(run_cmd)}")
+            logger.debug("Starting container: %s", ' '.join(run_cmd))
             try:
                 result = subprocess.run(
                     run_cmd,
@@ -1494,7 +1515,7 @@ class DockerEnvironment(BaseEnvironment):
                 )
                 raise
             self._container_id = result.stdout.strip()
-            logger.info(f"Started container {container_name} ({self._container_id[:12]})")
+            logger.info("Started container %s (%s)", container_name, self._container_id[:12])
 
         # Build the init-time env forwarding args used to seed the snapshot.
         self._init_env_args = self._build_init_env_args()

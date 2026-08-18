@@ -12,6 +12,83 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
 import run_agent
 
 
+def test_terminal_response_exits_fence_redirect_and_steer_before_persist():
+    """Every direct terminal response exit must cross the atomic correction fence."""
+    from pathlib import Path
+
+    source = (Path(__file__).parents[2] / "agent" / "conversation_loop.py").read_text()
+    source = source[source.index("def run_conversation("):]
+    fence = "_consume_redirect_for_retry(include_pending_steer=True)"
+    anchors = [
+        "Invalid API response after {max_retries} retries",
+        "return _content_policy_blocked_result(",
+        '"final_response": _exhaust_response,',
+        '"final_response": partial_response or None,',
+        "# never reaches finalize_turn (#48879 class).",
+        "Request payload too large: max compression attempts",
+        "Context length exceeded: max compression attempts",
+        "Incomplete REASONING_SCRATCHPAD after 2 retries",
+        "Codex response remained incomplete after 3 continuation attempts",
+        "Prior <3 retries (or an earlier successful tool batch)",
+        "# exhaustion — this path never reaches finalize_turn.",
+        "if messages is _overflow_input and compression_skipped_due_to_lock(agent):",
+        "Operation interrupted during retry ({_failure_hint}",
+        "Request payload too large (413). Cannot compress further.",
+        "max_tokens exceeds the provider's output cap for this model.",
+        "Context length exceeded ({new_tokens:,} tokens). Cannot compress further.",
+    ]
+    for anchor in anchors:
+        starts = []
+        offset = 0
+        while (position := source.find(anchor, offset)) >= 0:
+            starts.append(position)
+            offset = position + len(anchor)
+        assert starts, anchor
+        for position in starts:
+            assert fence in source[max(0, position - 1400):position + 900], anchor
+
+
+def test_remaining_terminal_error_and_interrupt_exits_fence_before_return():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[2] / "agent" / "conversation_loop.py").read_text()
+    source = source[source.index("def run_conversation("):]
+    fence = "_consume_redirect_for_retry(include_pending_steer=True)"
+    markers = (
+        "No fallback available — surface buffered context",
+        "Rolling back to last complete assistant turn",
+        "First response truncated - cannot recover",
+        "Operation interrupted: handling API error",
+        "auto-compaction disabled — not compressing",
+        "API call failed after {max_retries} retries",
+        "Operation interrupted: retrying API call after error",
+        "Operation interrupted: retrying empty response from model",
+    )
+    for marker in markers:
+        start = source.index(marker)
+        terminal = source.index("return {", start)
+        assert fence in source[start:terminal], marker
+
+
+def test_correction_admission_starts_after_lease_setup_and_exception_preserves_text():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[2] / "run_agent.py").read_text()
+    lease = source.index("acquire_session_turn_lease(")
+    admission = source.index("self._open_turn_correction_admission()", lease)
+    provider = source.index("result = run_conversation(", admission)
+    assert lease < admission < provider
+    exception = source.index("except BaseException as exc:", provider)
+    finalizer = source.index("finally:", exception)
+    exception_path = source[exception:finalizer]
+    assert "_take_text_commit_correction_and_close_admission()" in exception_path
+    assert "self._pending_steer" in exception_path
+    assert "preserve_exception_correction = True" in exception_path
+    assert "self.pending_steer" not in exception_path
+    finalizer_path = source[finalizer:source.index("def ", finalizer)]
+    assert "preserve_pending=preserve_exception_correction" in finalizer_path
+
+
 @pytest.fixture(autouse=True)
 def _no_codex_backoff(monkeypatch):
     """Short-circuit retry backoff so Codex retry tests don't block on real
@@ -121,6 +198,30 @@ def _codex_incomplete_message_response(text: str):
         status="in_progress",
         model="gpt-5-codex",
     )
+
+
+def test_codex_incomplete_direct_return_consumes_late_redirect(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_message_response(f"working-{idx}")
+        for idx in range(3)
+    ] + [_codex_message_response("Corrected final answer")]
+    calls = 0
+
+    def api_call(_kwargs):
+        nonlocal calls
+        response = responses[calls]
+        calls += 1
+        if calls == 3:
+            assert agent.redirect("late correction") is True
+        return response
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", api_call)
+    result = agent.run_conversation("start")
+
+    assert calls == 4
+    assert result["completed"] is True
+    assert result["final_response"] == "Corrected final answer"
 
 
 def _codex_max_output_incomplete_response(text: str = ""):
@@ -3926,3 +4027,182 @@ def test_run_conversation_codex_no_nudge_for_replayable_interim(monkeypatch):
         and "only internal reasoning" in str(item.get("content"))
         for item in replay_input
     )
+
+
+AZURE_FOUNDRY_BASE_URL = (
+    "https://placeholder.services.ai.azure.com/api/projects/placeholder/openai/v1"
+)
+
+def _build_azure_foundry_agent(monkeypatch, *, model="gpt-5.4"):
+    _patch_agent_bootstrap(monkeypatch)
+
+    agent = run_agent.AIAgent(
+        model=model,
+        provider="azure-foundry",
+        api_mode="codex_responses",
+        base_url=AZURE_FOUNDRY_BASE_URL,
+        api_key="foundry-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    return agent
+
+def _azure_reasoning_item():
+    return {"type": "reasoning", "encrypted_content": "sealed", "summary": []}
+
+def _azure_post_tool_messages():
+    return [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "Create a marker"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [_azure_reasoning_item()],
+            "tool_calls": [
+                {
+                    "id": "call_marker",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_marker", "content": "marker written"},
+    ]
+
+def test_build_api_kwargs_azure_foundry_post_tool_suppresses_reasoning(monkeypatch):
+    """Live agent path reaches Azure Foundry detection and scopes suppression.
+
+    Exercises ``chat_completion_helpers.build_api_kwargs`` end-to-end rather
+    than the transport in isolation: the agent must forward ``provider`` and
+    ``base_url`` into ``build_kwargs`` for the Foundry detection to fire at
+    all. On the post-tool follow-up shape the encrypted reasoning item is
+    dropped while function_call / function_call_output continuity is kept.
+    """
+    agent = _build_azure_foundry_agent(monkeypatch)
+    assert agent._codex_reasoning_replay_enabled is True
+
+    kwargs = agent._build_api_kwargs(_azure_post_tool_messages())
+
+    item_types = [item.get("type") for item in kwargs["input"] if isinstance(item, dict)]
+    assert "reasoning" not in item_types
+    assert "function_call" in item_types
+    assert "function_call_output" in item_types
+    assert kwargs.get("include") == []
+
+def test_build_api_kwargs_azure_foundry_non_tool_preserves_reasoning(monkeypatch):
+    """Ordinary (non-tool) Azure Foundry continuity is unchanged via the live path.
+
+    Without the post-tool follow-up shape there is no evidence Foundry rejects
+    the payload, so the encrypted reasoning item must still be replayed even
+    though the agent forwards the Foundry identity fields.
+    """
+    agent = _build_azure_foundry_agent(monkeypatch)
+
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "Explain recursion"},
+        {
+            "role": "assistant",
+            "content": "Recursion is when a function calls itself.",
+            "codex_reasoning_items": [_azure_reasoning_item()],
+        },
+        {"role": "user", "content": "Give an example"},
+    ]
+
+    kwargs = agent._build_api_kwargs(messages)
+
+    item_types = [item.get("type") for item in kwargs["input"] if isinstance(item, dict)]
+    assert "reasoning" in item_types
+    assert "function_call" not in item_types
+    assert "function_call_output" not in item_types
+    assert kwargs.get("include") == ["reasoning.encrypted_content"]
+
+def test_build_api_kwargs_azure_foundry_user_turn_after_tool_call_keeps_reasoning(
+    monkeypatch,
+):
+    """Suppression does not stick once the tool call is answered.
+
+    Regression guard for the sticky-history shape: after the assistant has
+    replied to the tool result, a plain user follow-up is a payload Foundry
+    accepts, so reasoning replay must come back on rather than stay off for
+    the remainder of the conversation.
+    """
+    agent = _build_azure_foundry_agent(monkeypatch)
+
+    messages = _azure_post_tool_messages() + [
+        {
+            "role": "assistant",
+            "content": "Marker created.",
+            "codex_reasoning_items": [_azure_reasoning_item()],
+        },
+        {"role": "user", "content": "Now explain recursion"},
+    ]
+
+    kwargs = agent._build_api_kwargs(messages)
+
+    item_types = [item.get("type") for item in kwargs["input"] if isinstance(item, dict)]
+    assert "reasoning" in item_types
+    assert "function_call" in item_types
+    assert "function_call_output" in item_types
+    assert kwargs.get("include") == ["reasoning.encrypted_content"]
+
+def test_consume_codex_stream_separates_reasoning_summary_parts():
+    """summary_index is the part boundary; the wire sends no separator itself."""
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    reasoning_streamed = []
+
+    _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                summary_index=0,
+                delta="**Investigating culprit PRs**",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                summary_index=1,
+                delta="**Inspecting message schema**",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                summary_index=1,
+                delta=" and tool_calls content",
+            ),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+        ]),
+        model="gpt-5-codex",
+        on_reasoning_delta=reasoning_streamed.append,
+    )
+
+    joined = "".join(reasoning_streamed)
+    assert "****" not in joined
+    assert joined == (
+        "**Investigating culprit PRs**"
+        "\n\n**Inspecting message schema** and tool_calls content"
+    )
+
+def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
+    """Streams with no summary_index (plain reasoning_text) must not gain breaks."""
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    reasoning_streamed = []
+
+    _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.reasoning_text.delta", delta="Need to "),
+            SimpleNamespace(type="response.reasoning_text.delta", delta="inspect files."),
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(status="completed")),
+        ]),
+        model="gpt-5-codex",
+        on_reasoning_delta=reasoning_streamed.append,
+    )
+
+    assert "".join(reasoning_streamed) == "Need to inspect files."

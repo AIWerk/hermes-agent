@@ -123,6 +123,44 @@ def test_live_child_session_gets_native_stream(server, emits):
     assert server._child_mirrors == {}
 
 
+def test_child_tool_mirror_redacts_preview_credentials(server, emits):
+    secret = "abcdefghijklmnopqrstuvwxyz123456"
+    server._sessions["live-1"] = {"session_key": "child-1", "agent": None}
+
+    _relay(
+        server,
+        "subagent.tool",
+        tool_name="terminal",
+        preview=f"curl https://alice:{secret}@example.test/?token={secret}",
+        child_session_id="child-1",
+    )
+
+    child_payloads = [payload for _event, sid, payload in emits if sid == "live-1"]
+    assert secret not in repr(child_payloads)
+
+
+def test_auxiliary_parent_events_redact_credentials_and_minimize_paths(server, emits):
+    secret = "abcdefghijklmnopqrstuvwxyz123456"
+    server._sessions["parent-sid"] = {"session_key": "parent", "agent": None}
+
+    _relay(server, "reasoning.available", preview=f"Authorization: Bearer {secret}")
+    _relay(server, "moa.reference", tool_name="reference", preview=f"token={secret}")
+    _relay(
+        server,
+        "subagent.complete",
+        child_session_id="child-1",
+        summary=f"Authorization: Bearer {secret}",
+        files_read=[f"/private/customer/{secret}/input.txt"],
+        files_written=[f"/private/customer/{secret}/output.txt"],
+        output_tail=[{"text": f"token={secret}"}],
+    )
+
+    parent_payloads = [payload for _event, sid, payload in emits if sid == "parent-sid"]
+    rendered = repr(parent_payloads)
+    assert secret not in rendered
+    assert "/private/customer/" not in rendered
+
+
 def test_window_closed_midrun_drops_state_then_fresh_turn_on_reopen(server, emits):
     server._sessions["live-1"] = {"session_key": "child-1", "agent": None}
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
