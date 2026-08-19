@@ -6289,8 +6289,8 @@ class TestRunConversation:
 
     def test_output_cap_retry_uses_provider_available_out(self, agent):
         """run_conversation retries an output-cap error with max_tokens <=
-        available_out - 64, and does NOT halve context_length or trigger
-        compression.
+        available_out - 64, preserves context_length, and attempts recovery
+        compression before retrying.
         """
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
@@ -6312,7 +6312,9 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(
+            side_effect=lambda messages, system_message, **_kwargs: (messages, system_message)
+        )
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -6326,7 +6328,7 @@ class TestRunConversation:
         assert result["completed"] is True
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_with_large_api_only_content(self, agent):
         """When a large system prompt makes api_messages huge while persisted
@@ -6356,7 +6358,9 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(
+            side_effect=lambda messages, system_message, **_kwargs: (messages, system_message)
+        )
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -6372,7 +6376,7 @@ class TestRunConversation:
         # near 199927 — this test fails on it.
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
@@ -7007,7 +7011,9 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(
+            side_effect=lambda messages, system_message, **_kwargs: (messages, system_message)
+        )
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -7031,7 +7037,7 @@ class TestRunConversation:
         assert local_available < 50_000
         assert second_call["max_tokens"] == expected_cap
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_safety_floor_at_one(self, agent):
         """When provider available_tokens is 1, the retry cap is floored at 1."""
@@ -7055,7 +7061,9 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(
+            side_effect=lambda messages, system_message, **_kwargs: (messages, system_message)
+        )
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -7069,12 +7077,12 @@ class TestRunConversation:
         assert result["completed"] is True
         assert second_call["max_tokens"] == 1
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_with_compression_disabled(self, agent):
         """Output-cap retry must still work when compression.enabled is false.
-        The recovery is a max_tokens-only retry — it does not require compression,
-        so the compression-disabled guard must not block it.
+        The output-cap recovery path still invokes its bounded compression seam;
+        a disabled/pass-through compressor must not block the capped retry.
         """
         self._setup_agent(agent)
         agent.api_mode = "chat_completions"
@@ -7096,7 +7104,9 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(
+            side_effect=lambda messages, system_message, **_kwargs: (messages, system_message)
+        )
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -7113,7 +7123,7 @@ class TestRunConversation:
         assert result.get("compaction_disabled") is None
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_with_compression_disabled_vllm_format(self, agent):
         """vLLM/LM Studio error messages contain 'prompt contains ... input
@@ -7146,7 +7156,9 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(
+            side_effect=lambda messages, system_message, **_kwargs: (messages, system_message)
+        )
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -7163,7 +7175,7 @@ class TestRunConversation:
         # parse_available_output_tokens_from_error returns 65535 for this message
         assert second_call["max_tokens"] <= 65471  # 65535 - 64
         assert agent.context_compressor.context_length == 131_072
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_empty_response_retry_backoff_interrupted(self, agent, monkeypatch):
         """If an interrupt is requested during the empty response retry wait, we abort."""

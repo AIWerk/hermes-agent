@@ -1177,6 +1177,40 @@ def test_config_set_battery_explicit_off(monkeypatch):
     assert writes == {"display.battery": False}
 
 
+class _CollectingTransport:
+    """Collect pool-delivered JSON-RPC frames without timing sleeps."""
+
+    _closed = False
+
+    def __init__(self):
+        self.frames = queue.Queue()
+
+    def write(self, frame: dict) -> bool:
+        self.frames.put(frame)
+        return True
+
+    def close(self) -> None:
+        self._closed = True
+
+    def response(self, request_id, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for response {request_id!r}")
+            frame = self.frames.get(timeout=remaining)
+            if frame.get("id") == request_id:
+                return frame
+
+
+def _dispatch_long(req: dict, transport: _CollectingTransport | None = None) -> dict:
+    """Assert the upstream async dispatch contract and await its transport result."""
+
+    target = transport or _CollectingTransport()
+    assert server.dispatch(req, transport=target) is None
+    return target.response(req["id"])
+
+
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -1197,10 +1231,10 @@ def test_voice_toggle_returns_configured_record_key(monkeypatch):
     # review on #19835).
     monkeypatch.setenv("HERMES_VOICE", "0")
 
-    on_resp = server.dispatch(
+    on_resp = _dispatch_long(
         {"id": "voice-on", "method": "voice.toggle", "params": {"action": "on"}}
     )
-    status_resp = server.dispatch(
+    status_resp = _dispatch_long(
         {"id": "voice-status", "method": "voice.toggle", "params": {"action": "status"}}
     )
 
@@ -1223,7 +1257,7 @@ def test_voice_toggle_on_carries_stop_hint(monkeypatch):
     )
     monkeypatch.setenv("HERMES_VOICE", "0")
 
-    on_resp = server.dispatch(
+    on_resp = _dispatch_long(
         {"id": "voice-on", "method": "voice.toggle", "params": {"action": "on"}}
     )
     assert on_resp["result"]["stop_hint"] == 'Say "halt" to end the voice chat.'
@@ -1237,13 +1271,13 @@ def test_voice_toggle_on_carries_stop_hint(monkeypatch):
             voice_stop_hint=lambda: "",
         ),
     )
-    on_resp = server.dispatch(
+    on_resp = _dispatch_long(
         {"id": "voice-on2", "method": "voice.toggle", "params": {"action": "on"}}
     )
     assert on_resp["result"]["stop_hint"] == ""
 
     # off carries no hint text (mode is ending).
-    off_resp = server.dispatch(
+    off_resp = _dispatch_long(
         {"id": "voice-off", "method": "voice.toggle", "params": {"action": "off"}}
     )
     assert off_resp["result"]["stop_hint"] == ""
@@ -1269,7 +1303,7 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
     for bad in (True, "cmd+b", None, 42, ["ctrl+b"]):
         monkeypatch.setattr(server, "_load_cfg", lambda b=bad: {"voice": b})
 
-        status_resp = server.dispatch(
+        status_resp = _dispatch_long(
             {
                 "id": "voice-status",
                 "method": "voice.toggle",
@@ -1288,7 +1322,7 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
     for bad_root in (True, None, [], "ctrl+b", 42):
         monkeypatch.setattr(server, "_load_cfg", lambda r=bad_root: r)
 
-        status_resp = server.dispatch(
+        status_resp = _dispatch_long(
             {
                 "id": "voice-status-root",
                 "method": "voice.toggle",
@@ -1329,7 +1363,7 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         captured.clear()
         monkeypatch.setattr(server, "_load_cfg", lambda b=bad: {"voice": b})
 
-        resp = server.dispatch(
+        resp = _dispatch_long(
             {
                 "id": "voice-record",
                 "method": "voice.record",
@@ -1358,7 +1392,7 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         captured.clear()
         monkeypatch.setattr(server, "_load_cfg", lambda c=bad_bool_cfg: {"voice": c})
 
-        resp = server.dispatch(
+        resp = _dispatch_long(
             {
                 "id": "voice-record-bool",
                 "method": "voice.record",
@@ -1514,7 +1548,7 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
     state = {"owner": None, "callback": None, "paused": False}
     voice_callbacks = {}
 
-    def start_listening(callback, *, owner, config):
+    def start_listening(callback, *, owner, config, external_audio=None):
         if state["owner"] is not None and state["owner"] is not owner:
             raise wake_word.WakeWordInUse
         state.update(owner=owner, callback=callback, paused=False)
@@ -1577,8 +1611,8 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
     )
     monkeypatch.setenv("HERMES_VOICE", "1")
 
-    first = types.SimpleNamespace(_closed=False)
-    second = types.SimpleNamespace(_closed=False)
+    first = _CollectingTransport()
+    second = _CollectingTransport()
     emitted = []
     monkeypatch.setattr(
         server,
@@ -1590,12 +1624,12 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
     server._wake_owner_transport = None
     server._wake_owner_surface = ""
     try:
-        started = server.dispatch({
+        started = _dispatch_long({
             "id": "wake-1",
             "method": "wake.start",
             "params": {"surface": "gui", "session_id": "first-session"},
         }, transport=first)
-        denied = server.dispatch({
+        denied = _dispatch_long({
             "id": "wake-2",
             "method": "wake.start",
             "params": {"surface": "tui", "session_id": "second-session"},
@@ -1605,7 +1639,7 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
             "method": "wake.stop",
             "params": {},
         }, transport=second)
-        denied_voice_stop = server.dispatch({
+        denied_voice_stop = _dispatch_long({
             "id": "voice-stop-2",
             "method": "voice.record",
             "params": {"action": "stop"},
@@ -1636,7 +1670,7 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
         )]
         assert state["paused"] is True
 
-        voice_started = server.dispatch({
+        voice_started = _dispatch_long({
             "id": "voice-start-1",
             "method": "voice.record",
             "params": {"action": "start", "session_id": "first-session"},
@@ -1656,7 +1690,7 @@ def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatc
             "disabled_persisted": False,
         }
 
-        reclaimed = server.dispatch({
+        reclaimed = _dispatch_long({
             "id": "wake-reclaim-2",
             "method": "wake.start",
             "params": {"surface": "tui", "session_id": "second-session"},
@@ -1711,7 +1745,7 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
     listener = {"owner": None}
     monkeypatch.setattr(
         wake_word, "start_listening",
-        lambda callback, *, owner, config: listener.update(owner=owner),
+        lambda callback, *, owner, config, external_audio=None: listener.update(owner=owner),
     )
     monkeypatch.setattr(
         wake_word, "stop_listening",
@@ -1719,12 +1753,12 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
     )
     monkeypatch.setattr(wake_word, "owns_listener", lambda owner: listener["owner"] is owner)
 
-    transport = types.SimpleNamespace(_closed=False)
+    transport = _CollectingTransport()
     server._wake_owner_transport = None
     server._wake_owner_surface = ""
     try:
         # Passive auto-arm (no persist): refused, config untouched.
-        passive = server.dispatch({
+        passive = _dispatch_long({
             "id": "wake-passive",
             "method": "wake.start",
             "params": {"surface": "gui"},
@@ -1733,7 +1767,7 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
         assert persisted == []
 
         # Explicit gesture: enables in config AND arms.
-        clicked = server.dispatch({
+        clicked = _dispatch_long({
             "id": "wake-click",
             "method": "wake.start",
             "params": {"surface": "gui", "persist": True},
@@ -1754,7 +1788,7 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
 
         # persist does NOT override an explicit surface scoping.
         config.update(enabled=True, surface="tui")
-        scoped = server.dispatch({
+        scoped = _dispatch_long({
             "id": "wake-scoped",
             "method": "wake.start",
             "params": {"surface": "gui", "persist": True},
@@ -1782,7 +1816,7 @@ def test_wake_status_reports_configured_input_device_and_windows_silence_hint(mo
         "hostapi": "Windows WASAPI",
         "default_samplerate": 48000.0,
     }
-    transport = types.SimpleNamespace(_closed=False)
+    transport = _CollectingTransport()
 
     monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: config)
     monkeypatch.setattr(
@@ -1808,7 +1842,7 @@ def test_wake_status_reports_configured_input_device_and_windows_silence_hint(mo
     server._wake_owner_transport = transport
     server._wake_owner_surface = "gui"
     try:
-        response = server.dispatch(
+        response = _dispatch_long(
             {"id": "wake-status", "method": "wake.status", "params": {}},
             transport=transport,
         )
@@ -1857,7 +1891,7 @@ def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):
         captured.clear()
         monkeypatch.setattr(server, "_load_cfg", lambda c=cfg: {"voice": c})
 
-        resp = server.dispatch(
+        resp = _dispatch_long(
             {
                 "id": "voice-record-cap",
                 "method": "voice.record",
@@ -1887,7 +1921,7 @@ def test_voice_record_stop_forces_transcription(monkeypatch):
         ),
     )
 
-    resp = server.dispatch(
+    resp = _dispatch_long(
         {
             "id": "voice-record-stop",
             "method": "voice.record",
@@ -1910,7 +1944,7 @@ def test_voice_record_stop_updates_event_session_id(monkeypatch):
     )
     monkeypatch.setattr(server, "_voice_event_sid", "old-session")
 
-    resp = server.dispatch(
+    resp = _dispatch_long(
         {
             "id": "voice-record-stop-session",
             "method": "voice.record",
@@ -1934,7 +1968,7 @@ def test_voice_record_start_reports_busy_when_stop_is_in_progress(monkeypatch):
     monkeypatch.setenv("HERMES_VOICE", "1")
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
 
-    resp = server.dispatch(
+    resp = _dispatch_long(
         {
             "id": "voice-record-busy",
             "method": "voice.record",
@@ -1972,7 +2006,7 @@ def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
     # later test in the file (which now spins up the streaming TTS pipeline).
     monkeypatch.setenv("HERMES_VOICE_TTS", "0")
 
-    tts_resp = server.dispatch(
+    tts_resp = _dispatch_long(
         {"id": "voice-tts", "method": "voice.toggle", "params": {"action": "tts"}}
     )
 
@@ -10779,9 +10813,13 @@ class _ImmediateThread:
 
 
 def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
-    """maybe_auto_title is called after a successful (complete) prompt."""
+    """The fake agent models shared turn-prologue auto-title ownership."""
 
     class _Agent:
+        _session_db = object()
+        _session_db_created = True
+        session_id = "session-key"
+        platform = "tui"
         model = "gpt-5.6-sol"
         provider = "openai-codex"
         base_url = "https://chatgpt.example.test/backend-api/codex"
@@ -10791,6 +10829,11 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
+            from agent.turn_context import _maybe_title_session_at_turn_start
+
+            _maybe_title_session_at_turn_start(
+                self, [{"role": "user", "content": prompt}]
+            )
             return {
                 "final_response": "Rome was founded in 753 BC.",
                 "messages": [
@@ -10817,9 +10860,12 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
 
     mock_title.assert_called_once()
     args = mock_title.call_args.args
+    assert args[0] is _Agent._session_db
     assert args[1] == "session-key"
     assert args[2] == "Tell me about Rome"
-    assert args[3] == "Rome was founded in 753 BC."
+    assert mock_title.call_args.kwargs["conversation_history"] == [
+        {"role": "user", "content": "Tell me about Rome"}
+    ]
     assert mock_title.call_args.kwargs["main_runtime"] == {
         "model": "gpt-5.6-sol",
         "provider": "openai-codex",
@@ -10829,13 +10875,28 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     }
 
 
-def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
-    """maybe_auto_title must NOT be called when the agent was interrupted."""
+def test_prompt_submit_auto_titles_at_turn_start_when_interrupted(monkeypatch):
+    """Turn-start titling is independent of a later interrupted response."""
 
     class _Agent:
+        _session_db = object()
+        _session_db_created = True
+        session_id = "session-key"
+        platform = "tui"
+        model = "gpt-5.6-sol"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.example.test/backend-api/codex"
+        api_key = object()
+        api_mode = "codex_responses"
+
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
+            from agent.turn_context import _maybe_title_session_at_turn_start
+
+            _maybe_title_session_at_turn_start(
+                self, [{"role": "user", "content": prompt}]
+            )
             return {
                 "final_response": "partial answer",
                 "interrupted": True,
@@ -10858,16 +10919,31 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
             }
         )
 
-    mock_title.assert_not_called()
+    mock_title.assert_called_once()
 
 
-def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
-    """maybe_auto_title must NOT be called when the agent returns an empty reply."""
+def test_prompt_submit_auto_titles_at_turn_start_when_response_empty(monkeypatch):
+    """Turn-start titling is independent of a later empty response."""
 
     class _Agent:
+        _session_db = object()
+        _session_db_created = True
+        session_id = "session-key"
+        platform = "tui"
+        model = "gpt-5.6-sol"
+        provider = "openai-codex"
+        base_url = "https://chatgpt.example.test/backend-api/codex"
+        api_key = object()
+        api_mode = "codex_responses"
+
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
+            from agent.turn_context import _maybe_title_session_at_turn_start
+
+            _maybe_title_session_at_turn_start(
+                self, [{"role": "user", "content": prompt}]
+            )
             return {
                 "final_response": "",
                 "messages": [],
@@ -10889,7 +10965,7 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
             }
         )
 
-    mock_title.assert_not_called()
+    mock_title.assert_called_once()
 
 
 def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
@@ -11374,8 +11450,14 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
+        from hermes_state import SessionDB as _RealSessionDB
+
+        _SESSION_COLUMN_VISIBILITY = _RealSessionDB._SESSION_COLUMN_VISIBILITY
+
         def list_sessions_rich(
-            self, *, source=None, limit=200, offset=0, order_by_last_active=False, compact_rows=False
+            self, *, source=None, limit=200, offset=0,
+            order_by_last_active=False, compact_rows=False,
+            compact_visibility=None
         ):
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
@@ -15981,6 +16063,10 @@ def test_session_list_filters_invisible_rows_before_pagination(monkeypatch):
     ]
 
     class _DB:
+        from hermes_state import SessionDB as _RealSessionDB
+
+        _SESSION_COLUMN_VISIBILITY = _RealSessionDB._SESSION_COLUMN_VISIBILITY
+
         def list_sessions_rich(self, **kwargs):
             return rows
 

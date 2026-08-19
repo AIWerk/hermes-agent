@@ -22026,6 +22026,76 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
 
 from hermes_cli.web_routers import profiles as _profiles_routes  # noqa: E402
 
+# Complete the profiles-router extraction without leaving duplicate active
+# routes behind.  The two legacy functions remain import-compatible for older
+# callers, but the app serves the extracted implementations.  Mount the
+# sessions router before the generic /api/profiles/{name} router so literal
+# session/project paths retain their original precedence.
+_legacy_profile_session_endpoints = {
+    get_profiles_sessions,
+    get_profiles_sessions_sidebar,
+}
+app.router.routes[:] = [
+    route
+    for route in app.router.routes
+    if getattr(route, "endpoint", None) not in _legacy_profile_session_endpoints
+]
+app.include_router(_profiles_routes.sessions_router)
+# The extracted PR scanner has no Request/actor context and searches every
+# profile database.  The extracted sidebar also dropped the established exact
+# recents total fields.  Do not expose either route directly: the PR scanner
+# stays disabled, while the compatibility adapter below composes the extracted
+# sidebar payload with actor-aware totals from the existing list seam.
+app.router.routes[:] = [
+    route
+    for route in app.router.routes
+    if not (
+        getattr(route, "path", None)
+        in {
+            "/api/profiles/sessions/sidebar",
+            "/api/profiles/sessions/pull-requests",
+        }
+    )
+]
+
+
+@app.get("/api/profiles/sessions/sidebar")
+def get_profiles_sessions_sidebar_compat(
+    request: Request,
+    recents_profile: str = "all",
+    recents_limit: int = 20,
+    recents_exclude: str = None,
+    cron_limit: int = 50,
+    messaging_limit: int = 100,
+    messaging_exclude: str = None,
+):
+    payload = _profiles_routes.get_profiles_sessions_sidebar(
+        request=request,
+        recents_profile=recents_profile,
+        recents_limit=recents_limit,
+        recents_exclude=recents_exclude,
+        cron_limit=cron_limit,
+        messaging_limit=messaging_limit,
+        messaging_exclude=messaging_exclude,
+    )
+    totals = get_profiles_sessions(
+        request=request,
+        limit=0,
+        offset=0,
+        min_messages=1,
+        archived="exclude",
+        order="recent",
+        profile=recents_profile,
+        source=None,
+        sources=None,
+        exclude_sources=recents_exclude,
+        full=False,
+    )
+    payload["recents"]["total"] = totals["total"]
+    payload["recents"]["profile_totals"] = totals["profile_totals"]
+    return payload
+
+
 app.include_router(_profiles_routes.router)
 from hermes_cli.web_routers.profiles import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     list_profiles_endpoint,

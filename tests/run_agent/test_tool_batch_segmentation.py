@@ -517,7 +517,8 @@ class TestSegmentedDispatchIntegration:
         def fake_handle(name, args, task_id, **kwargs):
             return json.dumps({"ok": True})
 
-        agent.steer("focus on the tests")
+        agent._open_turn_correction_admission()
+        assert agent.steer("focus on the tests")
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
 
@@ -587,6 +588,7 @@ class TestSegmentedDispatchIntegration:
                 return "L" * 1_000
             return "small"
 
+        agent._open_turn_correction_admission()
         with (
             patch("run_agent.handle_function_call", side_effect=fake_handle),
             patch("agent.tool_executor._budget_for_agent", return_value=budget),
@@ -616,6 +618,7 @@ class TestSegmentedDispatchIntegration:
         )
 
         assert _kinds(_plan_tool_batch_segments(calls)) == ["sequential"]
+        agent._open_turn_correction_admission()
         assert agent.steer("preserve malformed-call steer after budget enforcement")
 
         with patch("agent.tool_executor._budget_for_agent", return_value=budget):
