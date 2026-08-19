@@ -4181,7 +4181,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, **_kwargs):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4210,6 +4210,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
                     "session_id": "trunc-sid",
                     "text": "next",
                     "truncate_before_user_ordinal": -1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -8696,7 +8697,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, **_kwargs):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -8716,6 +8717,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
                     "session_id": "sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -8752,7 +8754,7 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
     server._sessions["trunc-fail-sid"] = sess
 
     class _FailDb:
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, **_kwargs):
             raise OSError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
@@ -8772,6 +8774,7 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
                     "session_id": "trunc-fail-sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -8843,7 +8846,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, **_kwargs):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -8865,6 +8868,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
                     "session_id": "sid",
                     "text": "edited first",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -14894,7 +14898,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, **_kwargs):
             replaced.append((key, list(messages)))
 
     history = [
@@ -14920,6 +14924,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                     "session_id": "empty-trunc-sid",
                     "text": "fresh typed message",
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -14934,6 +14939,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                         "session_id": "empty-trunc-sid",
                         "text": "fresh typed message",
                         "truncate_before_user_ordinal": 0,
+                        "confirm_truncate": True,
                         "confirm_empty_truncate": falsey,
                     },
                 }
@@ -14972,7 +14978,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             self._target()
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, **_kwargs):
             replaced.append((key, list(messages)))
 
     history = [
@@ -14998,6 +15004,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
                     "session_id": "confirm-empty-sid",
                     "text": "first",
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                     "confirm_empty_truncate": True,
                 },
             }

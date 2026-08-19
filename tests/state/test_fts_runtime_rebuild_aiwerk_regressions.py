@@ -186,10 +186,18 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "first heal")  # consumes the one shot
         assert db._fts_runtime_rebuild_attempted is True
 
-        # Corrupt again: the guard must NOT loop — the write now propagates.
+        # Corrupt again: the one-shot rebuild must not loop. Rank 19 now
+        # fails open by detaching corrupt FTS triggers, persisting the
+        # repair-required marker, and preserving the canonical write.
         _corrupt_fts(tmp_path / "state.db")
-        with pytest.raises(sqlite3.DatabaseError):
-            db.append_message("s1", "user", "second corruption")
+        msg_id = db.append_message("s1", "user", "second corruption")
+        assert msg_id is not None
+        assert _message_contents(tmp_path / "state.db") == [
+            "seed",
+            "first heal",
+            "second corruption",
+        ]
+        assert db.fts_health_state()["repair_required"] is True
 
     def test_non_fts_errors_still_propagate(self, db):
         db.create_session("s1", source="test")

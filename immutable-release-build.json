@@ -15,6 +15,7 @@
     ],
     "module_files": [
       "run_agent.py",
+      "registration_lifecycle.py",
       "model_tools.py",
       "toolsets.py",
       "batch_runner.py",
@@ -111,7 +112,7 @@
       ],
       "root_project": {
         "name": "hermes-agent",
-        "version": "0.19.1",
+        "version": "0.20.1",
         "source": ".",
         "source_kind": "exact-candidate-tree",
         "required_evidence": [

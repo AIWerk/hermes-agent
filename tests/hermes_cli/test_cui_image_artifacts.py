@@ -314,7 +314,7 @@ def test_emit_redacts_host_paths_from_live_message_frames(monkeypatch):
     delta_payload = frames[1]["params"]["payload"]
     complete_payload = frames[2]["params"]["payload"]
     assert delta_payload["text"] == "Created report.pdf\n"
-    assert "/tmp/private" not in delta_payload["rendered"]
+    assert "rendered" not in delta_payload
     assert "/home/alice" not in complete_payload["error"]
     assert "/tmp/private" not in complete_payload["reasoning"]["summary"]
     assert "/var/private" not in complete_payload["rendered"]
@@ -385,12 +385,15 @@ def test_emit_preserves_safe_uri_across_fragment_boundaries(monkeypatch):
         server._emit("message.start", sid)
         server._emit("message.delta", sid, {"text": uri[:split]})
         server._emit("message.delta", sid, {"text": f"{uri[split:]}\n"})
-        visible = "".join(
+        server._emit("message.complete", sid, {"text": f"{uri}\n"})
+        visible_delta = "".join(
             frame["params"]["payload"].get("text", "")
             for frame in frames
-            if frame["params"].get("payload")
+            if frame["params"]["type"] == "message.delta"
+            and frame["params"].get("payload")
         )
-        assert visible == f"{uri}\n"
+        assert visible_delta == f"{uri}\n"
+        assert frames[-1]["params"]["payload"]["text"] == f"{uri}\n"
 
 
 def test_emit_sanitizes_reasoning_delta_and_streams_harmless_slashes(monkeypatch):
@@ -402,14 +405,20 @@ def test_emit_sanitizes_reasoning_delta_and_streams_harmless_slashes(monkeypatch
     server._emit("message.start", "reasoning")
     server._emit("reasoning.delta", "reasoning", {"text": "read /home/alice/private.log\n"})
     server._emit("message.delta", "reasoning", {"text": "ratio 1/2 is safe. More text."})
+    server._emit(
+        "message.complete",
+        "reasoning",
+        {"text": "ratio 1/2 is safe. More text."},
+    )
 
-    visible = [
-        frame["params"]["payload"]["text"]
+    visible = {
+        frame["params"]["type"]: frame["params"]["payload"]["text"]
         for frame in frames
         if frame["params"].get("payload")
-    ]
-    assert all("/home/alice" not in text for text in visible)
-    assert "ratio 1/2 is safe. More text." in visible
+    }
+    assert all("/home/alice" not in text for text in visible.values())
+    assert visible["message.delta"] == "ratio 1/2 is safe. More text."
+    assert visible["message.complete"] == "ratio 1/2 is safe. More text."
 
 
 def test_safe_uri_sanitizer_has_no_placeholder_collision():

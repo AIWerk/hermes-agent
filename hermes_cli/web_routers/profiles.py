@@ -445,6 +445,7 @@ def get_profiles_sessions_sidebar(
     recents_rows: List[Dict[str, Any]] = []
     cron_rows: List[Dict[str, Any]] = []
     messaging_rows: List[Dict[str, Any]] = []
+
     recents_truncated: Dict[str, bool] = {}
     profile_totals: Dict[str, Dict[str, float]] = {}
     errors: List[Dict[str, str]] = []
@@ -464,7 +465,7 @@ def get_profiles_sessions_sidebar(
             s["pinned"] = bool(s.get("pinned"))
         return rows
 
-    def _slice(db, *, source=None, exclude=None, cap):
+    def _slice(db, *, source=None, exclude=None, cap, exhaustive=False):
         query = {
             "source": source,
             "exclude_sources": exclude or None,
@@ -475,7 +476,7 @@ def get_profiles_sessions_sidebar(
             "compact_rows": False if actor else True,
             "include_pinned": True,
         }
-        if actor:
+        if actor or exhaustive:
             return late("_list_sessions_rich_all")(db, **query)
         return db.list_sessions_rich(
             **query,
@@ -523,6 +524,7 @@ def get_profiles_sessions_sidebar(
                         db,
                         exclude=messaging_exclude_list,
                         cap=messaging_cap,
+                        exhaustive=True,
                     ),
                 }
                 _sidebar_profile_cache_put(profile_cache_key, slices)
@@ -545,6 +547,7 @@ def get_profiles_sessions_sidebar(
             profile_messaging_rows = [
                 row for row in profile_messaging_rows if visible(row, actor)
             ]
+
         # A full window means more rows remain on disk. That is all the
         # sidebar's "load more" needs, and unlike an exact COUNT(*) per
         # profile per refresh it costs nothing beyond the rows already
@@ -589,7 +592,7 @@ def get_profiles_sessions_sidebar(
         "cron": {"sessions": cron_window},
         "messaging": {
             "sessions": messaging_window,
-            "total": len(messaging_window) if actor else len(messaging_rows),
+            "total": len(messaging_rows),
         },
         "errors": errors,
     }

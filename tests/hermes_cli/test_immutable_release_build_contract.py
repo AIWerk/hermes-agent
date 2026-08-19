@@ -122,7 +122,7 @@ def test_release_build_contract_requires_canonical_two_phase_python_build() -> N
     ]
     assert python_build["root_project"] == {
         "name": "hermes-agent",
-        "version": "0.19.1",
+        "version": "0.20.1",
         "source": ".",
         "source_kind": "exact-candidate-tree",
         "required_evidence": [
