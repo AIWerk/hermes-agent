@@ -34,63 +34,37 @@ class TestMemorySetupProviderRouting:
 
 
 class TestInstallDependenciesRunner:
-    """`_install_dependencies` must route through the canonical
-    ``_pip_install`` ladder (uv → pip → ensurepip): uv when present, standard
-    pip when uv is unavailable, and an ensurepip bootstrap for pip-less venvs
-    instead of dead-ending with "cannot install"."""
+    """Provider installs must use the canonical environment-aware pipeline."""
 
-    def _run_with_missing_dep(self, tmp_path, which_side_effect, run_behavior=None):
-        """Drive _install_dependencies for a plugin that declares one missing
-        pip dep, capturing every subprocess.run argv issued by the ladder."""
-        import os
-        import sys
-        from unittest.mock import patch as _patch
+    def _run_with_outcome(self, tmp_path, outcome):
+        from tools.lazy_deps import InstallSpecsResult
 
         (tmp_path / "plugin.yaml").write_text(
             "pip_dependencies:\n  - definitely-not-installed-xyz\n", encoding="utf-8"
         )
-        calls = []
-
-        def fake_run(cmd, **kw):
-            calls.append(cmd)
-            if run_behavior:
-                return run_behavior(cmd)
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        # The hermetic conftest sets HERMES_DISABLE_LAZY_INSTALLS=1 so no test
-        # can trigger a real mid-run pip install. These tests exercise the
-        # install ladder itself (against a fully mocked subprocess.run), so
-        # they opt back in — the same both-directions override
-        # tests/tools/test_lazy_deps.py uses.
-        with _patch.dict(os.environ, {"HERMES_DISABLE_LAZY_INSTALLS": "0"}), \
-             patch("plugins.memory.find_provider_dir", return_value=tmp_path), \
-             patch("hermes_cli.tools_config.shutil.which", side_effect=which_side_effect), \
-             patch("hermes_cli.tools_config.subprocess.run", fake_run):
+        result = outcome if isinstance(outcome, InstallSpecsResult) else InstallSpecsResult(**outcome)
+        with patch("plugins.memory.find_provider_dir", return_value=tmp_path), \
+             patch("tools.lazy_deps.install_specs", return_value=result) as install:
             memory_setup._install_dependencies("x")
-        return calls, sys.executable
+        return install
 
-    def test_uses_uv_when_available(self, tmp_path):
-        calls, _ = self._run_with_missing_dep(
-            tmp_path, lambda b: "/usr/bin/uv" if b == "uv" else None
+    def test_routes_through_install_specs(self, tmp_path):
+        install = self._run_with_outcome(tmp_path, {"ok": True})
+        install.assert_called_once_with(["definitely-not-installed-xyz"], timeout=120)
+
+    def test_surfaces_blocked_install(self, tmp_path, capsys):
+        self._run_with_outcome(
+            tmp_path, {"ok": False, "blocked": True, "reason": "policy disabled"}
         )
-        assert calls
-        assert calls[0][:3] == ["/usr/bin/uv", "pip", "install"]
+        out = capsys.readouterr().out
+        assert "Cannot install" in out
+        assert "policy disabled" in out
 
-    def test_falls_back_to_pip_when_uv_missing(self, tmp_path):
-        """No uv but pip importable -> python -m pip install."""
-        calls, py = self._run_with_missing_dep(tmp_path, lambda b: None)
-        assert calls
-        # Ladder probes pip first, then installs with it.
-        assert calls[0][:3] == [py, "-m", "pip"]
-        assert calls[-1][:4] == [py, "-m", "pip", "install"]
-
-    def test_bootstraps_pip_via_ensurepip_when_missing(self, tmp_path):
-        """Neither uv nor pip -> ensurepip bootstrap, then pip install."""
-        def behavior(cmd):
-            if cmd[-1] == "--version":
-                return SimpleNamespace(returncode=1, stdout="", stderr="")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        calls, py = self._run_with_missing_dep(tmp_path, lambda b: None, behavior)
-        assert any("ensurepip" in c for c in calls)
-        assert calls[-1][:4] == [py, "-m", "pip", "install"]
+    def test_surfaces_failed_install(self, tmp_path, capsys):
+        self._run_with_outcome(
+            tmp_path, {"ok": False, "stderr": "installer failed"}
+        )
+        out = capsys.readouterr().out
+        assert "Failed to install" in out
+        assert "installer failed" in out
+        assert "Run manually" in out

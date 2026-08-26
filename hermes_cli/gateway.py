@@ -3435,7 +3435,9 @@ def _build_service_path_dirs(
 
     detected_venv = _detect_venv_dir()
     if detected_venv is not None:
-        venv_bin = detected_venv / ("Scripts" if is_windows() else "bin")
+        from hermes_constants import venv_bin_dir
+
+        venv_bin = venv_bin_dir(detected_venv, windows=is_windows())
         if _is_dir(venv_bin):
             rendered = _service_project_path(
                 venv_bin,

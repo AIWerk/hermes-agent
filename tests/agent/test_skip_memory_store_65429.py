@@ -85,7 +85,7 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     raw = memory_tool(
         action="add",
         target="memory",
-        content="User prefers concise answers.",
+        content="Project uses pytest.",
         store=agent._memory_store,
     )
     result = json.loads(raw)
@@ -98,7 +98,7 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     # The write must actually persist to the profile-scoped memories dir.
     memory_md = tmp_path / "hm" / "memories" / "MEMORY.md"
     assert memory_md.exists()
-    assert "User prefers concise answers." in memory_md.read_text()
+    assert "Project uses pytest." in memory_md.read_text()
 
 
 def test_skip_memory_disabled_toolset_does_not_load_store(monkeypatch, tmp_path):

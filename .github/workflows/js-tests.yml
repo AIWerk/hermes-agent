@@ -80,4 +80,8 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Standard GitHub runners have four vCPUs and substantially less RAM
+        # than the upstream 32-core lane. Two concurrent workspace checks keep
+        # the large desktop UI Vitest process from being OOM-killed after its
+        # assertions pass but before it can emit the final summary.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2

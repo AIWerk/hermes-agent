@@ -413,7 +413,7 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
 
 class _TitlingAgent:
-    """Only what ``_maybe_title_session_at_turn_start`` reads off an agent."""
+    """Only what ``maybe_title_session_after_success`` reads off an agent."""
 
     def __init__(self, platform):
         self.platform = platform
@@ -428,24 +428,27 @@ class _TitlingAgent:
 
 
 def _title_turn(platform, message="Fix the login button"):
-    """Run the prologue's titling step and return the maybe_auto_title mock."""
+    """Run post-success titling and return the maybe_auto_title mock."""
     from agent import turn_context
 
     with patch("agent.title_generator.maybe_auto_title") as titler:
-        turn_context._maybe_title_session_at_turn_start(
+        turn_context.maybe_title_session_after_success(
             _TitlingAgent(platform),
-            [{"role": "user", "content": message}],
+            [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "Done."},
+            ],
         )
     return titler
 
 
 @pytest.mark.parametrize("platform", ["cli", "telegram", "desktop", "acp", None])
-def test_prologue_titles_the_surfaces_a_person_reads(platform):
+def test_post_success_titles_the_surfaces_a_person_reads(platform):
     assert _title_turn(platform).called
 
 
 @pytest.mark.parametrize("platform", ["cron", "CRON", "subagent"])
-def test_prologue_does_not_title_machine_driven_runs(platform):
+def test_post_success_does_not_title_machine_driven_runs(platform):
     """Cron names its own session after the job, and nobody opens a subagent's.
 
     Both would otherwise pay a side-LLM call per run for a name that is either

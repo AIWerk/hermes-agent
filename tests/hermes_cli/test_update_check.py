@@ -22,15 +22,20 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
 
+    identity = {"rev": None, "repo": str(repo_dir), "head": "abc123"}
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+    cache_file.write_text(
+        json.dumps({"ts": time.time(), "behind": 3, "ver": __version__, **identity})
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner._resolve_repo_dir", return_value=repo_dir), \
+         patch("hermes_cli.banner._update_check_cache_identity", return_value=identity), \
+         patch("hermes_cli.banner._check_via_local_git") as check_git:
         result = check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    check_git.assert_not_called()
 
 
 

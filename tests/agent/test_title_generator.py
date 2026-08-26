@@ -264,12 +264,13 @@ class TestMaybeAutoTitle:
             time.sleep(0.1)
             mock_auto.assert_not_called()
 
-    def test_fires_on_first_exchange(self):
-        """Should fire a background thread for the opening message."""
+    def test_fires_after_first_successful_exchange(self):
+        """Should fire only after the opening exchange has an assistant reply."""
         db = MagicMock()
         db.get_session_title.return_value = None
         history = [
             {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
         ]
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
@@ -290,16 +291,18 @@ class TestMaybeAutoTitle:
                 runtime_validator=None,
             )
 
-    def test_writes_instant_title_before_the_model_runs(self, tmp_path):
-        """The derived title lands synchronously — no LLM, no waiting."""
+    def test_does_not_write_derived_title_before_model_completion(self, tmp_path):
+        """Post-success dispatch must not write a speculative derived title."""
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="cli")
         with patch("agent.title_generator.auto_title_session"):
             maybe_auto_title(
-                db, "sess-1", "fix the flaky auth test in login", []
+                db,
+                "sess-1",
+                "fix the flaky auth test in login",
+                [{"role": "assistant", "content": "done"}],
             )
-        assert db.get_session_title("sess-1") == "fix the flaky auth test in login"
-        assert db.get_session_title_source("sess-1") == "derived"
+        assert db.get_session_title("sess-1") is None
 
     def test_skips_machine_authored_opening_messages(self, tmp_path):
         """A compaction handoff is not a user request and must not title."""
@@ -371,9 +374,14 @@ class TestMaybeAutoTitle:
             {"role": "user", "content": "thanks"},
             {"role": "assistant", "content": "sure"},
         ]
-        with patch("agent.title_generator.auto_title_session"):
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
             maybe_auto_title(db, "sess-1", "fix the flaky auth test", history)
-        assert db.get_session_title("sess-1") == "fix the flaky auth test"
+            assert called.wait(timeout=10), "background title stage never ran"
+        assert db.get_session_title("sess-1") is None
 
     def test_leaves_an_already_titled_session_alone_on_later_turns(self, tmp_path):
         """The retry is for nameless sessions only; a named one asks nothing."""
@@ -414,22 +422,17 @@ class TestMaybeAutoTitle:
 class TestAutoTitleDuplicateHandling:
     """Duplicate auto-title handling and not-found hardening (#50537)."""
 
-    def test_background_stage_names_a_collision_the_instant_stage_declined(
+    def test_failed_background_generation_leaves_collision_untitled(
         self, tmp_path
     ):
-        """The lineage scan the turn skipped happens here instead.
-
-        The inline stage declines a collision to stay off the critical path, and
-        the model can still come back empty. Between them the session would be
-        left nameless, so the background stage spends the scan the turn wouldn't.
-        """
+        """A failed model generation must not synthesize a fallback title."""
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="taken", source="cli")
         db.set_session_title("taken", "hi")
         db.create_session(session_id="sess-1", source="cli")
         with patch("agent.title_generator.generate_title", return_value=None):
             auto_title_session(db, "sess-1", "hi")
-        assert db.get_session_title("sess-1") == "hi #2"
+        assert db.get_session_title("sess-1") is None
 
     def test_dedupes_duplicate_title_via_lineage(self):
         db = MagicMock()
@@ -577,6 +580,7 @@ class TestModelSwitchMarkerNotTitleable:
         history = [
             {"role": "user", "content": self.MARKER},
             {"role": "user", "content": "南京市秦淮区 小时级天气预报"},
+            {"role": "assistant", "content": "天气如下"},
         ]
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:

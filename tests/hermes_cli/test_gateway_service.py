@@ -1453,6 +1453,7 @@ class TestSystemUnitRefreshSyncsHermesHome:
         alice_hermes = alice_home / ".hermes"
         root_hermes.mkdir(parents=True)
         alice_hermes.mkdir(parents=True)
+        (alice_hermes / "hermes-agent").symlink_to(gateway_cli.PROJECT_ROOT)
         (root_hermes / "config.yaml").write_text(
             "agent:\n  restart_drain_timeout: 60\n", encoding="utf-8"
         )
@@ -1615,7 +1616,19 @@ class TestGeneratedUnitIncludesLocalBin:
     """~/.local/bin must be in PATH so uvx/pipx tools are discoverable."""
 
 
-    def test_system_unit_includes_local_bin_in_path(self, monkeypatch):
+    def test_system_unit_includes_local_bin_in_path(self, tmp_path, monkeypatch):
+        target_home = tmp_path / "alice"
+        target_hermes = target_home / ".hermes"
+        target_hermes.mkdir(parents=True)
+        (target_hermes / "hermes-agent").symlink_to(gateway_cli.PROJECT_ROOT)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", str(target_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_hermes_home_for_target_user", lambda _home: str(target_hermes)
+        )
         monkeypatch.setattr(
             gateway_cli,
             "_build_user_local_paths",
@@ -1785,6 +1798,9 @@ class TestProfileArg:
         target_home = tmp_path / "home" / "alice"
         root_profile = root_home / ".hermes" / "profiles" / "mybot"
         root_profile.mkdir(parents=True)
+        target_profile = target_home / ".hermes" / "profiles" / "mybot"
+        target_profile.mkdir(parents=True)
+        (target_profile / "hermes-agent").symlink_to(gateway_cli.PROJECT_ROOT)
 
         monkeypatch.setattr(Path, "home", lambda: root_home)
         monkeypatch.setenv("HERMES_HOME", str(root_profile))
@@ -2465,7 +2481,7 @@ class TestServiceWorkingDirIsStable:
     def test_user_unit_workingdirectory_is_hermes_home_not_checkout(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"
         home.mkdir()
-        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        monkeypatch.setenv("HERMES_HOME", str(home))
         unit = gateway_cli.generate_systemd_unit(system=False)
         wd = [l for l in unit.splitlines() if l.startswith("WorkingDirectory=")]
         assert wd, "unit has no WorkingDirectory line"
@@ -2479,7 +2495,7 @@ class TestServiceWorkingDirIsStable:
 
         home = tmp_path / ".hermes"
         home.mkdir()
-        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        monkeypatch.setenv("HERMES_HOME", str(home))
         plist = gateway_cli.generate_launchd_plist()
         m = re.search(r"<key>WorkingDirectory</key>\s*<string>(.*?)</string>", plist)
         assert m, "plist has no WorkingDirectory entry"

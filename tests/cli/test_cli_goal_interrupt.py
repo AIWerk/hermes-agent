@@ -143,11 +143,11 @@ class TestInterruptFlagLifecycle:
         from cli import HermesCLI
         import inspect
 
-        src = inspect.getsource(HermesCLI.chat)
+        src = inspect.getsource(HermesCLI._chat_impl)
         # Look for an explicit reset near the top of chat().
         head = src.split("if not self._ensure_runtime_credentials", 1)[0]
         assert "self._last_turn_interrupted = False" in head, (
-            "chat() must reset _last_turn_interrupted before run_conversation "
+            "_chat_impl() must reset _last_turn_interrupted before run_conversation "
             "runs — otherwise a prior turn's interrupt state leaks into the "
             "next turn's goal hook decision."
         )

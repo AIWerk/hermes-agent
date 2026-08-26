@@ -191,8 +191,8 @@ class TestIndependentStoreWriteGates:
         from tools.memory_tool import memory_tool
 
         store = self._store(memory_enabled=False, user_profile_enabled=True)
-        denied = json.loads(memory_tool(action="add", target="memory", content="fact", store=store))
-        allowed = json.loads(memory_tool(action="add", target="user", content="pref", store=store))
+        denied = json.loads(memory_tool(action="add", target="memory", content="Project uses pytest.", store=store))
+        allowed = json.loads(memory_tool(action="add", target="user", content="The user prefers concise answers.", store=store))
 
         assert denied["success"] is False
         assert denied["target"] == "memory"
@@ -202,8 +202,8 @@ class TestIndependentStoreWriteGates:
         from tools.memory_tool import memory_tool
 
         store = self._store(memory_enabled=True, user_profile_enabled=False)
-        denied = json.loads(memory_tool(action="add", target="user", content="pref", store=store))
-        allowed = json.loads(memory_tool(action="add", target="memory", content="fact", store=store))
+        denied = json.loads(memory_tool(action="add", target="user", content="The user prefers concise answers.", store=store))
+        allowed = json.loads(memory_tool(action="add", target="memory", content="Project uses pytest.", store=store))
 
         assert denied["success"] is False
         assert denied["target"] == "user"

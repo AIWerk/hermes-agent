@@ -3510,6 +3510,11 @@ def load_security_policy_bool_strict(
     from hermes_cli import managed_scope
 
     managed_dir = managed_scope.get_managed_dir()
+    managed_override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    if managed_override and managed_dir is None:
+        raise RuntimeError(
+            f"selected managed scope directory is unavailable: {managed_override}"
+        )
     if managed_dir is not None:
         managed_path = managed_dir / "config.yaml"
         resolved = _apply(

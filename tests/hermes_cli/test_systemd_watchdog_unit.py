@@ -32,6 +32,7 @@ def test_system_unit_reads_watchdog_from_target_home(tmp_path, monkeypatch):
     target_home = tmp_path / "target"
     caller_home.mkdir()
     target_home.mkdir()
+    (target_home / "hermes-agent").symlink_to(gateway_cli.PROJECT_ROOT)
     (caller_home / "config.yaml").write_text(
         "gateway:\n  systemd_watchdog_seconds: 0\n",
         encoding="utf-8",

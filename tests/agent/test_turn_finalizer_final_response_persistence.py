@@ -94,6 +94,11 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     because the assistant's visible final answer is missing from durable state.
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    title_calls = []
+    monkeypatch.setattr(
+        "agent.turn_context.maybe_title_session_after_success",
+        lambda agent, messages: title_calls.append((agent, list(messages))),
+    )
     agent = FakeAgent()
     messages = [
         {"role": "user", "content": "do it"},
@@ -128,6 +133,8 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == result["messages"][-1]
+    assert title_calls and title_calls[0][0] is agent
+    assert title_calls[0][1][-1]["content"] == "Done."
 
 
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(

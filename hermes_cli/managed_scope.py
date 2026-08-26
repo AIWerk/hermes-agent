@@ -69,7 +69,7 @@ def get_managed_dir() -> Optional[Path]:
             if p.is_symlink():
                 raise RuntimeError(f"managed scope directory must not be a symlink: {p}")
             if not p.is_dir():
-                raise RuntimeError(f"selected managed scope directory is unavailable: {p}")
+                return None
         except OSError as exc:
             raise RuntimeError(f"selected managed scope directory cannot be read: {p}") from exc
         return p

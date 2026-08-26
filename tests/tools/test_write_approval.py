@@ -72,7 +72,7 @@ def test_memory_gate_off_allows_write(hermes_home):
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "user", "save me", store=store))
+    r = json.loads(memory_tool("add", "user", "The user prefers concise replies.", store=store))
     assert r["success"] is True
     assert r["entry_count"] == 1
     assert wa.pending_count("memory") == 0
@@ -90,7 +90,7 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
 
     _set_approval("memory", True)
     staging = MemoryStore(); staging.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "remember the launch date", store=staging))
+    r = json.loads(memory_tool("add", "memory", "Project uses pytest.", store=staging))
     assert r.get("pending_id"), r
     assert wa.pending_count("memory") == 1
 
@@ -105,7 +105,7 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
     assert wa.pending_count("memory") == 0
     # The approved write landed in a freshly loaded on-disk store (MEMORY.md).
     reloaded = MemoryStore(); reloaded.load_from_disk()
-    assert any("remember the launch date" in e for e in reloaded.memory_entries)
+    assert "Project uses pytest." in reloaded.memory_entries
 
 
 def test_load_on_disk_store_honors_configured_limits_and_permissions(hermes_home, monkeypatch):
@@ -167,10 +167,10 @@ def test_handle_approve_all(hermes_home):
     from tools.memory_tool import MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
-    wa.stage_write("memory", {"action": "add", "target": "user", "content": "a"},
-                   summary="a", origin="foreground")
-    wa.stage_write("memory", {"action": "add", "target": "user", "content": "b"},
-                   summary="b", origin="foreground")
+    wa.stage_write("memory", {"action": "add", "target": "user", "content": "The user prefers concise replies."},
+                   summary="concise replies", origin="foreground")
+    wa.stage_write("memory", {"action": "add", "target": "user", "content": "The user likes dark mode."},
+                   summary="dark mode", origin="foreground")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 2" in out
     assert wa.pending_count("memory") == 0
@@ -227,14 +227,14 @@ def test_memory_inline_approve_writes(hermes_home, approval_callback_cleanup):
     set_approval_callback(approve_cb)
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "approved fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "Project uses pytest.", store=store))
     assert r["success"] is True
     assert r.get("staged") is None  # real write, not staged
-    assert store.memory_entries == ["approved fact"]
+    assert store.memory_entries == ["Project uses pytest."]
     assert wa.pending_count("memory") == 0
     # The registered callback must actually be invoked (not the input() path).
     assert len(calls) == 1
-    assert "approved fact" in calls[0][0]
+    assert "Project uses pytest." in calls[0][0]
 
 
 def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
@@ -245,7 +245,7 @@ def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
     set_approval_callback(lambda command, description, **kw: "deny")
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "denied fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "Project uses pytest.", store=store))
     assert r["success"] is False
     assert "denied" in r["error"].lower()
     assert store.memory_entries == []

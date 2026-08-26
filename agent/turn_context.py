@@ -186,12 +186,12 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
 _UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
 
 
-def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
-    """Kick off auto-titling for this session's first user message.
+def maybe_title_session_after_success(agent: Any, messages: List[Any]) -> None:
+    """Kick off auto-titling after a successful persisted exchange.
 
-    Called from the turn prologue, so every surface a human reads (CLI, gateway,
-    TUI/desktop, ACP) gets identical behavior without each one re-implementing
-    the call. Fully defensive: titling is cosmetic and must never break a turn.
+    Called from the shared finalizer, so every surface a human reads gets the
+    same post-success behavior. Fully defensive: titling is cosmetic and must
+    never break or lose a completed turn.
     """
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
@@ -255,7 +255,7 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
             ),
         )
     except Exception:
-        logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
+        logger.debug("Post-success auto-title dispatch failed", exc_info=True)
 
 
 def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
@@ -1503,16 +1503,6 @@ def build_turn_context(
         # close path must no longer treat it as a pre-worker UI input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
-
-    # Title the session from this user message, now — the row exists and the
-    # turn has not called the model yet. Titling is derived from the user's
-    # ask alone, so it runs concurrently with the turn instead of waiting for
-    # a final response; on a long tool-heavy first turn that is the difference
-    # between a title in ~1s and a title minutes later (or never, when the
-    # turn failed before producing one). Fire-and-forget on a daemon thread,
-    # a no-op once the session has a title, and shared by every surface
-    # because every surface enters the turn through this prologue.
-    _maybe_title_session_at_turn_start(agent, messages)
 
     return TurnContext(
         user_message=user_message,

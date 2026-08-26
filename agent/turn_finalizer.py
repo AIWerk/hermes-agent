@@ -456,6 +456,13 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        if completed and not interrupted and not failed and final_response:
+            try:
+                from agent.turn_context import maybe_title_session_after_success
+
+                maybe_title_session_after_success(agent, messages)
+            except Exception:
+                logger.debug("Post-success auto-title dispatch failed", exc_info=True)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

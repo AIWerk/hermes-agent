@@ -122,6 +122,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
             _resumed=False,
             reasoning_config={"enabled": True, "effort": "high"},
             _notify_session_boundary=MagicMock(),
+            _set_fresh_carryover_context=MagicMock(),
         )
 
         with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "medium"}):
@@ -150,6 +151,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
             _resumed=False,
             reasoning_config=None,
             _notify_session_boundary=MagicMock(),
+            _set_fresh_carryover_context=MagicMock(),
             # Session had switched to fast + a session-only model.
             service_tier="priority",
             _pending_one_turn_model_restore={"model": "stale"},

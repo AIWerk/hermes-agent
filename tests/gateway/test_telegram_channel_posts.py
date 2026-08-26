@@ -108,6 +108,7 @@ def _make_channel_message(text="channel id test @hermes_bot"):
     )
     return SimpleNamespace(
         chat=chat,
+        sender_chat=chat,
         from_user=None,
         text=text,
         caption=None,

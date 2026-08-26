@@ -114,6 +114,18 @@ def test_managed_override_rejects_symlink_directory(tmp_path, monkeypatch):
         managed_scope.get_managed_dir()
 
 
+def test_strict_policy_rejects_missing_explicit_managed_directory(tmp_path, monkeypatch):
+    from hermes_cli import config as cfg
+
+    user = tmp_path / "user.yaml"
+    user.write_text("security:\n  allow_lazy_installs: true\n")
+    monkeypatch.setattr(cfg, "get_config_path", lambda: user)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "missing-managed"))
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        cfg.load_security_policy_bool_strict("allow_lazy_installs", default=False)
+
+
 def test_strict_policy_rejects_symlink_managed_config(tmp_path, monkeypatch):
     from hermes_cli import config as cfg
     user = tmp_path / "user.yaml"

@@ -471,6 +471,11 @@ class TestGatewaySelfTargetingGuard:
         # real signal delivery, which would trip the live-system guard) by
         # short-circuiting the first downstream call with a sentinel.
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        from tools import process_registry
+
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process", lambda: False
+        )
         import hermes_cli.gateway as gw
 
         class _Reached(Exception):
@@ -659,10 +664,14 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(
             tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
         )
+        monkeypatch.setattr(
+            "hermes_cli.operator_verification.operator_verification_block_reason_for_command",
+            lambda *args, **kwargs: None,
+        )
 
         result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
 
-        assert result["exit_code"] == 0
+        assert result["exit_code"] == 0, result
         assert calls == ["hermes gateway restart"]
 
     def test_blocks_launchctl_submit_hidden_in_referenced_script(
