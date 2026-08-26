@@ -13,11 +13,7 @@ from pathlib import Path
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
 
-    monkeypatch.setattr(
-        executions,
-        "EXECUTIONS_FILE",
-        tmp_path / "cron" / "executions.db",
-    )
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
 
 
@@ -134,32 +130,6 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
-
-
-def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("other-live", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
-        conn.execute(
-            "UPDATE executions SET process_id=?, pid=? WHERE id=?",
-            ("another-import", os.getpid(), record["id"]),
-        )
-
-    assert executions.recover_interrupted_executions() == 0
-    assert executions.latest_execution("other-live")["status"] == "claimed"
-
-
-def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("recycled", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
-        conn.execute(
-            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
-            ("old-import", -1, record["id"]),
-        )
-
-    assert executions.recover_interrupted_executions() == 1
-    assert executions.latest_execution("recycled")["status"] == "unknown"
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):

@@ -56,9 +56,11 @@ SEVERITY_PATTERNS = (
 
 REDACTIONS = (
     (
-        re.compile(
-            r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*[^\s,;]+"
-        ),
+        re.compile(r"(?i)(authorization)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+"),
+        r"\1=[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+"),
         r"\1=[REDACTED]",
     ),
     (re.compile(r"(?i)bearer\s+[a-z0-9._\-]+"), "Bearer [REDACTED]"),

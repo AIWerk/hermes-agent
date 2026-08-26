@@ -1023,9 +1023,6 @@ def _build_tool_complete_content(
                 snapshot=snapshot,
             )
             if isinstance(diff_text, str) and diff_text.strip():
-                from agent.tool_argument_projection import sanitize_tool_display_text
-
-                diff_text = sanitize_tool_display_text(diff_text)
                 diff_content = _parse_unified_diff_content(diff_text)
                 if diff_content:
                     return diff_content
@@ -1314,19 +1311,14 @@ def build_tool_complete(
     snapshot: Any = None,
 ) -> ToolCallProgress:
     """Create a ToolCallUpdate (progress) event for a completed tool call."""
-    from agent.tool_argument_projection import sanitize_tool_display_text
-
-    display_result = (
-        sanitize_tool_display_text(result) if isinstance(result, str) else result
-    )
     kind = get_tool_kind(tool_name)
     if tool_name == "web_extract":
-        error_text = _format_web_extract_result(display_result)
+        error_text = _format_web_extract_result(result)
         content = [_text(error_text)] if error_text else None
     else:
         content = _build_tool_complete_content(
             tool_name,
-            display_result,
+            result,
             function_args=function_args,
             snapshot=snapshot,
         )
@@ -1335,11 +1327,7 @@ def build_tool_complete(
         kind=kind,
         status="failed" if _tool_result_failed(result, tool_name) else "completed",
         content=content,
-        raw_output=(
-            None
-            if tool_name in _POLISHED_TOOLS or _is_structured_json_result(display_result)
-            else display_result
-        ),
+        raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
     )
 
 

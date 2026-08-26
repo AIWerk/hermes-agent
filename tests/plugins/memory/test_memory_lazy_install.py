@@ -201,11 +201,12 @@ class TestSealedVenvDurableTarget:
         # Sealed venv + durable target = the published Docker image config.
         monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
         monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path / "lazy"))
-        # config.yaml kill-switch left at default (allow).
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: {"security": {"allow_lazy_installs": True}},
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "security:\n  allow_lazy_installs: true\n"
         )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
         # Real gate must permit installs because a durable target is set.
         assert ld._allow_lazy_installs() is True, (

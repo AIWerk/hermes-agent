@@ -4,7 +4,7 @@ Tests for mcp_serve — Hermes MCP server.
 Three layers of tests:
 1. Unit tests — helpers, content extraction, attachment parsing
 2. EventBridge tests — queue mechanics, cursors, waiters, concurrency
-3. End-to-end tests — call actual MCP tools through FastMCP's tool manager
+3. End-to-end tests — call actual MCP tools through the MCPServer's public API
    with real session data in SQLite and sessions.json
 """
 
@@ -228,7 +228,9 @@ class _FakeToolManager:
         return list(self._tools.values())
 
 
-class _FakeFastMCP:
+class _FakeMCPServer:
+    """Stand-in for ``mcp.server.MCPServer`` (``FastMCP`` before mcp 2.0)."""
+
     def __init__(self, *args, **kwargs):
         self._tool_manager = _FakeToolManager()
 
@@ -239,6 +241,17 @@ class _FakeFastMCP:
 
         return decorator
 
+    async def call_tool(self, name, args=None):
+        """Dispatch straight to the handler, with no schema validation.
+
+        Mirrors ``MCPServer.call_tool``'s name so ``_run_tool`` works against
+        either server, but deliberately skips the SDK's pydantic coercion:
+        the parameter-coercion tests exist to prove the handlers' own
+        ``_coerce_int`` guards hold when a client sends a wrongly-typed value,
+        which the real server would reject before the handler ever ran.
+        """
+        return await self._tool_manager.call_tool(name, args)
+
 
 @pytest.fixture
 def fake_mcp_server(populated_sessions_dir, mock_session_db, monkeypatch):
@@ -248,7 +261,7 @@ def fake_mcp_server(populated_sessions_dir, mock_session_db, monkeypatch):
     monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
     monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
     monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-    monkeypatch.setattr(mcp_serve, "FastMCP", _FakeFastMCP)
+    monkeypatch.setattr(mcp_serve, "MCPServer", _FakeMCPServer)
 
     bridge = mcp_serve.EventBridge()
     server = mcp_serve.create_mcp_server(event_bridge=bridge)
@@ -505,7 +518,7 @@ class TestEventBridge:
 
 
 # ---------------------------------------------------------------------------
-# 3. END-TO-END TESTS — call MCP tools through FastMCP server
+# 3. END-TO-END TESTS — call MCP tools through the MCP server
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -523,11 +536,24 @@ def mcp_server_e2e(populated_sessions_dir, mock_session_db, monkeypatch):
 
 
 def _run_tool(server, name, args=None):
-    """Call an MCP tool through FastMCP's tool manager and return parsed JSON."""
+    """Call an MCP tool through the server's public API and return parsed JSON.
+
+    Goes through ``MCPServer.call_tool`` rather than the private
+    ``_tool_manager`` the FastMCP-era version reached into: mcp 2.0's
+    ``ToolManager.call_tool`` gained a required ``context`` argument, and the
+    public method is what an actual MCP client exercises anyway. It returns a
+    ``CallToolResult``, so unwrap the text content block our tools produce.
+    """
     result = asyncio.get_event_loop().run_until_complete(
-        server._tool_manager.call_tool(name, args or {})
+        server.call_tool(name, args or {})
     )
-    return json.loads(result) if isinstance(result, str) else result
+    if isinstance(result, str):  # FastMCP-era shape
+        return json.loads(result)
+    text = "".join(
+        block.text for block in (getattr(result, "content", None) or [])
+        if getattr(block, "text", None)
+    )
+    return json.loads(text) if text else result
 
 
 @pytest.fixture
@@ -1135,11 +1161,6 @@ class TestEventBridgePollE2E:
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
-        # Keep the no-change premise true: the production DB index loader opens
-        # SessionDB, whose first-time schema setup can itself advance state.db's
-        # mtime. This test exercises the legacy JSON fallback and the poll gate,
-        # not SessionDB initialization.
-        monkeypatch.setattr(mcp_serve, "_load_sessions_index_from_db", lambda: {})
 
         session_id = "20260329_150000_skip_test"
         db_path = tmp_path / "state.db"
@@ -1353,8 +1374,7 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        baseline_mtime = db_path.stat().st_mtime
-        os.utime(db_path, (baseline_mtime + 1, baseline_mtime + 1))  # open poll gate
+        os.utime(db_path, None)  # bump mtime so the poll gate opens
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1392,8 +1412,7 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        baseline_mtime = db_path.stat().st_mtime
-        os.utime(db_path, (baseline_mtime + 1, baseline_mtime + 1))
+        os.utime(db_path, None)
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

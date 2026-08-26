@@ -16,11 +16,24 @@ import base64
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Optional
 
 from hermes_cli.auth import DEFAULT_CODEX_BASE_URL, resolve_codex_runtime_credentials
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+
+
+@dataclass(frozen=True)
+class _CodexCredential(UpstreamCredential):
+    """Credential carrying Codex's required non-auth upstream headers.
+
+    The current upstream base credential predates provider-specific headers.
+    Keeping this as a compatible subtype preserves that contract without
+    widening the shared base in this disjoint capability slice.
+    """
+
+    headers: Optional[Dict[str, str]] = None
 
 
 def _pooled_codex_credential() -> dict[str, Any]:
@@ -375,7 +388,7 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 "OpenAI Codex auth did not return an access token. Run hermes login --provider openai-codex."
             )
         base_url = str(creds.get("base_url") or DEFAULT_CODEX_BASE_URL).strip().rstrip("/")
-        return UpstreamCredential(
+        return _CodexCredential(
             bearer=access_token,
             base_url=base_url,
             expires_at=_token_expiry_iso(access_token),
@@ -474,7 +487,7 @@ class OpenAICodexAdapter(UpstreamAdapter):
             "proxy: Codex upstream returned %s; retrying with rotated pool credential",
             status_code,
         )
-        return UpstreamCredential(
+        return _CodexCredential(
             bearer=bearer,
             base_url=base_url or DEFAULT_CODEX_BASE_URL,
             expires_at=_token_expiry_iso(bearer),

@@ -96,8 +96,6 @@ const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
-// Customer assistant mode is the complete root and does not use the admin-shell boundary.
-import AiwerkAssistantPage from "@/pages/AiwerkAssistantPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -107,7 +105,6 @@ import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import {
   getHermesAgentDisplayName,
-  isAssistantDashboardMode,
   isDashboardEmbeddedChatEnabled,
 } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
@@ -376,27 +373,17 @@ function buildRoutes(
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
 export default function App() {
-  const isAssistantMode = isAssistantDashboardMode();
-
-  useEffect(() => {
-    if (isAssistantMode) {
-      const agentName = getHermesAgentDisplayName();
-      document.title = agentName ? `${agentName} AI Assistant` : "AI Assistant";
-      return;
-    }
-    document.title = "Assistant Dashboard";
-  }, [isAssistantMode]);
-
-  return isAssistantMode ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
-}
-
-function AdminDashboardApp() {
   const { t } = useI18n();
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+
+  useEffect(() => {
+    const agentName = getHermesAgentDisplayName();
+    document.title = agentName ? `${agentName} AI Assistant` : "AI Assistant";
+  }, []);
 
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -970,9 +957,11 @@ function SidebarSystemActions({
 
   useEffect(() => {
     if (!updateConfirmOpen) {
+      setUpdateConfirmInfo(null);
       return;
     }
     let cancelled = false;
+    setUpdateConfirmChecking(true);
     api
       .checkHermesUpdate(false)
       .then((info) => {
@@ -1028,8 +1017,6 @@ function SidebarSystemActions({
       return;
     }
     if (action === "update") {
-      setUpdateConfirmInfo(null);
-      setUpdateConfirmChecking(true);
       setUpdateConfirmOpen(true);
       return;
     }
@@ -1047,8 +1034,6 @@ function SidebarSystemActions({
 
   const confirmUpdate = () => {
     setUpdateConfirmOpen(false);
-    setUpdateConfirmInfo(null);
-    setUpdateConfirmChecking(false);
     void runAction("update");
     navigate("/sessions");
     onNavigate();
@@ -1118,11 +1103,7 @@ function SidebarSystemActions({
         updateConfirmChecking ? t.common.loading : updateConfirmDescription
       }
       loading={pendingAction === "update" || updateConfirmChecking}
-      onCancel={() => {
-        setUpdateConfirmOpen(false);
-        setUpdateConfirmInfo(null);
-        setUpdateConfirmChecking(false);
-      }}
+      onCancel={() => setUpdateConfirmOpen(false)}
       onConfirm={confirmUpdate}
       open={updateConfirmOpen}
       title={t.status.updateHermesConfirmTitle ?? `${t.status.updateHermes}?`}

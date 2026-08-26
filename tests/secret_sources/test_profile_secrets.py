@@ -46,8 +46,7 @@ def _clean_registry():
     registry._reset_registry_for_tests()
 
 
-def _apply(secrets, cfg_extra=None, home=None, env=None):
-    assert home is not None, "tests must pass an isolated profile home"
+def _apply(secrets, cfg_extra=None, home=Path("/tmp/x/.hermes"), env=None):
     registry.register_source(_FakeBulk(secrets), replace=True)
     cfg = {"fakebulk": {"enabled": True}}
     cfg.update(cfg_extra or {})
@@ -64,11 +63,10 @@ PROFILE_HOME = Path("/home/u/.hermes/profiles/milla")
 # ---------------------------------------------------------------------------
 
 
-def test_preserve_existing_beats_override(tmp_path):
+def test_preserve_existing_beats_override():
     report, env = _apply(
         {"FEISHU_APP_SECRET": "shared", "OPENAI_API_KEY": "fresh"},
         cfg_extra={"preserve_existing": ["FEISHU_APP_SECRET"]},
-        home=tmp_path / ".hermes",
         env={"FEISHU_APP_SECRET": "profile-local", "OPENAI_API_KEY": "stale"},
     )
     assert env["FEISHU_APP_SECRET"] == "profile-local"   # preserved
@@ -78,12 +76,11 @@ def test_preserve_existing_beats_override(tmp_path):
     assert "OPENAI_API_KEY" in sr.applied
 
 
-def test_preserve_existing_only_guards_set_vars(tmp_path):
+def test_preserve_existing_only_guards_set_vars():
     """A preserve-listed var with NO existing value still gets applied."""
     _, env = _apply(
         {"FEISHU_APP_SECRET": "shared"},
         cfg_extra={"preserve_existing": ["FEISHU_APP_SECRET"]},
-        home=tmp_path / ".hermes",
         env={},
     )
     assert env["FEISHU_APP_SECRET"] == "shared"

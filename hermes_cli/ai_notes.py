@@ -32,6 +32,66 @@ _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{8,}\b")
 _ABSOLUTE_HTTP_URL_RE = re.compile(r"(?i)\bhttps?://[^\s'\"<>]+")
 _PROTOCOL_RELATIVE_URL_RE = re.compile(r"(?<!:)//[^\s'\"<>),]+")
 _URL_ATTRS = {"href", "src", "srcset", "style", "action", "formaction", "poster", "data", "cite"}
+_STATIC_HTML_TAGS = {
+    "a", "abbr", "article", "aside", "b", "blockquote", "body", "br", "caption",
+    "cite", "code", "col", "colgroup", "dd", "del", "details", "dfn", "div", "dl",
+    "dt", "em", "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5",
+    "h6", "head", "header", "hr", "html", "i", "img", "ins", "kbd", "li", "main",
+    "mark", "meta", "nav", "ol", "p", "picture", "pre", "q", "s", "samp", "section",
+    "small", "source", "span", "strong", "sub", "summary", "sup", "table",
+    "tbody", "td", "tfoot", "th", "thead", "time", "title", "tr", "u", "ul", "var",
+}
+_STATIC_GLOBAL_ATTRS = {"class", "dir", "hidden", "id", "lang", "role", "title"}
+_STATIC_TAG_ATTRS = {
+    "a": {"download", "href", "referrerpolicy", "rel", "target"},
+    "blockquote": {"cite"}, "q": {"cite"},
+    "col": {"span", "width"}, "colgroup": {"span", "width"},
+    "details": {"open"},
+    "img": {"alt", "decoding", "height", "loading", "referrerpolicy", "sizes", "src", "srcset", "width"},
+    "ins": {"cite", "datetime"}, "del": {"cite", "datetime"},
+    "li": {"value"}, "ol": {"reversed", "start", "type"},
+    "meta": {"charset", "content", "name"},
+    "source": {"height", "media", "sizes", "src", "srcset", "type", "width"},
+    "style": {"media", "type"},
+    "td": {"colspan", "headers", "rowspan"},
+    "th": {"abbr", "colspan", "headers", "rowspan", "scope"},
+    "time": {"datetime"},
+}
+_ACTIVE_VALUE_RE = re.compile(r"(?i)(?:javascript|vbscript|data|blob)\s*:|expression\s*\(|-moz-binding|behavior\s*:")
+
+
+class _StaticHtmlValidator(HTMLParser):
+    """Fail closed unless markup is inert, supported static HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._validate(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._validate(tag, attrs)
+
+    def _validate(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag not in _STATIC_HTML_TAGS:
+            raise ValueError("AI Notes HTML contains active or unsupported HTML")
+        allowed = _STATIC_TAG_ATTRS.get(tag, set())
+        for raw_name, value in attrs:
+            name = raw_name.lower()
+            if name.startswith("on") or name == "srcdoc":
+                raise ValueError("AI Notes HTML contains active or unsupported HTML")
+            if (
+                name not in _STATIC_GLOBAL_ATTRS
+                and name not in allowed
+                and not name.startswith("aria-")
+                and not name.startswith("data-")
+            ):
+                raise ValueError("AI Notes HTML contains active or unsupported HTML")
+            if value:
+                canonical_value = re.sub(r"[\x00-\x20\x7f]+", "", value)
+                if _ACTIVE_VALUE_RE.search(canonical_value):
+                    raise ValueError("AI Notes HTML contains active or unsupported HTML")
 
 
 class _HtmlUrlCollector(HTMLParser):
@@ -147,6 +207,14 @@ def _validate_embedded_urls_safe(html: str) -> None:
 def _validate_html_safe_to_publish(html: str) -> None:
     if not isinstance(html, str) or not html.strip():
         raise ValueError("AI Notes HTML content is required")
+    validator = _StaticHtmlValidator()
+    try:
+        validator.feed(html)
+        validator.close()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("AI Notes HTML contains active or unsupported HTML") from exc
     checks = [
         (_FORBIDDEN_PATH_RE, "local filesystem or MEDIA path"),
         (_LOCALHOST_RE, "localhost/private service URL"),

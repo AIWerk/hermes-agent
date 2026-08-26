@@ -13,7 +13,6 @@ the whole tree as modified. These tests pin down that coupling.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -199,48 +198,11 @@ def test_churn_across_more_files_than_fit_in_one_argv(tmp_path: Path) -> None:
     """
     files = {f"pkg/mod_{i:04d}.py": f"VALUE = {i}\n".encode() for i in range(1200)}
     repo = _managed_repo(tmp_path, files)
-    # Force Git to inspect content instead of trusting checkout's fresh stat
-    # cache. On loaded/coarse-timestamp filesystems, an immediate config-switched
-    # diff can otherwise expose only a suffix of the 1200 CRLF files.
-    for name in files:
-        path = repo / name
-        st = path.stat()
-        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
     assert len(_dirty(repo)) == len(files)
 
     _normalize_managed_eol(GIT_CMD, repo)
 
     assert _dirty(repo) == set()
-    assert _autocrlf(repo) == "false"
-
-
-def test_literal_pathspec_magic_filename_cannot_expand_to_real_edits(tmp_path: Path) -> None:
-    """A tracked filename is data, never a Git pathspec expression."""
-    repo = _managed_repo(
-        tmp_path,
-        {
-            ":(glob)*.py": b"magic = 1\n",
-            "victim.py": b"value = 1\n",
-        },
-    )
-    genuine_edit = b"value = 1\r\nvalue += 1\r\n"
-    (repo / "victim.py").write_bytes(genuine_edit)
-
-    _normalize_managed_eol(GIT_CMD, repo)
-
-    assert (repo / "victim.py").read_bytes() == genuine_edit
-    assert _dirty(repo) == {"victim.py"}
-    assert b"\r\n" not in (repo / ":(glob)*.py").read_bytes()
-    assert _autocrlf(repo) == "false"
-
-
-def test_literal_pathspec_prefix_filename_is_normalized(tmp_path: Path) -> None:
-    repo = _managed_repo(tmp_path, {":(literal)magic.py": b"magic = 1\n"})
-
-    _normalize_managed_eol(GIT_CMD, repo)
-
-    assert _dirty(repo) == set()
-    assert b"\r\n" not in (repo / ":(literal)magic.py").read_bytes()
     assert _autocrlf(repo) == "false"
 
 

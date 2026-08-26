@@ -23,17 +23,19 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import copy
 import json
 import logging
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
-from utils import atomic_replace, atomic_write_text
 from agent.memory_router import MemorySensitivity, should_write_builtin_memory
-from hermes_cli.config import cfg_get, load_config
+from utils import atomic_write_text, is_truthy_value
+from tools.registry import no_cache_check_fn
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -47,6 +49,14 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+# One tool-definition pass must use one config decision for both availability
+# and the dynamic target schema. ContextVar keeps concurrent profile/session
+# builds isolated while allowing the check_fn result to flow to the immediately
+# following dynamic_schema_overrides call in ToolRegistry.get_definitions().
+_memory_surface_flags: ContextVar[Optional[Tuple[bool, bool]]] = ContextVar(
+    "memory_surface_flags", default=None
+)
 
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
@@ -164,17 +174,30 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        *,
+        memory_enabled: bool = True,
+        user_profile_enabled: bool = True,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.memory_enabled = memory_enabled
+        self.user_profile_enabled = user_profile_enabled
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         self.operator_session_context: Dict[str, Any] | None = None
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+
+    def target_enabled(self, target: str) -> bool:
+        """Return whether this session's selected built-in store is writable."""
+        return self.user_profile_enabled if target == "user" else self.memory_enabled
 
     def reset_consolidation_failures(self) -> None:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
@@ -887,55 +910,116 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
-def _memory_router_enabled() -> bool:
-    """Return whether the (curation) memory-write routing policy is enabled."""
+def _memory_router_curation_enabled() -> bool:
+    """Return whether non-inject writes are blocked by curation policy."""
     try:
-        cfg = load_config()
-        return bool(cfg_get(cfg, "memory", "router", "enabled", default=True)) and bool(
-            cfg_get(cfg, "memory", "router", "block_non_inject_writes", default=True)
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
+        return bool(
+            cfg_get(config, "memory", "router", "enabled", default=True)
+        ) and bool(
+            cfg_get(
+                config,
+                "memory",
+                "router",
+                "block_non_inject_writes",
+                default=True,
+            )
         )
     except Exception:
-        # Fail open for curation so a config glitch doesn't silently reject
-        # legitimate writes. Credential protection remains unconditional.
+        # Curation is optional and must not suppress legitimate memory writes
+        # merely because configuration is temporarily unreadable. Credential
+        # rejection below remains unconditional.
         return False
 
 
-def _router_block_response(content: str, target: str, *, policy_block: bool = True) -> Optional[str]:
-    ok, route = should_write_builtin_memory(content, target=target)
+def _memory_router_block(
+    content: str,
+    target: str,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    policy_block: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Reject credentials always and optional non-inject curation failures."""
+    allowed, route = should_write_builtin_memory(
+        content or "", target=target, metadata=metadata
+    )
     if route.sensitivity == MemorySensitivity.CREDENTIAL:
-        return json.dumps({
+        return {
             "success": False,
-            "error": "Memory router blocked a credential/secret from prompt-injected memory.",
+            "error": (
+                "Memory router blocked a credential/secret from "
+                "prompt-injected memory."
+            ),
             "route": route.to_dict(),
-        }, ensure_ascii=False)
-    if not policy_block:
+        }
+    if allowed or not policy_block or not _memory_router_curation_enabled():
         return None
-    if not _memory_router_enabled():
-        return None
-    if ok:
-        return None
-    return json.dumps({
+    return {
         "success": False,
         "error": "Memory router blocked this write from prompt-injected memory.",
         "route": route.to_dict(),
-    }, ensure_ascii=False)
+    }
+
+
+def _memory_router_block_batch(
+    target: str,
+    operations: List[Dict[str, Any]],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Gate every content-producing operation before staging or mutation."""
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return {
+                "success": False,
+                "error": "Each operation must be an object.",
+            }
+        if operation.get("action") not in {"add", "replace"}:
+            continue
+        content = operation.get("content") or operation.get("new_text")
+        blocked = _memory_router_block(
+            content or "", target, metadata=metadata, policy_block=False
+        )
+        if blocked is not None:
+            return blocked
+    return None
 
 
 def load_on_disk_store() -> "MemoryStore":
-    """Build a fresh on-disk MemoryStore, honoring configured char limits."""
+    """Build a fresh on-disk :class:`MemoryStore`, honoring configured char limits.
+
+    Use this from any context that has no live agent (the messaging gateway, the
+    Desktop GUI, the bare CLI ``/memory`` handler) but still needs to read or
+    apply approved memory writes. Mirrors how the live agent constructs its store
+    in ``agent/agent_init.py`` — including the user's ``memory.memory_char_limit``
+    / ``memory.user_char_limit`` overrides — so an approval applied without a live
+    agent enforces the SAME caps as one applied with one.
+
+    Falls back to the built-in defaults if config can't be loaded, so this can
+    never raise on a missing/unreadable config.
+    """
     memory_char_limit = 2200
     user_char_limit = 1375
+    memory_enabled = True
+    user_profile_enabled = True
     try:
-        from hermes_cli import config as hermes_config
+        from hermes_cli.config import load_config
 
-        mem_cfg = (hermes_config.load_config() or {}).get("memory", {}) or {}
+        config = load_config() or {}
+        mem_cfg = get_builtin_memory_config(config)
+        memory_enabled, user_profile_enabled = get_builtin_memory_store_flags(config)
         memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
         user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
     except Exception:
-        pass
+        pass  # config optional — fall back to defaults rather than break /memory
+
     store = MemoryStore(
         memory_char_limit=memory_char_limit,
         user_char_limit=user_char_limit,
+        memory_enabled=memory_enabled,
+        user_profile_enabled=user_profile_enabled,
     )
     store.load_from_disk()
     return store
@@ -996,17 +1080,6 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
          "message": decision.message},
         ensure_ascii=False,
     )
-
-
-
-def _operator_session_memory_block(store: Optional[MemoryStore]) -> str | None:
-    if store is not None and getattr(store, "operator_session_context", None):
-        return tool_error(
-            "Operator sessions cannot write to built-in prompt-injected user/memory stores. "
-            "Route durable AIWerk/operator knowledge to the sanitized wiki or an explicit operator memory store.",
-            success=False,
-        )
-    return None
 
 
 def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
@@ -1117,6 +1190,11 @@ def memory_tool(
     """
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    if action in {"add", "replace", "remove"} and getattr(store, "operator_session_context", None):
+        return tool_error(
+            "Operator sessions cannot write to built-in prompt-injected user/memory stores.",
+            success=False,
+        )
 
     # Accept new_text as an alias for content (single-op path). See docstring.
     if content is None and new_text is not None:
@@ -1128,36 +1206,17 @@ def memory_tool(
     if target is None:
         target = "memory"
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    target_error = _memory_target_error(store, target)
+    if target_error is not None:
+        return json.dumps(target_error)
 
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        blocked = _operator_session_memory_block(store)
+        blocked = _memory_router_block_batch(target, operations)
         if blocked is not None:
-            return blocked
-        write_approval_on = False
-        try:
-            from tools import write_approval as wa
-            write_approval_on = wa.write_approval_enabled(wa.MEMORY)
-        except Exception:
-            write_approval_on = False
-        for op in operations:
-            if not isinstance(op, dict):
-                return tool_error("Each operation must be an object.", success=False)
-            act = op.get("action")
-            if act in {"add", "replace"}:
-                op_content = op.get("content")
-                if isinstance(op_content, str):
-                    blocked = _router_block_response(
-                        op_content,
-                        target,
-                        policy_block=not write_approval_on,
-                    )
-                    if blocked is not None:
-                        return blocked
+            return json.dumps(blocked, ensure_ascii=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1181,23 +1240,10 @@ def memory_tool(
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
 
-    blocked = _operator_session_memory_block(store)
-    if blocked is not None:
-        return blocked
-
-    # AIWerk memory router runs before write approval only for credential safety
-    # so secrets are blocked instead of staged. Non-credential routing remains
-    # below and is bypassed when explicit write approval is enabled.
-    write_approval_on = False
     if action in {"add", "replace"}:
-        try:
-            from tools import write_approval as wa
-            write_approval_on = wa.write_approval_enabled(wa.MEMORY)
-        except Exception:
-            write_approval_on = False
-        blocked = _router_block_response(content, target, policy_block=False)
+        blocked = _memory_router_block(content or "", target)
         if blocked is not None:
-            return blocked
+            return json.dumps(blocked, ensure_ascii=False)
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
@@ -1206,17 +1252,9 @@ def memory_tool(
         return gate_result
 
     if action == "add":
-        if not write_approval_on:
-            blocked = _router_block_response(content, target)
-            if blocked is not None:
-                return blocked
         result = store.add(target, content)
 
     elif action == "replace":
-        if not write_approval_on:
-            blocked = _router_block_response(content, target)
-            if blocked is not None:
-                return blocked
         result = store.replace(target, old_text, content)
 
     elif action == "remove":
@@ -1228,9 +1266,64 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
+def get_builtin_memory_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a normalized built-in memory config mapping.
+
+    Missing, unreadable, or malformed sections become an empty mapping, whose
+    missing flags resolve to the enabled defaults. ``agent_init`` consumes this
+    same normalized section so tool availability and store construction cannot
+    diverge.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+        except Exception:
+            logger.debug("Could not read memory config for availability", exc_info=True)
+            return {}
+
+    section = config.get("memory") if isinstance(config, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> Tuple[bool, bool]:
+    """Return ``(memory_enabled, user_profile_enabled)`` from resolved config."""
+    section = get_builtin_memory_config(config)
+    return (
+        is_truthy_value(section.get("memory_enabled"), default=True),
+        is_truthy_value(section.get("user_profile_enabled"), default=True),
+    )
+
+
+@no_cache_check_fn
 def check_memory_requirements() -> bool:
-    """Memory tool has no external requirements -- always available."""
-    return True
+    """Snapshot store flags and report whether the built-in tool is available."""
+    _memory_surface_flags.set(None)
+    flags = get_builtin_memory_store_flags()
+    _memory_surface_flags.set(flags)
+    return flags[0] or flags[1]
+
+
+def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str, Any]]:
+    """Return a shared validation error for an invalid or disabled target."""
+    if target not in {"memory", "user"}:
+        from tools.registry import _bound_error_text
+
+        return {
+            "success": False,
+            "error": _bound_error_text(
+                f"Invalid memory target '{target}'. Use 'memory' or 'user'."
+            ),
+        }
+    if store.target_enabled(target):
+        return None
+    label = "USER.md" if target == "user" else "MEMORY.md"
+    return {
+        "success": False,
+        "error": f"Built-in {label} writes are disabled in memory config.",
+        "target": target,
+    }
 
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
@@ -1240,42 +1333,37 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     Returns the store's result dict.
     """
     action = payload.get("action")
+    if action in {"add", "replace", "remove", "batch"} and getattr(store, "operator_session_context", None):
+        return {
+            "success": False,
+            "error": "Operator sessions cannot write to built-in prompt-injected user/memory stores.",
+        }
     target = payload.get("target", "memory")
+    target_error = _memory_target_error(store, target)
+    if target_error is not None:
+        return target_error
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
+    metadata = payload.get("metadata")
     if action == "batch":
-        blocked_operator = _operator_session_memory_block(store)
-        if blocked_operator is not None:
-            return json.loads(blocked_operator)
         operations = payload.get("operations") or []
         if not isinstance(operations, list):
             return {"success": False, "error": "operations must be a list."}
-        for op in operations:
-            if isinstance(op, dict) and op.get("action") in {"add", "replace"}:
-                blocked = _router_block_response(op.get("content"), target, policy_block=False)
-                if blocked is not None:
-                    return json.loads(blocked)
+        blocked = _memory_router_block_batch(target, operations, metadata=metadata)
+        if blocked is not None:
+            return blocked
         return store.apply_batch(target, operations)
     if action == "add":
-        blocked_operator = _operator_session_memory_block(store)
-        if blocked_operator is not None:
-            return json.loads(blocked_operator)
-        blocked = _router_block_response(content, target, policy_block=False)
+        blocked = _memory_router_block(content, target, metadata=metadata)
         if blocked is not None:
-            return json.loads(blocked)
+            return blocked
         return store.add(target, content)
     if action == "replace":
-        blocked_operator = _operator_session_memory_block(store)
-        if blocked_operator is not None:
-            return json.loads(blocked_operator)
-        blocked = _router_block_response(content, target, policy_block=False)
+        blocked = _memory_router_block(content, target, metadata=metadata)
         if blocked is not None:
-            return json.loads(blocked)
+            return blocked
         return store.replace(target, old_text, content)
     if action == "remove":
-        blocked_operator = _operator_session_memory_block(store)
-        if blocked_operator is not None:
-            return json.loads(blocked_operator)
         return store.remove(target, old_text)
     return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
@@ -1286,20 +1374,24 @@ MEMORY_SCHEMA = {
     "description": (
         "Save durable facts to persistent memory that survive across sessions. Memory is "
         "injected into every future turn, so keep entries compact and high-signal.\n\n"
-        "HOW: make multiple changes in ONE call via an 'operations' array when useful. "
-        "The batch applies atomically and checks the char limit only on the final result. "
-        "Use bare action/content/old_text only for a single lone change.\n\n"
+        "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
+        "{action, content?, old_text?}). The batch applies atomically and the char limit is "
+        "checked only on the FINAL result — so a single call can remove/replace stale entries "
+        "to free room AND add new ones, even when an add alone would overflow. The response "
+        "reports current/limit chars and confirms completion; one batch call finishes the "
+        "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
+        "single lone change.\n\n"
         "WHEN: save proactively when the user states a preference, correction, or personal "
         "detail, or you learn a stable fact about their environment, conventions, or workflow. "
-        "Priority: user preferences & corrections > environment facts > procedures.\n\n"
-        "Router policy: credentials and raw dumps are discarded; customer-specific facts "
-        "go to isolated tenant-private memory; durable AIWerk product/architecture/SOP/strategy "
-        "knowledge goes to sanitized wiki; reusable procedures go to skills; only stable user "
-        "preferences and stable environment/tooling facts belong in prompt-injected memory.\n\n"
+        "Priority: user preferences & corrections > environment facts > procedures. The best "
+        "memory stops the user repeating themselves.\n\n"
+        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
+        "removes or shortens enough stale entries and adds the new one together.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
         "notes (environment, conventions, tool quirks, lessons).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
-        "completed-work logs, temporary TODO state (use session_search for those)."
+        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
+        "procedures belong in a skill, not memory."
     ),
     "parameters": {
         "type": "object",
@@ -1350,6 +1442,43 @@ MEMORY_SCHEMA = {
 }
 
 
+def _build_memory_schema_overrides() -> Dict[str, Any]:
+    """Narrow the advertised target surface using the availability snapshot."""
+    flags = _memory_surface_flags.get()
+    _memory_surface_flags.set(None)
+    if flags is None:
+        flags = get_builtin_memory_store_flags()
+    memory_enabled, user_profile_enabled = flags
+    targets = []
+    if memory_enabled:
+        targets.append("memory")
+    if user_profile_enabled:
+        targets.append("user")
+
+    parameters = copy.deepcopy(MEMORY_SCHEMA["parameters"])
+    target_schema = parameters["properties"]["target"]
+    target_schema["enum"] = targets
+
+    description = MEMORY_SCHEMA["description"]
+    if targets == ["memory"]:
+        target_schema["description"] = "The enabled built-in store: 'memory' for personal notes."
+        description = description.replace(
+            "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
+            "notes (environment, conventions, tool quirks, lessons).",
+            "TARGET: only 'memory' is enabled for personal notes (environment, conventions, "
+            "tool quirks, lessons).",
+        )
+    elif targets == ["user"]:
+        target_schema["description"] = "The enabled built-in store: 'user' for user profile."
+        description = description.replace(
+            "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
+            "notes (environment, conventions, tool quirks, lessons).",
+            "TARGET: only 'user' is enabled for user profile facts (name, role, preferences, style).",
+        )
+
+    return {"description": description, "parameters": parameters}
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -1367,6 +1496,7 @@ registry.register(
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
+    dynamic_schema_overrides=_build_memory_schema_overrides,
 )
 
 

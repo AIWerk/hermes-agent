@@ -35,8 +35,6 @@ class FakeAgent:
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
-        self.atomic_correction_close_called = False
-        self.atomic_correction = None
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -76,10 +74,6 @@ class FakeAgent:
     def _drain_pending_steer(self):
         return None
 
-    def _take_text_commit_correction_and_close_admission(self):
-        self.atomic_correction_close_called = True
-        return self.atomic_correction
-
     def clear_interrupt(self):
         pass
 
@@ -100,6 +94,11 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     because the assistant's visible final answer is missing from durable state.
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    title_calls = []
+    monkeypatch.setattr(
+        "agent.turn_context.maybe_title_session_after_success",
+        lambda agent, messages: title_calls.append((agent, list(messages))),
+    )
     agent = FakeAgent()
     messages = [
         {"role": "user", "content": "do it"},
@@ -134,31 +133,8 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == result["messages"][-1]
-
-
-def test_non_text_finalization_atomically_closes_and_preserves_late_correction(monkeypatch):
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    agent = FakeAgent()
-    agent.atomic_correction = "late correction"
-
-    result = finalize_turn(
-        agent,
-        final_response=None,
-        api_call_count=1,
-        interrupted=True,
-        failed=False,
-        messages=[{"role": "user", "content": "do it"}],
-        conversation_history=[],
-        effective_task_id="task",
-        turn_id="turn",
-        user_message="do it",
-        original_user_message="do it",
-        _should_review_memory=False,
-        _turn_exit_reason="interrupted",
-    )
-
-    assert agent.atomic_correction_close_called is True
-    assert result["pending_steer"] == "late correction"
+    assert title_calls and title_calls[0][0] is agent
+    assert title_calls[0][1][-1]["content"] == "Done."
 
 
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(

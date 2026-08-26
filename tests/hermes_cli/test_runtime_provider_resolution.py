@@ -86,281 +86,73 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
-def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypatch):
-    entry = SimpleNamespace(
-        provider="nous",
-        source="device_code",
-        runtime_api_key="pool-token",
-        agent_key="pool-token",
-        agent_key_expires_at="2099-01-01T00:00:00+00:00",
-        scope="inference:invoke",
-        runtime_base_url="https://inference-api.nousresearch.com/v1",
-    )
+class TestCustomProviderPoolLoopbackNoKeyExemption:
+    """Regression for issue #86864: legacy custom_providers configs often
+    used short/placeholder api_keys ('123', 'm') for local no-auth
+    services like Ollama -- fine for the endpoint itself, but
+    has_usable_secret's 4-char floor now rejects them with a misleading
+    "No usable credentials found" error and no migration path. Every
+    OTHER resolution path in this file already substitutes
+    "no-key-required" for a loopback endpoint with no usable secret; the
+    credential-pool path was the one gap.
+    """
 
-    class _Pool:
-        def has_credentials(self):
-            return True
+    @staticmethod
+    def _pool_with(api_key: str):
+        entry = SimpleNamespace(runtime_api_key=api_key, access_token="")
 
-        def select(self):
-            return entry
+        class _Pool:
+            def has_credentials(self):
+                return True
 
-    monkeypatch.setenv("NOUS_INFERENCE_BASE_URL", "https://ai.wildebeest-newton.ts.net/v1")
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
-    monkeypatch.setattr(rp, "_agent_key_is_usable", lambda *a, **k: True)
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+            def select(self):
+                return entry
 
-    resolved = rp.resolve_runtime_provider(requested="nous")
+        return _Pool()
 
-    assert resolved["provider"] == "nous"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["base_url"] == "https://ai.wildebeest-newton.ts.net/v1"
+    def test_short_placeholder_key_exempted_for_loopback_endpoint(self, monkeypatch):
+        """The exact reported repro: a 3-char legacy placeholder key
+        ('123') for a local Ollama endpoint must resolve to the same
+        "no-key-required" placeholder every other local no-auth path uses,
+        not the raw unusable value."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local-ollama")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("123"))
 
+        result = rp._try_resolve_from_custom_pool("http://localhost:11434/v1", "custom", None)
 
-def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
-    class _Entry:
-        access_token = "pool-token"
-        source = "manual"
-        base_url = "https://api.anthropic.com"
+        assert result is not None
+        assert result["api_key"] == "no-key-required"
 
-    class _Pool:
-        def has_credentials(self):
-            return True
+    def test_single_char_placeholder_key_also_exempted(self, monkeypatch):
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("m"))
 
-        def select(self):
-            return _Entry()
+        result = rp._try_resolve_from_custom_pool("http://127.0.0.1:11434/v1", "custom", None)
 
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(
-        rp,
-        "_get_model_config",
-        lambda: {
-            "provider": "anthropic",
-            "base_url": "https://proxy.example.com/anthropic",
-        },
-    )
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+        assert result["api_key"] == "no-key-required"
 
-    resolved = rp.resolve_runtime_provider(requested="anthropic")
+    def test_short_key_not_exempted_for_non_loopback_endpoint(self, monkeypatch):
+        """Sanity: the exemption is scoped to loopback hosts only -- a
+        remote endpoint with a genuinely-too-short key must NOT get a
+        free pass. The short value passes through unchanged, so the
+        downstream has_usable_secret() gate still catches it."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:remote")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("xy"))
 
-    assert resolved["provider"] == "anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+        result = rp._try_resolve_from_custom_pool("https://api.remote-vendor.example/v1", "custom", None)
 
+        assert result["api_key"] == "xy"
 
-def test_resolve_runtime_provider_anthropic_ignores_stale_aggregator_base_url(monkeypatch):
-    """A leftover OpenRouter base_url under provider: anthropic must not hijack
-    Anthropic OAuth traffic — fall back to the official Anthropic host."""
+    def test_usable_loopback_key_passes_through_unchanged(self, monkeypatch):
+        """Sanity: a genuinely usable key for a loopback endpoint (a real
+        API key happens to be configured for a local proxy, say) must not
+        be silently overwritten."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("sk-genuinely-long-real-key-12345"))
 
-    class _Entry:
-        access_token = "pool-token"
-        source = "manual"
-        base_url = "https://api.anthropic.com"
+        result = rp._try_resolve_from_custom_pool("http://localhost:11434/v1", "custom", None)
 
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-
-    for stale in (
-        "https://openrouter.ai/api/v1",
-        "https://api.openai.com/v1",
-    ):
-        monkeypatch.setattr(
-            rp,
-            "_get_model_config",
-            lambda stale=stale: {"provider": "anthropic", "base_url": stale},
-        )
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-        assert resolved["provider"] == "anthropic"
-        assert resolved["api_mode"] == "anthropic_messages"
-        assert resolved["base_url"] == "https://api.anthropic.com", stale
-
-
-def test_resolve_runtime_provider_anthropic_keeps_azure_base_url(monkeypatch):
-    """Azure Foundry Anthropic endpoints are not anthropic.com hosts but are a
-    legitimate override — they must survive the stale-URL guard."""
-
-    class _Entry:
-        access_token = "pool-token"
-        source = "manual"
-        base_url = "https://api.anthropic.com"
-
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-    monkeypatch.setattr(
-        rp,
-        "_get_model_config",
-        lambda: {"provider": "anthropic", "base_url": "https://myhost.azure.com/anthropic"},
-    )
-
-    resolved = rp.resolve_runtime_provider(requested="anthropic")
-    assert resolved["base_url"] == "https://myhost.azure.com/anthropic"
-
-
-def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
-    def _unexpected_pool(provider):
-        raise AssertionError(f"load_pool should not be called for {provider}")
-
-    def _unexpected_anthropic_token():
-        raise AssertionError("resolve_anthropic_token should not be called")
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(
-        rp,
-        "_get_model_config",
-        lambda: {
-            "provider": "anthropic",
-            "base_url": "https://config.example.com/anthropic",
-        },
-    )
-    monkeypatch.setattr(rp, "load_pool", _unexpected_pool)
-    monkeypatch.setattr(
-        "agent.anthropic_adapter.resolve_anthropic_token",
-        _unexpected_anthropic_token,
-    )
-
-    resolved = rp.resolve_runtime_provider(
-        requested="anthropic",
-        explicit_api_key="anthropic-explicit-token",
-        explicit_base_url="https://proxy.example.com/anthropic/",
-    )
-
-    assert resolved["provider"] == "anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "anthropic-explicit-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
-    assert resolved["source"] == "explicit"
-    assert resolved.get("credential_pool") is None
-
-
-def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
-    class _Pool:
-        def has_credentials(self):
-            return False
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-    monkeypatch.setattr(
-        rp,
-        "resolve_codex_runtime_credentials",
-        lambda: {
-            "provider": "openai-codex",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-token",
-            "source": "hermes-auth-store",
-            "last_refresh": "2026-02-26T00:00:00Z",
-        },
-    )
-
-    resolved = rp.resolve_runtime_provider(requested="openai-codex")
-
-    assert resolved["api_key"] == "codex-token"
-    assert resolved.get("credential_pool") is None
-
-
-def test_resolve_runtime_provider_codex(monkeypatch):
-    monkeypatch.setattr(
-        rp,
-        "load_pool",
-        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
-    )
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
-    monkeypatch.setattr(
-        rp,
-        "resolve_codex_runtime_credentials",
-        lambda: {
-            "provider": "openai-codex",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-token",
-            "source": "codex-auth-json",
-            "auth_file": "/tmp/auth.json",
-            "codex_home": "/tmp/codex",
-            "last_refresh": "2026-02-26T00:00:00Z",
-        },
-    )
-
-    resolved = rp.resolve_runtime_provider(requested="openai-codex")
-
-    assert resolved["provider"] == "openai-codex"
-    assert resolved["api_mode"] == "codex_responses"
-    assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
-    assert resolved["api_key"] == "codex-token"
-    assert resolved["requested_provider"] == "openai-codex"
-
-
-def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
-    monkeypatch.setattr(
-        rp,
-        "load_pool",
-        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
-    )
-    monkeypatch.setattr(
-        rp,
-        "resolve_qwen_runtime_credentials",
-        lambda: {
-            "provider": "qwen-oauth",
-            "base_url": "https://portal.qwen.ai/v1",
-            "api_key": "qwen-token",
-            "source": "qwen-cli",
-            "expires_at_ms": 1775640710946,
-        },
-    )
-
-    resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
-
-    assert resolved["provider"] == "qwen-oauth"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://portal.qwen.ai/v1"
-    assert resolved["api_key"] == "qwen-token"
-    assert resolved["requested_provider"] == "qwen-oauth"
-
-
-def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
-    class _Entry:
-        access_token = "pool-qwen-token"
-        source = "manual:qwen_cli"
-        base_url = "https://portal.qwen.ai/v1"
-
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "qwen-oauth", "default": "coder-model"})
-
-    resolved = rp.resolve_runtime_provider(requested="qwen-oauth")
-
-    assert resolved["provider"] == "qwen-oauth"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://portal.qwen.ai/v1"
-    assert resolved["api_key"] == "pool-qwen-token"
-    assert resolved["source"] == "manual:qwen_cli"
-
-
-def test_resolve_provider_alias_qwen(monkeypatch):
-    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    assert rp.resolve_provider("qwen-portal") == "qwen-oauth"
-    assert rp.resolve_provider("qwen-cli") == "qwen-oauth"
+        assert result["api_key"] == "sk-genuinely-long-real-key-12345"
 
 
 def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
@@ -368,11 +160,6 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
-    monkeypatch.setattr(
-        rp,
-        "load_pool",
-        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
-    )
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -1835,3 +1622,128 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["source"] == "pool:lmstudio-pool"
     assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
+
+
+def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
+    """OpenCode Free is keyless: an exhausted credential pool must not raise
+    a missing-credential error. The provider resolves with the keyless
+    placeholder + empty-Authorization headers so the request goes out
+    anonymously."""
+    class _ExhaustedPool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return None
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "opencode-free", "default": "x-preview-f-free"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _ExhaustedPool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-free", target_model="x-preview-f-free"
+    )
+
+    assert resolved["provider"] == "opencode-free"
+    assert resolved["api_key"] == "opencode-zen-free-keyless"
+    assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["default_headers"]["Authorization"] == ""
+
+
+def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):
+    """OpenCode Free resolves keylessly with no env var configured at all —
+    the provider declares no credentials."""
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "opencode-free", "default": "x-preview-f-free"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _NoPool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-free", target_model="x-preview-f-free"
+    )
+
+    assert resolved["provider"] == "opencode-free"
+    assert resolved["api_key"] == "opencode-zen-free-keyless"
+    assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+
+
+def test_custom_provider_explicit_target_model_wins(monkeypatch):
+    """An explicit target_model must not be silently replaced by the custom
+    provider's configured default model (regression: auxiliary slots such as
+    background-review resolve a concrete model and got default_model instead)."""
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "myproxy",
+            "base_url": "http://127.0.0.1:10100/v1",
+            "api_key": "no-key-required",
+            "model": "default-model",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="myproxy", target_model="myproxy/gemini-flash")
+
+    assert resolved is not None
+    assert resolved["provider"] == "custom"
+    assert resolved["model"] == "myproxy/gemini-flash"
+    assert resolved["base_url"] == "http://127.0.0.1:10100/v1"
+
+
+def test_custom_provider_without_target_model_keeps_default(monkeypatch):
+    """No target_model -> the provider's configured model is preserved."""
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "myproxy",
+            "base_url": "http://127.0.0.1:10100/v1",
+            "api_key": "no-key-required",
+            "model": "default-model",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="myproxy")
+
+    assert resolved is not None
+    assert resolved["model"] == "default-model"
+
+
+def test_custom_provider_pool_target_model_wins(monkeypatch):
+    """Pooled-credentials path also honors target_model over the default."""
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *a, **k: {
+            "provider": "custom",
+            "api_key": "pooled-key",
+            "base_url": "http://127.0.0.1:10100/v1",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "myproxy",
+            "base_url": "http://127.0.0.1:10100/v1",
+            "api_key": "no-key-required",
+            "model": "default-model",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="myproxy", target_model="myproxy/gemini-flash")
+
+    assert resolved is not None
+    assert resolved["model"] == "myproxy/gemini-flash"

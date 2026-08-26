@@ -116,42 +116,6 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
 
 
 @pytest.mark.asyncio
-async def test_base_auto_tts_requests_ogg_on_non_telegram_opus_platform():
-    """Matrix gets an explicit .ogg path even though the
-    HERMES_SESSION_PLATFORM contextvar is cleared by the time the block runs."""
-    adapter = _DummyAdapter(Platform.MATRIX)
-    requested, adapter = await _run_auto_tts(adapter, Platform.MATRIX)
-
-    assert requested and requested[0] is not None
-    assert requested[0].endswith(".ogg")
-    adapter.play_tts.assert_awaited_once()
-    assert adapter.play_tts.await_args.kwargs["audio_path"].endswith(".ogg")
-
-
-@pytest.mark.asyncio
-async def test_base_auto_tts_keeps_aiwerk_telegram_mp3_policy():
-    """Automatic Telegram replies use sendAudio/MP3 to avoid playlist autoplay."""
-    adapter = _DummyAdapter(Platform.TELEGRAM)
-    requested, adapter = await _run_auto_tts(adapter, Platform.TELEGRAM)
-
-    assert requested and requested[0] is not None
-    assert requested[0].endswith(".mp3")
-    adapter.play_tts.assert_awaited_once()
-    assert adapter.play_tts.await_args.kwargs["audio_path"].endswith(".mp3")
-
-
-@pytest.mark.asyncio
-async def test_base_auto_tts_keeps_mp3_on_non_opus_platform():
-    adapter = _DummyAdapter(Platform.DISCORD)
-    requested, adapter = await _run_auto_tts(adapter, Platform.DISCORD)
-
-    assert requested and requested[0] is not None
-    assert requested[0].endswith(".mp3")
-    adapter.play_tts.assert_awaited_once()
-    assert adapter.play_tts.await_args.kwargs["audio_path"].endswith(".mp3")
-
-
-@pytest.mark.asyncio
 async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     """A success=False tool result must not deliver a stale/partial file."""
     adapter = _DummyAdapter(Platform.TELEGRAM)

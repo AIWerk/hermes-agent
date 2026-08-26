@@ -18,6 +18,7 @@ import {
   isSessionNotFoundError,
   isSessionRecentlyInterrupted,
   isSubmitInFlight,
+  isTargetSessionBusy,
   markSessionRecentlyInterrupted,
   readFileDataUrlForAttach,
   RECENT_INTERRUPT_COOLDOWN_MS,
@@ -96,6 +97,18 @@ describe('submit in-flight TTL', () => {
     releaseSubmitInFlight(key)
     expect(isSubmitInFlight(key, t0 + 1)).toBe(false)
     expect(acquireSubmitInFlight(key, t0 + 1)).toBe(true)
+  })
+})
+
+describe('isTargetSessionBusy', () => {
+  it('reads the target session slice, not the leftover foreground flag', () => {
+    expect(isTargetSessionBusy({ a: { busy: true }, b: { busy: false } }, 'b', true)).toBe(false)
+    expect(isTargetSessionBusy({ a: { busy: true } }, 'b', true)).toBe(false)
+  })
+
+  it('uses the focused draft flag only when there is no session id', () => {
+    expect(isTargetSessionBusy({}, null, true)).toBe(true)
+    expect(isTargetSessionBusy({}, null, false)).toBe(false)
   })
 })
 
@@ -511,7 +524,7 @@ describe('renderRpcResult', () => {
   describe('session.usage', () => {
     it('formats calls / input / output / total with thousands separators', () => {
       expect(renderRpcResult({ calls: 12, input: 1_234_567, output: 89_012, total: 1_323_579 }, 'usage')).toBe(
-        `Usage: ${Number(12).toLocaleString()} calls · ${(1_234_567).toLocaleString()} in / ${(89_012).toLocaleString()} out · ${(1_323_579).toLocaleString()} total`
+        'Usage: 12 calls · 1,234,567 in / 89,012 out · 1,323,579 total'
       )
     })
 

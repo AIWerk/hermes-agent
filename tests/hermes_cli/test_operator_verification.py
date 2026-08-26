@@ -33,6 +33,24 @@ def clear_operator_cache_after_test():
     clear_operator_verification_cache()
 
 
+def _exact_subject(session_id="s1", requested_role="operator"):
+    return {
+        "session_id": session_id,
+        "interface": "cli",
+        "provenance": "callback",
+        "actor_id": "operator",
+        "requested_role": requested_role,
+    }
+
+
+def _exact_result(*, session_id="s1", now=100, requested_role="operator"):
+    return OperatorVerificationResult(
+        ok=True, actor_id="operator", role=requested_role, verified_at=now,
+        expires_at=now + 100, session_id=session_id, interface="cli",
+        provenance="callback", requested_role=requested_role,
+    )
+
+
 @pytest.fixture
 def short_broker_runtime_dir():
     """Keep AF_UNIX broker paths short without changing product path policy."""
@@ -61,11 +79,11 @@ def test_default_config_enables_operator_verification_gate():
     assert section["allowed_secret_read_patterns"] == []
 
 
-def test_current_operator_interface_prefers_gateway_platform(monkeypatch):
+def test_current_operator_interface_ignores_forgeable_gateway_environment(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_OPERATOR_INTERFACE", "cli")
 
-    assert current_operator_interface() == "telegram"
+    assert current_operator_interface() == "local"
 
 
 def test_current_operator_interface_routes_interactive_tool_worker_to_cli(monkeypatch):
@@ -77,12 +95,12 @@ def test_current_operator_interface_routes_interactive_tool_worker_to_cli(monkey
     assert current_operator_interface() == "cli"
 
 
-def test_current_operator_interface_detects_cui_actor_context(monkeypatch):
+def test_current_operator_interface_ignores_forgeable_cui_environment(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_OPERATOR_INTERFACE", raising=False)
     monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "aiwerk_admin")
 
-    assert current_operator_interface() == "web"
+    assert current_operator_interface() == "local"
 
 
 def test_operator_verification_config_selects_interface_specific_command(monkeypatch):
@@ -122,7 +140,7 @@ def test_operator_verification_config_selects_interface_specific_command(monkeyp
     assert missing_cfg.missing_interface is True
 
 
-def test_cui_admin_actor_context_verifies_without_prompt(monkeypatch):
+def test_cui_admin_environment_cannot_mint_verification(monkeypatch):
     monkeypatch.setenv("AIWERK_CUI_ACTOR_CONTEXT", json.dumps({"actor_id": "operator", "role": "aiwerk_admin"}))
 
     result = run_operator_verifier(
@@ -130,10 +148,8 @@ def test_cui_admin_actor_context_verifies_without_prompt(monkeypatch):
         now=100,
     )
 
-    assert result.ok is True
-    assert result.actor_id == "operator"
-    assert result.role == "aiwerk_admin"
-    assert result.expires_at == 160
+    assert result.ok is False
+    assert result.reason == "cui_actor_not_authorized"
 
 
 def test_cui_customer_actor_context_does_not_self_upgrade(monkeypatch):
@@ -160,15 +176,15 @@ def test_cui_actor_verification_sources_context_from_canonical_helper(monkeypatc
         "AIWERK_CUI_TENANT_ID",
     ):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(
-        "agent.cui_actor_context.current_cui_actor_context",
-        lambda: {"actor_id": "operator", "role": "aiwerk_admin"},
-    )
-
-    result = run_operator_verifier(
-        OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
-        now=200,
-    )
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+    token = bind_cui_actor_context({"actor_id": "operator", "role": "aiwerk_admin"})
+    try:
+        result = run_operator_verifier(
+            OperatorVerificationConfig(enabled=True, verifier_type="cui_actor", ttl_seconds=60),
+            now=200,
+        )
+    finally:
+        reset_cui_actor_context(token)
     assert result.ok is True
     assert result.actor_id == "operator"
     assert result.role == "aiwerk_admin"
@@ -196,7 +212,7 @@ def test_missing_interface_fails_closed_before_generic_command():
     assert result.reason == "not_configured_for_interface"
 
 
-def test_trusted_platform_actor_verifies_only_allowlisted_actor(monkeypatch):
+def test_trusted_platform_environment_cannot_mint_verification(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "12345")
 
@@ -219,9 +235,8 @@ def test_trusted_platform_actor_verifies_only_allowlisted_actor(monkeypatch):
         now=100,
     )
 
-    assert valid.ok is True
-    assert valid.actor_id == "12345"
-    assert valid.role == "operator"
+    assert valid.ok is False
+    assert valid.reason == "platform_actor_not_authorized"
     assert invalid.ok is False
     assert invalid.reason == "platform_actor_not_authorized"
 
@@ -242,12 +257,17 @@ def test_callback_operator_verifier_uses_masked_callback_and_store(monkeypatch, 
     result = run_operator_verifier(
         OperatorVerificationConfig(enabled=True, verifier_type="callback", ttl_seconds=60),
         now=100,
+        subject=_exact_subject(),
     )
 
     assert result.ok is True
     assert result.actor_id == "operator"
     assert result.role == "operator"
     assert result.expires_at == 160
+    assert result.session_id == "s1"
+    assert result.interface == "cli"
+    assert result.provenance == "callback"
+    assert result.requested_role == "operator"
     set_operator_verification_callback(None)
 
 
@@ -274,21 +294,38 @@ def test_cli_agent_thread_wires_operator_verifier_callback():
     import inspect
     import cli
 
-    src = inspect.getsource(cli.HermesCLI.chat)
-    assert "set_operator_verification_callback(self._operator_verification_callback)" in src
-    assert "set_operator_verification_callback(None)" in src
+    impl_src = inspect.getsource(cli.HermesCLI._chat_impl)
+    wrapper_src = inspect.getsource(cli.HermesCLI.chat)
+    assert "set_operator_verification_callback(self._operator_verification_callback)" in impl_src
+    assert "set_operator_verification_callback(None)" in wrapper_src
+
+
+def test_thread_context_propagates_and_clears_operator_callback(monkeypatch):
+    from hermes_cli.operator_verification import (
+        get_operator_verification_callback,
+        set_operator_verification_callback,
+    )
+    from tools.thread_context import propagate_context_to_thread
+
+    callback = lambda: "masked-secret"
+    set_operator_verification_callback(callback)
+    seen = []
+
+    wrapped = propagate_context_to_thread(
+        lambda: seen.append(get_operator_verification_callback())
+    )
+    set_operator_verification_callback(None)
+    wrapped()
+
+    assert seen == [callback]
+    assert get_operator_verification_callback() is None
 
 def test_operator_verification_result_valid_until_expiry():
-    result = OperatorVerificationResult(
-        ok=True,
-        actor_id="operator",
-        role="operator",
-        verified_at=100,
-        expires_at=200,
-    )
+    result = _exact_result()
+    subject = _exact_subject()
 
-    assert result.is_valid(now=150) is True
-    assert result.is_valid(now=200) is False
+    assert result.is_valid(now=150, **subject) is True
+    assert result.is_valid(now=200, **subject) is False
 
 
 def test_operator_verification_result_requires_actor_and_role():
@@ -312,6 +349,7 @@ def test_run_operator_verifier_parses_success_without_exposing_secret(tmp_path):
     result = run_operator_verifier(
         OperatorVerificationConfig(enabled=True, argv=[sys.executable, str(script)], timeout_seconds=5),
         now=100,
+        subject=_exact_subject(),
     )
 
     assert result.ok is True
@@ -320,6 +358,10 @@ def test_run_operator_verifier_parses_success_without_exposing_secret(tmp_path):
     assert result.verified_at == 100
     assert result.expires_at == 160
     assert result.reason == ""
+    assert result.session_id == "s1"
+    assert result.interface == "cli"
+    assert result.provenance == "callback"
+    assert result.requested_role == "operator"
 
 
 def test_run_operator_verifier_fails_closed_on_invalid_json_and_sanitizes_output(tmp_path):
@@ -352,13 +394,15 @@ def test_run_operator_verifier_fails_closed_when_disabled_or_missing_command():
 
 def test_operator_verification_cache_is_in_memory_and_expires():
     clear_operator_verification_cache()
-    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200)
+    now = int(time.time())
+    valid = _exact_result(now=now)
+    subject = _exact_subject()
 
-    assert get_cached_operator_verification(session_id="s1", now=150) is None
-    cache_operator_verification(valid, session_id="s1")
+    assert get_cached_operator_verification(**subject, now=now + 50) is None
+    cache_operator_verification(valid)
 
-    assert get_cached_operator_verification(session_id="s1", now=150) == valid
-    assert get_cached_operator_verification(session_id="s1", now=250) is None
+    assert get_cached_operator_verification(**subject, now=now + 50) == valid
+    assert get_cached_operator_verification(**subject, now=now + 100) is None
 
 
 def test_operator_verification_broker_rejects_overlong_socket_path(monkeypatch, tmp_path):
@@ -367,13 +411,7 @@ def test_operator_verification_broker_rejects_overlong_socket_path(monkeypatch, 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(
-        ok=True,
-        actor_id="operator",
-        role="operator",
-        verified_at=now,
-        expires_at=now + 100,
-    )
+    valid = _exact_result(now=now)
 
     with pytest.warns(RuntimeWarning, match=r"AF_UNIX socket path is \d+ bytes; limit is 107 bytes"):
         cache_operator_verification(valid, session_id="s1")
@@ -382,7 +420,7 @@ def test_operator_verification_broker_rejects_overlong_socket_path(monkeypatch, 
 
     assert ov._BROKER_SOCKET_ENV not in os.environ
     ov._cache.clear()
-    assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
+    assert get_cached_operator_verification(**_exact_subject(), now=now + 50) is None
 
 
 def test_operator_verification_broker_rejects_symlinked_runtime_root(monkeypatch, tmp_path):
@@ -394,43 +432,37 @@ def test_operator_verification_broker_rejects_symlinked_runtime_root(monkeypatch
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(linked_runtime))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(
-        ok=True,
-        actor_id="operator",
-        role="operator",
-        verified_at=now,
-        expires_at=now + 100,
-    )
+    valid = _exact_result(now=now)
 
     cache_operator_verification(valid, session_id="s1")
     from hermes_cli import operator_verification as ov
 
     assert ov._BROKER_SOCKET_ENV not in os.environ
     ov._cache.clear()
-    assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
+    assert get_cached_operator_verification(**_exact_subject(), now=now + 50) is None
 
 
 def test_operator_verification_broker_survives_process_local_cache_clear(monkeypatch, short_broker_runtime_dir):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
+    valid = _exact_result(now=now)
 
     cache_operator_verification(valid, session_id="s1")
     from hermes_cli import operator_verification as ov
 
     ov._cache.clear()
 
-    assert get_cached_operator_verification(session_id="s1", now=now + 50) == valid
-    assert get_cached_operator_verification(session_id="s2", now=now + 50) is None
-    assert get_cached_operator_verification(session_id="s1", now=now + 150) is None
+    assert get_cached_operator_verification(**_exact_subject(), now=now + 50) == valid
+    assert get_cached_operator_verification(**_exact_subject(session_id="s2"), now=now + 50) is None
+    assert get_cached_operator_verification(**_exact_subject(), now=now + 150) is None
 
 
 def test_operator_verification_broker_env_is_not_trusted_by_child_process(monkeypatch, short_broker_runtime_dir):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
+    valid = _exact_result(now=now)
 
     cache_operator_verification(valid, session_id="s1")
     script = """
@@ -508,7 +540,7 @@ def test_broker_rejects_child_raw_socket_even_with_inherited_capability(monkeypa
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_broker_runtime_dir))
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
+    valid = _exact_result(now=now)
 
     cache_operator_verification(valid, session_id="s1")
     script = """
@@ -533,7 +565,7 @@ def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeyp
     clear_operator_verification_cache()
     config = OperatorVerificationConfig(enabled=True, argv=["verify"], require_for_cli_admin=True)
     now = int(time.time())
-    verified = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
+    verified = _exact_result(session_id="tool-worker-session", now=now, requested_role="admin")
 
     cache_operator_verification(verified, session_id="tool-worker-session")
     from hermes_cli import operator_verification as ov
@@ -541,10 +573,10 @@ def test_admin_guard_accepts_broker_verification_after_local_cache_clear(monkeyp
     ov._cache.clear()
 
     assert operator_verification_block_reason_for_command(
-        "systemctl restart hermes", config=config, session_id="tool-worker-session", now=now + 50
+        "systemctl restart hermes", config=config, **_exact_subject(session_id="tool-worker-session", requested_role="admin"), now=now + 50
     ) is None
     assert operator_verification_block_reason_for_command(
-        "systemctl restart hermes", config=config, session_id="other-session", now=now + 50
+        "systemctl restart hermes", config=config, **_exact_subject(session_id="other-session", requested_role="admin"), now=now + 50
     ) is not None
 
 
@@ -593,14 +625,14 @@ def test_operator_verification_rejects_insecure_broker_runtime_dir(monkeypatch, 
     insecure.chmod(0o777)
     clear_operator_verification_cache()
     now = int(time.time())
-    valid = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=now, expires_at=now + 100)
+    valid = _exact_result(now=now)
 
     cache_operator_verification(valid, session_id="s1")
     from hermes_cli import operator_verification as ov
 
     ov._cache.clear()
 
-    assert get_cached_operator_verification(session_id="s1", now=now + 50) is None
+    assert get_cached_operator_verification(**_exact_subject(), now=now + 50) is None
 
 
 def test_broker_rejects_client_without_capability(short_broker_runtime_dir):
@@ -645,9 +677,12 @@ def test_admin_sensitive_command_is_blocked_until_operator_verified():
     assert blocked is not None
     assert "verify_operator_identity" in blocked
 
-    verified = OperatorVerificationResult(ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200)
+    now = int(time.time())
+    verified = _exact_result(now=now, requested_role="admin")
     cache_operator_verification(verified)
-    assert operator_verification_block_reason_for_command("systemctl restart hermes", config=config, now=150) is None
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, **_exact_subject(requested_role="admin"), now=now + 50
+    ) is None
 
 
 def test_operator_verification_allows_read_only_admin_tool_subcommands():
@@ -1278,12 +1313,7 @@ def test_sensitive_command_regex_is_redos_bounded():
 
 
 def test_gate_is_inert_until_a_verifier_is_provisioned(monkeypatch, tmp_path):
-    """Fail-closed-deadlock guard.
-
-    With the default callback verifier but no operator store and no callback,
-    nothing can ever satisfy the gate, so it must NOT block (otherwise the
-    command is permanently un-runnable). Once a store exists, it blocks.
-    """
+    """A required gate remains fail closed even when no verifier is provisioned."""
     clear_operator_verification_cache()
     set_operator_verification_callback(None)
     monkeypatch.setattr(
@@ -1295,7 +1325,7 @@ def test_gate_is_inert_until_a_verifier_is_provisioned(monkeypatch, tmp_path):
     )
     assert operator_verification_block_reason_for_command(
         "systemctl restart hermes", config=unprovisioned, now=100
-    ) is None
+    ) is not None
 
     # An argv-based verifier is provisioned -> the gate is live again.
     live = OperatorVerificationConfig(
@@ -1336,17 +1366,39 @@ def test_block_check_honors_session_scoped_verification_cache():
     config = _gate_config()
 
     assert operator_verification_block_reason_for_command(
-        "systemctl restart hermes", config=config, session_id="s1", now=100
+        "systemctl restart hermes", config=config, **_exact_subject(requested_role="admin"), now=100
     ) is not None
 
-    verified = OperatorVerificationResult(
-        ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200
-    )
+    now = int(time.time())
+    verified = _exact_result(now=now, requested_role="admin")
     cache_operator_verification(verified, session_id="s1")
 
     assert operator_verification_block_reason_for_command(
-        "systemctl restart hermes", config=config, session_id="s1", now=150
+        "systemctl restart hermes", config=config, **_exact_subject(requested_role="admin"), now=now + 50
     ) is None
+
+
+def test_verification_cache_has_no_process_wide_fallback():
+    clear_operator_verification_cache()
+    now = int(time.time())
+    verified = _exact_result(now=now)
+    cache_operator_verification(verified, session_id="s1")
+
+    assert get_cached_operator_verification(**_exact_subject(), now=now + 50) == verified
+    assert get_cached_operator_verification(**_exact_subject(session_id="s2"), now=now + 50) is None
+    assert get_cached_operator_verification(now=now + 50) is None
+
+
+def test_verification_result_enforces_requested_role_and_binding():
+    result = OperatorVerificationResult(
+        ok=True, actor_id="operator", role="operator", verified_at=100, expires_at=200,
+        session_id="s1", interface="cli", provenance="callback", requested_role="operator",
+    )
+
+    assert result.is_valid(now=150, session_id="s1", interface="cli", requested_role="operator")
+    assert not result.is_valid(now=150, session_id="s2", interface="cli", requested_role="operator")
+    assert not result.is_valid(now=150, session_id="s1", interface="web", requested_role="operator")
+    assert not result.is_valid(now=150, session_id="s1", interface="cli", requested_role="admin")
 
 
 def test_terminal_tool_passes_session_id_to_operator_block_check():
@@ -1357,3 +1409,88 @@ def test_terminal_tool_passes_session_id_to_operator_block_check():
     src = inspect.getsource(terminal_tool.terminal_tool)
     assert "operator_verification_block_reason_for_command(" in src
     assert "session_id=session_id" in src
+
+
+def _bound_result(*, role="operator", requested_role="operator"):
+    return OperatorVerificationResult(
+        ok=True, actor_id="actor-a", role=role, verified_at=100, expires_at=2_000_000_000,
+        session_id="session-a", interface="cli", provenance="callback",
+        requested_role=requested_role,
+    )
+
+
+def test_session_cache_lookup_never_falls_back_to_process_cache(monkeypatch):
+    import hermes_cli.operator_verification as verification
+
+    verification._cache["__process__"] = _bound_result()
+    assert get_cached_operator_verification(
+        session_id="session-b", interface="cli", provenance="callback",
+        actor_id="actor-a", requested_role="operator", now=150,
+    ) is None
+
+
+def test_cached_verification_requires_exact_session_interface_provenance_actor_and_requested_role():
+    result = _bound_result()
+    cache_operator_verification(result)
+    exact = dict(
+        session_id="session-a", interface="cli", provenance="callback",
+        actor_id="actor-a", requested_role="operator", now=150,
+    )
+    assert get_cached_operator_verification(**exact) == result
+    for field, value in {
+        "session_id": "session-b", "interface": "web", "provenance": "command",
+        "actor_id": "actor-b", "requested_role": "admin",
+    }.items():
+        mismatched = dict(exact)
+        mismatched[field] = value
+        assert get_cached_operator_verification(**mismatched) is None, field
+    for field in ("session_id", "interface", "provenance", "actor_id", "requested_role"):
+        omitted = dict(exact)
+        omitted[field] = ""
+        assert get_cached_operator_verification(**omitted) is None, field
+
+
+def test_terminal_gate_requires_command_specific_role_and_exact_binding():
+    config = _gate_config()
+    operator = _bound_result()
+    cache_operator_verification(operator)
+    subject = dict(
+        session_id="session-a", interface="cli", provenance="callback",
+        actor_id="actor-a", now=150,
+    )
+    assert operator_verification_block_reason_for_command(
+        "pass show service/token", config=config, requested_role="operator", **subject
+    ) is None
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, requested_role="admin", **subject
+    ) is not None
+
+    clear_operator_verification_cache()
+    cache_operator_verification(_bound_result(role="admin", requested_role="admin"))
+    assert operator_verification_block_reason_for_command(
+        "systemctl restart hermes", config=config, requested_role="admin", **subject
+    ) is None
+
+
+@pytest.mark.parametrize("failure", [False, KeyboardInterrupt])
+def test_chat_clears_operator_callback_on_early_return_and_baseexception(failure):
+    import cli
+    from hermes_cli.operator_verification import get_operator_verification_callback
+
+    instance = cli.HermesCLI.__new__(cli.HermesCLI)
+    instance._secret_capture_callback = lambda *_a, **_k: ""
+    instance._operator_verification_callback = lambda: ""
+    instance._last_turn_interrupted = True
+    if failure:
+        def credentials():
+            raise failure()
+        instance._ensure_runtime_credentials = credentials
+    else:
+        instance._ensure_runtime_credentials = lambda: False
+
+    if failure:
+        with pytest.raises(failure):
+            instance.chat("hello")
+    else:
+        assert instance.chat("hello") is None
+    assert get_operator_verification_callback() is None

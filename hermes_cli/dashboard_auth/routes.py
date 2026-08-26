@@ -21,7 +21,7 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
@@ -47,7 +47,6 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
-from hermes_cli.dashboard_auth.identity import greeting_identity_from_session
 
 _log = logging.getLogger(__name__)
 
@@ -578,7 +577,7 @@ async def auth_callback(
         # Clear the PKCE cookie (its job is done) but set NO session cookies:
         # the desktop is not a browser session, it redeems the code for a
         # bearer token it stores itself.
-        clear_pkce_cookie(resp, prefix=_prefix(request))
+        clear_pkce_cookie(resp, use_https=detect_https(request), prefix=_prefix(request))
         clear_sso_attempt_cookie(resp, prefix=_prefix(request))
         return resp
 
@@ -599,7 +598,7 @@ async def auth_callback(
         prefix=_prefix(request),
         provider=session.provider,
     )
-    clear_pkce_cookie(resp, prefix=_prefix(request))
+    clear_pkce_cookie(resp, use_https=detect_https(request), prefix=_prefix(request))
     # Clear the one-shot auto-SSO loop-guard marker now that login succeeded,
     # so it never lingers to suppress a future silent attempt after logout.
     clear_sso_attempt_cookie(resp, prefix=_prefix(request))
@@ -620,6 +619,8 @@ def _validate_post_login_target(raw: str) -> str:
         return ""
     from urllib.parse import unquote
     decoded = unquote(raw)
+    if "\\" in decoded:
+        return ""
     if not decoded.startswith("/") or decoded.startswith("//"):
         return ""
     # Don't loop back to login pages or auth flow.
@@ -855,7 +856,7 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
         # this window" page. No session cookies: the desktop is not a
         # browser session (mirrors the /auth/callback native branch).
         resp = JSONResponse({"ok": True, "next": loopback})
-        clear_pkce_cookie(resp, prefix=_prefix(request))
+        clear_pkce_cookie(resp, use_https=detect_https(request), prefix=_prefix(request))
         return resp
 
     expires_in = max(60, session.expires_at - int(time.time()))
@@ -900,7 +901,7 @@ async def auth_logout(request: Request):
     prefix = _prefix(request)
     resp = RedirectResponse(url=f"{prefix}/login", status_code=302)
     clear_session_cookies(resp, prefix=prefix)
-    clear_pkce_cookie(resp, prefix=prefix)
+    clear_pkce_cookie(resp, use_https=detect_https(request), prefix=prefix)
     return resp
 
 
@@ -910,7 +911,7 @@ async def auth_logout(request: Request):
 
 
 @router.get("/api/auth/me", name="auth_me")
-async def api_auth_me(request: Request, response: Response):
+async def api_auth_me(request: Request):
     """Return the verified session as JSON. Auth-required (gate enforces)."""
     sess = getattr(request.state, "session", None)
     if sess is None:
@@ -918,26 +919,20 @@ async def api_auth_me(request: Request, response: Response):
     tenant_id = getattr(sess, "tenant_id", "") or sess.org_id
     actor_id = getattr(sess, "actor_id", "") or sess.user_id
     role = getattr(sess, "role", "") or "user"
-    response.headers["Cache-Control"] = "private, no-store"
-    return {
-        "user_id": sess.user_id,
-        "email": sess.email,
-        "display_name": sess.display_name,
-        "org_id": sess.org_id,
-        "provider": sess.provider,
-        "expires_at": sess.expires_at,
-        "tenant_id": tenant_id,
-        "actor_id": actor_id,
-        "role": role,
-        "greeting": greeting_identity_from_session(sess, role=role),
-        "actor_context": {
+    return JSONResponse(
+        {
+            "user_id": sess.user_id,
+            "email": sess.email,
+            "display_name": sess.display_name,
+            "org_id": sess.org_id,
+            "provider": sess.provider,
+            "expires_at": sess.expires_at,
             "tenant_id": tenant_id,
             "actor_id": actor_id,
             "role": role,
-            "display_name": sess.display_name,
-            "provider": sess.provider,
         },
-    }
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------

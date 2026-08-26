@@ -14,13 +14,18 @@ without any external IDP.  Exercises:
 """
 from __future__ import annotations
 
+import secrets
+import threading
+
 import pytest
 
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
+from hermes_cli.dashboard_auth.base import RefreshExpiredError, Session
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE
+from plugins.dashboard_auth import basic as basic_auth
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
@@ -48,6 +53,32 @@ def gated_app():
 # ---------------------------------------------------------------------------
 # Allowlist (public) routes
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "next_value",
+    [
+        "<script>alert(1)</script>",
+        "javascript:alert(1)",
+        "../../etc/passwd",
+        "canary\r\nSet-Cookie: injected=1",
+    ],
+)
+def test_empty_provider_login_page_is_safe_through_real_route(
+    gated_app, next_value
+):
+    clear_providers()
+
+    response = gated_app.get("/login", params={"next": next_value})
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "no-store" in response.headers["cache-control"]
+    assert "Sign-in unavailable" in response.text
+    assert "username/password provider" in response.text
+    assert "OAuth provider" in response.text
+    assert "--insecure" not in response.text
+    assert next_value not in response.text
 
 
 def test_gated_status_is_public(gated_app):
@@ -238,6 +269,26 @@ def test_invalid_cookie_returns_401_on_api(gated_app):
 # ---------------------------------------------------------------------------
 
 
+def test_session_carries_explicit_tenant_actor_and_role_fields():
+    session = Session(
+        user_id="legacy-user",
+        email="user@example.test",
+        display_name="User",
+        org_id="legacy-org",
+        provider="test",
+        expires_at=123,
+        access_token="access",
+        refresh_token="refresh",
+        tenant_id="tenant-1",
+        actor_id="actor-1",
+        role="customer",
+    )
+
+    assert session.tenant_id == "tenant-1"
+    assert session.actor_id == "actor-1"
+    assert session.role == "customer"
+
+
 def test_api_auth_me_returns_session_after_login(gated_app):
     r1 = gated_app.get("/auth/login?provider=stub", follow_redirects=False)
     state = r1.headers["location"].split("state=")[1]
@@ -253,7 +304,183 @@ def test_api_auth_me_returns_session_after_login(gated_app):
     assert body["display_name"] == "Stub User"
     assert body["provider"] == "stub"
     assert body["org_id"] == "stub-org-1"
+    assert body["tenant_id"] == "stub-org-1"
+    assert body["actor_id"] == "stub-user-1"
+    assert body["role"] == "user"
     assert "expires_at" in body
+    cache_control = r.headers.get("cache-control", "")
+    assert "private" in cache_control
+    assert "no-store" in cache_control
+
+
+def test_public_auth_provider_bootstrap_contains_no_actor_identity(gated_app):
+    r = gated_app.get("/api/auth/providers")
+    assert r.status_code == 200
+    body = r.json()
+    serialized = repr(body)
+    for private_value in (
+        "stub-user-1",
+        "stub@example.test",
+        "stub-org-1",
+        "tenant_id",
+        "actor_id",
+        "role",
+    ):
+        assert private_value not in serialized
+
+
+def test_registered_basic_provider_reloads_current_membership_for_each_decision(
+    monkeypatch,
+):
+    password_hash = basic_auth.hash_password("hunter2")
+    current = {
+        "section": {
+            "secret": "test-signing-secret-that-is-long-enough",
+            "users": [
+                {
+                    "username": "alice",
+                    "password_hash": password_hash,
+                    "tenant_id": "tenant-a",
+                    "actor_id": "actor-a",
+                    "role": "admin",
+                }
+            ],
+        }
+    }
+    loads = 0
+
+    def load_section():
+        nonlocal loads
+        loads += 1
+        return current["section"]
+
+    class RegistrationContext:
+        provider = None
+
+        def register_dashboard_auth_provider(self, provider):
+            self.provider = provider
+
+    for name in (
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+        "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+        "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(basic_auth, "_load_config_basic_auth_section", load_section)
+
+    ctx = RegistrationContext()
+    basic_auth.register(ctx)
+    provider = ctx.provider
+    assert provider is not None
+    original = provider.complete_password_login(
+        username="alice", password="hunter2"
+    )
+    assert original.role == "admin"
+
+    current["section"]["users"][0]["role"] = "user"
+    verified = provider.verify_session(access_token=original.access_token)
+    assert verified is not None
+    assert verified.role == "user"
+    refreshed = provider.refresh_session(refresh_token=original.refresh_token)
+    assert refreshed.role == "user"
+
+    current["section"]["users"] = []
+    assert provider.verify_session(access_token=original.access_token) is None
+    with pytest.raises(RefreshExpiredError):
+        provider.refresh_session(refresh_token=original.refresh_token)
+    assert loads >= 6  # register plus login/verify/refresh/removal decisions
+
+
+def test_basic_provider_uses_one_coherent_authority_snapshot_per_verification():
+    source = {
+        "alice": {
+            "password_hash": basic_auth.hash_password("hunter2"),
+            "tenant_id": "tenant-a",
+            "actor_id": "actor-a",
+            "role": "admin",
+            "display_name": "Alice",
+            "email": "alice@example.test",
+        }
+    }
+    snapshot_taken = threading.Event()
+    mutation_complete = threading.Event()
+    resolver_calls = 0
+
+    def authority_resolver():
+        nonlocal resolver_calls
+        resolver_calls += 1
+        snapshot = {username: dict(record) for username, record in source.items()}
+        if resolver_calls == 2:
+            snapshot_taken.set()
+            assert mutation_complete.wait(timeout=5)
+        return snapshot
+
+    provider = basic_auth.BasicAuthProvider(
+        secret=secrets.token_bytes(32),
+        users=source,
+        authority_resolver=authority_resolver,
+    )
+    original = provider.complete_password_login(
+        username="alice", password="hunter2"
+    )
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            provider.verify_session(access_token=original.access_token)
+        )
+    )
+    worker.start()
+    assert snapshot_taken.wait(timeout=5)
+    source["alice"].update(
+        tenant_id="tenant-b", actor_id="actor-b", role="user"
+    )
+    mutation_complete.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    assert len(result) == 1
+    assert result[0] is not None
+    assert (result[0].tenant_id, result[0].actor_id, result[0].role) == (
+        "tenant-a",
+        "actor-a",
+        "admin",
+    )
+    assert resolver_calls == 2  # login once, verification once
+
+
+def test_basic_provider_static_authority_is_defensively_copied_and_roles_are_validated():
+    users = {
+        "alice": {
+            "password_hash": basic_auth.hash_password("hunter2"),
+            "tenant_id": "tenant-a",
+            "actor_id": "actor-a",
+            "role": "admin",
+        }
+    }
+    provider = basic_auth.BasicAuthProvider(
+        secret=secrets.token_bytes(32), users=users
+    )
+    original = provider.complete_password_login(
+        username="alice", password="hunter2"
+    )
+    users["alice"]["role"] = "user"
+    del users["alice"]
+    verified = provider.verify_session(access_token=original.access_token)
+    assert verified is not None
+    assert verified.role == "admin"
+
+    with pytest.raises(ValueError, match="role"):
+        basic_auth.BasicAuthProvider(
+            secret=secrets.token_bytes(32),
+            users={
+                "mallory": {
+                    "password_hash": basic_auth.hash_password("hunter2"),
+                    "role": "superadmin",
+                }
+            },
+        )
 
 
 def test_api_auth_me_requires_auth(gated_app):

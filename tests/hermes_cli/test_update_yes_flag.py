@@ -75,13 +75,7 @@ class TestUpdateYesConfigMigration:
 
         args = SimpleNamespace(yes=True)
 
-        with patch("builtins.input") as mock_input, patch(
-            "hermes_cli.gateway.find_gateway_pids", return_value=[]
-        ), patch(
-            "hermes_cli.gateway.find_profile_gateway_processes", return_value=[]
-        ), patch(
-            "hermes_cli.gateway.supports_systemd_services", return_value=False
-        ), patch("hermes_cli.gateway.is_macos", return_value=False):
+        with patch("builtins.input") as mock_input:
             cmd_update(args)
             # Never prompted the user.
             mock_input.assert_not_called()
@@ -134,13 +128,7 @@ class TestUpdateYesConfigMigration:
 
         with patch("builtins.input", return_value="n") as mock_input, patch.object(
             _sys.stdin, "isatty", return_value=True
-        ), patch.object(_sys.stdout, "isatty", return_value=True), patch(
-            "hermes_cli.gateway.find_gateway_pids", return_value=[]
-        ), patch(
-            "hermes_cli.gateway.find_profile_gateway_processes", return_value=[]
-        ), patch(
-            "hermes_cli.gateway.supports_systemd_services", return_value=False
-        ), patch("hermes_cli.gateway.is_macos", return_value=False):
+        ), patch.object(_sys.stdout, "isatty", return_value=True):
             cmd_update(args)
             # The user was actually prompted.
             assert mock_input.called
@@ -194,13 +182,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
             side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
         ), patch.object(_sys.stdin, "isatty", return_value=True), patch.object(
             _sys.stdout, "isatty", return_value=True
-        ), patch(
-            "hermes_cli.gateway.find_gateway_pids", return_value=[]
-        ), patch(
-            "hermes_cli.gateway.find_profile_gateway_processes", return_value=[]
-        ), patch(
-            "hermes_cli.gateway.supports_systemd_services", return_value=False
-        ), patch("hermes_cli.gateway.is_macos", return_value=False):
+        ):
             cmd_update(args)  # must not raise
 
         out = capsys.readouterr().out

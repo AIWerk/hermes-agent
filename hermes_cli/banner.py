@@ -14,13 +14,11 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from agent.i18n import t
-
 # rich and prompt_toolkit are imported lazily (inside the functions that use
-# them) rather than at module level. Importing this module is on the TUI
+# them) rather than at module level.  Importing this module is on the TUI
 # gateway's critical startup path purely to reach the lightweight update-check
 # helpers (``prefetch_update_check``); pulling rich.console + prompt_toolkit
-# eagerly added startup cost before ``gateway.ready`` could fire.
+# eagerly added ~50ms of wasted imports before ``gateway.ready`` could fire.
 # Keep the type-only reference available to checkers without the runtime cost.
 if TYPE_CHECKING:
     from rich.console import Console
@@ -321,6 +319,15 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
+        # Self-heal abandoned git lock files before fetching. A stale
+        # .git/shallow.lock from a crashed fetch makes the fetch fail, the
+        # exception below is swallowed, and stale refs get compared against
+        # HEAD — silently degrading the passive check until a human removes
+        # the lock (git never self-heals these).
+        from hermes_cli.gitlock import clear_stale_git_locks
+
+        clear_stale_git_locks(repo_dir)
+
         # Scope the fetch to the one branch the behind-count compares against.
         # An unscoped ``git fetch origin`` transfers every remote head (~1,400
         # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
@@ -375,48 +382,6 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    """Parse '0.13.0' into (0, 13, 0) for comparison. Non-numeric segments become 0."""
-    parts = []
-    for segment in v.split("."):
-        try:
-            parts.append(int(segment))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
-
-
-def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
-    """Fetch the latest version of a package from PyPI. Returns None on failure."""
-    try:
-        import urllib.request
-        url = f"https://pypi.org/pypi/{package}/json"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            return data.get("info", {}).get("version")
-    except Exception:
-        return None
-
-
-def check_via_pypi() -> Optional[int]:
-    """Compare installed version against PyPI latest.
-
-    Returns 0 if up-to-date, 1 if behind, None on failure.
-    """
-    latest = _fetch_pypi_latest()
-    if latest is None:
-        return None
-    if latest == VERSION:
-        return 0
-    try:
-        if _version_tuple(latest) > _version_tuple(VERSION):
-            return 1
-        return 0
-    except Exception:
-        return 1 if latest != VERSION else 0
-
-
 def _update_check_cache_identity(repo_dir: Optional[Path], embedded_rev: Optional[str]) -> dict:
     """Return identity fields that make a cached update result safe to reuse."""
     identity = {"rev": embedded_rev, "repo": None, "head": None}
@@ -438,6 +403,10 @@ def check_for_updates() -> Optional[int]:
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply. Cached for 6 hours.
     """
+    hermes_home = get_hermes_home()
+    cache_file = hermes_home / ".update_check"
+    embedded_rev = os.environ.get("HERMES_REVISION") or None
+
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
     # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
@@ -447,27 +416,18 @@ def check_for_updates() -> Optional[int]:
     # (web_server.py); mirror that here so the banner/TUI surfaces agree.
     try:
         from hermes_cli.config import detect_install_method, get_project_root
-        if detect_install_method(get_project_root()) == "docker":
+        if detect_install_method(get_project_root()) in {"docker", "apt"}:
             return None
     except Exception:
         pass
 
-    hermes_home = get_hermes_home()
-    cache_file = hermes_home / ".update_check"
-    embedded_rev = os.environ.get("HERMES_REVISION") or None
     repo_dir: Optional[Path] = None
     if not embedded_rev:
         repo_dir = _resolve_repo_dir()
     cache_identity = _update_check_cache_identity(repo_dir, embedded_rev)
 
     # Read cache — invalidate if the embedded rev, installed version, active
-    # repo, or current HEAD changed since the last check. The version guard
-    # matters for pip installs: `check_via_pypi()` compares against VERSION, so
-    # a `pip install --upgrade` changes VERSION but leaves rev unchanged (both
-    # None), and without this the stale "behind" count would survive the
-    # upgrade for up to 6h. See #34491. The repo/HEAD guards matter for local
-    # fork workflows where startup can switch from an old AIWerk branch to a
-    # freshly merged main while keeping the same version string.
+    # repo, or current HEAD changed since the last check.
     now = time.time()
     try:
         if cache_file.exists():
@@ -486,7 +446,10 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     elif repo_dir is None:
-        behind = check_via_pypi()
+        # No git checkout and no embedded revision — can't determine update
+        # status. This is the Docker path (already short-circuited above) or an
+        # unsupported install without a source tree.
+        behind = None
     else:
         behind = _check_via_local_git(repo_dir)
 
@@ -671,13 +634,10 @@ def format_banner_version_label() -> str:
     ahead = int(state.get("ahead") or 0)
 
     if ahead <= 0 or upstream == local:
-        return f"{base} · {t('cli.banner.version_upstream', upstream=upstream)}"
+        return f"{base} · upstream {upstream}"
 
-    carried_key = "cli.banner.version_carried_one" if ahead == 1 else "cli.banner.version_carried_many"
-    return (
-        f"{base} · {t('cli.banner.version_upstream', upstream=upstream)}"
-        f" · {t('cli.banner.version_local_carried', local=local, carried=t(carried_key, count=ahead))}"
-    )
+    carried_word = "commit" if ahead == 1 else "commits"
+    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
 
 
 # =========================================================================
@@ -1054,11 +1014,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         if len(preset_name) > 28:
             preset_name = preset_name[:25] + "..."
         agg_str = f" [dim {dim}]·[/] [dim {dim}]agg {agg_label}[/]" if agg_label else ""
-        ctx_str = (
-            f" [dim {dim}]·[/] [dim {dim}]"
-            f"{t('cli.banner.context_label', tokens=_format_context_length(context_length))}[/]"
-            if context_length else ""
-        )
+        ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
         left_lines.append(f"[{accent}]MoA: {preset_name}[/]{agg_str}{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
     else:
         if not (model or "").strip() or (model or "").strip().lower() == "unknown":
@@ -1066,8 +1022,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             # slug — this is the single clearest place to tell the user what
             # is wrong and how to fix it.
             left_lines.append(
-                f"[bold red]{t('cli.banner.no_model_configured')}[/] "
-                f"[dim {dim}]— {t('cli.banner.run_model_or_setup')}[/]"
+                f"[bold red]no model configured[/] "
+                f"[dim {dim}]— run /model or hermes setup[/]"
             )
         else:
             model_short = model.split("/")[-1] if "/" in model else model
@@ -1075,24 +1031,17 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
                 model_short = model_short[:-5]
             if len(model_short) > 28:
                 model_short = model_short[:25] + "..."
-            ctx_str = (
-                f" [dim {dim}]·[/] [dim {dim}]"
-                f"{t('cli.banner.context_label', tokens=_format_context_length(context_length))}[/]"
-                if context_length else ""
-            )
+            ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
             left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
 
     if os.getenv("HERMES_YOLO_MODE"):
-        left_lines.append(
-            f"[bold red]⚠ {t('cli.banner.yolo_mode')}[/] "
-            f"[dim {dim}]— {t('cli.banner.approvals_bypassed')}[/]"
-        )
+        left_lines.append(f"[bold red]⚠ YOLO mode[/] [dim {dim}]— all approval prompts bypassed[/]")
     left_lines.append(f"[dim {dim}]{cwd}[/]")
     if session_id:
-        left_lines.append(f"[dim {session_color}]{t('cli.banner.session_label', session_id=session_id)}[/]")
+        left_lines.append(f"[dim {session_color}]Session: {session_id}[/]")
     left_content = "\n".join(left_lines)
 
-    right_lines = [f"[bold {accent}]{t('cli.banner.available_tools')}[/]"]
+    right_lines = [f"[bold {accent}]Available Tools[/]"]
     toolsets_dict: Dict[str, list] = {}
 
     for tool in tools:
@@ -1149,7 +1098,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         right_lines.append(f"[dim {dim}]{toolset}:[/] {tools_str}")
 
     if remaining_toolsets > 0:
-        right_lines.append(f"[dim {dim}]({t('cli.banner.more_toolsets', count=remaining_toolsets)})[/]")
+        right_lines.append(f"[dim {dim}](and {remaining_toolsets} more toolsets...)[/]")
 
     # MCP Servers section (only if configured). Probe cheaply first: the
     # full get_mcp_status() path resolves portable plugin MCP servers,
@@ -1178,13 +1127,13 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     if mcp_status:
         right_lines.append("")
-        right_lines.append(f"[bold {accent}]{t('cli.banner.mcp_servers')}[/]")
+        right_lines.append(f"[bold {accent}]MCP Servers[/]")
         for srv in mcp_status:
             status = srv.get("status")
             if srv["connected"]:
                 right_lines.append(
                     f"[dim {dim}]{srv['name']}[/] [{text}]({srv['transport']})[/] "
-                    f"[dim {dim}]—[/] [{text}]{t('cli.banner.mcp_tool_count', count=srv['tools'])}[/]"
+                    f"[dim {dim}]—[/] [{text}]{srv['tools']} tool(s)[/]"
                 )
             elif srv.get("disabled") or status == "disabled":
                 right_lines.append(
@@ -1204,12 +1153,15 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             else:
                 right_lines.append(
                     f"[red]{srv['name']}[/] [dim]({srv['transport']})[/] "
-                    f"[red]— {t('cli.banner.failed')}[/]"
+                    f"[red]— failed[/]"
                 )
 
     right_lines.append("")
-    right_lines.append(f"[bold {accent}]{t('cli.banner.available_skills')}[/]")
-    # The skills catalog is only reachable when the skills toolset is enabled.
+    right_lines.append(f"[bold {accent}]Available Skills[/]")
+    # The skills catalog is only reachable when the `skills` toolset is enabled
+    # (it exposes skill_view / skill_manage). When it's disabled — e.g. a Blank
+    # Slate install — the agent literally cannot load any skill, so advertising
+    # the on-disk catalog here is misleading. Reflect the real state instead.
     _skills_enabled = (not _enabled_ts) or ("skills" in _enabled_ts)
     if _skills_enabled:
         if skills_by_category is None:
@@ -1232,34 +1184,31 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             # Account for "category: " prefix
             _prefix_len = len(category) + 2
             _avail = max(_right_col_width - _prefix_len, 20)
-            # Accumulate skills until we run out of space.
+            # Accumulate skills until we run out of space
             parts, length = [], 0
             for i, name in enumerate(skill_names):
                 _sep = ", " if parts else ""
                 _needed = len(_sep) + len(name)
-                _after = len(skill_names) - (i + 1)
-                _suffix = t('cli.banner.more_skills_suffix', count=_after) if _after > 0 else ""
-                _ind_len = len(", " + _suffix) if _suffix else 0
+                # Estimate indicator size IF we were to add this skill then stop
+                _after = len(skill_names) - (i + 1)  # remaining after adding this
+                _ind_len = len(f", +{_after} more") if _after > 0 else 0
                 if parts and length + _needed + _ind_len > _avail:
                     remaining = len(skill_names) - len(parts)
-                    parts.append(t('cli.banner.more_skills_suffix', count=remaining))
+                    parts.append(f"+{remaining} more")
                     break
                 parts.append(name)
                 length += _needed
             skills_str = ", ".join(parts)
             right_lines.append(f"[dim {dim}]{category}:[/] [{text}]{skills_str}[/]")
     else:
-        right_lines.append(f"[dim {dim}]{t('cli.banner.no_skills_installed')}[/]")
+        right_lines.append(f"[dim {dim}]No skills installed[/]")
 
     right_lines.append("")
     mcp_connected = sum(1 for s in mcp_status if s["connected"]) if mcp_status else 0
-    summary_parts = [
-        t('cli.banner.summary_tools', count=len(tools)),
-        t('cli.banner.summary_skills', count=total_skills),
-    ]
+    summary_parts = [f"{len(tools)} tools", f"{total_skills} skills"]
     if mcp_connected:
-        summary_parts.append(t('cli.banner.summary_mcp_servers', count=mcp_connected))
-    summary_parts.append(t('cli.banner.help_for_commands'))
+        summary_parts.append(f"{mcp_connected} MCP servers")
+    summary_parts.append("/help for commands")
     # Indicate when the codex_app_server runtime is active so users
     # understand why tool counts may not match what's actually reachable
     # (codex builds its own tool list inside the spawned subprocess).
@@ -1268,8 +1217,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         from hermes_cli.config import load_config as _load_cfg
         if get_current_runtime(_load_cfg()) == "codex_app_server":
             right_lines.append(
-                f"[bold {accent}]{t('cli.banner.runtime_label')}[/] [{text}]codex app-server[/] "
-                f"[dim {dim}]({t('cli.banner.codex_runtime_note')})[/]"
+                f"[bold {accent}]Runtime:[/] [{text}]codex app-server[/] "
+                f"[dim {dim}](terminal/file ops/MCP run inside codex)[/]"
             )
     except Exception:
         pass
@@ -1278,7 +1227,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         from hermes_cli.profiles import get_active_profile_name
         _profile_name = get_active_profile_name()
         if _profile_name and _profile_name != "default":
-            right_lines.append(f"[bold {accent}]{t('cli.banner.profile_label')}[/] [{text}]{_profile_name}[/]")
+            right_lines.append(f"[bold {accent}]Profile:[/] [{text}]{_profile_name}[/]")
     except Exception:
         pass  # Never break the banner over a profiles.py bug
 

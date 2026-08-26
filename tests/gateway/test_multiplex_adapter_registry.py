@@ -96,6 +96,39 @@ class TestProfileMessageHandler:
         assert seen["profile"] == "coder"
 
 
+class TestProfileRuntimeStatus:
+    def test_base_adapter_uses_namespaced_platform_key(self, monkeypatch):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        class _ConcreteAdapter(BasePlatformAdapter):
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def send(self, *_args, **_kwargs):
+                return None
+
+            async def get_chat_info(self, *_args, **_kwargs):
+                return None
+
+        adapter = _ConcreteAdapter.__new__(_ConcreteAdapter)
+        adapter.platform = Platform.DISCORD
+        adapter._runtime_status_platform_key = "reviewer:discord"
+        writes = []
+        monkeypatch.setattr(
+            "gateway.status.write_runtime_status",
+            lambda **kwargs: writes.append(kwargs),
+        )
+
+        adapter._write_runtime_status_safe("fatal", platform_state="fatal")
+
+        assert writes == [
+            {"platform": "reviewer:discord", "platform_state": "fatal"}
+        ]
+
+
 class _SecondaryRecoveryAdapter:
     platform = Platform.DISCORD
 
@@ -246,7 +279,7 @@ class TestSecondaryProfileConfigHandling:
 
 
     @pytest.mark.asyncio
-    async def test_secondary_reports_all_port_binding_platforms(self, monkeypatch, tmp_path):
+    async def test_secondary_reports_all_port_binding_platforms(self, monkeypatch):
         from gateway.run import SecondaryPortBindingConfigError
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
@@ -270,19 +303,107 @@ class TestSecondaryProfileConfigHandling:
         )
 
         with pytest.raises(SecondaryPortBindingConfigError) as ei:
-            await runner._start_one_profile_adapters(
-                "reviewer", str(tmp_path / "reviewer"), {}
-            )
+            await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         message = str(ei.value)
         assert "feishu" in message
         assert "webhook" in message
         assert "telegram" not in message
         assert "reviewer" not in runner._profile_adapters
 
+    def test_configured_secondary_adapter_namespaces_runtime_status(self):
+        runner = _secondary_recovery_runner()
+        adapter = _SecondaryRecoveryAdapter()
+
+        runner._configure_profile_adapter(adapter, "reviewer", Platform.DISCORD)
+
+        assert adapter._runtime_status_platform_key == "reviewer:discord"
+
     @pytest.mark.asyncio
-    async def test_multiplexer_skips_bad_profile_and_continues(
-        self, monkeypatch, caplog, tmp_path
+    async def test_duplicate_credential_is_persisted_as_profile_fatal(
+        self, monkeypatch
     ):
+        runner = _secondary_recovery_runner()
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True, token="shared-discord-token"
+                )
+            },
+        )
+        adapter = _SecondaryRecoveryAdapter()
+        adapter.config = config.platforms[Platform.DISCORD]
+        writes = []
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c: adapter)
+        monkeypatch.setattr(
+            runner,
+            "_update_platform_runtime_status",
+            lambda platform, **kwargs: writes.append((platform, kwargs)),
+        )
+        claim = runner._adapter_credential_claim(Platform.DISCORD, adapter)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/reviewer", {claim: "default"}
+        )
+
+        assert connected == 0
+        assert writes == [
+            (
+                "reviewer:discord",
+                {
+                    "platform_state": "fatal",
+                    "error_code": "duplicate_credential",
+                    "error_message": (
+                        "Profile 'default' and 'reviewer' both configure discord "
+                        "with the same credential. Give each profile its own "
+                        "discord credential."
+                    ),
+                },
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_listener_is_persisted_without_public_bind_details(
+        self, monkeypatch
+    ):
+        class _ListenerAdapter(_SecondaryRecoveryAdapter):
+            _sidecar_bind = "127.0.0.1"
+            _sidecar_port = 8789
+
+        runner = _secondary_recovery_runner()
+        platform = Platform("photon")
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            platforms={platform: PlatformConfig(enabled=True)},
+        )
+        adapter = _ListenerAdapter()
+        adapter.platform = platform
+        adapter.config = config.platforms[platform]
+        writes = []
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c: adapter)
+        monkeypatch.setattr(
+            runner,
+            "_update_platform_runtime_status",
+            lambda key, **kwargs: writes.append((key, kwargs)),
+        )
+        claim = runner._adapter_listener_claim(platform, adapter)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/reviewer", {claim: "default"}
+        )
+
+        assert connected == 0
+        assert writes[0][0] == "reviewer:photon"
+        assert writes[0][1]["error_code"] == "duplicate_listener"
+        assert "127.0.0.1" not in writes[0][1]["error_message"]
+        assert "8789" not in writes[0][1]["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_multiplexer_skips_bad_profile_and_continues(self, monkeypatch, caplog):
         from pathlib import Path
         from gateway.config import GatewayConfig
 
@@ -311,9 +432,9 @@ class TestSecondaryProfileConfigHandling:
             assert multiplex is True
             assert profile_allowlist == ["bad", "good"]
             return [
-                ("default", tmp_path / "default"),
-                ("bad", tmp_path / "bad"),
-                ("good", tmp_path / "good"),
+                ("default", Path("/tmp/default")),
+                ("bad", Path("/tmp/bad")),
+                ("good", Path("/tmp/good")),
             ]
 
         monkeypatch.setattr(
@@ -341,9 +462,7 @@ class TestSecondaryProfileConfigHandling:
         assert "Skipping secondary profile 'bad'" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_multiplexer_propagates_security_config_error(
-        self, monkeypatch, tmp_path
-    ):
+    async def test_multiplexer_propagates_security_config_error(self, monkeypatch):
         from pathlib import Path
         from gateway.config import GatewayConfig
         from gateway.run import MultiplexConfigError
@@ -361,8 +480,8 @@ class TestSecondaryProfileConfigHandling:
         monkeypatch.setattr(
             "hermes_cli.profiles.profiles_to_serve",
             lambda multiplex, profile_allowlist=None: [
-                ("default", tmp_path / "default"),
-                ("unsafe", tmp_path / "unsafe"),
+                ("default", Path("/tmp/default")),
+                ("unsafe", Path("/tmp/unsafe")),
             ],
         )
         monkeypatch.setattr(
@@ -377,7 +496,7 @@ class TestSecondaryProfileConfigHandling:
 
     @pytest.mark.asyncio
     async def test_secondary_distinct_photon_credentials_distinct_ports_connect(
-        self, monkeypatch, tmp_path
+        self, monkeypatch
     ):
         """Multiplexing remains supported when Photon sidecars cannot collide."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -427,7 +546,7 @@ class TestSecondaryProfileConfigHandling:
         )
 
         connected = await runner._start_one_profile_adapters(
-            "reviewer", str(tmp_path / "reviewer"), claimed
+            "reviewer", "/tmp/x", claimed
         )
 
         assert connected == 1
@@ -437,7 +556,7 @@ class TestSecondaryProfileConfigHandling:
 
     @pytest.mark.asyncio
     async def test_failed_photon_connect_releases_listener_for_later_profile(
-        self, monkeypatch, tmp_path
+        self, monkeypatch
     ):
         """A failed sidecar must not reserve an endpoint it never owned."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -484,12 +603,8 @@ class TestSecondaryProfileConfigHandling:
             runner, "_make_adapter_auth_check", lambda p, **kwargs: None
         )
 
-        first = await runner._start_one_profile_adapters(
-            "broken", str(tmp_path / "broken"), claimed
-        )
-        second = await runner._start_one_profile_adapters(
-            "later", str(tmp_path / "later"), claimed
-        )
+        first = await runner._start_one_profile_adapters("broken", "/tmp/x", claimed)
+        second = await runner._start_one_profile_adapters("later", "/tmp/y", claimed)
 
         assert first == 0
         assert failed.disconnected is True
@@ -501,7 +616,7 @@ class TestFeishuPortBindingConditional:
     """Feishu websocket mode does NOT bind a port; only webhook mode does (#52563)."""
 
     @pytest.mark.asyncio
-    async def test_feishu_websocket_mode_not_rejected(self, monkeypatch, tmp_path):
+    async def test_feishu_websocket_mode_not_rejected(self, monkeypatch):
         """Feishu in websocket mode (the default) should NOT raise MultiplexConfigError."""
         from gateway.run import MultiplexConfigError
         from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -520,9 +635,7 @@ class TestFeishuPortBindingConditional:
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
         monkeypatch.setattr(runner, "_create_adapter", lambda p, c: None)
 
-        connected = await runner._start_one_profile_adapters(
-            "reviewer", str(tmp_path / "reviewer"), {}
-        )
+        connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
 
 

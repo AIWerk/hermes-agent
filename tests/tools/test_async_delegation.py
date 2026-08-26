@@ -65,6 +65,38 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def test_active_for_session_counts_every_live_delegation_state():
+    with ad._records_lock:
+        ad._records.update(
+            {
+                "running": {
+                    "status": "running",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "stalling": {
+                    "status": "stalling",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "finalizing": {
+                    "status": "finalizing",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "completed": {
+                    "status": "completed",
+                    "origin_ui_session_id": "desktop-sid",
+                },
+                "other-session": {
+                    "status": "running",
+                    "origin_ui_session_id": "other-sid",
+                },
+            }
+        )
+
+    assert ad.active_for_session("desktop-sid") == 3
+    assert ad.active_for_session("other-sid") == 1
+    assert ad.active_for_session("") == 0
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
@@ -730,37 +762,6 @@ def test_gateway_cli_origin_event_left_unrouted():
     assert "platform" not in evt
 
 
-def test_active_for_session_counts_every_live_delegation_state():
-    with ad._records_lock:
-        ad._records.update(
-            {
-                "running": {
-                    "status": "running",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "stalling": {
-                    "status": "stalling",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "finalizing": {
-                    "status": "finalizing",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "completed": {
-                    "status": "completed",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "other-session": {
-                    "status": "running",
-                    "origin_ui_session_id": "other-sid",
-                },
-            }
-        )
-
-    assert ad.active_for_session("desktop-sid") == 3
-    assert ad.active_for_session("other-sid") == 1
-    assert ad.active_for_session("") == 0
-
 def test_single_task_truncation_banner_when_max_iterations():
     """A single async subagent that hit its iteration cap (exit_reason=
     max_iterations) must surface a TRUNCATED marker in the formatted result,
@@ -777,12 +778,14 @@ def test_single_task_truncation_banner_when_max_iterations():
     # The summary is still shown, just flagged.
     assert "Did part of the work" in text
 
+
 def test_single_task_no_banner_when_clean():
     """A cleanly-finished subagent must NOT get a truncation banner."""
     evt = _make_async_evt(status="completed", summary="All done.", exit_reason="completed")
     text = format_process_notification(evt)
     assert text is not None
     assert "TRUNCATED" not in text
+
 
 def test_batch_truncation_banner_marks_only_truncated_task():
     """In a batch, only the task that hit max_iterations gets the TRUNCATED
@@ -821,3 +824,4 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
+

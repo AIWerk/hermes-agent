@@ -1,5 +1,6 @@
 """Tests for gateway auto-TTS voice reply audio format selection."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,16 +16,19 @@ from gateway.session import SessionSource
 class TestAutoVoiceReplyFormat:
     @pytest.mark.asyncio
     async def test_telegram_auto_voice_reply_requests_ogg_for_native_voice_bubble(self):
-        """Telegram auto-TTS should use OGG/Opus for a native voice bubble."""
         runner = _make_runner()
         adapter = _make_adapter(Platform.TELEGRAM)
         runner.adapters[Platform.TELEGRAM] = adapter
-        event = _make_event(Platform.TELEGRAM)
+        event = _make_event(
+            Platform.TELEGRAM,
+            chat_id="telegram-chat",
+            thread_id="topic-7",
+            user_id="actor-9",
+        )
         requested_paths = []
 
         def fake_tts(*, text, output_path):
             requested_paths.append(output_path)
-            assert output_path.endswith(".ogg")
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             Path(output_path).write_bytes(b"fake ogg")
             return json.dumps({
@@ -37,14 +41,16 @@ class TestAutoVoiceReplyFormat:
         with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
             await runner._send_voice_reply(event, "hello from auto tts")
 
-        assert requested_paths
+        assert requested_paths == [adapter.send_voice.await_args.kwargs["audio_path"]]
         assert requested_paths[0].endswith(".ogg")
         adapter.send_voice.assert_awaited_once()
-        assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".ogg")
+        assert adapter.send_voice.await_args.kwargs["chat_id"] == "telegram-chat"
+        assert adapter.send_voice.await_args.kwargs["reply_to"] == "456"
+        assert adapter.send_voice.await_args.kwargs["metadata"]["thread_id"] == "topic-7"
+        assert adapter.send_voice.await_args.kwargs["metadata"]["notify"] is True
 
     @pytest.mark.asyncio
     async def test_non_telegram_auto_voice_reply_keeps_mp3_default(self):
-        """Non-Telegram platforms should keep the current MP3 default."""
         runner = _make_runner()
         adapter = _make_adapter(Platform.SLACK)
         runner.adapters[Platform.SLACK] = adapter
@@ -53,7 +59,6 @@ class TestAutoVoiceReplyFormat:
 
         def fake_tts(*, text, output_path):
             requested_paths.append(output_path)
-            assert output_path.endswith(".mp3")
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             Path(output_path).write_bytes(b"fake mp3")
             return json.dumps({
@@ -66,10 +71,42 @@ class TestAutoVoiceReplyFormat:
         with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
             await runner._send_voice_reply(event, "hello from auto tts")
 
-        assert requested_paths
-        assert requested_paths[0].endswith(".mp3")
+        assert requested_paths and requested_paths[0].endswith(".mp3")
         adapter.send_voice.assert_awaited_once()
-        assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".mp3")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "send_error",
+        [RuntimeError("send failed"), pytest.param("cancel", id="cancelled")],
+    )
+    async def test_auto_voice_reply_temp_media_is_cleaned_on_send_failure_or_cancel(
+        self, send_error
+    ):
+        runner = _make_runner()
+        adapter = _make_adapter(Platform.TELEGRAM)
+        if send_error == "cancel":
+            adapter.send_voice.side_effect = asyncio.CancelledError()
+        else:
+            adapter.send_voice.side_effect = send_error
+        runner.adapters[Platform.TELEGRAM] = adapter
+        event = _make_event(Platform.TELEGRAM)
+        requested_paths = []
+
+        def fake_tts(*, text, output_path):
+            requested_paths.append(output_path)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(b"temporary audio")
+            return json.dumps({"success": True, "file_path": output_path})
+
+        with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
+            if send_error == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await runner._send_voice_reply(event, "hello")
+            else:
+                await runner._send_voice_reply(event, "hello")
+
+        assert requested_paths
+        assert not Path(requested_paths[0]).exists()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -164,13 +201,21 @@ def _make_adapter(platform: Platform) -> MagicMock:
     return adapter
 
 
-def _make_event(platform: Platform, chat_id: str = "123", message_type: MessageType = MessageType.TEXT) -> MessageEvent:
+def _make_event(
+    platform: Platform,
+    chat_id: str = "123",
+    message_type: MessageType = MessageType.TEXT,
+    *,
+    thread_id: str | None = None,
+    user_id: str = "u1",
+) -> MessageEvent:
     return MessageEvent(
         text="trigger",
         source=SessionSource(
             platform=platform,
             chat_id=chat_id,
-            user_id="u1",
+            thread_id=thread_id,
+            user_id=user_id,
             user_name="User",
         ),
         message_type=message_type,

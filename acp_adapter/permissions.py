@@ -39,13 +39,19 @@ def _permission_option_supports_kind(kind: str) -> bool:
 
 
 def _build_permission_options(
-    *, allow_permanent: bool, smart_denied: bool = False,
+    *, allow_permanent: bool, allow_session: bool = True,
+    smart_denied: bool = False,
 ) -> list[PermissionOption]:
     """Return ACP options that match Hermes approval semantics."""
+    # A gate that re-asks every time (allow_session=False, e.g. protected
+    # agent-instruction writes) collapses to the same two options as a
+    # Smart DENY override — the editor must not offer a scope Hermes
+    # discards, or every subsequent write re-prompts (#81887).
+    once_only = smart_denied or not allow_session
     options = [PermissionOption(
         option_id="allow_once", kind="allow_once", name="Allow once",
     )]
-    if not smart_denied:
+    if not once_only:
         options.append(PermissionOption(
             option_id="allow_session",
             # ACP has no session-scoped kind, so use the closest persistent
@@ -53,7 +59,7 @@ def _build_permission_options(
             kind="allow_always",
             name="Allow for session",
         ))
-    if allow_permanent and not smart_denied:
+    if allow_permanent and not once_only:
         options.append(
             PermissionOption(
                 option_id="allow_always",
@@ -62,7 +68,7 @@ def _build_permission_options(
             ),
         )
     options.append(PermissionOption(option_id="deny", kind="reject_once", name="Deny"))
-    if not smart_denied and _permission_option_supports_kind("reject_always"):
+    if not once_only and _permission_option_supports_kind("reject_always"):
         options.append(
             PermissionOption(
                 option_id="deny_always",
@@ -81,25 +87,17 @@ def _build_permission_tool_call(command: str, description: str):
     gets a unique ``perm-check-N`` id so concurrent requests don't collide.
     """
     import acp as _acp
-    from agent.tool_argument_projection import (
-        project_tool_args_for_display,
-        sanitize_tool_display_text,
-    )
 
     tool_call_id = f"perm-check-{next(_PERMISSION_REQUEST_IDS)}"
-    display_command = project_tool_args_for_display(
-        "terminal", {"command": command}
-    ).get("command", "")
-    display_description = sanitize_tool_display_text(description)
-    title = f"{display_description}: {display_command}" if display_description else display_command
-    content_text = f"{display_description}\n$ {display_command}" if display_description else f"$ {display_command}"
+    title = f"{description}: {command}" if description else command
+    content_text = f"{description}\n$ {command}" if description else f"$ {command}"
     return _acp.update_tool_call(
         tool_call_id,
         title=title,
         kind="execute",
         status="pending",
         content=[_acp.tool_content(_acp.text_block(content_text))],
-        raw_input={"command": display_command, "description": display_description},
+        raw_input={"command": command, "description": description},
     )
 
 
@@ -140,6 +138,7 @@ def make_approval_callback(
         description: str,
         *,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
         **_: object,
     ) -> str:
@@ -147,6 +146,7 @@ def make_approval_callback(
 
         options = _build_permission_options(
             allow_permanent=allow_permanent,
+            allow_session=allow_session,
             smart_denied=smart_denied,
         )
 

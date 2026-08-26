@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import base64
 import hashlib
 import hmac
@@ -37,10 +37,33 @@ class OperatorVerificationResult:
     verified_at: int = 0
     expires_at: int = 0
     reason: str = ""
+    session_id: str = ""
+    interface: str = ""
+    provenance: str = ""
+    requested_role: str = ""
 
-    def is_valid(self, *, now: int | None = None) -> bool:
+    def is_valid(
+        self, *, now: int | None = None, session_id: str | None = None,
+        interface: str | None = None, provenance: str | None = None,
+        actor_id: str | None = None, requested_role: str | None = None,
+    ) -> bool:
         current = int(time.time()) if now is None else int(now)
-        return self.ok and bool(self.actor_id) and bool(self.role) and current < self.expires_at
+        if not (self.ok and self.actor_id and self.role and current < self.expires_at):
+            return False
+        if session_id is not None and self.session_id != session_id:
+            return False
+        if interface is not None and self.interface != interface:
+            return False
+        if provenance is not None and self.provenance != provenance:
+            return False
+        if actor_id is not None and self.actor_id != actor_id:
+            return False
+        if requested_role is not None:
+            granted = {"operator": 1, "admin": 2, "aiwerk_admin": 2}.get(self.role, 0)
+            required = {"operator": 1, "admin": 2, "aiwerk_admin": 2}.get(requested_role, 99)
+            if granted < required or self.requested_role != requested_role:
+                return False
+        return bool(self.provenance or not any((self.session_id, self.interface, self.requested_role)))
 
 
 @dataclass(frozen=True)
@@ -718,13 +741,24 @@ def _get_operator_verification_callback():
     return getattr(_callback_tls, "operator_verification", None)
 
 
+def get_operator_verification_callback():
+    """Return the task-local masked callback for audited thread propagation."""
+    return _get_operator_verification_callback()
+
+
 def set_operator_verification_callback(cb) -> None:
     """Register a masked in-process operator verifier prompt callback."""
     _callback_tls.operator_verification = cb
 
 
-def _cache_key(session_id: str | None = None) -> str:
-    return session_id or "__process__"
+def _cache_key(
+    session_id: str, interface: str, provenance: str, actor_id: str,
+    requested_role: str,
+) -> str:
+    values = (session_id, interface, provenance, actor_id, requested_role)
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        raise ValueError("operator verification subject is incomplete")
+    return json.dumps(values, separators=(",", ":"))
 
 
 def _clear_broker_env() -> None:
@@ -837,10 +871,14 @@ def _operator_result_from_payload(payload: Any) -> OperatorVerificationResult | 
         verified_at=verified_at,
         expires_at=expires_at,
         reason=str(payload.get("reason") or ""),
+        session_id=str(payload.get("session_id") or ""),
+        interface=str(payload.get("interface") or ""),
+        provenance=str(payload.get("provenance") or ""),
+        requested_role=str(payload.get("requested_role") or ""),
     )
 
 
-def _start_operator_verification_broker(result: OperatorVerificationResult, *, session_id: str | None = None) -> None:
+def _start_operator_verification_broker(result: OperatorVerificationResult) -> None:
     global _broker_proc
     if os.name != "posix" or not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
         return
@@ -864,7 +902,7 @@ def _start_operator_verification_broker(result: OperatorVerificationResult, *, s
             return
         capability = secrets.token_urlsafe(32)
         payload = json.dumps(
-            {"key": _cache_key(session_id), "capability": capability, "parent_pid": os.getpid(), "result": asdict(result)},
+            {"key": _cache_key(result.session_id, result.interface, result.provenance, result.actor_id, result.requested_role), "capability": capability, "parent_pid": os.getpid(), "result": asdict(result)},
             separators=(",", ":"),
         )
         try:
@@ -924,7 +962,8 @@ def _trusted_broker_env() -> tuple[str, int, str] | None:
 
 
 def _query_operator_verification_broker(
-    *, session_id: str | None = None, now: int | None = None
+    *, session_id: str, interface: str, provenance: str, actor_id: str,
+    requested_role: str, now: int | None = None,
 ) -> OperatorVerificationResult | None:
     if os.name != "posix" or not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
         return None
@@ -940,7 +979,10 @@ def _query_operator_verification_broker(
             peer_pid, _peer_uid, _peer_gid = struct.unpack("3i", creds)
             if peer_pid != expected_pid:
                 return None
-            request = {"session_id": session_id, "capability": capability}
+            request = {
+                "key": _cache_key(session_id, interface, provenance, actor_id, requested_role),
+                "capability": capability,
+            }
             client.sendall(json.dumps(request, separators=(",", ":")).encode("utf-8"))
             raw = client.recv(8192)
     except Exception:
@@ -950,7 +992,10 @@ def _query_operator_verification_broker(
     except Exception:
         return None
     result = _operator_result_from_payload(payload)
-    if result is None or not result.is_valid(now=now):
+    if result is None or not result.is_valid(
+        now=now, session_id=session_id, interface=interface,
+        provenance=provenance, actor_id=actor_id, requested_role=requested_role,
+    ):
         return None
     return result
 
@@ -975,27 +1020,46 @@ def clear_operator_verification_cache() -> None:
 def cache_operator_verification(
     result: OperatorVerificationResult, *, session_id: str | None = None
 ) -> None:
-    if result.ok and result.actor_id and result.role:
-        _cache[_cache_key(session_id)] = result
-        _start_operator_verification_broker(result, session_id=session_id)
+    if session_id is not None and session_id != result.session_id:
+        return
+    try:
+        key = _cache_key(
+            result.session_id, result.interface, result.provenance,
+            result.actor_id, result.requested_role,
+        )
+    except ValueError:
+        return
+    if result.is_valid(
+        session_id=result.session_id, interface=result.interface,
+        provenance=result.provenance, actor_id=result.actor_id,
+        requested_role=result.requested_role,
+    ):
+        _cache[key] = result
+        _start_operator_verification_broker(result)
 
 
 def get_cached_operator_verification(
-    *, session_id: str | None = None, now: int | None = None
+    *, session_id: str = "", interface: str = "", provenance: str = "",
+    actor_id: str = "", requested_role: str = "", now: int | None = None,
 ) -> OperatorVerificationResult | None:
-    key = _cache_key(session_id)
-    cache_key = key
+    try:
+        key = _cache_key(session_id, interface, provenance, actor_id, requested_role)
+    except ValueError:
+        return None
     result = _cache.get(key)
-    if result is None and session_id is not None:
-        cache_key = _cache_key(None)
-        result = _cache.get(cache_key)
     if result is not None:
-        if result.is_valid(now=now):
+        if result.is_valid(
+            now=now, session_id=session_id, interface=interface,
+            provenance=provenance, actor_id=actor_id, requested_role=requested_role,
+        ):
             return result
-        _cache.pop(cache_key, None)
-    result = _query_operator_verification_broker(session_id=session_id, now=now)
+        _cache.pop(key, None)
+    result = _query_operator_verification_broker(
+        session_id=session_id, interface=interface, provenance=provenance,
+        actor_id=actor_id, requested_role=requested_role, now=now,
+    )
     if result is not None:
-        _cache[_cache_key(session_id)] = result
+        _cache[key] = result
     return result
 
 
@@ -1033,11 +1097,10 @@ def current_operator_interface() -> str:
     prompt.
     """
     try:
-        from gateway.session_context import get_session_env
-
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        from gateway.session_context import get_session_env, session_context_engaged
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "") if session_context_engaged() else ""
     except Exception:
-        platform = os.getenv("HERMES_SESSION_PLATFORM", "")
+        platform = ""
     platform = _normalize_interface(platform)
     if platform:
         return platform
@@ -1045,9 +1108,6 @@ def current_operator_interface() -> str:
     # web verifier surface.
     if _cui_actor_context_data():
         return "web"
-    explicit = _normalize_interface(os.getenv("HERMES_OPERATOR_INTERFACE", ""))
-    if explicit:
-        return explicit
     if os.getenv("HERMES_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "on"}:
         # The interactive Hermes CLI owns the user-facing prompt even when tool
         # workers themselves have no controlling TTY. Route to the in-process
@@ -1221,9 +1281,10 @@ def _cui_actor_context_data() -> dict[str, Any]:
     keep this module importable without pulling in the agent package eagerly.
     """
     try:
-        from agent.cui_actor_context import current_cui_actor_context
-
-        return dict(current_cui_actor_context())
+        from agent import cui_actor_context
+        if cui_actor_context._actor_context.get() is None:
+            return {}
+        return dict(cui_actor_context.current_cui_actor_context())
     except Exception:
         return {}
 
@@ -1262,20 +1323,18 @@ def _cui_actor_verification(config: OperatorVerificationConfig, *, now: int) -> 
 def _trusted_platform_actor_verification(config: OperatorVerificationConfig, *, now: int) -> OperatorVerificationResult:
     """Trust the current gateway platform actor only when explicitly allowlisted."""
     try:
-        from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "") or os.getenv("HERMES_SESSION_PLATFORM", "") or ""
+        from gateway.session_context import get_session_env, session_context_engaged
+        if not session_context_engaged():
+            return _failure("platform_actor_not_authorized", now=now)
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "") or ""
         actor_id = (
             get_session_env("HERMES_SESSION_USER_ID", "")
             or get_session_env("HERMES_SESSION_CHAT_ID", "")
-            or os.getenv("HERMES_SESSION_USER_ID", "")
-            or os.getenv("HERMES_SESSION_CHAT_ID", "")
             or ""
         )
-        actor_name = get_session_env("HERMES_SESSION_USER_NAME", "") or os.getenv("HERMES_SESSION_USER_NAME", "") or ""
+        actor_name = get_session_env("HERMES_SESSION_USER_NAME", "") or ""
     except Exception:
-        platform = os.getenv("HERMES_SESSION_PLATFORM", "") or ""
-        actor_id = os.getenv("HERMES_SESSION_USER_ID", "") or os.getenv("HERMES_SESSION_CHAT_ID", "") or ""
-        actor_name = os.getenv("HERMES_SESSION_USER_NAME", "") or ""
+        platform = actor_id = actor_name = ""
     trusted = set(config.trusted_actor_ids or [])
     candidates = {str(actor_id), str(actor_name)} - {""}
     if not platform or not candidates or not (trusted & candidates):
@@ -1317,11 +1376,72 @@ def _verifier_is_provisioned(config: OperatorVerificationConfig) -> bool:
     return _load_operator_store() is not None and _get_operator_verification_callback() is not None
 
 
+def _normalized_provenance(config: OperatorVerificationConfig) -> str:
+    verifier = (config.verifier_type or "command").strip().lower().replace("-", "_")
+    if verifier in {"operator_callback", "prompt", "modal"}:
+        return "callback"
+    if verifier in {"cui_admin", "cui_actor_context"}:
+        return "cui_actor"
+    if verifier in {"platform_actor"}:
+        return "trusted_platform_actor"
+    return verifier
+
+
+def current_operator_verification_subject(
+    requested_role: str, *, session_id: str | None = None,
+) -> dict[str, str] | None:
+    """Return the complete subject from trusted runtime context, or fail closed."""
+    requested_role = str(requested_role or "").strip().lower()
+    if requested_role not in {"operator", "admin"}:
+        return None
+    try:
+        from gateway.session_context import get_session_env
+        trusted_session = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+        platform_actor = str(
+            get_session_env("HERMES_SESSION_USER_ID", "")
+            or get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+        ).strip()
+    except Exception:
+        trusted_session = platform_actor = ""
+    if not trusted_session or (session_id is not None and session_id != trusted_session):
+        return None
+    config = load_operator_verification_config()
+    interface = _normalize_interface(config.interface) or current_operator_interface()
+    provenance = _normalized_provenance(config)
+    actor = _cui_actor_context_data()
+    actor_id = str(actor.get("actor_id") or actor.get("user_id") or platform_actor).strip()
+    if not actor_id and provenance in {"callback", "command"}:
+        store = _load_operator_store() or {}
+        actor_id = str(store.get("actor_id") or "").strip()
+    if not all((interface, provenance, actor_id)):
+        return None
+    return {
+        "session_id": trusted_session,
+        "interface": interface,
+        "provenance": provenance,
+        "actor_id": actor_id,
+        "requested_role": requested_role,
+    }
+
+
+def required_operator_role_for_command(command: str) -> str:
+    tokens = _split_command(command or "")
+    cmd, args = _base_command(list(tokens)) if tokens else ("", [])
+    verb = _first_non_option(args)
+    if (cmd == "pass" and verb == "show") or (cmd == "bw" and verb == "get"):
+        return "operator"
+    return "admin"
+
+
 def operator_verification_block_reason_for_command(
     command: str,
     *,
     config: OperatorVerificationConfig | None = None,
     session_id: str | None = None,
+    interface: str = "",
+    provenance: str = "",
+    actor_id: str = "",
+    requested_role: str = "",
     now: int | None = None,
 ) -> str | None:
     cfg = config or load_operator_verification_config()
@@ -1329,9 +1449,20 @@ def operator_verification_block_reason_for_command(
         return None
     if not _requires_operator_verification(command or "", cfg):
         return None
-    if get_cached_operator_verification(session_id=session_id, now=now) is not None:
-        return None
-    if not _verifier_is_provisioned(cfg):
+    required_role = required_operator_role_for_command(command)
+    if requested_role and requested_role != required_role:
+        return "Operator verification subject does not match the command-required role."
+    if not all((session_id, interface, provenance, actor_id)):
+        subject = current_operator_verification_subject(required_role, session_id=session_id)
+        if subject is not None:
+            session_id = subject["session_id"]
+            interface = subject["interface"]
+            provenance = subject["provenance"]
+            actor_id = subject["actor_id"]
+    if get_cached_operator_verification(
+        session_id=session_id or "", interface=interface, provenance=provenance,
+        actor_id=actor_id, requested_role=required_role, now=now,
+    ) is not None:
         return None
     return (
         "Operator verification required before running this admin-sensitive "
@@ -1344,6 +1475,7 @@ def run_operator_verifier(
     config: OperatorVerificationConfig | None = None,
     *,
     now: int | None = None,
+    subject: dict[str, str] | None = None,
 ) -> OperatorVerificationResult:
     cfg = config or load_operator_verification_config()
     current = int(time.time()) if now is None else int(now)
@@ -1352,12 +1484,22 @@ def run_operator_verifier(
         return _failure("disabled", now=current)
     if cfg.missing_interface:
         return _failure("not_configured_for_interface", now=current)
+    def bound(result: OperatorVerificationResult) -> OperatorVerificationResult:
+        if not result.ok or subject is None:
+            return result
+        required = subject.get("requested_role", "")
+        granted = {"operator": 1, "admin": 2, "aiwerk_admin": 2}.get(result.role, 0)
+        needed = {"operator": 1, "admin": 2}.get(required, 99)
+        if result.actor_id != subject.get("actor_id") or granted < needed:
+            return _failure("requested_role_not_granted", now=current)
+        return replace(result, **subject)
+
     if cfg.verifier_type in {"cui_actor", "cui-actor", "cui_admin", "cui-admin", "cui_actor_context", "cui-actor-context"}:
-        return _cui_actor_verification(cfg, now=current)
+        return bound(_cui_actor_verification(cfg, now=current))
     if cfg.verifier_type in {"trusted_platform_actor", "trusted-platform-actor", "platform_actor", "platform-actor"}:
-        return _trusted_platform_actor_verification(cfg, now=current)
+        return bound(_trusted_platform_actor_verification(cfg, now=current))
     if cfg.verifier_type in {"callback", "operator_callback", "operator-callback", "prompt", "modal"}:
-        return _callback_operator_verification(cfg, now=current)
+        return bound(_callback_operator_verification(cfg, now=current))
     if not cfg.argv:
         return _failure("not_configured", now=current)
 
@@ -1403,6 +1545,7 @@ def run_operator_verifier(
         verified_at=current,
         expires_at=current + ttl,
     )
+    result = bound(result)
     if not result.is_valid(now=current):
         return _failure("invalid_verifier_output", now=current)
     return result

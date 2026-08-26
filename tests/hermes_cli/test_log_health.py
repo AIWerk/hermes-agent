@@ -8,13 +8,13 @@ from hermes_cli.log_health import classify, parse_ts, redact, render_report, sig
 
 
 def test_redacts_secrets_and_query_tokens() -> None:
-    line = "Authorization: Bearer sk-testsecret1234567890 url=https://x.test?a=1&token=abc123"
+    line = "Authorization: Bearer actual-bearer-value-123 url=https://x.test?a=1&token=abc123"
 
     redacted = redact(line)
 
-    assert "sk-testsecret" not in redacted
+    assert "actual-bearer-value-123" not in redacted
     assert "abc123" not in redacted
-    assert "[REDACTED]" in redacted or "[REDACTED_TOKEN]" in redacted
+    assert "Authorization=[REDACTED]" in redacted
 
 
 def test_classifies_critical_and_warning_patterns() -> None:

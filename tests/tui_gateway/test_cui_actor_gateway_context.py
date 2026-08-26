@@ -1,703 +1,816 @@
+import asyncio
 import json
-import os
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
-from agent import cui_actor_context
+import pytest
+
 from tui_gateway import server
 
 
-def test_dispatch_session_create_stores_authenticated_cui_actor(monkeypatch, tmp_path):
-    server._sessions.clear()
-    monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
+TRUSTED_ACTOR = {
+    "tenant_id": "tenant-a",
+    "actor_id": "actor-a",
+    "role": "user",
+    "display_name": "Actor A",
+    "user_id": "user-a",
+    "provider": "basic",
+}
+
+
+def _patch_session_create_dependencies(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
     monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_profile_home", lambda profile=None: None)
     monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
     monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "collapsed")
 
-    actor = {
-        "tenant_id": "example-tenant",
-        "actor_id": "aiwerk:operator:admin",
-        "role": "admin",
-        "display_name": "Operator",
-        "provider": "dashboard_auth",
-        "ignored": "must-not-persist",
-    }
+
+def test_dispatch_stores_only_server_actor_allowlist_and_resets(monkeypatch, tmp_path):
+    _patch_session_create_dependencies(monkeypatch, tmp_path)
+    server._sessions.clear()
+    actor = {**TRUSTED_ACTOR, "minted_at": 123, "arbitrary": "drop"}
     try:
-        resp = server.dispatch(
-            {"jsonrpc": "2.0", "id": "r1", "method": "session.create", "params": {"cols": 80}},
+        response = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "create",
+                "method": "session.create",
+                "params": {
+                    "_cui_actor_role": "admin",
+                    "actor_context": {"tenant_id": "evil", "role": "admin"},
+                },
+            },
             actor_context=actor,
         )
-        sid = resp["result"]["session_id"]
-        stored = server._sessions[sid]["cui_actor_context"]
-        assert stored == {
-            "tenant_id": "example-tenant",
-            "actor_id": "aiwerk:operator:admin",
-            "role": "admin",
-            "display_name": "Operator",
-            "provider": "dashboard_auth",
-        }
-        assert server.current_cui_actor_context() is None
+        sid = response["result"]["session_id"]
+        assert server._sessions[sid]["cui_actor_context"] == TRUSTED_ACTOR
+        assert server.current_cui_actor_context() == {}
     finally:
-        for sess in list(server._sessions.values()):
-            server._teardown_session(sess)
         server._sessions.clear()
 
 
-def _row(source="tui", model_config=None):
-    import json as _json
+def test_dispatch_resets_actor_context_after_handler_error(monkeypatch):
+    def explode(_request):
+        assert server.current_cui_actor_context() == TRUSTED_ACTOR
+        raise RuntimeError("boom")
 
-    return {
-        "id": "sess-x",
-        "source": source,
-        "model_config": _json.dumps(model_config) if isinstance(model_config, dict) else model_config,
+    monkeypatch.setattr(server, "handle_request", explode)
+    with pytest.raises(RuntimeError, match="boom"):
+        server.dispatch(
+            {"jsonrpc": "2.0", "id": "x", "method": "ping", "params": {}},
+            actor_context=TRUSTED_ACTOR,
+        )
+    assert server.current_cui_actor_context() == {}
+
+
+def test_concurrent_dispatches_do_not_bleed_actor_context(monkeypatch):
+    barrier = threading.Barrier(2)
+    seen = {}
+
+    def inspect(request):
+        barrier.wait(timeout=5)
+        seen[request["id"]] = server.current_cui_actor_context()
+        return {"id": request["id"], "result": True}
+
+    monkeypatch.setattr(server, "handle_request", inspect)
+    actors = {
+        "a": {"tenant_id": "tenant-a", "actor_id": "actor-a", "role": "user"},
+        "b": {"tenant_id": "tenant-b", "actor_id": "actor-b", "role": "support"},
     }
-
-
-def test_row_visibility_no_actor_is_unconfined():
-    # Standalone TUI / loopback admin dispatch (actor=None) sees everything.
-    assert server._row_visible_to_cui_actor(_row(source="cli"), None) is True
-    assert server._row_visible_to_cui_actor(_row(source="cli"), {}) is True
-
-
-def test_row_visibility_admin_actor_sees_legacy_but_not_other_tagged_actor():
-    admin = {"tenant_id": "t1", "actor_id": "a1", "role": "admin"}
-    assert server._row_visible_to_cui_actor(_row(source="cli"), admin) is True
-    other_tagged = _row(
-        model_config={
-            "_cui_actor_context": {"tenant_id": "t1", "actor_id": "a2", "role": "user"},
-        }
-    )
-    own_tagged = _row(
-        model_config={
-            "_cui_actor_context": {"tenant_id": "t1", "actor_id": "a1", "role": "admin"},
-        }
-    )
-    assert server._row_visible_to_cui_actor(other_tagged, admin) is False
-    assert server._row_visible_to_cui_actor(own_tagged, admin) is True
-
-
-def test_row_visibility_customer_blocked_from_internal_and_unowned():
-    cust = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-    # Legacy internal/CLI session with no CUI metadata: fail closed.
-    assert server._row_visible_to_cui_actor(_row(source="cli"), cust) is False
-    # A tui row with no metadata: cannot prove ownership, fail closed.
-    assert server._row_visible_to_cui_actor(_row(source="tui"), cust) is False
-    # Admin-tagged session: blocked even with matching tenant.
-    admin_tagged = _row(
-        source="tui",
-        model_config={
-            "_cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"},
-        },
-    )
-    assert server._row_visible_to_cui_actor(admin_tagged, cust) is False
-    # Other-tenant session: blocked.
-    other_tenant = _row(
-        source="tui",
-        model_config={
-            "_cui_actor_context": {"tenant_id": "other-co", "actor_id": "customer-1", "role": "user"},
-        },
-    )
-    assert server._row_visible_to_cui_actor(other_tenant, cust) is False
-    # Other-actor, same tenant: blocked.
-    other_actor = _row(
-        source="tui",
-        model_config={
-            "_cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-2", "role": "user"},
-        },
-    )
-    assert server._row_visible_to_cui_actor(other_actor, cust) is False
-
-
-def test_row_visibility_customer_sees_own_session():
-    cust = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-    own = _row(
-        source="tui",
-        model_config={
-            "_cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"},
-        },
-    )
-    assert server._row_visible_to_cui_actor(own, cust) is True
-
-
-def test_live_session_visibility_refuses_transport_rebind_for_non_owner():
-    cust = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-    # Live session owned by a different actor: rebind refused.
-    other = {"cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-2", "role": "user"}}
-    assert server._live_session_visible_to_cui_actor(other, cust) is False
-    # Live session with no owner identity (standalone TUI): not hijackable.
-    assert server._live_session_visible_to_cui_actor({"cui_actor_context": {}}, cust) is False
-    assert server._live_session_visible_to_cui_actor(
-        {"cui_actor_context": {}},
-        {"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"},
-    ) is False
-    # Own live session: allowed.
-    own = {"cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}}
-    assert server._live_session_visible_to_cui_actor(own, cust) is True
-    user_id_owned = {
-        "cui_actor_context": {
-            "tenant_id": "example-tenant",
-            "user_id": "customer-1",
-            "role": "user",
-        }
-    }
-    assert server._live_session_visible_to_cui_actor(
-        user_id_owned,
-        {"tenant_id": "example-tenant", "user_id": "customer-1", "role": "user"},
-    ) is True
-    assert server._live_session_visible_to_cui_actor(
-        user_id_owned,
-        {"tenant_id": "example-tenant", "user_id": "customer-2", "role": "user"},
-    ) is False
-    # A different admin actor may not hijack a tagged live session either.
-    assert server._live_session_visible_to_cui_actor(
-        other, {"role": "admin", "actor_id": "x", "tenant_id": "t"}
-    ) is False
-    # Trusted no-actor dispatch remains unconfined.
-    assert server._live_session_visible_to_cui_actor(other, None) is True
-
-
-def test_live_session_visibility_fails_closed_for_incomplete_actor():
-    other = {
-        "cui_actor_context": {
-            "tenant_id": "example-tenant",
-            "actor_id": "customer-2",
-            "role": "user",
-        }
-    }
-    incomplete = [
-        {"role": "user", "_restricted": "1"},
-        {"role": "user"},
-        {"tenant_id": "example-tenant", "role": "user"},
-        {"actor_id": "customer-1", "role": "user"},
-        {"tenant_id": "example-tenant", "actor_id": "customer-1"},
+    threads = [
+        threading.Thread(
+            target=server.dispatch,
+            args=({"jsonrpc": "2.0", "id": name, "method": "ping", "params": {}},),
+            kwargs={"actor_context": actor},
+        )
+        for name, actor in actors.items()
     ]
-    for actor in incomplete:
-        assert server._live_session_visible_to_cui_actor(other, actor) is False
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert seen == actors
+    assert server.current_cui_actor_context() == {}
 
 
-def _call_as(actor, method, params=None):
-    token = server.bind_cui_actor_context(actor)
+def test_deferred_record_captures_allowlisted_dispatch_actor():
+    token = server.bind_cui_actor_context({**TRUSTED_ACTOR, "ignored": "drop"})
     try:
-        return server.handle_request(
-            {
-                "jsonrpc": "2.0",
-                "id": method,
-                "method": method,
-                "params": params or {},
-            }
+        record = server._deferred_session_record(
+            "stored-session",
+            cols=80,
+            cwd="/tmp",
+            history=[],
+            lease=None,
         )
     finally:
         server.reset_cui_actor_context(token)
 
+    assert record["cui_actor_context"] == TRUSTED_ACTOR
+    assert server.current_cui_actor_context() == {}
 
-def _live_owned_by(actor_id, *, role="user"):
-    return {
-        "cui_actor_context": {
-            "tenant_id": "example-tenant",
-            "actor_id": actor_id,
-            "role": role,
+
+def test_session_actor_runner_rebinds_and_resets_on_success_and_error():
+    observations = []
+
+    def success():
+        observations.append(server.current_cui_actor_context())
+        return "ok"
+
+    assert server._run_with_cui_actor_context(TRUSTED_ACTOR, success) == "ok"
+    assert observations == [TRUSTED_ACTOR]
+    assert server.current_cui_actor_context() == {}
+
+    def failure():
+        observations.append(server.current_cui_actor_context())
+        raise ValueError("turn failed")
+
+    with pytest.raises(ValueError, match="turn failed"):
+        server._run_with_cui_actor_context(TRUSTED_ACTOR, failure)
+    assert observations[-1] == TRUSTED_ACTOR
+    assert server.current_cui_actor_context() == {}
+
+
+class _GatewaySocket:
+    def __init__(self, request):
+        self.request = request
+        self.sent = []
+        self.client = SimpleNamespace(host="127.0.0.1", port=1234)
+        self.scope = {}
+        self._received = False
+
+    async def accept(self, **_kwargs):
+        return None
+
+    async def send_text(self, text):
+        self.sent.append(text)
+
+    async def receive_text(self):
+        if not self._received:
+            self._received = True
+            return json.dumps(self.request)
+        from starlette.websockets import WebSocketDisconnect
+
+        raise WebSocketDisconnect(code=1000)
+
+    async def close(self, **_kwargs):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_handle_ws_passes_server_identity_not_client_rpc_actor(monkeypatch):
+    from tui_gateway import ws as gateway_ws
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": "rpc",
+        "method": "ping",
+        "params": {
+            "actor_context": {"tenant_id": "evil", "role": "admin"},
+            "_cui_actor_role": "admin",
         },
+    }
+    socket = _GatewaySocket(request)
+    captured = {}
+
+    def fake_dispatch(req, transport, actor_context=None):
+        captured["request"] = req
+        captured["actor_context"] = actor_context
+        return {"jsonrpc": "2.0", "id": req["id"], "result": True}
+
+    monkeypatch.setattr(gateway_ws.server, "dispatch", fake_dispatch)
+    monkeypatch.setattr(gateway_ws.server, "resolve_skin", lambda: {})
+    monkeypatch.setattr(gateway_ws.server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(gateway_ws.server, "register_live_transport", lambda _transport: None)
+    monkeypatch.setattr(gateway_ws.server, "unregister_live_transport", lambda _transport: None)
+    monkeypatch.setattr(gateway_ws.server, "_schedule_startup_orphan_sweep", lambda: None)
+    monkeypatch.setattr(gateway_ws, "_disable_nagle", lambda _ws: None)
+
+    await gateway_ws.handle_ws(socket, auth_identity=TRUSTED_ACTOR)
+
+    assert captured["actor_context"] == TRUSTED_ACTOR
+    assert captured["request"]["params"]["actor_context"]["tenant_id"] == "evil"
+
+
+def _owned_row(session_id, actor, *, visibility_scope="customer"):
+    return {
+        "id": session_id,
+        "source": "tui",
+        "model_config": json.dumps(
+            {
+                "_cui_visibility_scope": visibility_scope,
+                "_cui_actor_role": actor["role"],
+                "_cui_actor_id": actor["actor_id"],
+                "_cui_tenant_id": actor["tenant_id"],
+            }
+        ),
+    }
+
+
+def test_gateway_persisted_lookup_makes_foreign_and_missing_indistinguishable():
+    other = {**TRUSTED_ACTOR, "actor_id": "actor-b"}
+    rows = {
+        "own": _owned_row("own", TRUSTED_ACTOR),
+        "foreign": _owned_row("foreign", other),
+        "same-id-admin": _owned_row(
+            "same-id-admin",
+            {**TRUSTED_ACTOR, "role": "admin"},
+            visibility_scope="admin",
+        ),
+        "legacy": {"id": "legacy", "source": "tui", "model_config": None},
+    }
+
+    class DB:
+        def get_session(self, sid):
+            return rows.get(sid)
+
+    db = DB()
+    assert server._visible_persisted_session_row(db, "own", TRUSTED_ACTOR) == rows["own"]
+    assert server._visible_persisted_session_row(db, "foreign", TRUSTED_ACTOR) is None
+    assert server._visible_persisted_session_row(db, "same-id-admin", TRUSTED_ACTOR) is None
+    assert server._visible_persisted_session_row(db, "legacy", TRUSTED_ACTOR) is None
+    assert server._visible_persisted_session_row(db, "missing", TRUSTED_ACTOR) is None
+
+
+def test_gateway_actor_scoped_db_filters_before_page_and_denies_foreign_mutation():
+    other = {**TRUSTED_ACTOR, "actor_id": "actor-b"}
+    rows = [_owned_row("foreign", other), _owned_row("own-1", TRUSTED_ACTOR), _owned_row("own-2", TRUSTED_ACTOR)]
+
+    class DB:
+        def __init__(self):
+            self.reopened = []
+
+        def list_sessions_rich(self, *, limit, offset=0, **_kwargs):
+            return rows[offset : offset + limit]
+
+        def get_session(self, sid):
+            return next((row for row in rows if row["id"] == sid), None)
+
+        def get_session_by_title(self, _title):
+            return self.get_session("foreign")
+
+        def reopen_session(self, sid):
+            self.reopened.append(sid)
+
+    raw = DB()
+    db = server._CuiActorScopedSessionDB(raw, TRUSTED_ACTOR)
+    assert [row["id"] for row in db.list_sessions_rich(limit=1)] == ["own-1"]
+    assert db.get_session_by_title("guessed") is None
+    with pytest.raises(server._CuiSessionNotFound):
+        db.reopen_session("foreign")
+    assert raw.reopened == []
+
+
+def test_gateway_stamp_uses_only_dispatch_bound_actor():
+    config = {}
+    token = server.bind_cui_actor_context({**TRUSTED_ACTOR, "arbitrary": "drop"})
+    try:
+        server._stamp_cui_actor_context(config, server.current_cui_actor_context())
+    finally:
+        server.reset_cui_actor_context(token)
+    assert config["_cui_actor_context"] == TRUSTED_ACTOR
+    assert config["_cui_actor_id"] == "actor-a"
+    assert config["_cui_tenant_id"] == "tenant-a"
+
+
+def _live_record(actor, *, session_key="stored-key", pending_title=None):
+    return {
+        "agent": None,
+        "attached_images": ["kept.png"],
         "created_at": 100.0,
+        "cui_actor_context": actor,
+        "cwd": "/tmp/original",
         "history": [],
         "history_lock": threading.RLock(),
         "last_active": 100.0,
+        "pending_title": pending_title,
         "running": False,
-        "session_key": f"stored-{actor_id}",
-        "transport": "ORIGINAL",
+        "session_key": session_key,
+        "transport": SimpleNamespace(write=lambda _frame: True),
     }
 
 
-def test_active_list_only_returns_live_sessions_owned_by_actor(monkeypatch):
-    requester = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-    monkeypatch.setattr(
-        server,
-        "_sessions",
-        {
-            "own": _live_owned_by("customer-1"),
-            "foreign": _live_owned_by("customer-2"),
-            "legacy": {**_live_owned_by("customer-3"), "cui_actor_context": {}},
-        },
-    )
-    monkeypatch.setattr(server, "_session_live_item", lambda sid, _session, _current: {"id": sid})
-
-    response = _call_as(requester, "session.active_list")
-
-    assert response["result"]["sessions"] == [{"id": "own"}]
+def _bound_actor(actor):
+    return server.bind_cui_actor_context(actor)
 
 
-def test_active_list_fails_closed_for_incomplete_actor(monkeypatch):
-    monkeypatch.setattr(server, "_sessions", {"foreign": _live_owned_by("customer-2")})
-    monkeypatch.setattr(server, "_session_live_item", lambda sid, _session, _current: {"id": sid})
-
-    response = _call_as({"role": "user", "_restricted": "1"}, "session.active_list")
-
-    assert response["result"]["sessions"] == []
-
-
-def test_activate_rejects_foreign_session_before_touch_for_user_and_admin(monkeypatch):
-    foreign = _live_owned_by("customer-2")
-    touched = []
-    monkeypatch.setattr(server, "_sessions", {"foreign": foreign})
-    monkeypatch.setattr(
-        server,
-        "_live_session_payload",
-        lambda *args, **kwargs: touched.append((args, kwargs)) or {},
-    )
-
-    for actor in (
-        {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"},
-        {"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"},
-    ):
-        response = _call_as(actor, "session.activate", {"session_id": "foreign"})
-        assert response["error"]["code"] == 4007
-
-    assert touched == []
-    assert foreign["transport"] == "ORIGINAL"
-    assert foreign["last_active"] == 100.0
-
-
-def test_session_history_central_gate_rejects_foreign_incomplete_and_unowned(monkeypatch):
-    foreign = _live_owned_by("customer-2")
-    foreign["history"] = [{"role": "assistant", "content": "foreign secret"}]
-    unowned = {**_live_owned_by("legacy"), "cui_actor_context": {}}
-    unowned["history"] = [{"role": "assistant", "content": "legacy secret"}]
-    monkeypatch.setattr(server, "_sessions", {"foreign": foreign, "unowned": unowned})
-
-    cases = (
-        ({"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}, "foreign"),
-        ({"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"}, "foreign"),
-        ({"role": "user", "_restricted": "1"}, "foreign"),
-        ({"tenant_id": "example-tenant", "role": "user"}, "foreign"),
-        ({"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}, "unowned"),
-        ({"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"}, "unowned"),
-    )
-    for actor, sid in cases:
-        response = _call_as(actor, "session.history", {"session_id": sid})
-        assert response["error"]["code"] == 4007
-        assert "secret" not in str(response)
-
-
-def test_prompt_submit_rejects_foreign_session_before_attachment_or_rebind(monkeypatch):
-    foreign = _live_owned_by("customer-2")
-    foreign["running"] = True
-    processed = []
-    monkeypatch.setattr(server, "_sessions", {"foreign": foreign})
-    monkeypatch.setattr(
-        server,
-        "_process_prompt_attachments",
-        lambda attachments, sid: processed.append((attachments, sid)) or ([], ""),
-    )
-    monkeypatch.setattr(server, "_handle_busy_submit", lambda *a, **k: server._ok("x", {}))
-    requester = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-
-    response = _call_as(
-        requester,
-        "prompt.submit",
-        {"session_id": "foreign", "text": "take over", "attachments": [{"path": "x"}]},
-    )
-
-    assert response["error"]["code"] == 4007
-    assert processed == []
-    assert foreign["transport"] == "ORIGINAL"
-    assert foreign["cui_actor_context"]["actor_id"] == "customer-2"
-
-
-def test_compress_rejects_foreign_session_before_compute_or_local_mutation(monkeypatch):
-    foreign = _live_owned_by("customer-2")
-    compute_checks = []
-    local_checks = []
-    monkeypatch.setattr(server, "_sessions", {"foreign": foreign})
-    monkeypatch.setattr(
-        server,
-        "_session_uses_compute_host",
-        lambda session: compute_checks.append(session) or False,
-    )
-    monkeypatch.setattr(
-        server,
-        "_sess",
-        lambda params, rid: local_checks.append((params, rid)) or (foreign, None),
-    )
-
-    for actor in (
-        {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"},
-        {"tenant_id": "example-tenant", "actor_id": "admin-1", "role": "admin"},
-    ):
-        response = _call_as(actor, "session.compress", {"session_id": "foreign"})
-        assert response["error"]["code"] == 4007
-
-    assert compute_checks == []
-    assert local_checks == []
-
-
-def test_eager_resume_race_rechecks_live_owner_before_touch(monkeypatch):
-    target = "stored-session"
-    requester = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-    stored = _row(model_config={"_cui_actor_context": requester})
-    stored["id"] = target
-    foreign = _live_owned_by("customer-2")
-    foreign["session_key"] = target
-    touched = []
-    closed = []
-    released = []
-    lookups = iter((None, ("foreign", foreign)))
-
-    class _DB:
-        def get_session(self, session_id):
-            return stored if session_id == target else None
-
-        def resolve_resume_session_id(self, session_id):
-            return session_id
-
-        def reopen_session(self, _session_id):
-            return None
-
-        def get_resume_conversations(self, _session_id):
-            return ([], [])
-
-        def get_ancestor_display_prefix(self, _session_id):
-            return []
-
-    class _Lease:
-        def release(self):
-            released.append(True)
-
-    agent = SimpleNamespace(close=lambda: closed.append(True))
-    monkeypatch.setattr(server, "_sessions", {})
-    monkeypatch.setattr(server, "_find_live_session", lambda _target: None)
-    monkeypatch.setattr(server, "_find_live_session_by_key", lambda _target: next(lookups))
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
-    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (_Lease(), None))
-    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: agent)
-    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _row: {})
-    monkeypatch.setattr(
-        server,
-        "_live_session_payload",
-        lambda *args, **kwargs: touched.append((args, kwargs)) or {},
-    )
-
-    response = _call_as(requester, "session.resume", {"session_id": target, "eager_build": True})
-
-    assert response["error"]["code"] == 4007
-    assert touched == []
-    assert closed == [True]
-    # Resume is intentionally lease-lazy after the upstream active-session
-    # refactor; only the first real prompt claims a slot, so there is no lease
-    # to release on this eager-build ownership race.
-    assert released == []
-    assert foreign["transport"] == "ORIGINAL"
-    assert foreign["last_active"] == 100.0
-
-
-def test_resume_alias_live_session_cannot_bypass_actor_visibility(monkeypatch):
-    target = "stored-session"
-    requester = {
-        "tenant_id": "example-tenant",
-        "actor_id": "customer-1",
-        "role": "user",
-    }
-    stored = _row(
-        model_config={
-            "_cui_actor_context": requester,
-        }
-    )
-    stored["id"] = target
-
-    class _DB:
-        def get_session(self, session_id):
-            return stored if session_id == target else None
-
-        def resolve_resume_session_id(self, session_id):
-            return session_id
-
-    live = {
-        "session_key": "different-live-key",
-        "agent": SimpleNamespace(session_id=target),
-        "cui_actor_context": {
-            "tenant_id": "example-tenant",
-            "actor_id": "customer-2",
-            "role": "user",
-        },
-        "transport": "ORIGINAL",
-        "last_active": 123,
-    }
-    touched = []
-    monkeypatch.setattr(server, "_sessions", {"live-sid": live})
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
-    monkeypatch.setattr(
-        server,
-        "_live_session_payload",
-        lambda *args, **kwargs: touched.append((args, kwargs)) or {},
-    )
-
-    token = server.bind_cui_actor_context(requester)
+def _request_as(actor, request, *, transport=None):
+    actor_token = _bound_actor(actor)
+    transport_token = server.bind_transport(transport) if transport is not None else None
     try:
-        response = server.handle_request(
-            {
-                "jsonrpc": "2.0",
-                "id": "alias-resume",
-                "method": "session.resume",
-                "params": {"session_id": target},
-            }
-        )
+        return server.handle_request(request)
     finally:
-        server.reset_cui_actor_context(token)
-
-    assert response["error"]["code"] == 4007
-    assert touched == []
-    assert live["transport"] == "ORIGINAL"
-    assert live["last_active"] == 123
+        if transport_token is not None:
+            server.reset_transport(transport_token)
+        server.reset_cui_actor_context(actor_token)
 
 
-def test_resume_404s_cross_actor_stored_session(tmp_path, monkeypatch):
-    import json as _json
-
-    import hermes_state
-
-    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
-    db = hermes_state.SessionDB()
-    monkeypatch.setattr(server, "_db", db)
-    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+def test_gateway_live_lookup_confines_runtime_id_and_stored_key_actor_matrix():
+    own = _live_record(TRUSTED_ACTOR, session_key="own-key")
     server._sessions.clear()
-
-    # An ADMIN onboarding session with a predictable title, owned by an admin.
-    db.create_session(
-        "admin-onboarding-1",
-        source="tui",
-        model_config=_json.dumps(
-            {"_cui_actor_context": {"tenant_id": "aiwerk", "actor_id": "admin-1", "role": "admin"}}
-        ),
-    )
-    db.set_session_title("admin-onboarding-1", "Tenant Setup Example")
-
-    customer = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-
-    def _resume(target, actor, **extra):
-        # session.resume is a long handler (dispatch returns None and writes via
-        # transport). Bind the actor context like dispatch does and call the
-        # handler directly so we get the response dict back.
-        token = server.bind_cui_actor_context(actor)
+    server._sessions["runtime-own"] = own
+    try:
+        token = _bound_actor(TRUSTED_ACTOR)
         try:
-            return server.handle_request(
-                {"jsonrpc": "2.0", "id": "r", "method": "session.resume",
-                 "params": {"session_id": target, **extra}}
-            )
+            assert server._sess_nowait({"session_id": "runtime-own"}, "own") == (own, None)
+            assert server._find_live_session_by_key("own-key") == ("runtime-own", own)
         finally:
             server.reset_cui_actor_context(token)
 
-    try:
-        # Resume by id → 404 (not visible to the customer).
-        resp = _resume("admin-onboarding-1", customer)
-        assert resp["error"]["code"] == 4007
+        token = _bound_actor({**TRUSTED_ACTOR, "actor_id": "actor-b"})
+        try:
+            foreign, foreign_err = server._sess_nowait({"session_id": "runtime-own"}, "foreign")
+            missing, missing_err = server._sess_nowait({"session_id": "missing"}, "missing")
+            assert foreign is missing is None
+            assert foreign_err["error"] == missing_err["error"]
+            assert server._find_live_session_by_key("own-key") is None
+        finally:
+            server.reset_cui_actor_context(token)
 
-        # Resume by human-readable TITLE → 404 (title lookup disabled for
-        # confined customers; admin titles are predictable).
-        resp_title = _resume("Tenant Setup Example", customer)
-        assert resp_title["error"]["code"] == 4007
-
-        # An admin actor CAN resolve the title (affordance preserved): the
-        # visibility gate does not 404 it (it resolves to the real id).
-        admin = {"tenant_id": "aiwerk", "actor_id": "admin-1", "role": "admin"}
-        resp_admin = _resume("Tenant Setup Example", admin, eager_build=False)
-        assert resp_admin.get("result") is not None
-        assert resp_admin["result"]["resumed"] == "admin-onboarding-1"
+        assert server._sess_nowait({"session_id": "runtime-own"}, "local") == (own, None)
+        assert server._find_live_session_by_key("own-key") == ("runtime-own", own)
     finally:
-        for sess in list(server._sessions.values()):
-            try:
-                server._teardown_session(sess)
-            except Exception:
-                pass
         server._sessions.clear()
 
 
-def test_ensure_session_db_row_stamps_cui_actor_context(tmp_path, monkeypatch):
-    import json as _json
-
-    import hermes_state
-
-    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
-    db = hermes_state.SessionDB()
-    monkeypatch.setattr(server, "_db", db)
-    monkeypatch.setattr(server, "_resolve_model", lambda *a, **k: "test-model")
-
-    session = {
-        "session_key": "owned-1",
-        "model_override": None,
-        "cui_actor_context": {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"},
-        "explicit_cwd": False,
-        "parent_session_id": None,
-    }
-    server._ensure_session_db_row(session)
-    row = db.get_session("owned-1")
-    cfg = _json.loads(row["model_config"]) if isinstance(row.get("model_config"), str) else row.get("model_config")
-    assert cfg["_cui_actor_context"]["actor_id"] == "customer-1"
-    assert cfg["_cui_tenant_id"] == "example-tenant"
-    assert cfg["_cui_actor_role"] == "user"
-    # And the persisted row is visible to its owner, not to others.
-    owner = {"tenant_id": "example-tenant", "actor_id": "customer-1", "role": "user"}
-    intruder = {"tenant_id": "example-tenant", "actor_id": "customer-2", "role": "user"}
-    assert server._row_visible_to_cui_actor(row, owner) is True
-    assert server._row_visible_to_cui_actor(row, intruder) is False
-
-
-def test_apply_cui_actor_env_binds_contextvar_not_identity_env(monkeypatch):
-    # Actor identity and the launch-time autonomy flag must both remain
-    # process-stable; per-turn binding may mutate neither.
-    monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_TENANT_ID", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_ACTOR_ID", raising=False)
-    monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-    monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "old-role")
-    actor = {
-        "tenant_id": "example-tenant",
-        "actor_id": "aiwerk:operator:admin",
-        "role": "admin",
-        "display_name": "Operator",
-        "ignored": "must-not-leak",
-    }
-
-    token = server._apply_cui_actor_env(actor)
+def test_gateway_active_list_and_activate_hide_foreign_live_session_before_payload_or_rebind(monkeypatch):
+    foreign = _live_record({**TRUSTED_ACTOR, "actor_id": "actor-b"})
+    before_transport = foreign["transport"]
+    materialized = []
+    monkeypatch.setattr(
+        server,
+        "_session_live_item",
+        lambda sid, _record, _current="": materialized.append(sid) or {"id": sid},
+    )
+    server._sessions.clear()
+    server._sessions["foreign-live"] = foreign
     try:
-        # Identity is readable via the canonical helper (contextvar-backed).
-        ctx = server.current_cui_actor_context()
-        assert ctx["actor_id"] == "aiwerk:operator:admin"
-        assert ctx["role"] == "admin"
-        assert ctx["display_name"] == "Operator"
-        assert "ignored" not in ctx
-        # Identity env vars are NOT mutated (no more process-global clobber).
-        assert "AIWERK_CUI_ACTOR_CONTEXT" not in os.environ
-        assert "AIWERK_CUI_TENANT_ID" not in os.environ
-        assert "AIWERK_CUI_ACTOR_ID" not in os.environ
-        assert os.environ["AIWERK_CUI_ACTOR_ROLE"] == "old-role"
-        # The pre-existing launch flag is unchanged.
-        assert os.environ["AIWERK_CUI_MANAGED_AUTONOMY"] == "1"
+        listed = _request_as(
+            TRUSTED_ACTOR,
+            {"id": "list", "method": "session.active_list", "params": {}},
+        )
+        assert listed["result"]["sessions"] == []
+        assert materialized == []
+
+        activated = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "activate",
+                "method": "session.activate",
+                "params": {"session_id": "foreign-live"},
+            },
+            transport=SimpleNamespace(write=lambda _frame: True),
+        )
+        assert activated["error"] == {"code": 4001, "message": "session not found"}
+        assert foreign["last_active"] == 100.0
+        assert foreign["transport"] is before_transport
+        assert "viewers" not in foreign
     finally:
-        server._clear_cui_actor_env(token)
-
-    # Restored cleanly: the contextvar binding is gone, so reads fall back to
-    # os.environ — where the pre-existing role and launch flag remain.
-    assert server.current_cui_actor_context() == {"role": "old-role"}
-    assert os.environ["AIWERK_CUI_ACTOR_ROLE"] == "old-role"
-    assert os.environ["AIWERK_CUI_MANAGED_AUTONOMY"] == "1"
+        server._sessions.clear()
 
 
-def test_apply_cui_actor_env_empty_actor_is_noop():
-    token = server._apply_cui_actor_env(None)
-    assert token is None
-    # Clearing a no-op token must be safe.
-    server._clear_cui_actor_env(token)
-    assert server.current_cui_actor_context() is None
-
-
-def test_current_cui_actor_context_falls_back_to_os_environ(monkeypatch):
-    # No contextvar bound (CLI/cron/subprocess path) -> read os.environ.
-    monkeypatch.setenv(
-        "AIWERK_CUI_ACTOR_CONTEXT",
-        json.dumps({"tenant_id": "acme", "actor_id": "u1", "role": "user"}),
-    )
-    monkeypatch.delenv("AIWERK_CUI_TENANT_ID", raising=False)
-    # The canonical helper (and server's wrapper) read the env fallback.
-    assert cui_actor_context.current_cui_actor_context() == {
-        "tenant_id": "acme",
-        "actor_id": "u1",
-        "role": "user",
+@pytest.mark.parametrize(
+    ("method_name", "extra_params"),
+    [
+        ("session.title", {"title": "stolen"}),
+        ("session.cwd.set", {"cwd": "/tmp"}),
+        ("image.detach", {"path": "kept.png"}),
+    ],
+)
+def test_gateway_foreign_live_side_effect_handlers_stop_at_central_lookup(method_name, extra_params):
+    foreign = _live_record({**TRUSTED_ACTOR, "actor_id": "actor-b"})
+    before = {
+        "attached_images": list(foreign["attached_images"]),
+        "cwd": foreign["cwd"],
+        "last_active": foreign["last_active"],
+        "pending_title": foreign["pending_title"],
+        "transport": foreign["transport"],
     }
-    assert server.current_cui_actor_context() == {
-        "tenant_id": "acme",
-        "actor_id": "u1",
-        "role": "user",
-    }
-
-
-def test_contextvar_overrides_os_environ(monkeypatch):
-    # A bound contextvar must win over a (stale/clobbered) os.environ value,
-    # proving in-process turns are isolated from the process-global bridge.
-    monkeypatch.setenv(
-        "AIWERK_CUI_ACTOR_CONTEXT",
-        json.dumps({"tenant_id": "env-tenant", "actor_id": "env-actor", "role": "user"}),
-    )
-    token = cui_actor_context.bind_cui_actor_context(
-        {"tenant_id": "ctx-tenant", "actor_id": "ctx-actor", "role": "admin"}
-    )
+    server._sessions.clear()
+    server._sessions["foreign-live"] = foreign
     try:
-        assert cui_actor_context.current_cui_actor_context()["tenant_id"] == "ctx-tenant"
-        assert cui_actor_context.current_cui_actor_context()["actor_id"] == "ctx-actor"
+        response = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": method_name,
+                "method": method_name,
+                "params": {"session_id": "foreign-live", **extra_params},
+            },
+        )
+        assert response["error"] == {"code": 4001, "message": "session not found"}
+        assert {
+            "attached_images": foreign["attached_images"],
+            "cwd": foreign["cwd"],
+            "last_active": foreign["last_active"],
+            "pending_title": foreign["pending_title"],
+            "transport": foreign["transport"],
+        } == before
     finally:
-        cui_actor_context.reset_cui_actor_context(token)
-    # After reset, the env fallback is visible again.
-    assert cui_actor_context.current_cui_actor_context()["tenant_id"] == "env-tenant"
+        server._sessions.clear()
 
 
-def test_concurrent_threads_do_not_bleed_actor_context(monkeypatch):
-    # Two threads bind two different actor contexts and read back concurrently.
-    # With the old os.environ bridge, one thread's write clobbered the other's
-    # (cross-customer bleed). The contextvar is isolated per thread, so each
-    # thread must only ever observe its OWN actor.
-    monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT", raising=False)
+def test_profile_scoped_resume_uses_scoped_adapter_and_denies_foreign_exact_title_and_adoption_before_side_effects(monkeypatch):
+    foreign_actor = {**TRUSTED_ACTOR, "actor_id": "actor-b"}
+    target_rows = {
+        "foreign-id": _owned_row("foreign-id", foreign_actor),
+        "foreign-title": _owned_row("foreign-title", foreign_actor),
+    }
+    effects = []
 
-    barrier = threading.Barrier(2)
-    results: dict[str, list[str]] = {"a": [], "b": []}
-    errors: list[str] = []
+    class RawDB:
+        def get_session(self, sid):
+            return target_rows.get(sid)
 
-    def worker(name: str, tenant: str) -> None:
-        actor = {"tenant_id": tenant, "actor_id": f"{tenant}-actor", "role": "user"}
-        token = server._apply_cui_actor_env(actor)
+        def get_session_by_title(self, title):
+            return target_rows.get("foreign-title") if title == "guessed-title" else None
+
+        def reopen_session(self, sid):
+            effects.append(("reopen", sid))
+
+        def get_resume_conversations(self, sid):
+            effects.append(("history", sid))
+            return [], []
+
+        def adopt_session_lineage_from(self, _donor, sid):
+            effects.append(("adopt", sid))
+            return {"adopted": True}
+
+        def close(self):
+            effects.append(("close", None))
+
+    raw = RawDB()
+    donor_rows = {
+        "missing-with-foreign-donor": _owned_row(
+            "missing-with-foreign-donor", foreign_actor
+        )
+    }
+
+    class DonorDB(RawDB):
+        def get_session(self, sid):
+            return donor_rows.get(sid)
+
+    donor_raw = DonorDB()
+
+    def scoped_profile_db(_profile):
+        return server._CuiActorScopedSessionDB(raw, server.current_cui_actor_context()), True
+
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: Path("/tmp/profile-worker"))
+    monkeypatch.setattr(server, "_db_for_profile", scoped_profile_db)
+    monkeypatch.setattr("hermes_state.SessionDB", lambda **_kwargs: raw)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: server._CuiActorScopedSessionDB(
+            donor_raw, server.current_cui_actor_context()
+        ),
+    )
+
+    for target in ("foreign-id", "guessed-title", "missing-with-foreign-donor"):
+        response = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": target,
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker"},
+            },
+        )
+        assert response["error"] == {"code": 4007, "message": "session not found"}
+    assert not any(name in {"reopen", "history", "adopt"} for name, _ in effects)
+
+
+def test_profile_scoped_resume_denies_foreign_live_unpersisted_and_reuse_before_transport_rebind_but_preserves_owned_and_no_actor_paths(monkeypatch):
+    foreign = _live_record(
+        {**TRUSTED_ACTOR, "actor_id": "actor-b"},
+        session_key="unpersisted-key",
+        pending_title="Foreign Draft",
+    )
+    before_transport = foreign["transport"]
+    foreign["profile_home"] = "/tmp/profile-worker"
+
+    class EmptyDB:
+        def get_session(self, _sid):
+            return None
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: Path("/tmp/profile-worker"))
+    monkeypatch.setattr(server, "_db_for_profile", lambda _profile: (EmptyDB(), True))
+    monkeypatch.setattr("hermes_state.SessionDB", lambda **_kwargs: EmptyDB())
+    monkeypatch.setattr(server, "_get_db", lambda: EmptyDB())
+    server._sessions.clear()
+    server._sessions["foreign-live"] = foreign
+    try:
+        response = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "foreign-unpersisted",
+                "method": "session.resume",
+                "params": {"session_id": "unpersisted-key", "profile": "worker"},
+            },
+            transport=SimpleNamespace(write=lambda _frame: True),
+        )
+        assert response["error"] == {"code": 4007, "message": "session not found"}
+        assert foreign["last_active"] == 100.0
+        assert foreign["transport"] is before_transport
+        assert "viewers" not in foreign
+
+        token = _bound_actor({**TRUSTED_ACTOR, "actor_id": "actor-b"})
         try:
-            barrier.wait(timeout=5)
-            for _ in range(200):
-                seen = server.current_cui_actor_context()
-                if seen is None or seen.get("tenant_id") != tenant:
-                    errors.append(f"{name} saw {seen!r}, expected tenant {tenant!r}")
-                    break
-                results[name].append(seen["tenant_id"])
+            assert server._find_live_session_by_key("unpersisted-key") == ("foreign-live", foreign)
         finally:
-            server._clear_cui_actor_env(token)
-
-    ta = threading.Thread(target=worker, args=("a", "tenant-a"))
-    tb = threading.Thread(target=worker, args=("b", "tenant-b"))
-    ta.start()
-    tb.start()
-    ta.join(timeout=10)
-    tb.join(timeout=10)
-
-    assert not errors, errors
-    assert results["a"] and all(t == "tenant-a" for t in results["a"])
-    assert results["b"] and all(t == "tenant-b" for t in results["b"])
-    # No leftover binding on the main thread.
-    assert server.current_cui_actor_context() is None
-    # The shared (non-identifying) env flag may survive a racy concurrent
-    # restore; clean it so it does not leak into later tests.
-    os.environ.pop("AIWERK_CUI_MANAGED_AUTONOMY", None)
+            server.reset_cui_actor_context(token)
+        assert server._find_live_session_by_key("unpersisted-key") == ("foreign-live", foreign)
+    finally:
+        server._sessions.clear()
 
 
-def test_row_visibility_customer_can_resume_linked_telegram_session(monkeypatch):
-    cfg = {
-        "dashboard": {
-            "basic_auth": {
-                "users": [
-                    {
-                        "actor_id": "example-tenant:customer:user",
-                        "user_id": "Customer",
-                        "tenant_id": "example-tenant",
-                        "role": "user",
-                        "telegram_user_ids": ["1461953838"],
-                    }
-                ]
-            }
+def test_optional_live_inheritance_confines_completion_create_and_oneshot(monkeypatch, tmp_path):
+    owned_cwd = tmp_path / "owned"
+    foreign_cwd = tmp_path / "foreign"
+    fallback_cwd = tmp_path / "fallback"
+    for path in (owned_cwd, foreign_cwd, fallback_cwd):
+        path.mkdir()
+    (foreign_cwd / "foreign-secret.txt").write_text("secret", encoding="utf-8")
+    (fallback_cwd / "fallback-visible.txt").write_text("visible", encoding="utf-8")
+
+    owned = _live_record(TRUSTED_ACTOR)
+    owned["cwd"] = str(owned_cwd)
+    owned["agent"] = SimpleNamespace(runtime="owned-runtime")
+    foreign = _live_record({**TRUSTED_ACTOR, "actor_id": "actor-b"})
+    foreign["cwd"] = str(foreign_cwd)
+    foreign["agent"] = SimpleNamespace(runtime="foreign-runtime")
+
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda _home: str(fallback_cwd))
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: None)
+    monkeypatch.setattr(server, "_profile_home", lambda _profile=None: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "collapsed")
+    monkeypatch.setattr(server, "_resolve_model", lambda: "fallback-model")
+    monkeypatch.setattr(server, "_main_runtime_from_agent", lambda agent: agent.runtime)
+
+    inherited_runtimes = []
+    import agent.oneshot
+
+    monkeypatch.setattr(
+        agent.oneshot,
+        "run_oneshot",
+        lambda **kwargs: inherited_runtimes.append(kwargs["main_runtime"]) or "ok",
+    )
+
+    server._sessions.clear()
+    server._sessions.update({"owned": owned, "foreign": foreign})
+    try:
+        token = _bound_actor(TRUSTED_ACTOR)
+        try:
+            assert server._completion_cwd({"session_id": "owned"}) == str(owned_cwd)
+            assert server._completion_cwd({"session_id": "foreign"}) == str(fallback_cwd)
+            assert server._completion_cwd({"session_id": "missing"}) == str(fallback_cwd)
+        finally:
+            server.reset_cui_actor_context(token)
+        assert server._completion_cwd({"session_id": "foreign"}) == str(foreign_cwd)
+
+        created = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "create-foreign",
+                "method": "session.create",
+                "params": {"session_id": "foreign"},
+            },
+        )
+        assert created["result"]["info"]["cwd"] == str(fallback_cwd)
+
+        completed = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "complete-foreign",
+                "method": "complete.path",
+                "params": {"session_id": "foreign", "word": "fallback"},
+            },
+        )
+        displays = [item["display"] for item in completed["result"]["items"]]
+        assert displays == ["fallback-visible.txt"]
+        assert "foreign-secret.txt" not in displays
+
+        for actor, sid in (
+            (TRUSTED_ACTOR, "owned"),
+            (TRUSTED_ACTOR, "foreign"),
+            (TRUSTED_ACTOR, "missing"),
+            ({}, "foreign"),
+        ):
+            response = _request_as(
+                actor,
+                {
+                    "id": f"oneshot-{sid}",
+                    "method": "llm.oneshot",
+                    "params": {"session_id": sid, "input": "hello"},
+                },
+            )
+            assert response["result"]["text"] == "ok"
+        assert inherited_runtimes == [
+            "owned-runtime",
+            None,
+            None,
+            "foreign-runtime",
+        ]
+    finally:
+        server._sessions.clear()
+
+
+def test_config_set_confines_all_session_consuming_branches_before_mutation(monkeypatch):
+    foreign = _live_record({**TRUSTED_ACTOR, "actor_id": "actor-b"})
+    foreign["running"] = True
+    owned = _live_record(TRUSTED_ACTOR)
+    writes = []
+    switches = []
+    parses = []
+
+    import hermes_cli.model_switch
+
+    def parse(value):
+        parses.append(value)
+        return SimpleNamespace(model_input=value, explicit_provider="")
+
+    monkeypatch.setattr(hermes_cli.model_switch, "parse_model_switch_args", parse)
+    monkeypatch.setattr(
+        server,
+        "_apply_model_switch",
+        lambda *args, **kwargs: switches.append((args, kwargs))
+        or {"value": args[2], "warning": "", "scope": "global"},
+    )
+    monkeypatch.setattr(server, "_write_config_key", lambda key, value: writes.append((key, value)))
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    server._sessions.clear()
+    server._sessions.update({"foreign": foreign, "owned": owned})
+    try:
+        for sid, key, value in (
+            ("foreign", "model", "new-model"),
+            ("missing", "model", "new-model"),
+            ("foreign", "verbose", "off"),
+            ("missing", "verbose", "off"),
+        ):
+            before = (dict(foreign), dict(owned), list(writes), list(switches), list(parses))
+            response = _request_as(
+                TRUSTED_ACTOR,
+                {
+                    "id": f"{sid}-{key}",
+                    "method": "config.set",
+                    "params": {"session_id": sid, "key": key, "value": value},
+                },
+            )
+            assert response["error"] == {"code": 4001, "message": "session not found"}
+            assert (dict(foreign), dict(owned), writes, switches, parses) == before
+
+        owned_response = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "owned-verbose",
+                "method": "config.set",
+                "params": {"session_id": "owned", "key": "verbose", "value": "off"},
+            },
+        )
+        assert owned_response["result"]["value"] == "off"
+        assert owned["tool_progress_mode"] == "off"
+
+        trusted_response = _request_as(
+            {},
+            {
+                "id": "trusted-model",
+                "method": "config.set",
+                "params": {"session_id": "foreign", "key": "model", "value": "trusted-model"},
+            },
+        )
+        assert trusted_response["result"]["deferred"] is True
+        assert foreign["pending_model_switch"]["display_model"] == "trusted-model"
+
+        global_model = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "global-model",
+                "method": "config.set",
+                "params": {"key": "model", "value": "global-model"},
+            },
+        )
+        assert global_model["result"]["value"] == "global-model"
+
+        global_focus_status = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "global-focus-status",
+                "method": "config.set",
+                "params": {"session_id": "foreign", "key": "focus", "value": "status"},
+            },
+        )
+        assert global_focus_status["result"] == {
+            "key": "focus",
+            "value": "off",
+            "tool_progress": "all",
         }
-    }
-    monkeypatch.setattr(server, "_load_dashboard_user_config", lambda: cfg)
-    cust = {
-        "tenant_id": "example-tenant",
-        "actor_id": "example-tenant:customer:user",
-        "role": "user",
-        "user_id": "Customer",
-    }
 
-    own = {"id": "own-tg", "source": "telegram", "user_id": "1461953838", "model_config": None}
-    other = {"id": "other-tg", "source": "telegram", "user_id": "1392690488", "model_config": None}
+        global_only = _request_as(
+            TRUSTED_ACTOR,
+            {
+                "id": "global-busy",
+                "method": "config.set",
+                "params": {"session_id": "foreign", "key": "busy", "value": "steer"},
+            },
+        )
+        assert global_only["result"] == {"key": "busy", "value": "steer"}
+        assert ("display.busy_input_mode", "steer") in writes
+    finally:
+        server._sessions.clear()
 
-    assert server._row_visible_to_cui_actor(own, cust) is True
-    assert server._row_visible_to_cui_actor(other, cust) is False
+
+def test_profile_resume_reauthorizes_resolved_continuation_tip_before_side_effects(monkeypatch):
+    foreign_actor = {**TRUSTED_ACTOR, "actor_id": "actor-b"}
+    rows = {
+        "parent": _owned_row("parent", TRUSTED_ACTOR),
+        "owned-tip": _owned_row("owned-tip", TRUSTED_ACTOR),
+        "foreign-tip": _owned_row("foreign-tip", foreign_actor),
+    }
+    effects = []
+
+    class RawDB:
+        def __init__(self):
+            self.tip = "foreign-tip"
+
+        def get_session(self, sid):
+            return rows.get(sid)
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, _sid):
+            return self.tip
+
+        def assert_resume_safe(self, sid):
+            effects.append(("safety", sid))
+
+        def close(self):
+            effects.append(("close", None))
+
+    raw = RawDB()
+
+    def actor_db(_profile):
+        actor = server.current_cui_actor_context()
+        return (server._CuiActorScopedSessionDB(raw, actor) if actor else raw), False
+
+    monkeypatch.setattr(server, "_profile_home", lambda _profile=None: None)
+    monkeypatch.setattr(server, "_db_for_profile", actor_db)
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda _home: "/tmp")
+    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _row: {})
+    monkeypatch.setattr(
+        server,
+        "_deferred_session_record",
+        lambda session_key, **_kwargs: {
+            "created_at": 1.0,
+            "session_key": session_key,
+            "resume_message_count": 0,
+            "resume_hydrating": True,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_claim_or_reuse_live",
+        lambda sid, target, record, lease: effects.append(("publish", target)) or None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_schedule_resume_hydration",
+        lambda sid, target, db, close_db=False: effects.append(("history", target)),
+    )
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: effects.append(("cap", None)))
+
+    request = {
+        "id": "resume",
+        "method": "session.resume",
+        "params": {"session_id": "parent", "defer_history": True},
+    }
+    denied = _request_as(TRUSTED_ACTOR, request)
+    assert denied["error"] == {"code": 4007, "message": "session not found"}
+    assert effects == []
+
+    raw.tip = "owned-tip"
+    owned = _request_as(TRUSTED_ACTOR, request)
+    assert owned["result"]["resumed"] == "owned-tip"
+    assert ("safety", "owned-tip") in effects
+    assert ("publish", "owned-tip") in effects
+
+    effects.clear()
+    raw.tip = "foreign-tip"
+    trusted = _request_as({}, request)
+    assert trusted["result"]["resumed"] == "foreign-tip"
+    assert ("safety", "foreign-tip") in effects
+    assert ("publish", "foreign-tip") in effects

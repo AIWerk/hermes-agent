@@ -6,8 +6,13 @@ import logging
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+
+import agent.prompt_builder as prompt_builder
+from agent.system_prompt import build_system_prompt_parts
 
 from agent.prompt_builder import (
     _scan_context_content,
@@ -30,7 +35,6 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
-    INFORMATION_RETRIEVAL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
@@ -38,6 +42,23 @@ from agent.prompt_builder import (
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+
+
+@pytest.fixture(autouse=True)
+def _drain_truncation_warnings():
+    """Leave no truncation warnings in the shared thread context.
+
+    Truncation warnings ride a ContextVar; under plain ``pytest`` (no
+    per-file subprocess isolation) anything this file records leaks into
+    later files' contexts and breaks their assertions/ordering.
+
+    Drain on both sides: before, so warnings leaked by earlier files can't
+    pollute this file's assertions, and after, so this file leaves the
+    ContextVar clean for later files.
+    """
+    drain_truncation_warnings()
+    yield
+    drain_truncation_warnings()
 
 
 # =========================================================================
@@ -58,16 +79,87 @@ class TestGuidanceConstants:
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
     def test_information_retrieval_guidance_orders_lookup_layers(self):
-        text = INFORMATION_RETRIEVAL_GUIDANCE.lower()
-        assert "current user message" in text
-        assert "session_search" in text
-        assert "skills" in text
-        assert "files" in text
-        assert "git" in text
-        assert "terminal" in text
-        assert "web" in text
-        assert "ask the user only" in text
-        assert len(INFORMATION_RETRIEVAL_GUIDANCE) < 600
+        text = prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE.lower()
+        ordered_markers = (
+            "current user message and active context",
+            "session_search",
+            "skills",
+            "files, git, terminal, apis, wiki, neo4j, or web",
+            "ask the user only",
+        )
+
+        positions = [text.index(marker) for marker in ordered_markers]
+
+        assert positions == sorted(positions)
+        assert "retrieval cannot resolve" in text
+        assert "ambiguity changes the action" in text
+        assert len(prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE) < 600
+
+
+def _retrieval_prompt_parts(valid_tool_names):
+    agent = SimpleNamespace(
+        load_soul_identity=False,
+        skip_context_files=True,
+        valid_tool_names=valid_tool_names,
+        _task_completion_guidance=False,
+        _parallel_tool_call_guidance=False,
+        _tool_use_enforcement=False,
+        _execution_guidance=False,
+        _environment_probe=False,
+        _kanban_worker_guidance="",
+        _memory_store=None,
+        _memory_manager=None,
+        _plugin_system_prompt_sections_snapshot=(),
+        model="",
+        provider="",
+        platform="",
+        pass_session_id=False,
+        session_id="",
+    )
+    with (
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch(
+            "agent.coding_context.coding_system_prompt_parts",
+            return_value=([], [], []),
+        ),
+    ):
+        return agent, build_system_prompt_parts(agent)
+
+
+class TestInformationRetrievalGuidanceInjection:
+    def test_information_retrieval_guidance_appears_once_in_stable_only(self):
+        _, parts = _retrieval_prompt_parts({"custom_lookup"})
+        guidance = prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE
+
+        assert parts["stable"].count(guidance) == 1
+        assert guidance not in parts["context"]
+        assert guidance not in parts["volatile"]
+
+    def test_information_retrieval_guidance_is_absent_without_tools(self):
+        _, parts = _retrieval_prompt_parts(set())
+
+        assert prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE not in "\n".join(
+            parts.values()
+        )
+
+    def test_information_retrieval_guidance_does_not_add_tool_names(self):
+        valid_tool_names = {"custom_lookup"}
+        original_tool_names = valid_tool_names.copy()
+
+        _, parts = _retrieval_prompt_parts(valid_tool_names)
+
+        assert prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE in parts["stable"]
+        assert valid_tool_names == original_tool_names
+        assert "custom_lookup" not in "\n".join(parts.values())
+
+    def test_information_retrieval_guidance_changes_only_stable_partition(self):
+        _, with_tools = _retrieval_prompt_parts({"custom_lookup"})
+        _, without_tools = _retrieval_prompt_parts(set())
+
+        assert with_tools["stable"] != without_tools["stable"]
+        assert with_tools["context"] == without_tools["context"]
+        assert with_tools["volatile"] == without_tools["volatile"]
 
 
 # =========================================================================
@@ -115,8 +207,6 @@ class TestTruncateContent:
         monkeypatch.setattr("hermes_cli.config.load_config", default_load_config)
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", default_load_config)
 
-    def test_context_file_max_chars_default_matches_aiwerk_limit(self):
-        assert CONTEXT_FILE_MAX_CHARS == 81_920
 
 
     def test_long_content_truncated(self):
@@ -183,23 +273,16 @@ class TestDynamicContextFileCap:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
 
-    def test_dynamic_floor_for_small_window(self):
-        # A small context window never drops below the default 80 KiB floor.
-        assert _dynamic_context_file_max_chars(8_000) == CONTEXT_FILE_MAX_CHARS
 
     def test_dynamic_scales_above_floor_for_large_window(self):
-        # 400K-token window → ~96K (400000 * 4 * 0.06), well above the floor
+        # 200K-token window → ~48K (200000 * 4 * 0.06), well above the floor
         # and above Codex's 32 KiB project_doc default.
-        cap = _dynamic_context_file_max_chars(400_000)
-        assert cap == 96_000
+        cap = _dynamic_context_file_max_chars(200_000)
+        assert cap == 48_000
         assert cap > CONTEXT_FILE_MAX_CHARS
 
 
 
-    def test_get_context_file_max_chars_uses_context_length(self):
-        # With no explicit config, the resolver derives the cap from context.
-        assert _get_context_file_max_chars(400_000) == 96_000
-        assert _get_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
 
     def test_explicit_config_beats_dynamic(self, monkeypatch):
         # An explicit value always wins, even when a big window is available.
@@ -211,30 +294,18 @@ class TestDynamicContextFileCap:
             "hermes_cli.config.load_config_readonly",
             lambda: {"context_file_max_chars": 1_000},
         )
-        assert _get_context_file_max_chars(400_000) == 1_000
+        assert _get_context_file_max_chars(200_000) == 1_000
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
-        # A 90K-char AGENTS.md is truncated at the 80 KiB floor but survives
-        # whole on a large-context model (dynamic cap ~96K).
-        content = "z" * 90_000
+        # A 30K-char AGENTS.md is truncated at the flat default but survives
+        # whole on a large-context model (dynamic cap ~48K).
+        content = "z" * 30_000
         small = _truncate_content(content, "AGENTS.md", context_length=8_000)
-        big = _truncate_content(content, "AGENTS.md", context_length=400_000)
+        big = _truncate_content(content, "AGENTS.md", context_length=200_000)
         assert "truncated" in small.lower()
         assert big == content
 
-    def test_marker_points_to_read_path(self):
-        content = "h" * 90_000
-        result = _truncate_content(
-            content, "AGENTS.md", context_length=8_000,
-            read_path="/proj/AGENTS.md",
-        )
-        assert "read_file" in result
-        assert "/proj/AGENTS.md" in result
 
-    def test_marker_defaults_to_filename_without_read_path(self):
-        result = _truncate_content("h" * 90_000, "AGENTS.md", context_length=8_000)
-        assert "read_file" in result
-        assert "AGENTS.md" in result
 
 
 # =========================================================================
@@ -550,6 +621,29 @@ class TestBuildContextFilesPrompt:
 
         assert _load_agents_md(sub) == ""
 
+    # --- AGENTS.override.md personal override (port of pi#7681) ---
+
+    def test_agents_override_md_wins_over_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "AGENTS.override.md").write_text("Use Black instead.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Use Black instead" in result
+        assert "Ruff for linting" not in result
+        assert "AGENTS.override.md" in result
+
+    def test_agents_override_md_loads_alone(self, tmp_path):
+        (tmp_path / "AGENTS.override.md").write_text("Override-only context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Override-only context" in result
+        assert "Project Context" in result
+
+    def test_hermes_md_still_wins_over_agents_override(self, tmp_path):
+        (tmp_path / ".hermes.md").write_text("Hermes-first context.")
+        (tmp_path / "AGENTS.override.md").write_text("Override context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Hermes-first context" in result
+        assert "Override context" not in result
+
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
@@ -686,58 +780,130 @@ class TestFindGitRoot:
         if result is not None:
             assert (result / ".git").exists()
 
-    def test_ignores_inaccessible_git_probe(self, tmp_path, monkeypatch):
-        inaccessible_parent = tmp_path / "tenant-home"
-        child = inaccessible_parent / "workspace"
+    @pytest.mark.parametrize(
+        ("helper_name", "path_factory"),
+        [
+            ("_safe_path_exists", lambda root: root / "file.txt"),
+            ("_safe_path_is_file", lambda root: root / "file.txt"),
+            ("_safe_path_is_dir", lambda root: root),
+        ],
+    )
+    def test_safe_path_probes_preserve_success(self, tmp_path, helper_name, path_factory):
+        (tmp_path / "file.txt").write_text("ok", encoding="utf-8")
+        helper = getattr(prompt_builder, helper_name)
+
+        assert helper(path_factory(tmp_path)) is True
+
+    @pytest.mark.parametrize(
+        ("helper_name", "path_method", "error_type"),
+        [
+            ("_safe_path_exists", "exists", PermissionError),
+            ("_safe_path_is_file", "is_file", type("ProbeFileError", (OSError,), {})),
+            ("_safe_path_is_dir", "is_dir", type("ProbeDirectoryError", (OSError,), {})),
+        ],
+    )
+    def test_safe_path_probes_treat_os_errors_as_inaccessible(
+        self, tmp_path, monkeypatch, helper_name, path_method, error_type
+    ):
+        original_method = getattr(Path, path_method)
+
+        def raise_os_error(path):
+            if path == tmp_path:
+                raise error_type("inaccessible")
+            return original_method(path)
+
+        monkeypatch.setattr(Path, path_method, raise_os_error)
+        helper = getattr(prompt_builder, helper_name)
+
+        assert helper(tmp_path) is False
+
+    @pytest.mark.parametrize(
+        ("helper_name", "path_method"),
+        [
+            ("_safe_path_exists", "exists"),
+            ("_safe_path_is_file", "is_file"),
+            ("_safe_path_is_dir", "is_dir"),
+        ],
+    )
+    def test_safe_path_probes_do_not_catch_programming_errors(
+        self, tmp_path, monkeypatch, helper_name, path_method
+    ):
+        original_method = getattr(Path, path_method)
+
+        def raise_type_error(path):
+            if path == tmp_path:
+                raise TypeError("bug in probe")
+            return original_method(path)
+
+        monkeypatch.setattr(Path, path_method, raise_type_error)
+        helper = getattr(prompt_builder, helper_name)
+
+        with pytest.raises(TypeError, match="bug in probe"):
+            helper(tmp_path)
+
+    def test_find_git_root_skips_inaccessible_parent_probe(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        child = repo / "unreadable-parent" / "workspace"
         child.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        blocked_probe = child.parent / ".git"
         original_exists = Path.exists
 
         def guarded_exists(path):
-            if str(path) == str(inaccessible_parent / ".git"):
+            if path == blocked_probe:
                 raise PermissionError("permission denied")
             return original_exists(path)
 
         monkeypatch.setattr(Path, "exists", guarded_exists)
-        assert _find_git_root(child) is None
 
-    def test_context_files_ignore_inaccessible_cwd_probes(self, tmp_path, monkeypatch):
-        inaccessible_parent = tmp_path / "tenant-home"
-        child = inaccessible_parent / "workspace"
-        child.mkdir(parents=True)
-        original_exists = Path.exists
-        original_is_file = Path.is_file
-        original_is_dir = Path.is_dir
+        assert _find_git_root(child) == repo
 
-        def guarded_exists(path):
-            if str(path).startswith(str(inaccessible_parent)) and path.name in {
-                ".git",
-                "AGENTS.md",
-                "agents.md",
-                "CLAUDE.md",
-                "claude.md",
-                ".cursorrules",
-                "rules",
-            }:
-                raise PermissionError("permission denied")
-            return original_exists(path)
+    @pytest.mark.parametrize(
+        ("blocked_relative", "path_method", "error_type", "fallback_relative", "fallback_content"),
+        [
+            ("HERMES.md", "is_file", PermissionError, "AGENTS.md", "agents fallback"),
+            ("AGENTS.md", "exists", type("AgentsProbeError", (OSError,), {}), "CLAUDE.md", "claude fallback"),
+            ("CLAUDE.md", "exists", PermissionError, ".cursorrules", "cursor fallback"),
+            (".cursorrules", "exists", type("CursorProbeError", (OSError,), {}), None, None),
+            (".cursor/rules", "is_dir", type("CursorDirectoryError", (OSError,), {}), None, None),
+        ],
+    )
+    def test_context_prompt_excludes_inaccessible_optional_candidates(
+        self,
+        tmp_path,
+        monkeypatch,
+        blocked_relative,
+        path_method,
+        error_type,
+        fallback_relative,
+        fallback_content,
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        blocked = workspace / blocked_relative
+        if blocked_relative == ".cursor/rules":
+            blocked.mkdir(parents=True)
+        else:
+            blocked.parent.mkdir(parents=True, exist_ok=True)
+            blocked.write_text("must stay excluded", encoding="utf-8")
+        if fallback_relative:
+            (workspace / fallback_relative).write_text(fallback_content, encoding="utf-8")
+        original_method = getattr(Path, path_method)
 
-        def guarded_is_file(path):
-            if str(path).startswith(str(inaccessible_parent)) and path.name in {
-                ".hermes.md",
-                "HERMES.md",
-            }:
-                raise PermissionError("permission denied")
-            return original_is_file(path)
+        def guarded_probe(path):
+            if path == blocked:
+                raise error_type("inaccessible")
+            return original_method(path)
 
-        def guarded_is_dir(path):
-            if str(path).startswith(str(inaccessible_parent)) and path.name == "rules":
-                raise PermissionError("permission denied")
-            return original_is_dir(path)
+        monkeypatch.setattr(Path, path_method, guarded_probe)
 
-        monkeypatch.setattr(Path, "exists", guarded_exists)
-        monkeypatch.setattr(Path, "is_file", guarded_is_file)
-        monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
-        assert isinstance(build_context_files_prompt(cwd=str(child)), str)
+        prompt = build_context_files_prompt(cwd=str(workspace), skip_soul=True)
+
+        assert "must stay excluded" not in prompt
+        if fallback_content:
+            assert fallback_content in prompt
+        else:
+            assert prompt == ""
 
 
 class TestStripYamlFrontmatter:
@@ -1046,22 +1212,55 @@ class TestOpenAIModelExecutionGuidance:
         assert "correctness" in text
 
 
-    def test_guidance_allows_temporal_context_for_coarse_time_classification(self):
-        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
-        assert "trusted temporal_context" in text
-        assert "coarse relative-time classification" in text
-        assert "morning/afternoon" in text
-        assert "operational decision" in text
-
-    def test_guidance_uses_xml_tags(self):
-        assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "<verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
 
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
+
+    def test_guidance_covers_external_write_readback(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "read" in text and "back" in text
+        assert "successful tool call is not a successful task" in text
+
+    def test_guidance_covers_count_reconciliation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "has_more" in text
+        assert "hard assertions" in text
+
+    def test_guidance_covers_literal_preservation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "normalize" in text
+        assert "malformed" in text
+
+    def test_guidance_covers_retry_differently(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "suspiciously narrow" in text
+        assert "retry" in text
+
+    def test_guidance_gates_completion_on_verification(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "plausible subset" in text
+
+
+class TestExecutionGuidanceModels:
+    """Behavior contracts for the default auto-match model list."""
+
+    def test_includes_historical_families(self):
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("gpt", "codex", "grok"):
+            assert fam in EXECUTION_GUIDANCE_MODELS
+
+    def test_includes_composio_eval_families(self):
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral"):
+            assert fam in EXECUTION_GUIDANCE_MODELS
+
+    def test_excludes_google_and_claude(self):
+        # Gemini/Gemma get GOOGLE_MODEL_OPERATIONAL_GUIDANCE instead;
+        # Claude doesn't exhibit the targeted failure modes.
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("gemini", "gemma", "claude"):
+            assert fam not in EXECUTION_GUIDANCE_MODELS
 
 
 class TestParallelToolCallGuidance:

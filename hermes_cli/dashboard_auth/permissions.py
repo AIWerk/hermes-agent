@@ -1,152 +1,53 @@
-"""Proportional role policy for AIWerk dashboard actions.
+"""Fail-closed policy for authenticated CUI mutations."""
 
-The policy is intentionally permissive for normal own-tenant work.  A
-non-admin user should only hit the admin gate when an action can cross a
-human/tenant boundary, weaken security, change shared runtime state, create
-billing/legal exposure, or cause irreversible destructive damage.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Literal
-
-from .base import Session
-
-Scope = Literal["own_tenant", "cross_tenant", "shared_runtime"]
-
-
-class PermissionLevel(str, Enum):
-    USER = "user"
-    CONFIRM = "confirm"
-    ADMIN_ONLY = "admin_only"
+from typing import Mapping, Any
 
 
 @dataclass(frozen=True)
-class PermissionDecision:
+class MutationDecision:
     allowed: bool
-    level: PermissionLevel
-    admin_required: bool
     reason: str
+    requires_confirmation: bool = False
 
 
-# Ordinary user-owned work. Some of these still need a visible preview and
-# confirmation, but they should not force an admin login just because they are
-# important settings. This preserves UX for the actual tenant user.
-_USER_CONFIRM_ACTIONS: frozenset[str] = frozenset(
-    {
-        "connector.connect",
-        "connector.reconnect",
-        "connector.disconnect_own",
-        "credential.update_own",
-        "external_write.email_send",
-        "external_write.calendar_update",
-        "external_write.task_update",
-        "external_write.contact_update",
-        "automation.cron.create_own",
-        "automation.cron.edit_own",
-        "automation.cron.pause_own",
-        "automation.cron.remove_own",
-        "ai_notes.publish_own",
-        "agent.settings.update_own",
-        "memory.export_own",
-        "wiki.export_own",
-        "backup.download_own",
-    }
-)
-
-_USER_ACTIONS: frozenset[str] = frozenset(
-    {
-        "chat.send",
-        "task.create_own",
-        "task.edit_own",
-        "task.complete_own",
-        "resource.read_own",
-        "artifact.download_own",
-        "artifact.upload_own",
-        "draft.create_own",
-    }
-)
-
-# Keep this list small. These are the big red buttons only.
-_ADMIN_ONLY_ACTIONS: frozenset[str] = frozenset(
-    {
-        # Identity and ownership boundaries.
-        "identity.user_invite",
-        "identity.user_remove",
-        "identity.role_change",
-        "identity.admin_grant",
-        "identity.admin_revoke",
-        "tenant.owner_transfer",
-        # Tenant boundary and destructive tenant state.
-        "tenant.cross_access",
-        "tenant.migrate_host",
-        "tenant.delete",
-        "tenant.restore_overwrite",
-        # Runtime and security policy.
-        "runtime.update_shared_prod",
-        "runtime.rollback_shared_prod",
-        "runtime.restart_shared_prod",
-        "tool.allowlist.change",
-        "mcp.policy.change",
-        "security.policy_weaken",
-        "audit.disable",
-        "audit.delete",
-        # Cost, legal, and external blast radius.
-        "billing.plan_change",
-        "billing.spending_limit_increase",
-        "external_write.bulk_email",
-        "external_write.bulk_calendar_update",
-        "invoice.issue_or_delete",
-        "contract.execute",
-        # Irreversible destructive operations.
-        "data.bulk_delete_irreversible",
-        "memory.reset_all",
-        "agent.reset_all",
-        "backup.restore_overwrite",
-    }
-)
+_LOW_RISK = frozenset({"session.rename"})
+_ADMIN_BOUNDARY = frozenset({"gateway.restart"})
+_ADMIN_ROLES = frozenset({"admin", "aiwerk_admin", "operator"})
 
 
-def is_admin_role(role: str | None) -> bool:
-    return (role or "").strip().lower() in {"admin", "owner", "operator"}
-
-
-def is_admin_only_action(action: str) -> bool:
-    return action in _ADMIN_ONLY_ACTIONS
-
-
-def decide_dashboard_permission(
-    action: str,
+def evaluate_cui_mutation(
     *,
-    session: Session | None,
-    scope: Scope = "own_tenant",
-) -> PermissionDecision:
-    if session is None:
-        return PermissionDecision(False, PermissionLevel.ADMIN_ONLY, True, "no_session")
-
-    if scope in {"cross_tenant", "shared_runtime"}:
-        if is_admin_role(session.role):
-            return PermissionDecision(True, PermissionLevel.ADMIN_ONLY, True, f"{scope}_admin")
-        return PermissionDecision(False, PermissionLevel.ADMIN_ONLY, True, scope)
-
-    if action in _ADMIN_ONLY_ACTIONS:
-        if is_admin_role(session.role):
-            return PermissionDecision(True, PermissionLevel.ADMIN_ONLY, True, "admin_session")
-        return PermissionDecision(False, PermissionLevel.ADMIN_ONLY, True, "admin_only")
-
-    if action in _USER_ACTIONS:
-        return PermissionDecision(True, PermissionLevel.USER, False, "user_owned")
-
-    if action in _USER_CONFIRM_ACTIONS:
-        return PermissionDecision(True, PermissionLevel.CONFIRM, False, "user_owned_confirm")
-
-    # Fail closed on the unknown surface. An action string the table does not
-    # recognise is not implicitly safe: a newly-added or mis-named sensitive
-    # action that an engineer forgets to register here must NOT silently become
-    # a non-admin-permitted operation. Require an admin for anything we cannot
-    # positively classify as user-owned, and let the caller promote it into
-    # _USER_ACTIONS / _USER_CONFIRM_ACTIONS once it is reviewed as safe.
-    if is_admin_role(session.role):
-        return PermissionDecision(True, PermissionLevel.ADMIN_ONLY, True, "unknown_admin")
-    return PermissionDecision(False, PermissionLevel.ADMIN_ONLY, True, "unknown_denied")
+    action: str,
+    actor: Mapping[str, Any] | None,
+    target_tenant_id: str | None,
+    confirmed: bool = False,
+) -> MutationDecision:
+    """Evaluate a write using only authenticated actor fields."""
+    if not isinstance(actor, Mapping):
+        return MutationDecision(False, "authenticated_actor_required")
+    actor_id = actor.get("actor_id")
+    role = actor.get("role")
+    tenant_id = actor.get("tenant_id")
+    if not isinstance(actor_id, str) or not actor_id:
+        return MutationDecision(False, "authenticated_actor_required")
+    if not isinstance(role, str) or not role:
+        return MutationDecision(False, "authenticated_actor_required")
+    if not isinstance(tenant_id, str) or not tenant_id:
+        return MutationDecision(False, "authenticated_actor_required")
+    if not isinstance(target_tenant_id, str) or not target_tenant_id:
+        return MutationDecision(False, "target_tenant_required")
+    if tenant_id != target_tenant_id:
+        return MutationDecision(False, "cross_tenant_blocked")
+    normalized_role = role.strip().lower()
+    if action in _ADMIN_BOUNDARY:
+        if normalized_role not in _ADMIN_ROLES:
+            return MutationDecision(False, "admin_required")
+        return MutationDecision(True, "allowed")
+    if action in _LOW_RISK:
+        if not confirmed:
+            return MutationDecision(False, "confirmation_required", True)
+        return MutationDecision(True, "allowed")
+    return MutationDecision(False, "unknown_write_blocked")

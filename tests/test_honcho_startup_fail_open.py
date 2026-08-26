@@ -240,8 +240,6 @@ def test_honcho_system_prompt_advertises_active_while_background_init_runs(monke
         prompt = provider.system_prompt_block()
         assert "Honcho Memory" in prompt
         assert "hybrid mode" in prompt
-        assert "not new user input" in prompt
-        assert "current user message takes precedence" in prompt
     finally:
         release.set()
         init_thread = getattr(provider, "_init_thread", None)
@@ -328,35 +326,9 @@ def test_honcho_tools_lazy_hooks_do_not_prestart_background_init(monkeypatch):
     assert not background_started.is_set()
 
 
-def test_honcho_session_end_drains_background_init_before_flush():
-    """Short-lived CLI exits must not leave Honcho init alive at interpreter shutdown."""
-    provider = HonchoMemoryProvider()
-    cfg = _configured_hybrid_config()
-    cfg.timeout = 1.0
-    provider._config = cfg
-
-    flush_called = threading.Event()
-
-    class FlushManager:
-        def flush_all(self):
-            flush_called.set()
-
-    def finish_init():
-        time.sleep(0.05)
-        provider._manager = FlushManager()
-        provider._session_initialized = True
-
-    provider._init_thread = threading.Thread(
-        target=finish_init,
-        daemon=True,
-        name="honcho-session-init",
-    )
-    provider._init_thread.start()
-
-    provider.on_session_end([])
-
-    assert not provider._init_thread.is_alive()
-    assert flush_called.is_set()
+# ---------------------------------------------------------------------------
+# Write-containment regression tests
+# ---------------------------------------------------------------------------
 
 
 def test_honcho_sync_turn_skips_write_when_save_messages_is_disabled():
@@ -380,6 +352,7 @@ def test_honcho_sync_turn_skips_write_when_save_messages_is_disabled():
 
     assert provider._sync_thread is None
     assert manager_calls == []
+
 
 def test_honcho_sync_turn_skips_anchored_gateway_notifications():
     """Known bracketed gateway wrappers must not become durable messages."""
@@ -414,6 +387,7 @@ def test_honcho_sync_turn_skips_anchored_gateway_notifications():
         assert provider._sync_thread is None, f"wrapper not suppressed: {wrapper[:60]!r}"
         assert manager_calls == [], f"wrapper not suppressed: {wrapper[:60]!r}"
 
+
 def test_honcho_sync_turn_skips_prose_gateway_notifications():
     """Prose-form gateway notifications must not become durable messages."""
     prose_wrappers = (
@@ -439,6 +413,7 @@ def test_honcho_sync_turn_skips_prose_gateway_notifications():
 
         assert provider._sync_thread is None, f"prose wrapper not suppressed: {wrapper[:60]!r}"
         assert manager_calls == [], f"prose wrapper not suppressed: {wrapper[:60]!r}"
+
 
 def test_honcho_sync_turn_does_not_suppress_genuine_user_messages():
     """Genuine user messages that mention gateway terms must still be stored."""
@@ -472,6 +447,7 @@ def test_honcho_sync_turn_does_not_suppress_genuine_user_messages():
         assert provider._sync_thread is not None, f"genuine message suppressed: {msg[:60]!r}"
         assert manager_calls != [], f"genuine message suppressed: {msg[:60]!r}"
 
+
 def test_honcho_sync_turn_skips_empty_content():
     """Empty or whitespace-only turns must not be stored."""
     provider = HonchoMemoryProvider()
@@ -491,6 +467,7 @@ def test_honcho_sync_turn_skips_empty_content():
 
     assert provider._sync_thread is None
     assert manager_calls == []
+
 
 def test_honcho_sync_turn_same_instance_config_flip_gates_writes():
     """The cached-provider regression: flipping save_messages on the SAME
@@ -526,6 +503,7 @@ def test_honcho_sync_turn_same_instance_config_flip_gates_writes():
     # no new write may occur; the stale _sync_thread from the enabled write is fine
     assert manager_calls == []
 
+
 def test_honcho_on_memory_write_honors_save_messages_false():
     """The memory-tool mirror is an automatic write path and must respect the
     write-disable switch; otherwise containment only covers conversation turns."""
@@ -546,6 +524,7 @@ def test_honcho_on_memory_write_honors_save_messages_false():
     provider.on_memory_write("add", "user", "prefers fail-open memory")
 
     assert conclusion_calls == []
+
 
 def test_honcho_on_memory_write_still_writes_when_enabled():
     """With save_messages enabled, the memory-tool mirror still writes."""

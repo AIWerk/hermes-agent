@@ -203,7 +203,18 @@ class TestTranscribeCallSitesReadDotenv:
         assert result["success"] is True
         assert captured["headers"]["xi-api-key"] == "elevenlabs-dotenv-key"
 
-    def test_transcribe_elevenlabs_forwards_normalized_language_code(self):
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("hu", "hun"),
+            ("de", "deu"),
+            ("hun", "hun"),
+            ("de-CH", "de-CH"),
+        ],
+    )
+    def test_transcribe_elevenlabs_forwards_supported_language_code(
+        self, configured, expected
+    ):
         from tools import transcription_tools as tt
 
         captured: dict = {}
@@ -215,20 +226,21 @@ class TestTranscribeCallSitesReadDotenv:
             response.json.return_value = {"text": "szia"}
             return response
 
-        def fake_get_env_value(name, default=None):
-            if name == "ELEVENLABS_API_KEY":
-                return "elevenlabs-dotenv-key"
-            return None
-
-        with patch.object(tt, "get_env_value", side_effect=fake_get_env_value), \
-             patch.object(tt, "_load_stt_config", return_value={"elevenlabs": {"language_code": "hu"}}), \
-             patch("requests.post", side_effect=fake_post), \
-             patch("builtins.open", MagicMock()):
+        with patch.object(
+            tt,
+            "_resolve_provider_key",
+            return_value="elevenlabs-dotenv-key",
+        ), patch.object(
+            tt,
+            "_load_stt_config",
+            return_value={"elevenlabs": {"language_code": configured}},
+        ), patch("requests.post", side_effect=fake_post), patch(
+            "builtins.open", MagicMock()
+        ):
             result = tt._transcribe_elevenlabs("/tmp/fake.mp3", "scribe_v2")
 
         assert result["success"] is True
-        assert captured["data"]["language_code"] == "hun"
-
+        assert captured["data"]["language_code"] == expected
 
 
 class TestEndToEndRegressionGuard:

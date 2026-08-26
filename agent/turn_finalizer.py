@@ -22,9 +22,11 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import logging
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
@@ -53,6 +55,54 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+
+
+def _record_kanban_budget_exhausted(
+    kanban_task: str,
+    api_call_count: int,
+    max_iterations: int,
+    logger: logging.Logger,
+) -> None:
+    """Record a terminal ``timed_out`` outcome for a kanban worker that
+    exhausted its iteration budget.
+
+    This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
+    (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
+    already closed the run this is a no-op — so it is safe to call from
+    multiple exit paths.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        _conn = _kb.connect()
+        try:
+            _kb._record_task_failure(
+                _conn,
+                kanban_task,
+                error=(
+                    f"Iteration budget exhausted "
+                    f"({api_call_count}/{max_iterations}) — "
+                    "task could not complete within the allowed "
+                    "iterations"
+                ),
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+                event_payload_extra={
+                    "budget_used": api_call_count,
+                    "budget_max": max_iterations,
+                },
+            )
+        finally:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.warning(
+            "Failed to record budget-exhausted failure for task %s",
+            kanban_task,
+            exc_info=True,
+        )
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
@@ -92,26 +142,6 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
-
-    # Defensive atomic close/drain for non-text exits
-    # (budget/error/interrupt). Preserve any accepted late correction for
-    # caller delivery rather than leaving a drain-to-outer-close race.
-    _atomic_take = getattr(
-        agent, "_take_text_commit_correction_and_close_admission", None
-    )
-    if callable(_atomic_take):
-        _leftover_correction = _atomic_take()
-    else:
-        # Compatibility for lightweight/custom agents that predate the atomic
-        # correction API. Production AIAgent always takes the atomic branch.
-        _legacy_close = getattr(agent, "_close_turn_correction_admission", None)
-        _leftover_correction = (
-            agent._drain_pending_steer()
-            if callable(getattr(agent, "_drain_pending_steer", None))
-            else None
-        )
-        if callable(_legacy_close):
-            _legacy_close()
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -175,42 +205,23 @@ def finalize_turn(
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
-            try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+            _record_kanban_budget_exhausted(
+                _kanban_task, api_call_count, agent.max_iterations, logger,
+            )
+    elif budget_exhausted:
+        # Bounded fallback (#87096): budget was exhausted but none of the
+        # normal fallback paths were eligible (interrupted / failed /
+        # anomalous exit_reason). If running as a kanban worker we must
+        # still record a terminal outcome so the task does not remain in
+        # an ambiguous lifecycle state. The worker's run is closed via
+        # ``_record_task_failure`` (compare-and-swap receipt path) which
+        # is a no-op if another path closed it — the CAS invariant in
+        # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
+        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        if _kanban_task:
+            _record_kanban_budget_exhausted(
+                _kanban_task, api_call_count, agent.max_iterations, logger,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -367,7 +378,7 @@ def finalize_turn(
                 # re-writes the filled content to the durable store —
                 # otherwise ``/resume`` reloads ``content=""`` and the bug
                 # resurfaces cross-session.
-                _tail.pop("_db_persisted", None)
+                _tail.pop(_DB_PERSISTED_MARKER, None)
                 # The bounded flush-scan cursor (run_agent.py) skips the
                 # identity-matched prefix of its previous snapshot on the
                 # assumption that no live dict loses the marker in place —
@@ -403,6 +414,14 @@ def finalize_turn(
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
+                    # compression.checkpoint_required: agent init already
+                    # forces _micro_compact_enabled off, but the compressor
+                    # attribute is plain state a future path could flip on a
+                    # live agent. Micro-compaction has no checkpoint hook in
+                    # its path, so it must never run while the gate is armed.
+                    and getattr(
+                        agent, "compression_checkpoint_required", False
+                    ) is not True
                     # Persistence-isolated agents (background review fork)
                     # must not micro-compact: the pass burns a real aux-LLM
                     # call on a throwaway replay transcript, and if the
@@ -437,12 +456,13 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
-        try:
-            from agent.conversation_loop import _record_incremental_session_notes
+        if completed and not interrupted and not failed and final_response:
+            try:
+                from agent.turn_context import maybe_title_session_after_success
 
-            _record_incremental_session_notes(agent, messages, conversation_history, final_response)
-        except Exception as exc:
-            logger.debug("incremental session note capture failed: %s", exc, exc_info=True)
+                maybe_title_session_after_success(agent, messages)
+            except Exception:
+                logger.debug("Post-success auto-title dispatch failed", exc_info=True)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -733,7 +753,7 @@ def finalize_turn(
             "health (`hermes doctor`), then send your message again"
         )
         # Machine-readable cause for the gateway/desktop: exactly
-        # 'session_persistence_failed:<locked|compression|turn_lease|disk|unknown>'.
+        # 'session_persistence_failed:<locked|compression|turn_lease|corrupt|disk|unknown>'.
         # Never clobber a failure_reason another path already stamped.
         if "failure_reason" not in result:
             _cause = getattr(agent, "_last_persistence_error_cause", None)
@@ -748,7 +768,7 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = _leftover_correction
+    _leftover_steer = agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

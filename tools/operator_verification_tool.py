@@ -5,6 +5,7 @@ from typing import Any
 
 from hermes_cli.operator_verification import (
     cache_operator_verification,
+    current_operator_verification_subject,
     get_cached_operator_verification,
     load_operator_verification_config,
     run_operator_verifier,
@@ -15,9 +16,14 @@ from tools.registry import registry, tool_result
 def verify_operator_identity(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
     """Verify the local human operator without exposing the secret to the model."""
     args = args or {}
-    session_id = str(args.get("session_id") or kwargs.get("session_id") or "") or None
-    cached = get_cached_operator_verification(session_id=session_id)
+    requested_role = str(args.get("requested_role") or kwargs.get("requested_role") or "").strip().lower()
+    subject = current_operator_verification_subject(requested_role)
+    if subject is None:
+        return tool_result(success=False, verified=False, reason="trusted_subject_unavailable")
+    cached = get_cached_operator_verification(**subject)
     if cached is not None:
+        if requested_role and str(cached.role).strip().lower() != requested_role:
+            return tool_result(success=False, verified=False, reason="requested_role_not_granted")
         return tool_result(
             success=True,
             verified=True,
@@ -28,9 +34,11 @@ def verify_operator_identity(args: dict[str, Any] | None = None, **kwargs: Any) 
         )
 
     cfg = load_operator_verification_config()
-    result = run_operator_verifier(cfg)
-    if result.is_valid():
-        cache_operator_verification(result, session_id=session_id)
+    result = run_operator_verifier(cfg, subject=subject)
+    if requested_role and str(result.role).strip().lower() != requested_role:
+        return tool_result(success=False, verified=False, reason="requested_role_not_granted")
+    if result.is_valid(**subject):
+        cache_operator_verification(result)
         return tool_result(
             success=True,
             verified=True,
@@ -65,9 +73,11 @@ _OPERATOR_VERIFY_SCHEMA = {
             },
             "requested_role": {
                 "type": "string",
-                "description": "Optional role being requested, e.g. operator or admin.",
+                "enum": ["operator", "admin"],
+                "description": "Mandatory role required for the sensitive action.",
             },
         },
+        "required": ["requested_role"],
         "additionalProperties": False,
     },
 }

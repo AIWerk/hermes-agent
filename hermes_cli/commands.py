@@ -146,8 +146,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]",
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
-    CommandDef("fresh", "Start a fresh session while keeping recent messages as read-only context", "Session",
-               args_hint="[message-count]", cli_only=True),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
@@ -169,14 +167,17 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("worktree", "Show, list, create, or prune isolated git worktrees", "Session",
+               cli_only=True, args_hint="[new [name]|list|prune [--dry-run]]",
+               subcommands=("new", "list", "prune")),
     CommandDef("side", "Start a clean temporary side session and park the current one", "Session",
                args_hint="[name]"),
     CommandDef("back", "Return from the active side session", "Session",
                aliases=("return",)),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
-    CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
-               args_hint="[number]"),
+    CommandDef("rollback", "List or restore filesystem checkpoints (restores keep your hand-edits; --all overrides)", "Session",
+               args_hint="[number] [--all]"),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
                cli_only=True, aliases=("snap",), args_hint="[create|restore <id>|prune]"),
     CommandDef("export", "Export a profile (config, skills, theme) to a shareable archive", "Configuration",
@@ -214,6 +215,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="dispatch"),
     CommandDef("refine", "Review this conversation now and save lessons to memory/skills", "Session",
                args_hint="[focus instructions]"),
+    CommandDef("review", "Spawn an independent subagent to review the work just discussed (PR, code, docs)", "Session",
+               args_hint="[review instructions]"),
     CommandDef("loop", "Re-run a prompt on a recurring interval in this session", "Session",
                aliases=("proactive",),
                args_hint="[interval] <prompt> [--times N] [--until <condition>] | status | pause | resume | stop",
@@ -266,7 +269,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("diff", "Show git changes in the working directory", "Info",
                args_hint="[staged|all|session] [--stat] [path...]",
                subcommands=("staged", "all", "session")),
-    CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose -> log",
+    CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command",
                busy_policy="dispatch"),
@@ -289,10 +292,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
-    CommandDef("language", "Show or change UI language and matching default skin", "Configuration",
-               cli_only=True, aliases=("lang", "locale"), args_hint="[code]",
-               subcommands=("en", "zh", "zh-hant", "ja", "de", "es", "fr", "tr", "uk",
-                            "af", "ko", "it", "ga", "pt", "ru", "hu")),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
                cli_only=True, args_hint=f"[{'|'.join(INDICATOR_STYLES)}]",
                subcommands=INDICATOR_STYLES),
@@ -356,8 +355,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("reload-skills", "Re-scan ~/.hermes/skills/ for newly installed or removed skills",
                "Tools & Skills", aliases=("reload_skills",)),
     CommandDef("browser", "Connect browser tools to your live Chromium-family browser via CDP, or switch to Browser Use mode", "Tools & Skills",
-               cli_only=True, args_hint="[connect|disconnect|status|launch|open-local|close-local|use]",
-               subcommands=("connect", "disconnect", "status", "launch", "open-local", "close-local", "use")),
+               cli_only=True, args_hint="[connect|disconnect|status|use]",
+               subcommands=("connect", "disconnect", "status", "use")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 
@@ -365,8 +364,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]", busy_policy="dispatch",
                execute="gateway_commands"),
-    CommandDef("help", "Show available commands", "Info", busy_policy="dispatch",
-               execute="gateway_help"),
+    CommandDef("help", "Show available commands (/help skills lists skill commands, /help <text> filters)", "Info", busy_policy="dispatch",
+               execute="gateway_help", args_hint="[skills|<filter>]"),
+    CommandDef("palette", "Open the fuzzy command palette (also Ctrl+P)", "Info",
+               cli_only=True, busy_policy="dispatch"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True, busy_policy="dispatch"),
     CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset", "Info",
@@ -454,6 +455,24 @@ SUBCOMMANDS: dict[str, list[str]] = {}
 for _cmd in COMMAND_REGISTRY:
     if _cmd.subcommands:
         SUBCOMMANDS[f"/{_cmd.name}"] = list(_cmd.subcommands)
+
+
+# Help renderer sub-grouping: the "Session" category accumulated ~46 commands
+# spanning genuinely different concerns (lifecycle, context, background/async).
+# Rather than re-tag every CommandDef (category is load-bearing for gateway
+# help + other surfaces), the /help renderer splits Session into readable
+# sub-headers using these command-name sets. Any Session command not listed
+# here falls under the base "Session" header. Names are bare (no leading /).
+HELP_SESSION_SUBGROUPS: dict[str, tuple[str, ...]] = {
+    "Context": (
+        "compress", "compact", "context", "ctx", "status",
+    ),
+    "Background & Automation": (
+        "background", "bg", "btw", "agents", "tasks", "queue", "q", "steer",
+        "goal", "subgoal", "heartbeat", "hb", "refine", "loop", "proactive",
+        "moa", "journey", "learning", "memory-graph",
+    ),
+}
 
 # Also extract subcommands hinted in args_hint via pipe-separated patterns
 # e.g. args_hint="[on|off|tts|status]" for commands that don't have explicit subcommands.
@@ -654,14 +673,6 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     return entries
 
 
-
-_TELEGRAM_MENU_EXCLUDE = {
-    # Keep Telegram's advertised command set within Slack native-slash parity.
-    # These remain reachable when typed manually or via /hermes on Slack.
-    "insights",
-    "reload_skills",
-}
-
 def telegram_bot_commands() -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
@@ -685,13 +696,13 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         # usage text when invoked without arguments, and hiding them from
         # the menu hurts discoverability (issue #24312).
         tg_name = _sanitize_telegram_name(cmd.name)
-        if tg_name and tg_name not in _TELEGRAM_MENU_EXCLUDE:
+        if tg_name:
             result.append((tg_name, cmd.description))
     for name, description, args_hint in _iter_plugin_command_entries():
         if _requires_argument(args_hint):
             continue
         tg_name = _sanitize_telegram_name(name)
-        if tg_name and tg_name not in _TELEGRAM_MENU_EXCLUDE:
+        if tg_name:
             result.append((tg_name, description))
     return result
 
@@ -716,7 +727,6 @@ _TELEGRAM_MENU_PRIORITY = (
     "model",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
-    "version",
     "restart",
     "update",
     "verbose",
@@ -992,11 +1002,12 @@ def _collect_gateway_skill_entries(
     try:
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import SKILLS_DIR
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         _skills_dir = str(SKILLS_DIR.resolve())
         _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
         # Build set of allowed directory prefixes: local skills dir + any
-        # user-configured ``skills.external_dirs``. Ensure each prefix ends
+        # user-configured ``skills.external_dirs`` + trusted project dirs.
+        # Ensure each prefix ends
         # with ``/`` so ``/my-skills`` does not also match ``/my-skills-extra``.
         # Without this widening, external skills are visible in
         # ``hermes skills list`` and the agent's ``/skill-name`` dispatch but
@@ -1004,6 +1015,9 @@ def _collect_gateway_skill_entries(
         _allowed_prefixes = [_skills_dir.rstrip("/") + "/"]
         _allowed_prefixes.extend(
             str(d).rstrip("/") + "/" for d in get_external_skills_dirs()
+        )
+        _allowed_prefixes.extend(
+            str(d).rstrip("/") + "/" for d in get_project_skills_dirs()
         )
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
@@ -1172,7 +1186,7 @@ def discord_skill_commands_by_category(
 
     try:
         from agent.skill_commands import get_skill_commands
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
         from tools.skills_tool import SKILLS_DIR
 
         _skills_dir = SKILLS_DIR.resolve()
@@ -1185,6 +1199,14 @@ def discord_skill_commands_by_category(
             for ext in get_external_skills_dirs():
                 try:
                     _scan_roots.append(_P(ext).resolve())
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            for proj in get_project_skills_dirs():
+                try:
+                    _scan_roots.append(_P(proj).resolve())
                 except Exception:
                     continue
         except Exception:
@@ -1350,7 +1372,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "usage"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1409,9 +1431,10 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # Priority pass: pin high-value Slack aliases ahead of the 50-command clamp.
-    # Use the upstream curated list so /reset is not reintroduced as a pinned
-    # Slack slash, while keeping AIWerk Telegram-visible canonical commands.
+    # Priority pass: pin high-value aliases (e.g. /btw, /bg, /reset) ahead of
+    # everything except /hermes, so a new canonical command can never silently
+    # clamp them off the 50-slash cap. Each alias borrows its parent command's
+    # description and hint.
     _alias_to_cmd = {
         alias: cmd
         for cmd in COMMAND_REGISTRY
@@ -1422,32 +1445,6 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         cmd = _alias_to_cmd.get(alias)
         if cmd is not None:
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
-
-    # Reserve Telegram-visible canonical commands before the 50-command clamp so
-    # cross-platform operational parity survives registry growth.
-    priority_names = {
-        _sanitize_telegram_name(name)
-        for name, _description in telegram_bot_commands()
-    } | {_sanitize_telegram_name(name) for name in _TELEGRAM_MENU_PRIORITY}
-
-    # First add the curated Telegram menu priority order. This keeps critical
-    # operational commands such as /debug and /version from being clamped after
-    # the registry grows near Slack's 50-command limit.
-    _cmd_by_sanitized_name = {
-        _sanitize_telegram_name(cmd.name): cmd
-        for cmd in COMMAND_REGISTRY
-        if _is_gateway_available(cmd, overrides)
-    }
-    for name in _TELEGRAM_MENU_PRIORITY:
-        cmd = _cmd_by_sanitized_name.get(_sanitize_telegram_name(name))
-        if cmd is not None:
-            _add(cmd.name, cmd.description, cmd.args_hint or "")
-
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
-        if _sanitize_telegram_name(cmd.name) in priority_names:
-            _add(cmd.name, cmd.description, cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:

@@ -6,13 +6,12 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 
 import asyncio
 import contextlib
+import sys
 
+import pytest
 import uvicorn
 
 from hermes_cli import web_server
-
-import sys
-import pytest
 
 
 def _stub_uvicorn(monkeypatch):
@@ -149,53 +148,7 @@ def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     assert captured["ws_ping_timeout"] >= captured["ws_ping_interval"]
 
 
-def _fake_resource_payload(name: str) -> dict:
-    payload = {"status": "connected", "summary": name, "items": []}
-    if name in {"email", "calendar"}:
-        payload["accounts"] = []
-    if name == "email":
-        payload["unread_count"] = 0
-    if name == "shared_folder":
-        payload["can_open_folder"] = False
-    if name == "vault":
-        payload.update({"weak_count": 0, "reused_count": 0, "compromised_count": 0})
-    if name == "todos":
-        payload["open_count"] = 0
-    if name == "contacts":
-        payload.update({"relevant": [], "frequent": [], "total_count": 0})
-    return payload
-
-
-def _stub_assistant_cached_resource(monkeypatch):
-    def fake_cached_resource(name, ttl_seconds, cache_key, builder, **kwargs):
-        meta = {"cached": False, "updated_at": "now", "expires_at": "later", "ttl_seconds": ttl_seconds}
-        return _fake_resource_payload(name), meta
-
-    monkeypatch.setattr(web_server, "_assistant_cached_resource", fake_cached_resource)
-
-
-def test_assistant_resource_force_refresh_drops_mcp_bridge_sessions(monkeypatch):
-    """A CUI resource refresh must recover after Google Workspace re-auth."""
-    web_server._MCP_BRIDGE_SESSIONS.clear()
-    web_server._MCP_BRIDGE_SESSIONS["stale"] = "session-id"
-    monkeypatch.setattr(web_server, "load_config", lambda: {})
-    _stub_assistant_cached_resource(monkeypatch)
-
-    web_server._assistant_resources_payload(force_refresh=True, refresh_resource="calendar")
-
-    assert web_server._MCP_BRIDGE_SESSIONS == {}
-
-
-def test_assistant_non_bridge_resource_refresh_keeps_mcp_bridge_sessions(monkeypatch):
-    web_server._MCP_BRIDGE_SESSIONS.clear()
-    web_server._MCP_BRIDGE_SESSIONS["active"] = "session-id"
-    monkeypatch.setattr(web_server, "load_config", lambda: {})
-    _stub_assistant_cached_resource(monkeypatch)
-
-    web_server._assistant_resources_payload(force_refresh=True, refresh_resource="shared_folder")
-
-    assert web_server._MCP_BRIDGE_SESSIONS == {"active": "session-id"}
-
+@pytest.mark.windows_only
 def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     """The dashboard/desktop backend must serve uvicorn on the loop *uvicorn*
     selects, not the interpreter default.
@@ -211,12 +164,11 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     This asserts the behavioral contract: on Windows the loop factory the runner
     receives is the one uvicorn's own Config produced, and bare ``asyncio.run``
     is never the serve path when the loop-factory runner exists.
+
+    Windows-only: faking ``sys.platform`` selected the branch but left the
+    proactor/selector loop policy this exists for entirely absent.
     """
     _stub_uvicorn(monkeypatch)
-
-    # The fix only changes behavior on win32; simulate it so the Windows branch
-    # is actually exercised on a POSIX CI host.
-    monkeypatch.setattr(web_server.sys, "platform", "win32")
 
     # The fake Config (installed by _stub_uvicorn) returns its ``_loop_factory``
     # from get_loop_factory(). Pin a sentinel so we can assert it is threaded
@@ -256,15 +208,17 @@ def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
 
 
 def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
-    """POSIX behavior must be byte-for-byte unchanged: serve via the plain
-    ``asyncio.run(_serve())`` path, never the Windows loop-factory branch.
+    """POSIX continues to serve via the plain ``asyncio.run(_serve())`` path,
+    never the Windows loop-factory branch.
 
-    The #50641 fix is intentionally win32-scoped to keep the blast radius
-    minimal — Python's default loop on POSIX is already a SelectorEventLoop
-    (or uvloop), which is what uvicorn serves on, so there is nothing to fix.
+    The #50641 fix is intentionally win32-scoped to keep the loop selection
+    unchanged — Python's default loop on POSIX is already a SelectorEventLoop
+    (or uvloop), which is what uvicorn serves on.
+
+    No platform patching: the Linux CI host is already POSIX, so this asserts
+    the real host's serve path.
     """
     _stub_uvicorn(monkeypatch)
-    monkeypatch.setattr(web_server.sys, "platform", "linux")
 
     # If the Windows branch were taken, the loop-factory runner would fire.
     runner_called = {"hit": False}
@@ -318,6 +272,7 @@ def test_start_server_treats_posix_keyboardinterrupt_as_clean_shutdown(monkeypat
             "shutdown, not propagate it"
         )
 
+
 @pytest.mark.windows_only
 def test_start_server_treats_windows_keyboardinterrupt_as_clean_shutdown(monkeypatch):
     """Console Ctrl+C on the Windows loop-factory branch is a clean exit too.
@@ -349,6 +304,7 @@ def test_start_server_treats_windows_keyboardinterrupt_as_clean_shutdown(monkeyp
             "start_server must treat serve-time KeyboardInterrupt as a clean "
             "shutdown on the Windows branch, not propagate it"
         )
+
 
 @pytest.mark.windows_only
 def test_start_server_treats_windows_fallback_keyboardinterrupt_as_clean_shutdown(

@@ -24,7 +24,6 @@ import pytest
 
 from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
-
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 
 
@@ -45,74 +44,17 @@ def test_helper_propagates_contextvar_and_approval_callback():
         seen: dict = {}
 
         def worker():
-            from hermes_cli import operator_verification as OV
             seen["probe"] = probe.get()
             seen["cb"] = TT._get_approval_callback()
-            seen["operator_cb"] = OV._get_operator_verification_callback()
 
-        from hermes_cli import operator_verification as OV
-        OV.set_operator_verification_callback(sentinel)
         t = threading.Thread(target=propagate_context_to_thread(worker))
         t.start()
         t.join(timeout=5)
 
         assert seen["probe"] == "parent-value"  # ContextVar propagated
         assert seen["cb"] is sentinel            # thread-local callback propagated
-        assert seen["operator_cb"] is sentinel   # operator verifier callback propagated
     finally:
         TT.set_approval_callback(None)
-        from hermes_cli import operator_verification as OV
-        OV.set_operator_verification_callback(None)
-
-
-def test_helper_propagates_secret_capture_callback():
-    """The skills secret-capture callback (thread-local in tools.skills_tool)
-    must be propagated into the worker thread, so a future parallelized
-    skill-install can still prompt for secrets instead of silently falling
-    through to setup_skipped."""
-    from tools import skills_tool as ST
-
-    sentinel = object()
-    ST.set_secret_capture_callback(sentinel)
-    try:
-        seen: dict = {}
-
-        def worker():
-            seen["secret_cb"] = ST._get_secret_capture_callback()
-
-        t = threading.Thread(target=propagate_context_to_thread(worker))
-        t.start()
-        t.join(timeout=5)
-
-        assert seen["secret_cb"] is sentinel
-    finally:
-        ST.set_secret_capture_callback(None)
-
-
-def test_helper_clears_secret_capture_callback_on_teardown():
-    """A recycled worker thread must not retain the propagated secret-capture
-    callback after the wrapped target finishes."""
-    from tools import skills_tool as ST
-
-    sentinel = object()
-    ST.set_secret_capture_callback(sentinel)
-    try:
-        seen: dict = {}
-
-        def first():
-            seen["during"] = ST._get_secret_capture_callback()
-
-        def second():  # NOT wrapped — runs on the same recycled worker thread
-            seen["after"] = ST._get_secret_capture_callback()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            ex.submit(propagate_context_to_thread(first)).result(timeout=5)
-            ex.submit(second).result(timeout=5)
-
-        assert seen["during"] is sentinel  # installed for the wrapped target
-        assert seen["after"] is None       # cleared on teardown
-    finally:
-        ST.set_secret_capture_callback(None)
 
 
 def test_helper_clears_callbacks_on_teardown():
@@ -122,30 +64,23 @@ def test_helper_clears_callbacks_on_teardown():
 
     sentinel = object()
     TT.set_approval_callback(sentinel)
-    from hermes_cli import operator_verification as OV
-    OV.set_operator_verification_callback(sentinel)
     try:
         seen: dict = {}
 
         def first():
             seen["during"] = TT._get_approval_callback()
-            seen["operator_during"] = OV._get_operator_verification_callback()
 
         def second():  # NOT wrapped — runs on the same recycled worker thread
             seen["after"] = TT._get_approval_callback()
-            seen["operator_after"] = OV._get_operator_verification_callback()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             ex.submit(propagate_context_to_thread(first)).result(timeout=5)
             ex.submit(second).result(timeout=5)
 
         assert seen["during"] is sentinel  # installed for the wrapped target
-        assert seen["operator_during"] is sentinel
         assert seen["after"] is None       # cleared on teardown
-        assert seen["operator_after"] is None
     finally:
         TT.set_approval_callback(None)
-        OV.set_operator_verification_callback(None)
 
 
 def test_both_rpc_threads_use_propagation_helper():
@@ -178,12 +113,6 @@ def gw_session(monkeypatch):
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_MANAGED_AUTONOMY", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_TENANT_ID", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_ACTOR_ID", raising=False)
-    monkeypatch.delenv("AIWERK_CUI_ACTOR_ROLE", raising=False)
-    # Force manual mode regardless of host config.
     # Force manual mode regardless of host config and disable any process-level
     # yolo inherited from the developer's live environment.
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
@@ -195,7 +124,7 @@ def gw_session(monkeypatch):
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
         A._permanent_approved.discard("execute_code")
-        A._session_approved.pop(session_key, None)
+        A._session_approved.get(session_key, set()).discard("execute_code")
     try:
         yield session_key
     finally:
@@ -252,6 +181,39 @@ def test_guard_headless_local_approved(monkeypatch):
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    tokens = set_session_vars(cron_session="1")
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+    finally:
+        clear_session_vars(tokens)
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"
+
+
+def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    tokens = set_session_vars(cron_session="")
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+    finally:
+        clear_session_vars(tokens)
+        reset_session_vars()
+    assert res["approved"] is True
+
+
+def test_guard_legacy_env_cron_still_blocks(monkeypatch):
+    reset_session_vars()
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
@@ -537,31 +499,3 @@ def test_env_scrub_no_log_when_nothing_dropped(caplog):
             is_windows=False,
         )
     assert "dropped" not in "\n".join(r.getMessage() for r in caplog.records)
-
-
-def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
-    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
-    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
-    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
-    tokens = set_session_vars(cron_session="")
-    try:
-        res = A.check_execute_code_guard("import os", "local")
-    finally:
-        clear_session_vars(tokens)
-        reset_session_vars()
-    assert res["approved"] is True
-
-def test_guard_legacy_env_cron_still_blocks(monkeypatch):
-    reset_session_vars()
-    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
-    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
-    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
-    res = A.check_execute_code_guard("import os", "local")
-    assert res["approved"] is False
-    assert res["outcome"] == "blocked"

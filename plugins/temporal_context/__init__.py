@@ -1,26 +1,7 @@
-"""Neutral temporal context plugin for Hermes.
-
-The plugin injects the current local time into the current user turn at
-API-call time via the ``pre_llm_call`` hook. It is intentionally config-driven:
-no user name, tenant name, locale, or timezone is hardcoded in this module.
-
-Example config.yaml::
-
-    plugins:
-      enabled: [temporal_context]
-    temporal_context:
-      enabled: true
-      timezone: America/New_York
-      display_name: "Operator"
-      relative_time_warning: true
-      output_guard:
-        enabled: false
-        replacements: []
-"""
+"""Deterministic per-turn local temporal context for Hermes."""
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -30,18 +11,15 @@ _DEFAULT_WARNING = (
     "Relative time/daypart claims require an explicit timestamp from tools, "
     "messages, or provided context."
 )
-_TIMESTAMP_RE = re.compile(
-    r"(\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}\.\d{2}\b|"
-    r"\b\d{1,2}\s*(?:AM|PM|am|pm)\b|\bUTC\b|\bCEST\b|\bCET\b|\bGMT\b|[+-]\d{4}\b)"
-)
+_CONTEXT_MARKER = "[Temporal context:"
+_CONTEXT_KEY = "temporal_current_origin"
 
 
 def _load_plugin_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import cfg_get, load_config
 
-        cfg = load_config()
-        raw = cfg_get(cfg, "temporal_context", default={})
+        raw = cfg_get(load_config(), "temporal_context", default={})
         return raw if isinstance(raw, dict) else {}
     except Exception:
         return {}
@@ -59,27 +37,44 @@ def _truthy(value: Any, *, default: bool = False) -> bool:
     return default
 
 
+def _text(value: Any, default: str = "") -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
 def _settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    cfg: Mapping[str, Any] = config if config is not None else _load_plugin_config()
-    timezone_name = str(cfg.get("timezone") or _DEFAULT_TIMEZONE).strip() or _DEFAULT_TIMEZONE
-    display_name = str(cfg.get("display_name") or "").strip()
-    warning_enabled = _truthy(cfg.get("relative_time_warning"), default=True)
-    enabled = _truthy(cfg.get("enabled"), default=True)
+    cfg: Mapping[str, Any]
+    if config is None:
+        cfg = _load_plugin_config()
+    elif isinstance(config, Mapping):
+        cfg = config
+    else:
+        cfg = {}
     return {
-        "enabled": enabled,
-        "timezone": timezone_name,
-        "display_name": display_name,
-        "relative_time_warning": warning_enabled,
-        "warning": str(cfg.get("warning") or _DEFAULT_WARNING).strip() or _DEFAULT_WARNING,
-        "output_guard": cfg.get("output_guard") if isinstance(cfg.get("output_guard"), dict) else {},
+        "enabled": _truthy(cfg.get("enabled"), default=True),
+        "timezone": _text(cfg.get("timezone"), _DEFAULT_TIMEZONE),
+        "display_name": _text(cfg.get("display_name")),
+        "relative_time_warning": _truthy(
+            cfg.get("relative_time_warning"), default=True
+        ),
+        "warning": _text(cfg.get("warning"), _DEFAULT_WARNING),
     }
 
 
-def _zoneinfo(timezone_name: str) -> ZoneInfo:
+def _zoneinfo(timezone_name: str) -> ZoneInfo | None:
     try:
         return ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo(_DEFAULT_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return None
+
+
+def _daypart(hour: int) -> str:
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 21:
+        return "evening"
+    return "night"
 
 
 def build_temporal_context(
@@ -87,27 +82,28 @@ def build_temporal_context(
     now: datetime | None = None,
     config: Mapping[str, Any] | None = None,
 ) -> str | None:
-    """Build an ephemeral temporal-context block, or ``None`` when disabled.
-
-    ``now`` is injectable for tests. Naive datetimes are treated as UTC.
-    """
+    """Build a local-time context block from an aware runtime timestamp."""
 
     settings = _settings(config)
     if not settings["enabled"]:
         return None
 
-    tz_name = settings["timezone"]
-    tz = _zoneinfo(tz_name)
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    local = current.astimezone(tz)
+    current = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(current, datetime) or current.tzinfo is None:
+        return None
+
+    timezone_name = settings["timezone"]
+    zone = _zoneinfo(timezone_name)
+    if zone is None:
+        return None
+    local = current.astimezone(zone)
     rendered = local.strftime("%Y-%m-%d %H:%M %Z (%z)")
 
     label = f" for {settings['display_name']}" if settings["display_name"] else ""
     parts = [
-        f"[Temporal context: current local time{label} is {rendered}.",
-        f"Time zone: {tz_name}.",
+        f"{_CONTEXT_MARKER} current local time{label} is {rendered}.",
+        f"Time zone: {timezone_name}.",
+        f"Daypart: {_daypart(local.hour)}.",
     ]
     if settings["relative_time_warning"]:
         parts.append(settings["warning"])
@@ -115,78 +111,14 @@ def build_temporal_context(
 
 
 def pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
-    """Hermes ``pre_llm_call`` hook: append context to the current user message."""
+    """Inject temporal context into the current API-bound user turn."""
 
     context = build_temporal_context(
         now=kwargs.get("now"),
         config=kwargs.get("config"),
     )
-    if not context:
-        return None
-    return {"context": context}
-
-
-def _has_explicit_timestamp(text: str) -> bool:
-    return bool(_TIMESTAMP_RE.search(text))
-
-
-def _regex_flags(item: Mapping[str, Any]) -> int:
-    raw = item.get("flags")
-    names: list[str]
-    if isinstance(raw, str):
-        names = [part.strip().lower() for part in raw.split("|")]
-    elif isinstance(raw, list):
-        names = [str(part).strip().lower() for part in raw]
-    else:
-        names = []
-    flags = 0
-    if "ignorecase" in names or "i" in names:
-        flags |= re.IGNORECASE
-    if "multiline" in names or "m" in names:
-        flags |= re.MULTILINE
-    return flags
-
-
-def transform_llm_output(text: str | None = None, **kwargs: Any) -> str:
-    """Optional conservative output transform configured entirely by the user.
-
-    Defaults to no-op. Hermes calls this hook with ``response_text=...``;
-    tests may pass ``text`` positionally. If enabled, applies literal/regex
-    replacements supplied under ``temporal_context.output_guard.replacements``.
-    By default the guard skips rewrites when the answer already contains an
-    explicit timestamp, so grounded temporal claims are preserved.
-    """
-
-    source_text = text if text is not None else str(kwargs.get("response_text") or "")
-    cfg = kwargs.get("config") if isinstance(kwargs.get("config"), Mapping) else _load_plugin_config()
-    settings = _settings(cfg)
-    guard = settings.get("output_guard") or {}
-    if not _truthy(guard.get("enabled"), default=False):
-        return source_text
-    if _truthy(guard.get("skip_if_explicit_timestamp"), default=True) and _has_explicit_timestamp(source_text):
-        return source_text
-    replacements = guard.get("replacements")
-    if not isinstance(replacements, list):
-        return source_text
-
-    result = source_text
-    for item in replacements:
-        if not isinstance(item, Mapping):
-            continue
-        pattern = item.get("pattern")
-        replacement = item.get("replacement")
-        if not isinstance(pattern, str) or not isinstance(replacement, str):
-            continue
-        if _truthy(item.get("regex"), default=False):
-            try:
-                result = re.sub(pattern, replacement, result, flags=_regex_flags(item))
-            except re.error:
-                continue
-        else:
-            result = result.replace(pattern, replacement)
-    return result
+    return {"context": context, "context_key": _CONTEXT_KEY} if context else None
 
 
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", pre_llm_call)
-    ctx.register_hook("transform_llm_output", transform_llm_output)

@@ -35,26 +35,6 @@ client = TestClient(app)
 HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
 
 
-@pytest.fixture(autouse=True)
-def _reset_dashboard_auth_state():
-    from hermes_cli import web_server as ws
-
-    global HEADERS
-    previous = getattr(app.state, "auth_required", None)
-    app.state.auth_required = False
-    HEADERS = {"X-Hermes-Session-Token": ws._SESSION_TOKEN}
-    try:
-        yield
-    finally:
-        if previous is None:
-            try:
-                delattr(app.state, "auth_required")
-            except AttributeError:
-                pass
-        else:
-            app.state.auth_required = previous
-
-
 def _make_profile_home(tmp_path, monkeypatch, profile="coder"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     profile_home = tmp_path / "profiles" / profile

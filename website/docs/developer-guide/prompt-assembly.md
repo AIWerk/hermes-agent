@@ -174,14 +174,7 @@ When `load_soul_md()` returns content, it replaces the hardcoded `DEFAULT_AGENT_
 If `SOUL.md` doesn't exist, the system falls back to:
 
 ```
-You are Hermes Agent, an intelligent AI assistant created by Nous Research.
-You are helpful, knowledgeable, direct, and concise. You assist users with a wide
-range of tasks including answering questions, writing and editing code,
-analyzing information, creative work, and executing actions via your tools.
-Optimize for useful signal over verbosity: keep answers tight, summarize tool
-outputs instead of pasting long raw logs, and avoid unnecessary explanation.
-Be targeted and token-efficient in your exploration and investigations.
-When the conversation context is close to the limit, warn the user briefly.
+You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, direct, and concise. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Optimize for useful signal over verbosity: keep answers tight, summarize tool outputs instead of pasting long raw logs, and avoid unnecessary explanation. Be targeted and token-efficient in your exploration and investigations. When the conversation context is close to the limit, warn the user briefly.
 ```
 
 ## How context files are injected
@@ -233,7 +226,7 @@ def build_context_files_prompt(cwd=None, skip_soul=False):
 
 All context files are:
 - **Security scanned** — checked for prompt injection patterns (invisible unicode, "ignore previous instructions", credential exfiltration attempts)
-- **Truncated** — capped at `context_file_max_chars` characters using a 70/20 head/tail split with a truncation marker. The cap scales with the model's context window (81,920-char floor, 500K ceiling); an explicit `context_file_max_chars` in `config.yaml` always wins.
+- **Truncated** — capped at `context_file_max_chars` characters using a 70/20 head/tail split with a truncation marker. The cap scales with the model's context window (20,000-char floor, 500K ceiling); an explicit `context_file_max_chars` in `config.yaml` always wins.
 - **YAML frontmatter stripped** — `.hermes.md` frontmatter is removed (reserved for future config overrides)
 
 ## API-call-time-only layers

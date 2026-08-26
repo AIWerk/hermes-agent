@@ -8,7 +8,6 @@ blocks completion, and never upgrades targeted checks into "repo green".
 from __future__ import annotations
 
 import json
-import re
 import shlex
 import sqlite3
 import tempfile
@@ -29,7 +28,12 @@ _MAX_EVENTS_PER_SESSION_ROOT = 100
 _MAX_TOTAL_UNREFERENCED_EVENTS = 10_000
 _AD_HOC_SCRIPT_NAME_PREFIXES = ("hermes-verify-", "hermes-ad-hoc-")
 _VERIFY_SCHEMA_VERSION = 1
-_SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
+
+
+@dataclass(frozen=True)
+class _ShellSegment:
+    tokens: list[str]
+    following_operator: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,18 +154,102 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _split_segment_tokens(command: str, *, posix: bool = True) -> list[list[str]]:
-    segments: list[list[str]] = []
-    for segment in _SHELL_SPLIT_RE.split(command.strip()):
-        if not segment:
+def _split_shell_segments(command: str, *, posix: bool = True) -> list[_ShellSegment]:
+    """Tokenize top-level shell commands while preserving their control operators."""
+    raw_segments: list[tuple[str, str | None]] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
             continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+
+        operator = None
+        if command.startswith(("&&", "||", "|&"), index):
+            operator = command[index:index + 2]
+        elif char == "\n":
+            operator = ";"
+        elif char in ";|":
+            operator = char
+        elif (
+            char == "&"
+            and (index == 0 or command[index - 1] not in "<>")
+            and not command.startswith(("&>", "&>>"), index)
+        ):
+            operator = char
+
+        if operator is None:
+            index += 1
+            continue
+
+        raw = command[start:index].strip()
+        if not raw:
+            return []
+        raw_segments.append((raw, operator))
+        index += 1 if char == "\n" else len(operator)
+        start = index
+
+    if quote or escaped:
+        return []
+    trailing = command[start:].strip()
+    if trailing:
+        raw_segments.append((trailing, None))
+    elif raw_segments and raw_segments[-1][1] not in {";"}:
+        return []
+
+    segments: list[_ShellSegment] = []
+    for raw, operator in raw_segments:
         try:
-            tokens = shlex.split(segment, posix=posix)
+            tokens = shlex.split(raw, posix=posix)
         except ValueError:
-            continue
-        if tokens:
-            segments.append(tokens)
+            return []
+        if not tokens:
+            return []
+        segments.append(_ShellSegment(tokens=tokens, following_operator=operator))
     return segments
+
+
+def _exit_status_is_attributable(
+    segments: list[_ShellSegment], match_index: int, exit_code: int
+) -> bool:
+    """Whether the shell's status proves the matched segment's own status."""
+    if not segments or not 0 <= match_index < len(segments):
+        return False
+    if any(segment.following_operator == "&" for segment in segments):
+        return False
+
+    sequence_start = 0
+    for index, segment in enumerate(segments[:-1]):
+        if segment.following_operator == ";":
+            sequence_start = index + 1
+    if match_index < sequence_start:
+        return False
+
+    sequence = segments[sequence_start:]
+    operators = [segment.following_operator for segment in sequence[:-1]]
+    if any(operator in {"|", "|&", "||"} for operator in operators):
+        return False
+    if len(sequence) == 1:
+        return True
+    return int(exit_code) == 0 and all(operator == "&&" for operator in operators)
 
 
 def _clean_token(token: str) -> str:
@@ -225,44 +313,58 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     return candidates
 
 
-def _effective_cwd_from_leading_cd(command: str, cwd: str | Path | None) -> str | Path | None:
-    """Return the shell cwd after a leading ``cd ... &&`` segment, if present.
+def _proven_segment_cwds(
+    command: str, cwd: str | Path | None
+) -> tuple[list[_ShellSegment], list[Path]]:
+    """Return parsed shell segments and the proven cwd before each segment.
 
-    The terminal tool records evidence with the tool worker cwd, but agents often
-    run checks as ``cd /repo && pytest ...``. Resolve that leading ``cd`` so the
-    verification ledger reads project facts from the checked repo instead of the
-    caller's outer directory.
+    Directory changes are accepted only as simple ``cd/chdir TARGET &&``
+    prerequisites. This lets the classifier apply prefixed and repeated changes
+    in order while rejecting semicolon, ``||``, argumentless, and stateful
+    forms whose success or target is not proven by the final shell status.
     """
-    segments = _split_segment_tokens(command)
+    segments = _split_shell_segments(command)
     if not segments:
-        return cwd
-    first = _strip_command_prefix(segments[0])
-    if len(first) < 2 or first[0] not in {"cd", "chdir"}:
-        return cwd
-    target = first[1]
-    if target in {"-", "--"}:
-        return cwd
-    try:
+        raise ValueError("unparseable shell command")
+
+    current = Path(cwd or ".").expanduser().resolve()
+    segment_cwds: list[Path] = []
+    for segment in segments:
+        segment_cwds.append(current)
+        first = _strip_command_prefix(segment.tokens)
+        if not first or first[0] not in {"cd", "chdir"}:
+            continue
+        if segment.following_operator != "&&" or len(first) != 2:
+            raise ValueError("unproven directory change")
+        target = first[1]
+        if target in {"-", "--"}:
+            raise ValueError("state-dependent directory change")
         path = Path(target).expanduser()
         if not path.is_absolute():
-            path = Path(cwd or ".").expanduser() / path
-        return path.resolve()
-    except Exception:
-        return cwd
+            path = current / path
+        current = path.resolve()
+    return segments, segment_cwds
 
 
-def _find_canonical_match(command: str, canonical_commands: list[str]) -> Optional[tuple[str, list[str]]]:
+def _find_canonical_match(
+    command: str,
+    canonical_commands: list[str],
+    exit_code: int,
+) -> Optional[tuple[str, list[str]]]:
     """Return ``(canonical, trailing_args)`` for the first detected command."""
 
-    segments = _split_segment_tokens(command)
+    segments = _split_shell_segments(command)
     for canonical in canonical_commands:
         needle = _canonical_tokens(canonical)
         if not needle:
             continue
-        for tokens in segments:
-            candidate_tokens = _strip_command_prefix(tokens)
+        for index, segment in enumerate(segments):
+            candidate_tokens = _strip_command_prefix(segment.tokens)
             for candidate in _equivalent_needles(needle):
-                if candidate_tokens[:len(candidate)] == candidate:
+                if (
+                    candidate_tokens[:len(candidate)] == candidate
+                    and _exit_status_is_attributable(segments, index, exit_code)
+                ):
                     return canonical, candidate_tokens[len(candidate):]
     return None
 
@@ -353,13 +455,20 @@ def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> Optional[
     return None
 
 
-def _find_ad_hoc_match(command: str, root: str | Path | None) -> Optional[list[str]]:
+def _find_ad_hoc_match(
+    command: str,
+    root: str | Path | None,
+    exit_code: int = 0,
+) -> Optional[list[str]]:
     # Try both posix=True (default) and posix=False (Windows backslash paths)
     # so ad-hoc verification scripts with backslash paths are matched on Windows.
     for posix in (True, False):
-        for tokens in _split_segment_tokens(command, posix=posix):
-            trailing_args = _ad_hoc_script_args(tokens, root)
-            if trailing_args is not None:
+        segments = _split_shell_segments(command, posix=posix)
+        for index, segment in enumerate(segments):
+            trailing_args = _ad_hoc_script_args(segment.tokens, root)
+            if trailing_args is not None and _exit_status_is_attributable(
+                segments, index, exit_code
+            ):
                 return trailing_args
     return None
 
@@ -454,38 +563,60 @@ def classify_verification_command(
     try:
         from agent.coding_context import project_facts_for
 
-        effective_cwd = _effective_cwd_from_leading_cd(command, cwd)
-        facts = project_facts_for(effective_cwd)
+        segments, segment_cwds = _proven_segment_cwds(command, cwd)
     except Exception:
-        effective_cwd = cwd
-        facts = None
-    if not facts:
         return None
 
-    verify_commands = list(facts.get("verifyCommands") or [])
-    match = _find_canonical_match(command, verify_commands)
-    is_ad_hoc = False
-    if match is None and not verify_commands:
-        ad_hoc_args = _find_ad_hoc_match(command, facts.get("root"))
-        if ad_hoc_args is not None:
-            match = ("ad-hoc verification script", ad_hoc_args)
-            is_ad_hoc = True
-    if match is None:
-        return None
+    for index, (segment, effective_cwd) in enumerate(zip(segments, segment_cwds)):
+        try:
+            facts = project_facts_for(effective_cwd)
+        except Exception:
+            facts = None
+        if not facts:
+            continue
 
-    canonical, trailing_args = match
-    return VerificationEvidence(
-        command=command,
-        canonical_command=canonical,
-        kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
-        scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
-        status="passed" if int(exit_code) == 0 else "failed",
-        exit_code=int(exit_code),
-        cwd=str(Path(effective_cwd or ".").resolve()),
-        root=str(facts.get("root") or Path(effective_cwd or ".").resolve()),
-        session_id=str(session_id or "default"),
-        output_summary=_summarize_output(output),
-    )
+        match: Optional[tuple[str, list[str]]] = None
+        is_ad_hoc = False
+        verify_commands = list(facts.get("verifyCommands") or [])
+        candidate_tokens = _strip_command_prefix(segment.tokens)
+        for canonical in verify_commands:
+            needle = _canonical_tokens(canonical)
+            if not needle:
+                continue
+            for candidate in _equivalent_needles(needle):
+                if (
+                    candidate_tokens[:len(candidate)] == candidate
+                    and _exit_status_is_attributable(segments, index, int(exit_code))
+                ):
+                    match = (canonical, candidate_tokens[len(candidate):])
+                    break
+            if match is not None:
+                break
+
+        if match is None and not verify_commands:
+            ad_hoc_args = _ad_hoc_script_args(segment.tokens, facts.get("root"))
+            if ad_hoc_args is not None and _exit_status_is_attributable(
+                segments, index, int(exit_code)
+            ):
+                match = ("ad-hoc verification script", ad_hoc_args)
+                is_ad_hoc = True
+        if match is None:
+            continue
+
+        canonical, trailing_args = match
+        return VerificationEvidence(
+            command=command,
+            canonical_command=canonical,
+            kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
+            scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
+            status="passed" if int(exit_code) == 0 else "failed",
+            exit_code=int(exit_code),
+            cwd=str(effective_cwd),
+            root=str(facts.get("root") or effective_cwd),
+            session_id=str(session_id or "default"),
+            output_summary=_summarize_output(output),
+        )
+    return None
 
 
 def record_terminal_result(

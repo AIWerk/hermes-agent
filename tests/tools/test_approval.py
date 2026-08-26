@@ -13,18 +13,102 @@ import tools.approval as approval_module
 from hermes_constants import get_hermes_home
 from tools.approval import (
     _get_approval_mode,
-    _is_cui_managed_autonomy_enabled,
     _normalize_approval_mode,
     _smart_approve,
     approve_session,
-    check_all_command_guards,
-    check_execute_code_guard,
     detect_dangerous_command,
     detect_hardline_command,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
 )
+
+
+def test_requires_flag_and_authenticated_actor_context(monkeypatch):
+    cases = (
+        (False, "operator-1", "operator"),
+        (True, "", "operator"),
+        (True, "operator-1", ""),
+    )
+    for context in cases:
+        monkeypatch.setattr(
+            approval_module, "_MANAGED_AUTONOMY_CONTEXT_FROZEN", context
+        )
+        assert approval_module._managed_autonomy_authorized() is False
+
+    monkeypatch.setattr(
+        approval_module,
+        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+        (True, "operator-1", "operator"),
+    )
+    assert approval_module._managed_autonomy_authorized() is True
+
+
+def test_lay_customer_roles_do_not_get_managed_autonomy(monkeypatch):
+    for role in (
+        "customer",
+        "user",
+        "support",
+        "internal",
+        "server-internal",
+        "admin-dashboard",
+    ):
+        monkeypatch.setattr(
+            approval_module,
+            "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+            (True, "actor-1", role),
+        )
+        assert approval_module._managed_autonomy_authorized() is False
+
+
+def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        approval_module,
+        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+        (True, "operator-1", "operator"),
+    )
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: True)
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+
+    managed = approval_module.check_all_command_guards(
+        'python -c "print(1)"', "local"
+    )
+    hardline = approval_module.check_all_command_guards("rm -rf /", "local")
+
+    assert managed["approved"] is True
+    assert managed["managed_autonomy"] is True
+    assert hardline["approved"] is False
+    assert hardline.get("hardline") is True
+
+
+def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(monkeypatch):
+    monkeypatch.setattr(
+        approval_module,
+        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+        (True, "operator-1", "admin"),
+    )
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    approval_module._gateway_notify_cbs.clear()
+
+    result = approval_module.check_execute_code_guard(
+        "from pathlib import Path\nPath('changed.txt').write_text('changed')",
+        "local",
+    )
+
+    assert result["approved"] is False
+    assert result["status"] == "pending_approval"
 
 
 class TestApprovalModeParsing:
@@ -84,107 +168,6 @@ class TestSmartApproval:
         assert result["approved"] is True
         assert result["smart_approved"] is True
         assert is_approved(session_key, pattern_key) is False
-
-
-class TestCuiManagedAutonomy:
-    def test_requires_flag_and_authenticated_actor_context(self, monkeypatch):
-        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv(
-            "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"example-tenant","actor_id":"example-tenant:operator","role":"operator"}',
-        )
-        assert _is_cui_managed_autonomy_enabled() is True
-
-        monkeypatch.delenv("AIWERK_CUI_ACTOR_CONTEXT")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:operator")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
-        assert _is_cui_managed_autonomy_enabled() is True
-
-        monkeypatch.delenv("AIWERK_CUI_ACTOR_ID")
-        assert _is_cui_managed_autonomy_enabled() is False
-
-    def test_actor_context_reads_through_canonical_helper(self, monkeypatch):
-        """approval._cui_actor_context() must source identity from the canonical
-        agent.cui_actor_context helper (env-driven here; ContextVar-backed once
-        PR-2 lands), not re-parse os.environ itself."""
-        monkeypatch.setenv(
-            "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"example-tenant","actor_id":"example-tenant:operator","role":"operator"}',
-        )
-        # The helper is the single source of truth for the actor dict.
-        from agent.cui_actor_context import current_cui_actor_context
-
-        assert approval_module._cui_actor_context() == current_cui_actor_context()
-        assert approval_module._cui_actor_context()["actor_id"] == "example-tenant:operator"
-
-        # Delegation, not a private re-parse: stubbing the helper changes what
-        # approval sees, proving it does not read os.environ directly.
-        monkeypatch.setattr(
-            "agent.cui_actor_context.current_cui_actor_context",
-            lambda: {"tenant_id": "t2", "actor_id": "a2", "role": "admin"},
-        )
-        assert approval_module._cui_actor_context() == {
-            "tenant_id": "t2",
-            "actor_id": "a2",
-            "role": "admin",
-        }
-
-    def test_lay_customer_roles_do_not_get_managed_autonomy(self, monkeypatch):
-        """'user'/'tenant_user' are customers, not operators — no bypass."""
-        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:user")
-        for role in ("user", "tenant_user"):
-            monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", role)
-            assert _is_cui_managed_autonomy_enabled() is False
-
-    def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(self, monkeypatch):
-        monkeypatch.setenv("HERMES_EXEC_ASK", "true")
-        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv(
-            "AIWERK_CUI_ACTOR_CONTEXT",
-            '{"tenant_id":"example-tenant","actor_id":"example-tenant:operator","role":"operator"}',
-        )
-
-        approved = check_all_command_guards("rm -rf /tmp/hermes-demo", "local")
-        assert approved["approved"] is True
-        assert approved["policy_scoped_autonomy"] is True
-
-        blocked = check_all_command_guards("rm -rf /", "local")
-        assert blocked["approved"] is False
-        assert blocked.get("hardline") is True
-
-    def test_execute_code_auto_approves_low_risk_public_reads_in_cui_autonomy(self, monkeypatch):
-        monkeypatch.setenv("HERMES_EXEC_ASK", "true")
-        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:operator")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
-
-        code = """
-from hermes_tools import terminal
-result = terminal("curl -sS 'https://api.open-meteo.com/v1/forecast?latitude=46.95&longitude=7.44'")
-print(result)
-"""
-        with mock_patch("tools.approval._is_public_http_url", return_value=True):
-            result = check_execute_code_guard(code, "local")
-        assert result["approved"] is True
-        assert result["policy_scoped_autonomy"] is True
-        assert result["low_risk_cui_read"] is True
-
-    def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(self, monkeypatch):
-        monkeypatch.setenv("HERMES_EXEC_ASK", "true")
-        monkeypatch.setenv("AIWERK_CUI_MANAGED_AUTONOMY", "1")
-        monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "example-tenant")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "example-tenant:operator")
-        monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
-
-        with mock_patch("tools.approval._get_approval_mode", return_value="manual"), \
-            mock_patch.object(approval_module, "_permanent_approved", set()):
-            result = check_execute_code_guard("open('/tmp/x', 'w').write('ok')", "local")
-        assert result["approved"] is False
-        assert result["status"] == "pending_approval"
 
 
 class TestDetectDangerousRm:
@@ -656,12 +639,11 @@ class TestPatternKeyUniqueness:
         )
         session = "test_find_collision"
         _clear_session(session)
-        with mock_patch.object(approval_module, "_permanent_approved", set()):
-            approve_session(session, key_exec)
-            assert is_approved(session, key_exec) is True
-            assert is_approved(session, key_delete) is False, (
-                "approving find -exec rm should not auto-approve find -delete"
-            )
+        approve_session(session, key_exec)
+        assert is_approved(session, key_exec) is True
+        assert is_approved(session, key_delete) is False, (
+            "approving find -exec rm should not auto-approve find -delete"
+        )
         _clear_session(session)
 
     def test_legacy_find_key_still_approves_both_variants(self):
@@ -953,6 +935,52 @@ class TestLaunchctlGatewayLifecycle:
         ):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
+
+    def test_quote_spliced_verbs_detected(self):
+        """#80269: the shell joins ``kick"start"`` into the literal verb
+        ``kickstart`` before execution, so the spliced form runs exactly as
+        the gated one. Backslash splices already normalized here; quote
+        splices sit in an argument position that word-scoped deobfuscation
+        deliberately does not touch, so they auto-approved.
+        """
+        for cmd in (
+            'launchctl kick"start" -k gui/501/ai.hermes.gateway',
+            "launchctl kick'start' -k gui/501/ai.hermes.gateway",
+            'launchctl boot"out" gui/501/ai.hermes.gateway',
+            'launchctl bootout gui/501/ai.hermes."gateway"',
+            'hermes gateway re"start"',
+            'systemctl re"start" hermes-gateway',
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+
+    def test_spliced_detection_does_not_flag_prose_or_other_services(self):
+        """The splice pass must not widen the blast radius: it is anchored on
+        a hermes-gateway identifier, so quoted prose and non-gateway hermes
+        services stay auto-approved."""
+        for cmd in (
+            'launchctl kick"start" -k gui/501/ai.hermes.update-checker',
+            'echo "restart the payment gateway"',
+            'git commit -m "document the api gateway restart flow"',
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+    def test_label_built_before_verb_detected(self):
+        """2026-08-02 incident: the label was defined in a shell for-loop
+        BEFORE the `launchctl bootout` call, referenced only via a `$label`
+        variable at the point of the verb. The old sequential regex required
+        "hermes"/"ai.hermes" to appear AFTER the verb and missed this
+        entirely, restarting 4 gateways with zero approval."""
+        cmd = (
+            "uid=$(id -u); for item in 'ai.hermes.gateway-apollo:/a.plist' "
+            "'ai.hermes.gateway:/Users/botuser/Library/LaunchAgents/ai.hermes.gateway.plist'; "
+            "do label=${item%%:*}; plist=${item#*:}; "
+            'launchctl bootout "gui/$uid/$label"; '
+            'launchctl bootstrap "gui/$uid" "$plist"; done'
+        )
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True, cmd
+        assert "launchd" in desc.lower()
 
 
 class TestGitDestructiveOps:
@@ -1252,12 +1280,9 @@ class TestApprovalTimeoutIsNotConsent:
         os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
-        self._approval_session_token = mod.set_current_session_key(self.SESSION_KEY)
 
     def teardown_method(self):
         from tools import approval as mod
-        if hasattr(self, "_approval_session_token"):
-            mod.reset_current_session_key(self._approval_session_token)
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         for k, v in self._saved_env.items():
@@ -1476,6 +1501,162 @@ class TestApprovalTimeoutIsNotConsent:
         ) == 1
         thread.join(timeout=5)
         assert result_holder["result"]["approved"] is False
+
+
+# =========================================================================
+# Coalesce identical concurrent approvals — one prompt, one answer.
+# Port of anomalyco/opencode#40869 (deduplicate websearch consent prompts):
+# parallel tool calls hitting the same dangerous-command gate must produce
+# ONE user-facing prompt; followers adopt the leader's session/always/deny
+# decision, while a single-use "once" makes the follower re-prompt.
+# =========================================================================
+
+
+class TestConcurrentApprovalCoalescing:
+    SESSION_KEY = "test-coalesce-session"
+
+    def setup_method(self):
+        from tools import approval as mod
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+
+    teardown_method = setup_method
+
+    def _data(self, command="rm -rf .git"):
+        return {
+            "command": command,
+            "description": "desc",
+            "pattern_key": "dangerous",
+            "pattern_keys": ["dangerous"],
+        }
+
+    def _spawn_waits(self, mod, notified, n=2, command="rm -rf .git"):
+        import threading
+        results = [None] * n
+        threads = []
+        for i in range(n):
+            def _run(idx=i):
+                results[idx] = mod._await_gateway_decision(
+                    self.SESSION_KEY, notified.append, self._data(command)
+                )
+            t = threading.Thread(target=_run)
+            t.start()
+            threads.append(t)
+            if i == 0:
+                # Wait for the leader to enqueue AND for its notify_cb to
+                # fire (the pre-approval hook dispatch runs between the
+                # queue append and the notify, and can be slow on first
+                # call) so follower threads deterministically find it and
+                # coalesce against a fully-presented prompt.
+                for _ in range(400):
+                    if mod._gateway_queues.get(self.SESSION_KEY) and notified:
+                        break
+                    time.sleep(0.005)
+            else:
+                # Followers never enqueue; give the thread a beat to reach
+                # the leader wait.
+                time.sleep(0.05)
+        return results, threads
+
+    def test_identical_concurrent_approvals_send_one_prompt(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+
+        notified = []
+        results, threads = self._spawn_waits(mod, notified, n=3)
+
+        # Only the leader is in the queue; only one notify fired.
+        assert len(mod._gateway_queues.get(self.SESSION_KEY, [])) == 1
+        assert len(notified) == 1
+
+        # One answer resolves everyone.
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "session") == 1
+        for t in threads:
+            t.join(timeout=5)
+        for r in results:
+            assert r is not None and r["resolved"] and r["choice"] == "session"
+        # Followers are marked as coalesced adoptions.
+        assert sum(1 for r in results if r.get("coalesced")) == 2
+
+    def test_deny_propagates_to_followers(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+
+        notified = []
+        results, threads = self._spawn_waits(mod, notified, n=2)
+        assert len(notified) == 1
+
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny", reason="nope")
+        for t in threads:
+            t.join(timeout=5)
+        for r in results:
+            assert r is not None and r["choice"] == "deny"
+        follower = next(r for r in results if r.get("coalesced"))
+        assert follower["reason"] == "nope"
+
+    def test_once_makes_follower_reprompt(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+
+        notified = []
+        results, threads = self._spawn_waits(mod, notified, n=2)
+        assert len(notified) == 1
+
+        # "once" covers only the leader — the follower must re-prompt.
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        for _ in range(400):
+            if len(notified) == 2:
+                break
+            time.sleep(0.01)
+        assert len(notified) == 2, "follower did not issue a fresh prompt after 'once'"
+
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        for t in threads:
+            t.join(timeout=5)
+        assert all(r is not None and r["choice"] == "once" for r in results)
+
+    def test_different_commands_are_not_coalesced(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+        import threading
+
+        notified = []
+        results = [None, None]
+
+        def _run(idx, cmd):
+            results[idx] = mod._await_gateway_decision(
+                self.SESSION_KEY, notified.append, self._data(cmd)
+            )
+
+        t1 = threading.Thread(target=_run, args=(0, "rm -rf .git"))
+        t1.start()
+        for _ in range(200):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.005)
+        t2 = threading.Thread(target=_run, args=(1, "rm -rf /tmp/x"))
+        t2.start()
+        for _ in range(200):
+            if len(mod._gateway_queues.get(self.SESSION_KEY, [])) == 2:
+                break
+            time.sleep(0.005)
+        # notify_cb fires after the queue append (hook dispatch runs in
+        # between and can be slow on first call) — wait for both prompts.
+        for _ in range(1000):
+            if len(notified) == 2:
+                break
+            time.sleep(0.005)
+
+        # Two distinct prompts, two queue entries, two resolutions needed.
+        assert len(notified) == 2
+        assert len(mod._gateway_queues.get(self.SESSION_KEY, [])) == 2
+        mod.resolve_gateway_approval(self.SESSION_KEY, "session", resolve_all=True)
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert all(r is not None and r["choice"] == "session" for r in results)
+
 
 class TestTirithImportErrorFailOpenPolicy:
     """Regression guard for #20733.
@@ -1734,3 +1915,73 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+# launchd verbs that stop, unload or deregister a running gateway. `disable`
+# does not stop a live job on its own, but it is what makes an unload survive
+# a reboot, so it belongs to the same family.
+GATEWAY_LIFECYCLE_LAUNCHCTL = (
+    "launchctl kickstart -k gui/501/ai.hermes.gateway",
+    "launchctl unload ~/Library/LaunchAgents/ai.hermes.gateway.plist",
+    "launchctl load ~/Library/LaunchAgents/ai.hermes.gateway.plist",
+    "launchctl stop ai.hermes.gateway",
+    "launchctl restart ai.hermes.gateway",
+    "launchctl bootout gui/501/ai.hermes.gateway",
+    "launchctl remove ai.hermes.gateway",
+    "launchctl disable gui/501/ai.hermes.gateway",
+)
+
+
+class TestLifecycleGuardLaunchctlParity:
+    """The in-gateway hard block must cover every launchd verb the approval
+    layer already treats as gateway lifecycle.
+
+    These two layers are not interchangeable. In ``tools/terminal_tool.py``
+    under ``_HERMES_GATEWAY == "1"``, the ``cron.lifecycle_guard`` block is
+    documented as applying unconditionally ("force=True cannot help here"),
+    while ``detect_dangerous_command`` below it is explicitly skipped when
+    ``force=True``. A verb covered only by the approval layer is therefore
+    reachable from inside the gateway, where SIGTERM propagates to the child
+    before the command completes and the service may never come back (#74973).
+
+    ``bootout`` was missing exactly this way: it is the modern replacement for
+    the ``unload`` the guard already listed. See #80260.
+    """
+
+    def test_hard_block_covers_every_lifecycle_verb(self):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        for cmd in GATEWAY_LIFECYCLE_LAUNCHCTL:
+            assert contains_gateway_lifecycle_command(cmd) is True, cmd
+
+    def test_bypassable_layer_is_never_stricter(self):
+        """One-directional invariant: anything ``detect_dangerous_command``
+        flags as gateway lifecycle, the hard block must also catch.
+
+        Not equality — the hard block is legitimately stricter (it also covers
+        ``load``/``restart``, which the approval layer leaves alone). What must
+        never happen is the reverse: a command stopped only by the layer that
+        ``force=True`` skips, leaving no cover inside the gateway."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        for cmd in GATEWAY_LIFECYCLE_LAUNCHCTL:
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            if not dangerous:
+                continue
+            assert contains_gateway_lifecycle_command(cmd) is True, (
+                f"approval layer flags this but the unbypassable hard block "
+                f"does not: {cmd}"
+            )
+
+    def test_unrelated_labels_are_not_blocked(self):
+        """The label anchor must still scope this to the gateway — unrelated
+        services, including other Hermes ones, stay runnable."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        for cmd in (
+            "launchctl bootout gui/501/com.example.unrelated",
+            "launchctl remove ai.hermes.update-checker",
+            "launchctl disable gui/501/com.apple.WindowServer",
+            "launchctl print system/com.apple.WindowServer",
+        ):
+            assert contains_gateway_lifecycle_command(cmd) is False, cmd

@@ -33,26 +33,6 @@ class EditProposal:
     arguments: dict[str, Any]
 
 
-def project_edit_proposal_for_display(proposal: EditProposal) -> EditProposal:
-    """Return a credential-redacted ACP-only view of an internal edit proposal."""
-    from agent.tool_argument_projection import (
-        project_tool_args_for_display,
-        sanitize_tool_display_text,
-    )
-
-    return EditProposal(
-        tool_name=proposal.tool_name,
-        path=sanitize_tool_display_text(proposal.path),
-        old_text=(
-            sanitize_tool_display_text(proposal.old_text)
-            if proposal.old_text is not None
-            else None
-        ),
-        new_text=sanitize_tool_display_text(proposal.new_text),
-        arguments=project_tool_args_for_display(proposal.tool_name, proposal.arguments),
-    )
-
-
 EditApprovalRequester = Callable[[EditProposal], bool]
 
 _EDIT_APPROVAL_REQUESTER: ContextVar[EditApprovalRequester | None] = ContextVar(
@@ -285,8 +265,6 @@ def build_acp_edit_tool_call(proposal: EditProposal):
     """Build the ToolCallUpdate payload for ACP request_permission."""
 
     import acp
-
-    proposal = project_edit_proposal_for_display(proposal)
 
     tool_call_id = f"edit-approval-{next(_PERMISSION_REQUEST_IDS)}"
     return acp.update_tool_call(

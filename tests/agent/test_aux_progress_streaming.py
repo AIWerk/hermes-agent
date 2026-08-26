@@ -7,7 +7,6 @@ auxiliary call streams and ticks the hook per chunk, so outer watchdogs
 hook, behavior is byte-for-byte the old non-streaming call.
 """
 
-import asyncio
 import threading
 import time
 from types import SimpleNamespace
@@ -180,89 +179,6 @@ class TestAggregateChatStream:
         assert result.choices[0].finish_reason == "tool_calls"
 
 
-    def test_total_ceiling_bounds_final_blocking_read_and_late_eof(self):
-        def _late_eof():
-            yield _chunk(content="x")
-            time.sleep(0.2)
-
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match="timed out"):
-            _aggregate_chat_stream(_late_eof(), total_ceiling=0.05)
-        assert time.monotonic() - started < 0.15
-
-    def test_timed_out_pump_stops_after_inflight_read_returns(self):
-        release = threading.Event()
-        second_read_started = threading.Event()
-        third_read_started = threading.Event()
-
-        class _Stream:
-            def __init__(self):
-                self.reads = 0
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                self.reads += 1
-                if self.reads == 1:
-                    return _chunk(content="x")
-                if self.reads == 2:
-                    second_read_started.set()
-                    release.wait(timeout=1)
-                    return _chunk(content="late")
-                third_read_started.set()
-                return _chunk(content="leaked")
-
-        stream = _Stream()
-        with pytest.raises(TimeoutError, match="timed out"):
-            _aggregate_chat_stream(stream, total_ceiling=0.05)
-        assert second_read_started.is_set()
-        release.set()
-        assert not third_read_started.wait(timeout=0.1)
-        assert stream.reads == 2
-
-    def test_pump_does_not_read_ahead_while_caller_processes_chunk(self):
-        second_read_started = threading.Event()
-
-        class _Stream:
-            def __init__(self):
-                self.reads = 0
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                self.reads += 1
-                if self.reads == 1:
-                    return _chunk(content="x")
-                second_read_started.set()
-                return _chunk(content="unexpected")
-
-        stream = _Stream()
-        with aux_progress_hook(lambda: time.sleep(0.06)):
-            with pytest.raises(TimeoutError, match="timed out"):
-                _aggregate_chat_stream(stream, total_ceiling=0.05)
-        assert not second_read_started.is_set()
-        assert stream.reads == 1
-
-    def test_timeout_does_not_wait_for_blocking_close(self):
-        close_finished = threading.Event()
-
-        class _Stream:
-            def __iter__(self):
-                yield _chunk(content="x")
-                time.sleep(0.2)
-
-            def close(self):
-                time.sleep(0.2)
-                close_finished.set()
-
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match="timed out"):
-            _aggregate_chat_stream(_Stream(), total_ceiling=0.05)
-        assert time.monotonic() - started < 0.15
-        assert close_finished.wait(timeout=0.4)
-
     def test_stream_close_is_called(self):
         closed = []
 
@@ -366,75 +282,6 @@ class TestForceStream:
 
 
 class TestAsyncStreamAggregation:
-    @pytest.mark.asyncio
-    async def test_provider_timeout_error_is_not_rewritten_as_ceiling_timeout(self):
-        class _ProviderTimeoutStream:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise TimeoutError("provider read timed out")
-
-        with pytest.raises(TimeoutError, match="provider read timed out"):
-            await _aggregate_chat_stream_async(
-                _ProviderTimeoutStream(), total_ceiling=1,
-            )
-
-    @pytest.mark.asyncio
-    async def test_total_ceiling_bounds_final_async_read_and_late_eof(self):
-        class _LateEofStream:
-            def __init__(self):
-                self._first = True
-                self.closed = False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if self._first:
-                    self._first = False
-                    return _chunk(content="x")
-                await asyncio.sleep(0.2)
-                raise StopAsyncIteration
-
-            async def close(self):
-                self.closed = True
-
-        stream = _LateEofStream()
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match="timed out"):
-            await _aggregate_chat_stream_async(stream, total_ceiling=0.05)
-        assert time.monotonic() - started < 0.15
-        await asyncio.sleep(0)
-        assert stream.closed is True
-
-    @pytest.mark.asyncio
-    async def test_ceiling_does_not_wait_for_cancellation_resistant_iterator(self):
-        closed = asyncio.Event()
-
-        class _CancellationResistantStream:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                try:
-                    await asyncio.sleep(1)
-                except asyncio.CancelledError:
-                    await closed.wait()
-                raise StopAsyncIteration
-
-            async def close(self):
-                closed.set()
-
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match="timed out"):
-            await _aggregate_chat_stream_async(
-                _CancellationResistantStream(), total_ceiling=0.05,
-            )
-        assert time.monotonic() - started < 0.15
-        await asyncio.sleep(0)
-        assert closed.is_set()
-
     @pytest.mark.asyncio
     async def test_async_stream_is_consumed_with_async_for(self):
         # The sweeper review of PR #60686 flagged that awaiting create() and

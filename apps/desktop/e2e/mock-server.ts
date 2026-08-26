@@ -22,10 +22,6 @@ import nodePath from 'node:path'
 
 /** A canned assistant reply used for every chat completion request. */
 export const MOCK_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
-export function generatedTitle(text: string): string {
-  return text.replace(/[\s.?!:;,-]+$/g, '')
-}
-export const MOCK_TITLE = generatedTitle(MOCK_REPLY)
 
 export interface MockServerOptions {
   /** Pause the matching stream after its first token for session-switch E2E coverage. */
@@ -343,6 +339,40 @@ const BLOCKING_CLARIFY_TURN: ScriptedTurn = {
   toolCalls: [{ name: 'clarify', args: { question: BLOCKING_CLARIFY_QUESTION, choices: ['Yes', 'No'] } }],
 }
 
+/**
+ * A marker that makes the mock emit a blocking BATCH clarify tool call
+ * (multi-question form). Regression coverage for the duplicated-card bug:
+ * the tool.start row and the clarify.request row carry different ids and a
+ * batch payload has no top-level question, so the correlation key must come
+ * from the question list or the card mounts twice.
+ */
+export const BATCH_CLARIFY_TRIGGER = 'E2E_BATCH_CLARIFY_TRIGGER'
+export const BATCH_CLARIFY_QUESTIONS = [
+  { question: 'Pick a batch drink?', choices: ['Coffee', 'Tea'] },
+  { question: 'Pick a batch time?', choices: ['Morning', 'Night'] },
+]
+
+const BATCH_CLARIFY_TURN: ScriptedTurn = {
+  text: '',
+  toolCalls: [{ name: 'clarify', args: { questions: BATCH_CLARIFY_QUESTIONS } }],
+}
+
+function includesBatchClarifyTrigger(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.includes(BATCH_CLARIFY_TRIGGER)
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(includesBatchClarifyTrigger)
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.values(value).some(includesBatchClarifyTrigger)
+  }
+
+  return false
+}
+
 function includesBlockingClarifyTrigger(value: unknown): boolean {
   if (typeof value === 'string') {
     return value.includes(BLOCKING_CLARIFY_TRIGGER)
@@ -486,6 +516,24 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
               respond()
             }
             return
+          }
+
+          if (includesBatchClarifyTrigger(parsed.messages)) {
+            // Only the FIRST completion of the conversation scripts the batch
+            // clarify. The trigger text stays in message history, so once the
+            // answered tool result is present the turn falls through to the
+            // canned reply — otherwise the mock loops the quiz forever.
+            const hasToolResult = Array.isArray(parsed.messages)
+              && parsed.messages.some((message: { role?: string }) => message?.role === 'tool')
+
+            if (!hasToolResult) {
+              if (stream) {
+                streamScriptedTurn(res, model, BATCH_CLARIFY_TURN)
+              } else {
+                nonStreamingScriptedTurn(res, model, BATCH_CLARIFY_TURN)
+              }
+              return
+            }
           }
 
           if (includesBlockingClarifyTrigger(parsed.messages)) {
@@ -925,11 +973,10 @@ export const SIDEBAR_CROSS_TEXTS = {
   interimText: SIDEBAR_CROSS_SCRIPT[0].text,
   /** The final answer text. */
   finalText: SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text,
-  /** Canonical generated session title. */
-  titleText: generatedTitle(SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text),
   /**
    * The default (unheld) background process command. Tests that pass a
-   * `backgroundReleasePath` get a sentinel-waiting command instead.
+   * `backgroundReleasePath` get a sentinel-waiting command instead — see
+   * `createBackgroundReleaseHandle`.
    */
   bgCommand: sidebarCrossBgCommand(),
   /** The subagent's goal. */

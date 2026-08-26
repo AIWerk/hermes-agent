@@ -340,7 +340,7 @@ class CLIAgentSetupMixin:
         """
         Initialize the agent on first use.
         When resuming a session, restores conversation history from SQLite.
-
+        
         Returns:
             bool: True if successful, False otherwise
         """
@@ -374,7 +374,7 @@ class CLIAgentSetupMixin:
                 self._session_db = SessionDB()
             except Exception as e:
                 logger.warning("SQLite session store not available — session will NOT be indexed: %s", e)
-
+        
         # If resuming, validate the session exists and load its history.
         # _preload_resumed_session() may have already loaded it (called from
         # run() for immediate display).  In that case, conversation_history
@@ -473,7 +473,7 @@ class CLIAgentSetupMixin:
                 self._session_db.reopen_session(self.session_id)
             except Exception:
                 pass
-
+        
         try:
             runtime = runtime_override or {
                 "api_key": self.api_key,
@@ -500,6 +500,7 @@ class CLIAgentSetupMixin:
                 credential_pool=runtime.get("credential_pool"),
                 max_tokens=self.max_tokens,
                 max_iterations=self.max_turns,
+                run_budget_seconds=getattr(self, "run_budget_seconds", None),
                 enabled_toolsets=self.enabled_toolsets,
                 disabled_toolsets=self.disabled_toolsets,
                 verbose_logging=self.verbose,
@@ -530,7 +531,6 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
-                operator_session_context=getattr(self, "operator_session_context", None),
                 skip_context_files=self.ignore_rules,
                 skip_memory=self.ignore_rules,
                 tool_progress_callback=self._on_tool_progress,
@@ -901,20 +901,20 @@ class CLIAgentSetupMixin:
             elif role == "user":
                 lines.append("  ● You: ", style=f"dim bold {_session_label_c}")
                 # Show first line inline, indent rest
-                msg_lines = text.splitlines()
+                msg_lines = text.splitlines() or [""]
                 lines.append(msg_lines[0] + "\n", style="dim")
                 for ml in msg_lines[1:]:
                     lines.append(f"         {ml}\n", style="dim")
             elif role == "assistant_last":
                 # Last assistant response shown in full, non-dim
                 lines.append("  ◆ Hermes: ", style=f"bold {_assistant_label_c}")
-                msg_lines = text.splitlines()
+                msg_lines = text.splitlines() or [""]
                 lines.append(msg_lines[0] + "\n", style="")
                 for ml in msg_lines[1:]:
                     lines.append(f"            {ml}\n", style="")
             else:
                 lines.append("  ◆ Hermes: ", style=f"dim bold {_assistant_label_c}")
-                msg_lines = text.splitlines()
+                msg_lines = text.splitlines() or [""]
                 lines.append(msg_lines[0] + "\n", style="dim")
                 for ml in msg_lines[1:]:
                     lines.append(f"            {ml}\n", style="dim")

@@ -171,3 +171,44 @@ def test_fk_rebuild_drops_orphan_rows_referencing_missing_sessions(tmp_path):
         "SELECT side_session_id FROM session_stack"
     ).fetchall()
     assert [r[0] for r in rows] == ["side"]
+
+
+def test_telegram_topic_rebuild_recovers_from_leftover_temp_table(tmp_path):
+    """A crashed topic-binding rebuild must not wedge its explicit retry."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("session", source="telegram")
+    conn = db._conn
+    conn.executescript(
+        """
+        CREATE TABLE telegram_dm_topic_bindings (
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(id),
+            managed_mode TEXT NOT NULL DEFAULT 'auto',
+            linked_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (chat_id, thread_id)
+        );
+        INSERT INTO telegram_dm_topic_bindings
+            VALUES ('chat', 'thread', 'user', 'key', 'session', 'auto', 1.0, 1.0);
+        CREATE TABLE telegram_dm_topic_bindings_new (bogus INTEGER);
+        INSERT INTO state_meta(key, value)
+            VALUES ('telegram_dm_topic_schema_version', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+    )
+
+    db.apply_telegram_topic_migration()
+
+    fk_rows = conn.execute(
+        "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+    ).fetchall()
+    assert any(row[2] == "sessions" and row[6] == "CASCADE" for row in fk_rows)
+    assert [row[0] for row in conn.execute(
+        "SELECT session_id FROM telegram_dm_topic_bindings"
+    ).fetchall()] == ["session"]
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='telegram_dm_topic_bindings_new'"
+    ).fetchone() is None

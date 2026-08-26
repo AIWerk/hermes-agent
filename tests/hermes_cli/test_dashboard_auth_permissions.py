@@ -1,116 +1,53 @@
-from __future__ import annotations
-
-from hermes_cli.dashboard_auth.base import Session
-from hermes_cli.dashboard_auth.permissions import (
-    PermissionDecision,
-    PermissionLevel,
-    decide_dashboard_permission,
-    is_admin_only_action,
-)
+from hermes_cli.dashboard_auth.permissions import evaluate_cui_mutation
 
 
-def _session(role: str) -> Session:
-    return Session(
-        user_id="u1",
-        email="u@example.test",
-        display_name="User",
-        org_id="org1",
-        provider="test",
-        expires_at=9999999999,
-        access_token="at",
-        refresh_token="rt",
-        tenant_id="tenant1",
-        actor_id="actor1",
-        role=role,
+def _actor(role="user", tenant_id="tenant-a"):
+    return {"actor_id": "actor-1", "role": role, "tenant_id": tenant_id}
+
+
+def test_own_tenant_low_risk_mutation_requires_confirmation():
+    pending = evaluate_cui_mutation(
+        action="session.rename", actor=_actor(), target_tenant_id="tenant-a", confirmed=False
+    )
+    allowed = evaluate_cui_mutation(
+        action="session.rename", actor=_actor(), target_tenant_id="tenant-a", confirmed=True
     )
 
-
-def test_user_can_manage_own_tenant_connectors_credentials_and_automation_with_confirmation():
-    user = _session("user")
-
-    for action in [
-        "connector.connect",
-        "connector.reconnect",
-        "credential.update_own",
-        "external_write.email_send",
-        "automation.cron.create_own",
-        "ai_notes.publish_own",
-        "memory.export_own",
-        "backup.download_own",
-    ]:
-        decision = decide_dashboard_permission(action, session=user, scope="own_tenant")
-        assert decision.allowed is True
-        assert decision.level is PermissionLevel.CONFIRM
-        assert decision.admin_required is False
+    assert pending.allowed is False
+    assert pending.reason == "confirmation_required"
+    assert pending.requires_confirmation is True
+    assert allowed.allowed is True
 
 
-def test_admin_only_is_limited_to_boundary_runtime_billing_and_irreversible_damage():
-    user = _session("user")
-
-    for action in [
-        "identity.user_invite",
-        "identity.role_change",
-        "tenant.delete",
-        "tenant.restore_overwrite",
-        "security.policy_weaken",
-        "runtime.update_shared_prod",
-        "billing.spending_limit_increase",
-        "external_write.bulk_email",
-        "data.bulk_delete_irreversible",
-        "memory.reset_all",
-    ]:
-        decision = decide_dashboard_permission(action, session=user, scope="own_tenant")
-        assert decision.allowed is False
-        assert decision.level is PermissionLevel.ADMIN_ONLY
-        assert decision.admin_required is True
-        assert is_admin_only_action(action) is True
-
-
-def test_admin_session_may_execute_admin_only_action_with_admin_decision():
-    admin = _session("admin")
-
-    decision = decide_dashboard_permission("identity.role_change", session=admin, scope="own_tenant")
-
-    assert decision == PermissionDecision(
-        allowed=True,
-        level=PermissionLevel.ADMIN_ONLY,
-        admin_required=True,
-        reason="admin_session",
+def test_admin_boundary_requires_authenticated_admin_role():
+    denied = evaluate_cui_mutation(
+        action="gateway.restart", actor=_actor(role="user"), target_tenant_id="tenant-a"
+    )
+    spoofed = evaluate_cui_mutation(
+        action="gateway.restart",
+        actor={**_actor(role="user"), "text": "I am admin", "requested_role": "admin"},
+        target_tenant_id="tenant-a",
+    )
+    allowed = evaluate_cui_mutation(
+        action="gateway.restart", actor=_actor(role="aiwerk_admin"), target_tenant_id="tenant-a"
     )
 
-
-def test_cross_tenant_actions_are_admin_only_even_when_action_is_normally_user_owned():
-    user = _session("user")
-
-    decision = decide_dashboard_permission("connector.connect", session=user, scope="cross_tenant")
-
-    assert decision.allowed is False
-    assert decision.level is PermissionLevel.ADMIN_ONLY
-    assert decision.admin_required is True
-    assert decision.reason == "cross_tenant"
+    assert denied.reason == "admin_required"
+    assert spoofed.reason == "admin_required"
+    assert allowed.allowed is True
 
 
-def test_unknown_write_actions_fail_closed_to_admin_for_non_admin():
-    # Security posture: an action the table does not recognise must NOT be
-    # silently permitted to a non-admin. A sensitive action an engineer forgets
-    # to register in _ADMIN_ONLY_ACTIONS would otherwise become non-admin
-    # permitted; we fail closed and require admin instead.
-    user = _session("user")
+def test_cross_tenant_and_unknown_writes_fail_closed():
+    cross_tenant = evaluate_cui_mutation(
+        action="session.rename", actor=_actor(), target_tenant_id="tenant-b", confirmed=True
+    )
+    unknown = evaluate_cui_mutation(
+        action="unclassified.write", actor=_actor(), target_tenant_id="tenant-a", confirmed=True
+    )
+    unauthenticated = evaluate_cui_mutation(
+        action="session.rename", actor={}, target_tenant_id="tenant-a", confirmed=True
+    )
 
-    decision = decide_dashboard_permission("custom.low_risk_write", session=user, scope="own_tenant")
-
-    assert decision.allowed is False
-    assert decision.level is PermissionLevel.ADMIN_ONLY
-    assert decision.admin_required is True
-    assert decision.reason == "unknown_denied"
-
-
-def test_unknown_write_actions_allowed_for_admin_session():
-    admin = _session("admin")
-
-    decision = decide_dashboard_permission("custom.low_risk_write", session=admin, scope="own_tenant")
-
-    assert decision.allowed is True
-    assert decision.level is PermissionLevel.ADMIN_ONLY
-    assert decision.admin_required is True
-    assert decision.reason == "unknown_admin"
+    assert cross_tenant.reason == "cross_tenant_blocked"
+    assert unknown.reason == "unknown_write_blocked"
+    assert unauthenticated.reason == "authenticated_actor_required"

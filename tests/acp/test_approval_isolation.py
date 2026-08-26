@@ -153,16 +153,6 @@ class TestAcpExecAskGate:
     notify_cb registered in _gateway_notify_cbs — not applicable to ACP,
     which uses a direct callback shape.)"""
 
-    @pytest.fixture(autouse=True)
-    def _isolate_approval_state(self, monkeypatch):
-        """Full-suite collection may preload the operator's permanent patterns."""
-        from tools import approval
-
-        monkeypatch.setattr(approval, "_permanent_approved", set())
-        approval.clear_session("default")
-        yield
-        approval.clear_session("default")
-
     def test_interactive_env_var_routes_to_callback(self, monkeypatch):
         """When HERMES_INTERACTIVE is set and an approval callback is
         registered, a dangerous command must route through the callback."""
@@ -202,3 +192,4 @@ class TestAcpExecAskGate:
             "GHSA-96vc-wcxf-jjff"
         )
         assert result["approved"] is True
+

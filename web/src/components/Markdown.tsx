@@ -83,14 +83,15 @@ function parseBlocks(text: string): BlockNode[] {
       continue;
     }
 
-    // Heading. While streaming, the model can briefly leave a line as only
-    // "### " before the heading text arrives. Treat that incomplete marker as
-    // literal text; otherwise the paragraph parser below would make no progress.
+    // A streaming response can temporarily end at a heading marker. Consume
+    // that line as literal text so the paragraph parser cannot stall on it.
     if (/^#{1,4}\s*$/.test(line)) {
       blocks.push({ type: "paragraph", content: line });
       i++;
       continue;
     }
+
+    // Heading
     const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
     if (headingMatch) {
       blocks.push({
