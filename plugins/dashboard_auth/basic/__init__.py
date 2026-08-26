@@ -65,7 +65,7 @@ import logging
 import os
 import secrets
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
@@ -105,6 +105,7 @@ _SIG_LEN = hashlib.sha256().digest_size
 
 
 LAST_SKIP_REASON: str = ""
+_ALLOWED_ROLES = frozenset({"admin", "user"})
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +209,41 @@ class BasicAuthProvider(DashboardAuthProvider):
     def __init__(
         self,
         *,
-        username: str,
-        password_hash: str,
         secret: bytes,
+        username: str = "",
+        password_hash: str = "",
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+        users: Optional[dict[str, dict[str, str]]] = None,
+        authority_resolver: Optional[
+            Callable[[], dict[str, dict[str, str]]]
+        ] = None,
     ) -> None:
-        if not username:
-            raise ValueError("username must be non-empty")
-        if not password_hash:
-            raise ValueError("password_hash must be non-empty")
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
-        self._username = username
-        self._password_hash = password_hash
+        if users:
+            static_users: dict[str, dict[str, str]] = {}
+            for configured_username, record in users.items():
+                if not configured_username or not isinstance(record, dict):
+                    raise ValueError("each user must have a username and record")
+                static_users[configured_username] = self._copy_valid_record(record)
+        else:
+            if not username:
+                raise ValueError("username must be non-empty")
+            if not password_hash:
+                raise ValueError("password_hash must be non-empty")
+            static_users = {
+                username: {
+                    "password_hash": password_hash,
+                    "display_name": username,
+                    "actor_id": username,
+                    "role": "admin",
+                    "tenant_id": "",
+                }
+            }
+        # Legacy env/single-user authority is process-static. Copy every
+        # caller-owned record so later mutations cannot change authority.
+        self._static_users = static_users
+        self._authority_resolver = authority_resolver
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
 
@@ -245,18 +268,15 @@ class BasicAuthProvider(DashboardAuthProvider):
         self, *, username: str, password: str
     ) -> Session:
         # Constant-time-ish: always run a scrypt verify (against the real
-        # hash if the username matches, else a dummy hash) so an unknown
-        # username and a wrong password take comparable time. Compare the
-        # username with compare_digest too, to avoid a length/byte timing
-        # leak on the username itself.
-        username_ok = hmac.compare_digest(
-            username.encode("utf-8"), self._username.encode("utf-8")
-        )
-        target_hash = self._password_hash if username_ok else _DUMMY_HASH
+        # hash if the username exists, else a dummy hash) so an unknown
+        # username and a wrong password take comparable time.
+        record = self._resolve_record(username)
+        username_ok = record is not None
+        target_hash = (record or {}).get("password_hash", _DUMMY_HASH)
         password_ok = _verify_password(password, target_hash)
         if not (username_ok and password_ok):
             raise InvalidCredentialsError("invalid username or password")
-        return self._mint_session(self._username)
+        return self._mint_session(username, record or {})
 
     # ---- session lifecycle -------------------------------------------------
 
@@ -268,7 +288,13 @@ class BasicAuthProvider(DashboardAuthProvider):
             or payload.get("exp", 0) <= int(time.time())
         ):
             return None
-        return self._session_from_payload(access_token, "", payload)
+        user_id = str(payload.get("sub", ""))
+        record = self._resolve_record(user_id)
+        if not record or not record.get("password_hash"):
+            return None
+        return self._session_from_record(
+            access_token, "", int(payload["exp"]), user_id, record
+        )
 
     def refresh_session(self, *, refresh_token: str) -> Session:
         if not refresh_token:
@@ -280,7 +306,11 @@ class BasicAuthProvider(DashboardAuthProvider):
             or payload.get("exp", 0) <= int(time.time())
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
-        return self._mint_session(str(payload.get("sub", self._username)))
+        user_id = str(payload.get("sub", ""))
+        record = self._resolve_record(user_id)
+        if not record or not record.get("password_hash"):
+            raise RefreshExpiredError("session membership no longer exists")
+        return self._mint_session(user_id, record)
 
     def revoke_session(self, *, refresh_token: str) -> None:
         # Stateless tokens — nothing to revoke server-side. The session
@@ -290,7 +320,45 @@ class BasicAuthProvider(DashboardAuthProvider):
 
     # ---- internals ---------------------------------------------------------
 
-    def _mint_session(self, user_id: str) -> Session:
+    @staticmethod
+    def _copy_valid_record(record: dict[str, str]) -> dict[str, str]:
+        """Copy one authority record and reject malformed privilege data."""
+        copied = dict(record)
+        password_hash = copied.get("password_hash")
+        if not isinstance(password_hash, str) or not password_hash:
+            raise ValueError("each user must have a password_hash")
+        role = copied.get("role", "user")
+        if not isinstance(role, str) or role.strip().lower() not in _ALLOWED_ROLES:
+            raise ValueError("each user role must be admin or user")
+        for key in ("tenant_id", "actor_id", "display_name", "email"):
+            value = copied.get(key, "")
+            if not isinstance(value, str):
+                raise ValueError(f"each user {key} must be a string")
+        copied["role"] = role.strip().lower()
+        return copied
+
+    def _resolve_record(self, username: str) -> Optional[dict[str, str]]:
+        """Resolve and copy one record from exactly one authority snapshot."""
+        try:
+            snapshot = (
+                self._authority_resolver()
+                if self._authority_resolver is not None
+                else self._static_users
+            )
+            if not isinstance(snapshot, dict):
+                return None
+            record = snapshot.get(username)
+            if not isinstance(record, dict):
+                return None
+            return self._copy_valid_record(record)
+        except Exception as exc:  # noqa: BLE001 - authority errors fail closed
+            logger.warning(
+                "dashboard-auth-basic: current authority resolution failed: %s",
+                exc,
+            )
+            return None
+
+    def _mint_session(self, user_id: str, record: dict[str, str]) -> Session:
         now = int(time.time())
         exp = now + self._ttl
         access_token = _sign(
@@ -300,30 +368,33 @@ class BasicAuthProvider(DashboardAuthProvider):
             {"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
             self._secret,
         )
-        return Session(
-            user_id=user_id,
-            email="",
-            display_name=user_id,
-            org_id="",
-            provider=self.name,
-            expires_at=exp,
-            access_token=access_token,
-            refresh_token=refresh_token,
+        return self._session_from_record(
+            access_token, refresh_token, exp, user_id, record
         )
 
-    def _session_from_payload(
-        self, access_token: str, refresh_token: str, payload: dict
+    def _session_from_record(
+        self,
+        access_token: str,
+        refresh_token: str,
+        expires_at: int,
+        user_id: str,
+        record: dict[str, str],
     ) -> Session:
-        user_id = str(payload.get("sub", ""))
+        tenant_id = str(record.get("tenant_id", "") or "")
+        actor_id = str(record.get("actor_id", "") or user_id)
+        role = str(record.get("role", "user") or "user").lower()
         return Session(
             user_id=user_id,
-            email="",
-            display_name=user_id,
-            org_id="",
+            email=str(record.get("email", "") or ""),
+            display_name=str(record.get("display_name", "") or user_id),
+            org_id=tenant_id,
             provider=self.name,
-            expires_at=int(payload["exp"]),
+            expires_at=expires_at,
             access_token=access_token,
             refresh_token=refresh_token,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            role=role,
         )
 
 
@@ -359,6 +430,38 @@ def _resolve(env_name: str, cfg_section: dict, cfg_key: str) -> str:
     if env:
         return env
     return str(cfg_section.get(cfg_key, "") or "").strip()
+
+
+def _load_users_from_config(section: dict) -> dict[str, dict[str, str]]:
+    """Return valid role-bearing records from dashboard.basic_auth.users."""
+    raw_users = section.get("users") or []
+    if isinstance(raw_users, dict):
+        raw_users = [
+            {"username": username, **(record if isinstance(record, dict) else {})}
+            for username, record in raw_users.items()
+        ]
+    if not isinstance(raw_users, list):
+        return {}
+
+    users: dict[str, dict[str, str]] = {}
+    for item in raw_users:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username", "") or "").strip()
+        password_hash = str(item.get("password_hash", "") or "").strip()
+        if not username or not password_hash:
+            continue
+        users[username] = {
+            "password_hash": password_hash,
+            "tenant_id": str(item.get("tenant_id", "") or "").strip(),
+            "actor_id": str(item.get("actor_id", "") or username).strip(),
+            "role": str(item.get("role", "user") or "user").strip().lower(),
+            "display_name": str(
+                item.get("display_name", "") or username
+            ).strip(),
+            "email": str(item.get("email", "") or "").strip(),
+        }
+    return users
 
 
 def _resolve_secret(cfg_section: dict) -> bytes:
@@ -416,19 +519,19 @@ def register(ctx) -> None:
     ttl_raw = _resolve(
         "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS", section, "session_ttl_seconds"
     )
+    users = _load_users_from_config(section)
 
-    if not username:
+    if not users and not username:
         LAST_SKIP_REASON = (
-            "dashboard.basic_auth.username is not set (and "
-            "HERMES_DASHBOARD_BASIC_AUTH_USERNAME is empty). Set a username "
-            "and a password (or password_hash) under dashboard.basic_auth in "
-            "config.yaml to enable username/password dashboard login, or use "
-            "the OAuth provider, or pass --insecure to skip the auth gate."
+            "dashboard.basic_auth.username is not set and "
+            "dashboard.basic_auth.users is empty (and "
+            "HERMES_DASHBOARD_BASIC_AUTH_USERNAME is empty). Configure a "
+            "username/password or role-bearing users under dashboard.basic_auth."
         )
         logger.debug("dashboard-auth-basic: %s", LAST_SKIP_REASON)
         return
 
-    if not password_hash and not plaintext:
+    if not users and not password_hash and not plaintext:
         LAST_SKIP_REASON = (
             "dashboard.basic_auth.username is set but neither password_hash "
             "nor password is configured. Provide one of them (password_hash "
@@ -478,6 +581,12 @@ def register(ctx) -> None:
             password_hash=password_hash,
             secret=secret,
             ttl_seconds=ttl,
+            users=users or None,
+            authority_resolver=(
+                (lambda: _load_users_from_config(_load_config_basic_auth_section()))
+                if users
+                else None
+            ),
         )
     except ValueError as exc:
         LAST_SKIP_REASON = f"BasicAuthProvider construction failed: {exc}"
@@ -486,6 +595,6 @@ def register(ctx) -> None:
 
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
-        "dashboard-auth-basic: registered password provider (username=%s)",
-        username,
+        "dashboard-auth-basic: registered password provider (users=%s)",
+        len(users) if users else 1,
     )

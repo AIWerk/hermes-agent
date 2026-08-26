@@ -131,6 +131,15 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
 
+ELEVENLABS_LANGUAGE_CODE_ALIASES = {
+    "en": "eng",
+    "de": "deu",
+    "fr": "fra",
+    "es": "spa",
+    "it": "ita",
+    "hu": "hun",
+}
+
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
@@ -158,6 +167,14 @@ _IDLE_UNLOAD_CHECK_INTERVAL = 30  # seconds between idle checks
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
+
+
+def _normalize_elevenlabs_language_code(language_code: str) -> str:
+    """Normalize short language aliases without erasing specific codes."""
+    code = (language_code or "").strip()
+    if not code:
+        return ""
+    return ELEVENLABS_LANGUAGE_CODE_ALIASES.get(code.lower(), code)
 
 
 
@@ -2631,9 +2648,11 @@ def _transcribe_elevenlabs(
         or ELEVENLABS_STT_BASE_URL
     ).strip().rstrip("/")
     # Language: hook override > stt.elevenlabs.language(_code) > stt.language.
-    language_code = language or _resolve_stt_language(
-        "elevenlabs", stt_config, extra_keys=("language_code",)
-    ) or ""
+    language_code = _normalize_elevenlabs_language_code(
+        language or _resolve_stt_language(
+            "elevenlabs", stt_config, extra_keys=("language_code",)
+        ) or ""
+    )
     tag_audio_events = is_truthy_value(elevenlabs_config.get("tag_audio_events", False))
     diarize = is_truthy_value(elevenlabs_config.get("diarize", False))
 

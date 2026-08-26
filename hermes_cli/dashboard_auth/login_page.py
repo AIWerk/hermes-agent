@@ -225,30 +225,29 @@ _LOGIN_HTML_TEMPLATE = """\
     outline-offset: 3px;
   }}
 
-  /* Password provider form — same visual language as the OAuth buttons:
-     squared inputs, hairline borders, amber focus ring. */
+  /* Zugangsdatenformular — gleiche visuelle Sprache wie die Login-Buttons. */
   .provider-form {{
     display: grid;
     gap: 0.75rem;
     text-align: left;
   }}
   .form-title {{
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600;
-    font-size: 0.72rem;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 70%, transparent);
+    font-family: inherit;
+    font-weight: 700;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
+    text-transform: none;
+    color: var(--foreground);
   }}
   .field {{
     display: grid;
     gap: 0.3rem;
   }}
   .field-label {{
-    font-size: 0.72rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 55%, transparent);
+    font-size: 0.82rem;
+    letter-spacing: 0;
+    text-transform: none;
+    color: color-mix(in srgb, var(--foreground) 60%, transparent);
   }}
   .field-input {{
     width: 100%;
@@ -513,25 +512,30 @@ def _render_password_form(provider, next_path: str) -> str:
     form-field ordering.
     """
     pname = html.escape(provider.name, quote=True)
-    plabel = html.escape(provider.display_name)
+    display_name = html.escape(provider.display_name, quote=False)
+    form_label = html.escape(
+        f"Mit Benutzername und Passwort anmelden — {provider.display_name}",
+        quote=True,
+    )
     safe_next = html.escape(next_path, quote=True) if next_path else ""
     return (
         f'      <form class="provider-form" data-provider="{pname}" '
-        f'autocomplete="on">\n'
-        f'        <div class="form-title">Sign in with {plabel}</div>\n'
+        f'aria-label="{form_label}" autocomplete="on">\n'
+        f'        <div class="form-title">Mit Benutzername und Passwort anmelden — '
+        f'{display_name}</div>\n'
         f'        <input type="hidden" name="next" value="{safe_next}">\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Username</span>\n'
+        f'          <span class="field-label">Benutzername</span>\n'
         f'          <input class="field-input" type="text" name="username" '
         f'autocomplete="username" autocapitalize="none" '
         f'autocorrect="off" spellcheck="false" required>\n'
         f'        </label>\n'
         f'        <label class="field">\n'
-        f'          <span class="field-label">Password</span>\n'
+        f'          <span class="field-label">Passwort</span>\n'
         f'          <input class="field-input" type="password" name="password" '
         f'autocomplete="current-password" required>\n'
         f'        </label>\n'
         f'        <div class="form-error" role="alert" hidden></div>\n'
-        f'        <button class="provider-btn" type="submit">Sign in</button>\n'
+        f'        <button class="provider-btn" type="submit">Anmelden</button>\n'
         f'      </form>'
     )

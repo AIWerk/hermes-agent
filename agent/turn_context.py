@@ -1289,6 +1289,8 @@ def build_turn_context(
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []
+        _ctx_keys: set[str] = set()
+        _temporal_current_origin: str = ""
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
         # openai/codex PR #21069 ("Spill large hook outputs from context").
@@ -1303,12 +1305,19 @@ def build_turn_context(
             _spill_config_cached = None
         for r in _pre_results:
             _piece: str = ""
+            _context_key: str = ""
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])
+                if isinstance(r.get("context_key"), str):
+                    _context_key = r["context_key"].strip()
             elif isinstance(r, str) and r.strip():
                 _piece = r
             else:
                 continue
+            if _context_key:
+                if _context_key in _ctx_keys:
+                    continue
+                _ctx_keys.add(_context_key)
             if _spill_if_oversized is not None:
                 try:
                     _piece = _spill_if_oversized(
@@ -1319,7 +1328,12 @@ def build_turn_context(
                     )
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
+            if _context_key == "temporal_current_origin":
+                _temporal_current_origin = _piece
+            else:
+                _ctx_parts.append(_piece)
+        if _temporal_current_origin:
+            _ctx_parts.append(_temporal_current_origin)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:

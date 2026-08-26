@@ -5,8 +5,14 @@ import importlib
 import logging
 import os
 import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+
+import agent.prompt_builder as prompt_builder
+from agent.system_prompt import build_system_prompt_parts
 
 from agent.prompt_builder import (
     _scan_context_content,
@@ -71,6 +77,89 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_information_retrieval_guidance_orders_lookup_layers(self):
+        text = prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE.lower()
+        ordered_markers = (
+            "current user message and active context",
+            "session_search",
+            "skills",
+            "files, git, terminal, apis, wiki, neo4j, or web",
+            "ask the user only",
+        )
+
+        positions = [text.index(marker) for marker in ordered_markers]
+
+        assert positions == sorted(positions)
+        assert "retrieval cannot resolve" in text
+        assert "ambiguity changes the action" in text
+        assert len(prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE) < 600
+
+
+def _retrieval_prompt_parts(valid_tool_names):
+    agent = SimpleNamespace(
+        load_soul_identity=False,
+        skip_context_files=True,
+        valid_tool_names=valid_tool_names,
+        _task_completion_guidance=False,
+        _parallel_tool_call_guidance=False,
+        _tool_use_enforcement=False,
+        _execution_guidance=False,
+        _environment_probe=False,
+        _kanban_worker_guidance="",
+        _memory_store=None,
+        _memory_manager=None,
+        _plugin_system_prompt_sections_snapshot=(),
+        model="",
+        provider="",
+        platform="",
+        pass_session_id=False,
+        session_id="",
+    )
+    with (
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch(
+            "agent.coding_context.coding_system_prompt_parts",
+            return_value=([], [], []),
+        ),
+    ):
+        return agent, build_system_prompt_parts(agent)
+
+
+class TestInformationRetrievalGuidanceInjection:
+    def test_information_retrieval_guidance_appears_once_in_stable_only(self):
+        _, parts = _retrieval_prompt_parts({"custom_lookup"})
+        guidance = prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE
+
+        assert parts["stable"].count(guidance) == 1
+        assert guidance not in parts["context"]
+        assert guidance not in parts["volatile"]
+
+    def test_information_retrieval_guidance_is_absent_without_tools(self):
+        _, parts = _retrieval_prompt_parts(set())
+
+        assert prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE not in "\n".join(
+            parts.values()
+        )
+
+    def test_information_retrieval_guidance_does_not_add_tool_names(self):
+        valid_tool_names = {"custom_lookup"}
+        original_tool_names = valid_tool_names.copy()
+
+        _, parts = _retrieval_prompt_parts(valid_tool_names)
+
+        assert prompt_builder.INFORMATION_RETRIEVAL_GUIDANCE in parts["stable"]
+        assert valid_tool_names == original_tool_names
+        assert "custom_lookup" not in "\n".join(parts.values())
+
+    def test_information_retrieval_guidance_changes_only_stable_partition(self):
+        _, with_tools = _retrieval_prompt_parts({"custom_lookup"})
+        _, without_tools = _retrieval_prompt_parts(set())
+
+        assert with_tools["stable"] != without_tools["stable"]
+        assert with_tools["context"] == without_tools["context"]
+        assert with_tools["volatile"] == without_tools["volatile"]
 
 
 # =========================================================================
@@ -690,6 +779,131 @@ class TestFindGitRoot:
         # If result is not None, it must actually contain .git
         if result is not None:
             assert (result / ".git").exists()
+
+    @pytest.mark.parametrize(
+        ("helper_name", "path_factory"),
+        [
+            ("_safe_path_exists", lambda root: root / "file.txt"),
+            ("_safe_path_is_file", lambda root: root / "file.txt"),
+            ("_safe_path_is_dir", lambda root: root),
+        ],
+    )
+    def test_safe_path_probes_preserve_success(self, tmp_path, helper_name, path_factory):
+        (tmp_path / "file.txt").write_text("ok", encoding="utf-8")
+        helper = getattr(prompt_builder, helper_name)
+
+        assert helper(path_factory(tmp_path)) is True
+
+    @pytest.mark.parametrize(
+        ("helper_name", "path_method", "error_type"),
+        [
+            ("_safe_path_exists", "exists", PermissionError),
+            ("_safe_path_is_file", "is_file", type("ProbeFileError", (OSError,), {})),
+            ("_safe_path_is_dir", "is_dir", type("ProbeDirectoryError", (OSError,), {})),
+        ],
+    )
+    def test_safe_path_probes_treat_os_errors_as_inaccessible(
+        self, tmp_path, monkeypatch, helper_name, path_method, error_type
+    ):
+        original_method = getattr(Path, path_method)
+
+        def raise_os_error(path):
+            if path == tmp_path:
+                raise error_type("inaccessible")
+            return original_method(path)
+
+        monkeypatch.setattr(Path, path_method, raise_os_error)
+        helper = getattr(prompt_builder, helper_name)
+
+        assert helper(tmp_path) is False
+
+    @pytest.mark.parametrize(
+        ("helper_name", "path_method"),
+        [
+            ("_safe_path_exists", "exists"),
+            ("_safe_path_is_file", "is_file"),
+            ("_safe_path_is_dir", "is_dir"),
+        ],
+    )
+    def test_safe_path_probes_do_not_catch_programming_errors(
+        self, tmp_path, monkeypatch, helper_name, path_method
+    ):
+        original_method = getattr(Path, path_method)
+
+        def raise_type_error(path):
+            if path == tmp_path:
+                raise TypeError("bug in probe")
+            return original_method(path)
+
+        monkeypatch.setattr(Path, path_method, raise_type_error)
+        helper = getattr(prompt_builder, helper_name)
+
+        with pytest.raises(TypeError, match="bug in probe"):
+            helper(tmp_path)
+
+    def test_find_git_root_skips_inaccessible_parent_probe(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        child = repo / "unreadable-parent" / "workspace"
+        child.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        blocked_probe = child.parent / ".git"
+        original_exists = Path.exists
+
+        def guarded_exists(path):
+            if path == blocked_probe:
+                raise PermissionError("permission denied")
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+
+        assert _find_git_root(child) == repo
+
+    @pytest.mark.parametrize(
+        ("blocked_relative", "path_method", "error_type", "fallback_relative", "fallback_content"),
+        [
+            ("HERMES.md", "is_file", PermissionError, "AGENTS.md", "agents fallback"),
+            ("AGENTS.md", "exists", type("AgentsProbeError", (OSError,), {}), "CLAUDE.md", "claude fallback"),
+            ("CLAUDE.md", "exists", PermissionError, ".cursorrules", "cursor fallback"),
+            (".cursorrules", "exists", type("CursorProbeError", (OSError,), {}), None, None),
+            (".cursor/rules", "is_dir", type("CursorDirectoryError", (OSError,), {}), None, None),
+        ],
+    )
+    def test_context_prompt_excludes_inaccessible_optional_candidates(
+        self,
+        tmp_path,
+        monkeypatch,
+        blocked_relative,
+        path_method,
+        error_type,
+        fallback_relative,
+        fallback_content,
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        blocked = workspace / blocked_relative
+        if blocked_relative == ".cursor/rules":
+            blocked.mkdir(parents=True)
+        else:
+            blocked.parent.mkdir(parents=True, exist_ok=True)
+            blocked.write_text("must stay excluded", encoding="utf-8")
+        if fallback_relative:
+            (workspace / fallback_relative).write_text(fallback_content, encoding="utf-8")
+        original_method = getattr(Path, path_method)
+
+        def guarded_probe(path):
+            if path == blocked:
+                raise error_type("inaccessible")
+            return original_method(path)
+
+        monkeypatch.setattr(Path, path_method, guarded_probe)
+
+        prompt = build_context_files_prompt(cwd=str(workspace), skip_soul=True)
+
+        assert "must stay excluded" not in prompt
+        if fallback_content:
+            assert fallback_content in prompt
+        else:
+            assert prompt == ""
 
 
 class TestStripYamlFrontmatter:

@@ -454,6 +454,65 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_stack (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT,
+    pushed_at REAL NOT NULL,
+    popped_at REAL,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_stack_active
+    ON session_stack(source, status, id DESC);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    short_summary TEXT NOT NULL,
+    outline_json TEXT NOT NULL DEFAULT '[]',
+    topics_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_index INTEGER,
+    event_type TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'runtime',
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_scratchpads (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    current_goal TEXT,
+    decisions_json TEXT NOT NULL DEFAULT '[]',
+    artifacts_json TEXT NOT NULL DEFAULT '[]',
+    open_items_json TEXT NOT NULL DEFAULT '[]',
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_stack (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT,
+    pushed_at REAL NOT NULL,
+    popped_at REAL,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_session_stack_active ON session_stack(source, status, id DESC);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

@@ -548,6 +548,17 @@ DEFAULT_CONFIG = {
         "cache_exempt_hosts": [],
     },
 
+    "ai_notes": {
+        # Static HTML publishing surface for AIWerk/customer-readable notes.
+        # Disabled by default; tenant/base-agent templates opt in only after
+        # DNS/webroot/proxy activation is verified.
+        "enabled": False,
+        "agent_name": "",
+        "public_base_url": "",
+        "publish_root": "",
+        "visibility": "disabled",
+    },
+
     "browser": {
         # Browser tool implementation.
         # ""            — DEFAULT: Browser Use mode when the browser-use CLI
@@ -2519,6 +2530,19 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        "operator_verification": {
+            "enabled": True,
+            "ttl_seconds": 900,
+            "require_for_cli_admin": True,
+            "verifier": "command",
+            "command": {"argv": [], "timeout_seconds": 60},
+            "interfaces": {
+                "cli": {"verifier": "callback"},
+                "tui": {"verifier": "callback"},
+            },
+            "trusted_actor_ids": [],
+            "allowed_secret_read_patterns": [],
+        },
         # Persisted acknowledgement for unattended model overrides whose tier
         # lets the vendor train on prompts/completions. The startup guard still
         # prints the full warning on every run and never bypasses cost guards.
@@ -2555,14 +2579,14 @@ DEFAULT_CONFIG = {
         # <id>`; remove by editing the list directly. See
         # ``hermes_cli/security_advisories.py`` for the catalog.
         "acked_advisories": [],
-        # Allow Hermes to lazy-install opt-in backend packages from PyPI
-        # the first time the user enables a backend that needs them
+        # Runtime installation of opt-in backend packages from PyPI is denied
+        # until the user explicitly sets this exact policy leaf to true
         # (e.g. installing ``elevenlabs`` when the user picks ElevenLabs as
         # their TTS provider). Set to false to require explicit
         # ``pip install`` for everything beyond the base set — appropriate
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
-        "allow_lazy_installs": True,
+        "allow_lazy_installs": False,
     },
 
     "cron": {

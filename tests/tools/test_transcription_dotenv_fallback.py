@@ -203,6 +203,45 @@ class TestTranscribeCallSitesReadDotenv:
         assert result["success"] is True
         assert captured["headers"]["xi-api-key"] == "elevenlabs-dotenv-key"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("hu", "hun"),
+            ("de", "deu"),
+            ("hun", "hun"),
+            ("de-CH", "de-CH"),
+        ],
+    )
+    def test_transcribe_elevenlabs_forwards_supported_language_code(
+        self, configured, expected
+    ):
+        from tools import transcription_tools as tt
+
+        captured: dict = {}
+
+        def fake_post(url, **kwargs):
+            captured["data"] = kwargs.get("data", {})
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = {"text": "szia"}
+            return response
+
+        with patch.object(
+            tt,
+            "_resolve_provider_key",
+            return_value="elevenlabs-dotenv-key",
+        ), patch.object(
+            tt,
+            "_load_stt_config",
+            return_value={"elevenlabs": {"language_code": configured}},
+        ), patch("requests.post", side_effect=fake_post), patch(
+            "builtins.open", MagicMock()
+        ):
+            result = tt._transcribe_elevenlabs("/tmp/fake.mp3", "scribe_v2")
+
+        assert result["success"] is True
+        assert captured["data"]["language_code"] == expected
+
 
 class TestEndToEndRegressionGuard:
     """End-to-end probe: patch ``hermes_cli.config.load_env`` to simulate

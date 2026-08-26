@@ -85,6 +85,27 @@ def _scan_context_content(content: str, filename: str) -> str:
     return content
 
 
+def _safe_path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _safe_path_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _safe_path_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _find_git_root(start: Path) -> Optional[Path]:
     """Walk *start* and its parents looking for a ``.git`` directory.
 
@@ -93,7 +114,7 @@ def _find_git_root(start: Path) -> Optional[Path]:
     """
     current = start.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        if _safe_path_exists(parent / ".git"):
             return parent
     return None
 
@@ -118,7 +139,7 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     for directory in search_dirs:
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
-            if candidate.is_file():
+            if _safe_path_is_file(candidate):
                 return candidate
         if stop_at and directory == stop_at:
             break
@@ -149,12 +170,15 @@ def _strip_yaml_frontmatter(content: str) -> str:
 
 DEFAULT_AGENT_IDENTITY = (
     "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
+    "You are helpful, knowledgeable, direct, and concise. You assist users with a wide "
     "range of tasks including answering questions, writing and editing code, "
     "analyzing information, creative work, and executing actions via your tools. "
     "You communicate clearly, admit uncertainty when appropriate, and prioritize "
     "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
+    "Optimize for useful signal over verbosity: keep answers tight, summarize tool "
+    "outputs instead of pasting long raw logs, and avoid unnecessary explanation. "
+    "Be targeted and token-efficient in your exploration and investigations. "
+    "When the conversation context is close to the limit, warn the user briefly."
 )
 
 HERMES_AGENT_HELP_GUIDANCE = (
@@ -224,6 +248,15 @@ SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
     "asking them to repeat themselves."
+)
+
+INFORMATION_RETRIEVAL_GUIDANCE = (
+    "# Information retrieval routing\n"
+    "Resolve needed information in this order: current user message and active "
+    "context first; session_search for prior conversations; skills for known "
+    "workflows; direct/live files, git, terminal, APIs, wiki, Neo4j, or web "
+    "evidence for current or verifiable facts. Ask the user only when retrieval "
+    "cannot resolve the missing information or ambiguity changes the action."
 )
 
 # NOTE (#82154): the opening sentence is worded deliberately. Anthropic's
@@ -2413,7 +2446,7 @@ def load_soul_md(
 
     _home = Path(home_override) if home_override is not None else get_hermes_home()
     soul_path = _home / "SOUL.md"
-    if not soul_path.exists():
+    if not _safe_path_exists(soul_path):
         return None
     try:
         content = soul_path.read_text(encoding="utf-8").strip()
@@ -2503,7 +2536,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     for directory in _agents_md_directory_chain(cwd_resolved):
         for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
             candidate = directory / name
-            if not candidate.exists():
+            if not _safe_path_exists(candidate):
                 continue
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
@@ -2545,7 +2578,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
-        if candidate.exists():
+        if _safe_path_exists(candidate):
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
@@ -2564,7 +2597,7 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
     cursorrules_file = cwd_path / ".cursorrules"
-    if cursorrules_file.exists():
+    if _safe_path_exists(cursorrules_file):
         try:
             content = cursorrules_file.read_text(encoding="utf-8").strip()
             if content:
@@ -2574,7 +2607,7 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
             logger.debug("Could not read .cursorrules: %s", e)
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
-    if cursor_rules_dir.exists() and cursor_rules_dir.is_dir():
+    if _safe_path_exists(cursor_rules_dir) and _safe_path_is_dir(cursor_rules_dir):
         mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
         for mdc_file in mdc_files:
             try:

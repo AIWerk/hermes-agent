@@ -998,6 +998,302 @@ class TestDetectVenvDir:
         assert result is None
 
 
+class TestStableServiceProjectPath:
+    """Persisted project PATH entries require strict stable-link proof."""
+
+    @staticmethod
+    def _release_layout(tmp_path, monkeypatch, *, link_matches: bool):
+        hermes_home = tmp_path / "home" / ".hermes"
+        running_release = hermes_home / "releases" / "running"
+        other_release = hermes_home / "releases" / "other"
+        (running_release / "node_modules" / ".bin").mkdir(parents=True)
+        other_release.mkdir(parents=True)
+        stable_root = hermes_home / "hermes-agent"
+        stable_root.symlink_to(
+            running_release if link_matches else other_release,
+            target_is_directory=True,
+        )
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(
+            "hermes_constants.get_process_hermes_home", lambda: hermes_home
+        )
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _command: None)
+        return stable_root, running_release
+
+    @pytest.mark.parametrize(
+        "generate_definition",
+        [gateway_cli.generate_systemd_unit, gateway_cli.generate_launchd_plist],
+        ids=["systemd", "launchd"],
+    )
+    def test_matching_link_renders_stable_project_path(
+        self, tmp_path, monkeypatch, generate_definition
+    ):
+        stable_root, running_release = self._release_layout(
+            tmp_path, monkeypatch, link_matches=True
+        )
+
+        definition = generate_definition()
+
+        assert str(stable_root / "node_modules" / ".bin") in definition
+        assert str(running_release / "node_modules" / ".bin") not in definition
+
+    @pytest.mark.parametrize(
+        "generate_definition",
+        [gateway_cli.generate_systemd_unit, gateway_cli.generate_launchd_plist],
+        ids=["systemd", "launchd"],
+    )
+    def test_mismatched_link_keeps_physical_project_path(
+        self, tmp_path, monkeypatch, generate_definition
+    ):
+        stable_root, running_release = self._release_layout(
+            tmp_path, monkeypatch, link_matches=False
+        )
+
+        definition = generate_definition()
+
+        assert str(running_release / "node_modules" / ".bin") in definition
+        assert str(stable_root / "node_modules" / ".bin") not in definition
+
+    @pytest.mark.parametrize(
+        "generate_definition",
+        [gateway_cli.generate_systemd_unit, gateway_cli.generate_launchd_plist],
+        ids=["systemd", "launchd"],
+    )
+    def test_project_path_symlink_escape_is_omitted(
+        self, tmp_path, monkeypatch, generate_definition
+    ):
+        hermes_home = tmp_path / "home" / ".hermes"
+        running_release = hermes_home / "releases" / "running"
+        outside_bin = tmp_path / "outside" / ".bin"
+        outside_bin.mkdir(parents=True)
+        (running_release / "node_modules").mkdir(parents=True)
+        (running_release / "node_modules" / ".bin").symlink_to(
+            outside_bin, target_is_directory=True
+        )
+        stable_root = hermes_home / "hermes-agent"
+        stable_root.symlink_to(running_release, target_is_directory=True)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _command: None)
+
+        definition = generate_definition()
+
+        assert str(running_release / "node_modules" / ".bin") not in definition
+        assert str(stable_root / "node_modules" / ".bin") not in definition
+        assert str(outside_bin) not in definition
+
+    def test_cross_user_unverified_link_omits_project_path(
+        self, tmp_path, monkeypatch
+    ):
+        caller_home = tmp_path / "caller"
+        target_home = tmp_path / "target"
+        running_release = caller_home / ".hermes" / "releases" / "running"
+        other_release = target_home / ".hermes" / "releases" / "other"
+        (running_release / "node_modules" / ".bin").mkdir(parents=True)
+        other_release.mkdir(parents=True)
+        target_stable = target_home / ".hermes" / "hermes-agent"
+        target_stable.symlink_to(other_release)
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(
+            gateway_cli, "get_hermes_home", lambda: caller_home / ".hermes"
+        )
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        caller_node_dir = caller_home / "bin"
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda command: str(caller_node_dir / "node") if command == "node" else None,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("target", "target", str(target_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda _home, _existing: []
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_wsl_interop_paths", lambda _existing: []
+        )
+
+        with pytest.raises(ValueError, match="stable project runtime"):
+            gateway_cli.generate_systemd_unit(system=True, run_as_user="target")
+
+
+class TestStableServiceRuntimeFields:
+    """Interpreter and virtualenv fields share the project-path proof."""
+
+    @staticmethod
+    def _venv_layout(tmp_path, monkeypatch, *, link_matches: bool):
+        hermes_home = tmp_path / "home" / ".hermes"
+        running_release = hermes_home / "releases" / "running"
+        other_release = hermes_home / "releases" / "other"
+        physical_venv = running_release / ".venv"
+        physical_python = physical_venv / "bin" / "python"
+        physical_python.parent.mkdir(parents=True)
+        physical_python.touch()
+        other_release.mkdir(parents=True)
+        stable_root = hermes_home / "hermes-agent"
+        stable_root.symlink_to(
+            running_release if link_matches else other_release,
+            target_is_directory=True,
+        )
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(
+            "hermes_constants.get_process_hermes_home", lambda: hermes_home
+        )
+        monkeypatch.setattr(gateway_cli.sys, "prefix", str(physical_venv))
+        monkeypatch.setattr(gateway_cli.sys, "base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _command: None)
+        return hermes_home, stable_root, running_release, physical_venv
+
+    @pytest.mark.parametrize("manager", ["systemd", "launchd"])
+    @pytest.mark.parametrize("link_matches", [True, False])
+    def test_runtime_fields_follow_stable_link_proof(
+        self, tmp_path, monkeypatch, manager, link_matches
+    ):
+        _, stable_root, running_release, physical_venv = self._venv_layout(
+            tmp_path, monkeypatch, link_matches=link_matches
+        )
+
+        definition = (
+            gateway_cli.generate_systemd_unit(system=False)
+            if manager == "systemd"
+            else gateway_cli.generate_launchd_plist()
+        )
+
+        expected_venv = stable_root / ".venv" if link_matches else physical_venv
+        expected_python = expected_venv / "bin" / "python"
+        assert str(expected_python) in definition
+        assert str(expected_venv) in definition
+        if manager == "systemd":
+            assert f"ExecStart={expected_python} " in definition
+            assert f"ExecStopPost=-{expected_python} " in definition
+        rejected_root = running_release if link_matches else stable_root
+        assert str(rejected_root / ".venv") not in definition
+
+    @pytest.mark.parametrize("manager", ["systemd", "launchd"])
+    @pytest.mark.parametrize("link_matches", [True, False])
+    def test_missing_venv_fallback_follows_stable_link_proof(
+        self, tmp_path, monkeypatch, manager, link_matches
+    ):
+        hermes_home = tmp_path / "home" / ".hermes"
+        running_release = hermes_home / "releases" / "running"
+        other_release = hermes_home / "releases" / "other"
+        running_release.mkdir(parents=True)
+        other_release.mkdir(parents=True)
+        stable_root = hermes_home / "hermes-agent"
+        stable_root.symlink_to(
+            running_release if link_matches else other_release,
+            target_is_directory=True,
+        )
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(
+            "hermes_constants.get_process_hermes_home", lambda: hermes_home
+        )
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _command: None)
+
+        definition = (
+            gateway_cli.generate_systemd_unit(system=False)
+            if manager == "systemd"
+            else gateway_cli.generate_launchd_plist()
+        )
+
+        expected = (
+            stable_root / "venv" if link_matches else running_release / "venv"
+        )
+        assert str(expected) in definition
+        if link_matches:
+            assert str(running_release / "venv") not in definition
+
+    def test_verified_cross_user_home_renders_target_stable_runtime_fields(
+        self, tmp_path, monkeypatch
+    ):
+        caller_home = tmp_path / "caller"
+        target_home = tmp_path / "target"
+        running_release = caller_home / ".hermes" / "releases" / "running"
+        physical_venv = running_release / ".venv"
+        physical_python = physical_venv / "bin" / "python"
+        physical_python.parent.mkdir(parents=True)
+        physical_python.touch()
+        target_stable = target_home / ".hermes" / "hermes-agent"
+        target_stable.parent.mkdir(parents=True)
+        target_stable.symlink_to(running_release)
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", running_release.resolve())
+        monkeypatch.setattr(
+            gateway_cli, "get_hermes_home", lambda: caller_home / ".hermes"
+        )
+        monkeypatch.setattr(gateway_cli.sys, "prefix", str(physical_venv))
+        monkeypatch.setattr(gateway_cli.sys, "base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _command: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("target", "target", str(target_home)),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda _home, _existing: []
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_build_wsl_interop_paths", lambda _existing: []
+        )
+
+        definition = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="target"
+        )
+
+        stable_venv = target_stable / ".venv"
+        stable_python = stable_venv / "bin" / "python"
+        assert f"ExecStart={stable_python} " in definition
+        assert f'Environment="VIRTUAL_ENV={stable_venv}"' in definition
+        assert f"ExecStopPost=-{stable_python} " in definition
+        assert str(running_release / ".venv") not in definition
+
+    def test_unverified_cross_user_runtime_fails_before_returning_unit(
+        self, tmp_path, monkeypatch
+    ):
+        caller = tmp_path / "caller"
+        target = tmp_path / "target"
+        release = caller / ".hermes" / "releases" / "running"
+        python = release / ".venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        wrong = target / ".hermes" / "releases" / "wrong"
+        wrong.mkdir(parents=True)
+        stable = target / ".hermes" / "hermes-agent"
+        stable.symlink_to(wrong)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller))
+        monkeypatch.setenv("HERMES_HOME", str(caller / ".hermes"))
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", release.resolve())
+        monkeypatch.setattr(gateway_cli.sys, "prefix", str(release / ".venv"))
+        monkeypatch.setattr(gateway_cli.sys, "base_prefix", "/usr")
+        monkeypatch.setattr(gateway_cli, "_system_service_identity", lambda run_as_user=None: ("target", "target", str(target)))
+        monkeypatch.setattr(gateway_cli, "_build_user_local_paths", lambda *_: [])
+        monkeypatch.setattr(gateway_cli, "_build_wsl_interop_paths", lambda *_: [])
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: None)
+
+        with pytest.raises(ValueError, match="stable project runtime"):
+            gateway_cli.generate_systemd_unit(system=True, run_as_user="target")
+
+
 class TestSystemUnitHermesHome:
     """HERMES_HOME in system units must reference the target user, not root."""
 
@@ -1046,6 +1342,7 @@ class TestSystemUnitHermesHome:
         node.write_text("#!/bin/sh\n")
         node.chmod(0o755)
         root_hermes.mkdir(parents=True)
+        (target_hermes / "hermes-agent").symlink_to(gateway_cli.PROJECT_ROOT)
 
         monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
         monkeypatch.setenv("HERMES_HOME", str(root_hermes))
@@ -1055,7 +1352,9 @@ class TestSystemUnitHermesHome:
             lambda run_as_user=None: ("alice", "alice", str(target_home)),
         )
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: root_hermes)
-        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(
+            gateway_cli, "_build_service_path_dirs", lambda **_kwargs: []
+        )
 
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/root/bin/node")
         root_unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
@@ -1087,13 +1386,23 @@ class TestSystemUnitHermesHome:
 
         assert entries == ["/opt/external-node/bin"]
 
-    def test_system_unit_uses_target_user_home_not_calling_user(self, monkeypatch):
-        # Simulate sudo: Path.home() returns /root, target user is alice
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
+    def test_system_unit_uses_target_user_home_not_calling_user(
+        self, monkeypatch, tmp_path
+    ):
+        # Simulate sudo: process home belongs to root; target user is alice.
+        root_home = tmp_path / "root"
+        target_home = tmp_path / "home" / "alice"
+        target_hermes = target_home / ".hermes"
+        target_hermes.mkdir(parents=True)
+        (target_hermes / "hermes-agent").symlink_to(gateway_cli.PROJECT_ROOT)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: root_home))
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(
+            "hermes_constants.get_process_hermes_home", lambda: root_home / ".hermes"
+        )
+        monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
-            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+            lambda run_as_user=None: ("alice", "alice", str(target_home)),
         )
         monkeypatch.setattr(
             gateway_cli, "_build_user_local_paths",
@@ -1102,8 +1411,8 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        assert 'HERMES_HOME=/home/alice/.hermes' in unit
-        assert '/root/.hermes' not in unit
+        assert f'HERMES_HOME={target_hermes}' in unit
+        assert str(root_home / ".hermes") not in unit
 
 
     def test_user_unit_unaffected_by_change(self):
@@ -1112,6 +1421,26 @@ class TestSystemUnitHermesHome:
 
         hermes_home = str(gateway_cli.get_hermes_home().resolve())
         assert f'HERMES_HOME={hermes_home}' in unit
+
+    @pytest.mark.parametrize("manager", ["systemd", "launchd"])
+    def test_user_service_uses_process_home_not_context_override(self, tmp_path, monkeypatch, manager):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        process_home = tmp_path / "process-home"
+        request_home = tmp_path / "request-home"
+        process_home.mkdir()
+        request_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: None)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda _: None)
+        token = set_hermes_home_override(request_home)
+        try:
+            definition = gateway_cli.generate_systemd_unit(system=False) if manager == "systemd" else gateway_cli.generate_launchd_plist()
+        finally:
+            reset_hermes_home_override(token)
+        assert str(process_home) in definition
+        assert str(request_home) not in definition
 
 
 class TestSystemUnitRefreshSyncsHermesHome:
@@ -1254,6 +1583,13 @@ class TestHermesHomeForTargetUser:
 
         result = gateway_cli._hermes_home_for_target_user("/home/alice")
         assert result == "/home/alice/.hermes"
+
+    def test_remaps_custom_caller_home_descendant(self, tmp_path, monkeypatch):
+        caller = tmp_path / "caller"
+        target = tmp_path / "target"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller))
+        monkeypatch.setenv("HERMES_HOME", str(caller / "custom" / "hermes"))
+        assert gateway_cli._hermes_home_for_target_user(str(target)) == str(target / "custom" / "hermes")
 
 
 
@@ -1526,18 +1862,21 @@ class TestRemapPathForUser:
 
 
 class TestSystemUnitPathRemapping:
-    """System units must remap ALL paths from the caller's home to the target user."""
+    """System units use target paths only after target-home identity proof."""
 
     def test_system_unit_has_no_root_paths(self, monkeypatch, tmp_path):
         root_home = tmp_path / "root"
         root_home.mkdir()
-        project = root_home / ".hermes" / "hermes-agent"
+        project = root_home / ".hermes" / "releases" / "running"
         project.mkdir(parents=True)
         venv_bin = project / "venv" / "bin"
         venv_bin.mkdir(parents=True)
         (venv_bin / "python").write_text("")
 
-        target_home = "/home/alice"
+        target_home = tmp_path / "alice"
+        target_stable = target_home / ".hermes" / "hermes-agent"
+        target_stable.parent.mkdir(parents=True)
+        target_stable.symlink_to(project)
 
         monkeypatch.setattr(Path, "home", lambda: root_home)
         monkeypatch.setenv("HERMES_HOME", str(root_home / ".hermes"))
@@ -1547,21 +1886,20 @@ class TestSystemUnitPathRemapping:
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(venv_bin / "python"))
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
-            lambda run_as_user=None: ("alice", "alice", target_home),
+            lambda run_as_user=None: ("alice", "alice", str(target_home)),
         )
 
         unit = gateway_cli.generate_systemd_unit(system=True)
 
-        # No root paths should leak into the unit
+        # Caller-owned paths do not leak after the target link proves identity.
         assert str(root_home) not in unit
-        # Target user paths should be present
-        assert "/home/alice" in unit
+        assert str(target_home) in unit
         # WorkingDirectory is anchored at the target user's HERMES_HOME (stable,
         # always exists) — NOT the source checkout under it. Pinning cwd to the
         # checkout is the rot bug fixed alongside this: a relocated/removed
         # checkout would crash-loop the unit on CHDIR (status=200).
-        assert "WorkingDirectory=/home/alice/.hermes" in unit
-        assert "WorkingDirectory=/home/alice/.hermes/hermes-agent" not in unit
+        assert f"WorkingDirectory={target_home}/.hermes" in unit
+        assert f"WorkingDirectory={target_stable}" not in unit
 
 
 class TestDockerAwareGateway:

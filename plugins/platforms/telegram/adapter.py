@@ -4522,7 +4522,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     5.0,
                     min_value=0.0,
                 )
-                logger.warning(
+                logger.info(
                     "[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…",
                     self.name,
                 )
@@ -4637,7 +4637,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"or set HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT / "
                             f"HERMES_TELEGRAM_INIT_TIMEOUT to a lower value."
                         )
-                    logger.warning(
+                    logger.info(
                         "[%s] Connecting to Telegram (attempt %d/%d)…",
                         self.name, _attempt + 1, _max_connect,
                     )
@@ -10616,24 +10616,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     break
 
         # Build source
+        auth_source = self._source_from_message_for_auth(message)
         source = self.build_source(
             chat_id=str(chat.id),
             chat_name=chat.title or (chat.full_name if hasattr(chat, "full_name") else None),
             chat_type=chat_type,
-            user_id=(
-                str(user.id)
-                if user
-                else (str(chat.id) if chat_type in {"dm", "channel"} else None)
-            ),
-            user_name=(
-                user.full_name
-                if user
-                else (
-                    chat.full_name
-                    if hasattr(chat, "full_name") and chat_type == "dm"
-                    else (chat.title if chat_type == "channel" else None)
-                )
-            ),
+            user_id=auth_source.user_id,
+            user_name=auth_source.user_name,
             thread_id=thread_id_str,
             chat_topic=chat_topic,
             message_id=str(message.message_id),

@@ -5216,8 +5216,10 @@ def _maybe_autoinstall_chromium() -> bool:
     if _running_in_docker():
         return False
 
-    from tools.lazy_deps import _allow_lazy_installs
-    if not _allow_lazy_installs():
+    from tools.lazy_deps import _lazy_install_authorization
+
+    authorization = _lazy_install_authorization()
+    if not authorization.allowed:
         return False
 
     try:
@@ -5236,6 +5238,8 @@ def _maybe_autoinstall_chromium() -> bool:
         "browser: Chromium missing — auto-installing the browser binary "
         "(one-time ~170MB; disable via security.allow_lazy_installs)"
     )
+    if not authorization.validate():
+        return False
     try:
         proc = subprocess.run(
             install_cmd,

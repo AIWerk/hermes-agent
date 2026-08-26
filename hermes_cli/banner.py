@@ -382,6 +382,16 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
+def _update_check_cache_identity(repo_dir: Optional[Path], embedded_rev: Optional[str]) -> dict:
+    """Return identity fields that make a cached update result safe to reuse."""
+    identity = {"rev": embedded_rev, "repo": None, "head": None}
+    if repo_dir is None:
+        return identity
+    identity["repo"] = str(repo_dir)
+    identity["head"] = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+    return identity
+
+
 def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
@@ -411,15 +421,22 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
+    repo_dir: Optional[Path] = None
+    if not embedded_rev:
+        repo_dir = _resolve_repo_dir()
+    cache_identity = _update_check_cache_identity(repo_dir, embedded_rev)
+
+    # Read cache — invalidate if the embedded rev, installed version, active
+    # repo, or current HEAD changed since the last check.
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-                and cached.get("rev") == embedded_rev
+                and cached.get("rev") == cache_identity["rev"]
+                and cached.get("repo") == cache_identity["repo"]
+                and cached.get("head") == cache_identity["head"]
                 and cached.get("ver") == VERSION
             ):
                 return cached.get("behind")
@@ -428,26 +445,18 @@ def check_for_updates() -> Optional[int]:
 
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
+    elif repo_dir is None:
+        # No git checkout and no embedded revision — can't determine update
+        # status. This is the Docker path (already short-circuited above) or an
+        # unsupported install without a source tree.
+        behind = None
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            # No git checkout and no embedded revision — can't determine
-            # update status. This is the Docker path (already short-circuited
-            # above) or an unsupported install without a source tree.
-            behind = None
-        else:
-            behind = _check_via_local_git(repo_dir)
+        behind = _check_via_local_git(repo_dir)
 
     try:
-        cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
-        )
+        payload = {"ts": now, "behind": behind, "ver": VERSION}
+        payload.update(cache_identity)
+        cache_file.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
 

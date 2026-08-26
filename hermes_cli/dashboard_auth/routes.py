@@ -619,6 +619,8 @@ def _validate_post_login_target(raw: str) -> str:
         return ""
     from urllib.parse import unquote
     decoded = unquote(raw)
+    if "\\" in decoded:
+        return ""
     if not decoded.startswith("/") or decoded.startswith("//"):
         return ""
     # Don't loop back to login pages or auth flow.
@@ -914,14 +916,23 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return {
-        "user_id": sess.user_id,
-        "email": sess.email,
-        "display_name": sess.display_name,
-        "org_id": sess.org_id,
-        "provider": sess.provider,
-        "expires_at": sess.expires_at,
-    }
+    tenant_id = getattr(sess, "tenant_id", "") or sess.org_id
+    actor_id = getattr(sess, "actor_id", "") or sess.user_id
+    role = getattr(sess, "role", "") or "user"
+    return JSONResponse(
+        {
+            "user_id": sess.user_id,
+            "email": sess.email,
+            "display_name": sess.display_name,
+            "org_id": sess.org_id,
+            "provider": sess.provider,
+            "expires_at": sess.expires_at,
+            "tenant_id": tenant_id,
+            "actor_id": actor_id,
+            "role": role,
+        },
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +962,16 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    ticket = mint_ticket(
+        user_id=sess.user_id,
+        provider=sess.provider,
+        tenant_id=getattr(sess, "tenant_id", "") or sess.org_id,
+        actor_id=getattr(sess, "actor_id", "") or sess.user_id,
+        role=getattr(sess, "role", "") or "user",
+        display_name=sess.display_name,
+        email=sess.email,
+        org_id=sess.org_id,
+    )
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,

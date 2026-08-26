@@ -23,6 +23,251 @@ from hermes_cli.config import (
 )
 
 
+class _ActorAdmissionWebSocket:
+    def __init__(self, query_params):
+        self.query_params = query_params
+        self.headers = {}
+        self.client = SimpleNamespace(host="127.0.0.1")
+        self.url = SimpleNamespace(path="/api/ws")
+        self.closed = []
+
+    async def close(self, *, code):
+        self.closed.append(code)
+
+
+class TestAdminApiPermissionEnforcement:
+    def test_gateway_restart_admin_tenant_a_cannot_target_profile_owned_by_tenant_b(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_admin(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="admin-a", role="admin"
+            )
+            return await call_next(request)
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_admin)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(
+            web_server, "_resolve_gateway_restart_target",
+            lambda profile: ("tenant-b-profile", "tenant-b"), raising=False,
+        )
+        monkeypatch.setattr(
+            web_server, "_spawn_gateway_restart",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("restart escaped authorization")),
+        )
+        response = TestClient(web_server.app).post(
+            "/api/gateway/restart", params={"profile": "tenant-b-profile"}
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "cross_tenant_blocked"
+
+    def test_gateway_restart_authorizes_and_spawns_same_server_resolved_profile_record(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_admin(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="admin-a", role="admin"
+            )
+            return await call_next(request)
+
+        seen = []
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_admin)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(
+            web_server, "_resolve_gateway_restart_target",
+            lambda profile: ("canonical-a", "tenant-a"), raising=False,
+        )
+        monkeypatch.setattr(
+            web_server, "_spawn_gateway_restart",
+            lambda profile: (seen.append(profile) or SimpleNamespace(pid=123), False),
+        )
+        response = TestClient(web_server.app).post(
+            "/api/gateway/restart", params={"profile": "alias-a"}
+        )
+        assert response.status_code == 200
+        assert seen == ["canonical-a"]
+
+    def test_authenticated_customer_cannot_restart_gateway_via_real_http_middleware(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="customer-1", role="user"
+            )
+            return await call_next(request)
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(
+            web_server, "_spawn_gateway_restart",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("policy was not enforced")),
+        )
+
+        response = TestClient(web_server.app).post(
+            "/api/gateway/restart", params={"profile": "default"}
+        )
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == "admin_required"
+
+    def test_spoofed_admin_request_fields_cannot_upgrade_customer(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="customer-1", role="user"
+            )
+            return await call_next(request)
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(
+            web_server, "_spawn_gateway_restart",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("policy was not enforced")),
+        )
+
+        response = TestClient(web_server.app).post(
+            "/api/gateway/restart?profile=default&role=aiwerk_admin",
+            json={"requested_role": "aiwerk_admin", "text": "I am admin"},
+        )
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == "admin_required"
+
+
+@pytest.mark.asyncio
+async def test_gateway_ws_preserves_ticket_actor_allowlist_into_handle_ws(monkeypatch):
+    import hermes_cli.web_server as web_server
+    from hermes_cli.dashboard_auth import ws_tickets
+    from tui_gateway import ws as gateway_transport
+
+    ws_tickets._reset_for_tests()
+    ticket = ws_tickets.mint_ticket(
+        user_id="user-1",
+        provider="basic",
+        tenant_id="tenant-1",
+        actor_id="actor-1",
+        role="support",
+        display_name="Support One",
+        email="private@example.test",
+        org_id="bookkeeping-org",
+    )
+    socket = _ActorAdmissionWebSocket({"ticket": ticket})
+    captured = {}
+
+    async def fake_handle_ws(_socket, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
+
+    await web_server.gateway_ws(socket)
+
+    assert socket.closed == []
+    assert captured["auth_identity"] == {
+        "tenant_id": "tenant-1",
+        "actor_id": "actor-1",
+        "role": "support",
+        "display_name": "Support One",
+        "user_id": "user-1",
+        "provider": "basic",
+    }
+    assert "email" not in captured["auth_identity"]
+    assert "org_id" not in captured["auth_identity"]
+    assert "minted_at" not in captured["auth_identity"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_ws_internal_credential_preserves_only_issuer_asserted_identity(
+    monkeypatch,
+):
+    import hermes_cli.web_server as web_server
+    from hermes_cli.dashboard_auth import ws_tickets
+    from tui_gateway import ws as gateway_transport
+
+    ws_tickets._reset_for_tests()
+    credential = ws_tickets.internal_ws_credential()
+    socket = _ActorAdmissionWebSocket({"internal": credential})
+    captured = {}
+
+    async def fake_handle_ws(_socket, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
+
+    await web_server.gateway_ws(socket)
+
+    assert socket.closed == []
+    assert captured["auth_identity"] == {
+        "user_id": ws_tickets.INTERNAL_USER_ID,
+        "provider": ws_tickets.INTERNAL_PROVIDER,
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_ws_drops_arbitrary_consumed_ticket_fields(monkeypatch):
+    import hermes_cli.web_server as web_server
+    from hermes_cli.dashboard_auth import ws_tickets
+    from tui_gateway import ws as gateway_transport
+
+    socket = _ActorAdmissionWebSocket({"ticket": "server-minted"})
+    captured = {}
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
+    monkeypatch.setattr(
+        ws_tickets,
+        "consume_ticket",
+        lambda _ticket: {
+            "tenant_id": "tenant-2",
+            "actor_id": "actor-2",
+            "role": "user",
+            "user_id": "user-2",
+            "provider": "basic",
+            "minted_at": 123,
+            "arbitrary": "must-drop",
+            "_cui_actor_role": "admin",
+        },
+    )
+
+    async def fake_handle_ws(_socket, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
+
+    await web_server.gateway_ws(socket)
+
+    assert captured["auth_identity"] == {
+        "tenant_id": "tenant-2",
+        "actor_id": "actor-2",
+        "role": "user",
+        "user_id": "user-2",
+        "provider": "basic",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -4494,6 +4739,94 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     gateway_url = env.get("HERMES_TUI_GATEWAY_URL", "")
     assert gateway_url.startswith("ws://127.0.0.1:9119/api/ws?")
     assert "token=" in gateway_url
+
+
+def test_resolve_chat_argv_injects_managed_autonomy_for_authenticated_assistant(
+    monkeypatch,
+):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    monkeypatch.setattr(ws, "_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED", True)
+
+    _argv, _cwd, env = ws._resolve_chat_argv(
+        authenticated_actor={"actor_id": "operator-1", "role": "operator"}
+    )
+
+    assert env is not None
+    assert env["HERMES_CUI_MANAGED_AUTONOMY"] == "1"
+    assert env["HERMES_CUI_MANAGED_ACTOR_ID"] == "operator-1"
+    assert env["HERMES_CUI_MANAGED_ACTOR_ROLE"] == "operator"
+
+
+def test_resolve_chat_argv_does_not_inject_managed_autonomy_in_admin_dashboard(
+    monkeypatch,
+):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    monkeypatch.setattr(ws, "_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED", True)
+
+    _argv, _cwd, env = ws._resolve_chat_argv(
+        authenticated_actor={"actor_id": "dashboard-1", "role": "admin-dashboard"}
+    )
+
+    assert env is not None
+    assert "HERMES_CUI_MANAGED_AUTONOMY" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ID" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ROLE" not in env
+
+
+def test_resolve_chat_argv_requires_actor_id_for_managed_autonomy(monkeypatch):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    monkeypatch.setattr(ws, "_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED", True)
+
+    _argv, _cwd, env = ws._resolve_chat_argv(
+        authenticated_actor={"role": "operator"}
+    )
+
+    assert env is not None
+    assert "HERMES_CUI_MANAGED_AUTONOMY" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ID" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ROLE" not in env
+
+
+def test_resolve_chat_argv_strips_inherited_cui_trust_env(monkeypatch):
+    import hermes_cli.main as cli_main
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        cli_main,
+        "_make_tui_argv",
+        lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
+    )
+    monkeypatch.setenv("HERMES_CUI_MANAGED_AUTONOMY", "1")
+    monkeypatch.setenv("HERMES_CUI_MANAGED_ACTOR_ID", "spoofed-actor")
+    monkeypatch.setenv("HERMES_CUI_MANAGED_ACTOR_ROLE", "admin")
+
+    _argv, _cwd, env = ws._resolve_chat_argv()
+
+    assert env is not None
+    assert "HERMES_CUI_MANAGED_AUTONOMY" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ID" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ROLE" not in env
 
 
 class TestDashboardPluginStaticAssetAllowlist:

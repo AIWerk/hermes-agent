@@ -32,6 +32,7 @@ import threading
 import time
 from typing import Any
 
+from agent.cui_actor_context import sanitize_cui_actor_context
 from tui_gateway import server
 from tui_gateway.event_replay import replay_epoch
 
@@ -333,6 +334,7 @@ async def handle_ws(
     ``None`` transport identity — unchanged behaviour.
     """
     peer = _ws_peer_label(ws)
+    trusted_actor_context = sanitize_cui_actor_context(auth_identity)
     transport: WSTransport | None = None
     messages = 0
     parse_errors = 0
@@ -355,7 +357,7 @@ async def handle_ws(
             ws,
             asyncio.get_running_loop(),
             peer=peer,
-            auth_identity=auth_identity,
+            auth_identity=trusted_actor_context or None,
         )
 
         # resolve_skin() reads config + initializes the skin engine —
@@ -478,7 +480,12 @@ async def handle_ws(
                 continue
 
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                resp = await asyncio.to_thread(
+                    server.dispatch,
+                    req,
+                    transport,
+                    auth_identity,
+                )
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

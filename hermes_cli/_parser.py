@@ -317,6 +317,10 @@ def build_top_level_parser():
         help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules)",
     )
     _inherited_flag(
+        parser, "--operator", action="store_true", default=False,
+        help="Start a non-authorizing operator session; sensitive actions still require verification.",
+    )
+    _inherited_flag(
         parser,
         "--tui",
         action="store_true",
@@ -562,6 +566,10 @@ def build_top_level_parser():
         "--source",
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
+    )
+    _inherited_flag(
+        chat_parser, "--operator", action="store_true", default=argparse.SUPPRESS,
+        help="Start a non-authorizing operator session; sensitive actions still require verification.",
     )
     _inherited_flag(
         chat_parser,

@@ -967,6 +967,11 @@ def set_secret_capture_callback(*args, **kwargs):
     return _set_secret_capture_callback(*args, **kwargs)
 
 
+def set_operator_verification_callback(*args, **kwargs):
+    from hermes_cli.operator_verification import set_operator_verification_callback as _set
+    return _set(*args, **kwargs)
+
+
 def _cleanup_all_browsers(*args, **kwargs):
     from tools.browser_tool import _emergency_cleanup_all_sessions
 
@@ -9752,6 +9757,52 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass
 
+    _FRESH_CONTEXT_BEGIN = "[Hermes /fresh carryover context]"
+    _FRESH_CONTEXT_END = "[/Hermes /fresh carryover context]"
+
+    def _strip_fresh_carryover_context(self, text: str | None) -> str:
+        text = text if isinstance(text, str) else ""
+        while self._FRESH_CONTEXT_BEGIN in text:
+            start = text.find(self._FRESH_CONTEXT_BEGIN)
+            stop = text.find(self._FRESH_CONTEXT_END, start)
+            text = text[:start] if stop < 0 else text[:start] + text[stop + len(self._FRESH_CONTEXT_END):]
+        return text.strip()
+
+    def _set_fresh_carryover_context(self, carryover: str | None) -> None:
+        if not self.agent:
+            return
+        base = self._strip_fresh_carryover_context(getattr(self.agent, "ephemeral_system_prompt", None))
+        self.agent.ephemeral_system_prompt = "\n\n".join(p for p in (base, carryover) if p) or None
+
+    def _build_fresh_carryover_context(self, message_count: int) -> tuple[str | None, int]:
+        visible = [m for m in (self.conversation_history or []) if m.get("role") in {"user", "assistant"}]
+        selected = visible[-max(1, min(message_count, 100)):]
+        if not selected:
+            return None, 0
+        lines = [
+            self._FRESH_CONTEXT_BEGIN,
+            "Read-only topic context from the previous session; current user direction remains authoritative.",
+            f"Source session: {self.session_id}",
+            f"Carried messages: {len(selected)}",
+        ]
+        for item in selected:
+            content = str(item.get("content") or "")
+            content = content.replace(self._FRESH_CONTEXT_BEGIN, "").replace(self._FRESH_CONTEXT_END, "")
+            lines.append(f"{item.get('role')}: {content}")
+        lines.append(self._FRESH_CONTEXT_END)
+        from agent.redact import redact_sensitive_text
+        block = redact_sensitive_text("\n".join(lines), force=True)
+        # Carryover is injected into a future system prompt, so apply a
+        # conservative prefix guard even to shortened/display-form tokens
+        # that intentionally fall below the global live-secret threshold.
+        import re
+        block = re.sub(r"\bsk-[^\s]{4,}", "sk-[REDACTED]", block, flags=re.IGNORECASE)
+        raw = block.encode("utf-8")
+        if len(raw) > 8192:
+            suffix = ("\n" + self._FRESH_CONTEXT_END).encode()
+            block = raw[:8192 - len(suffix)].decode("utf-8", "ignore") + suffix.decode()
+        return block, len(selected)
+
     def _discard_session_if_empty(self, session_id: Optional[str]) -> bool:
         """Drop a just-ended session row when it never gained content.
 
@@ -9826,7 +9877,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
-    def new_session(self, silent=False, title=None):
+    def new_session(self, silent=False, title=None, fresh_context=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         old_session_id = self.session_id
         _boundary_snapshot = None
@@ -9957,6 +10008,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
+            self._set_fresh_carryover_context(fresh_context)
 
             if self._session_db:
                 try:
@@ -12190,6 +12242,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.new_session(title=title)
+        elif canonical == "fresh":
+            parts = cmd_original.split()
+            try:
+                message_count = int(parts[1]) if len(parts) > 1 else 20
+            except ValueError:
+                _cprint("  Usage: /fresh [message-count]")
+                return True
+            fresh_context, carried = self._build_fresh_carryover_context(message_count)
+            self.new_session(fresh_context=fresh_context)
+            if carried:
+                _cprint(f"  Fresh session kept {carried} previous message(s) as read-only context.")
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
         elif canonical == "sessions":
@@ -15857,6 +15920,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
 
+    def _operator_verification_callback(self) -> str:
+        """Collect a masked verifier value through the existing secret modal."""
+        response_queue = queue.Queue()
+        self._capture_modal_input_snapshot()
+        self._secret_state = {
+            "var_name": "HERMES_OPERATOR_VERIFICATION",
+            "prompt": "Hermes operator verification",
+            "metadata": {"purpose": "operator_verification"},
+            "response_queue": response_queue,
+        }
+        self._secret_deadline = time.monotonic() + 90
+        try:
+            while time.monotonic() < self._secret_deadline:
+                try:
+                    return response_queue.get(timeout=1) or ""
+                except queue.Empty:
+                    self._paint_now()
+            return ""
+        finally:
+            self._secret_state = None
+            self._secret_deadline = 0
+            self._restore_modal_input_snapshot()
+            self._paint_now()
+
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
                            allow_session: bool = True,
@@ -16267,7 +16354,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def _chat_impl(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -16291,6 +16378,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
+        set_operator_verification_callback(self._operator_verification_callback)
 
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
@@ -16663,6 +16751,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         set_sudo_password_callback(None)
                         set_approval_callback(None)
                         set_secret_capture_callback(None)
+                        set_operator_verification_callback(None)
                     except Exception:
                         pass
                     # Release the per-turn approval session key. ``_session_yolo``
@@ -17124,6 +17213,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 stop_event.set()
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
+
+    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+        """Run one turn while owning every parent-thread callback lifetime."""
+        try:
+            return self._chat_impl(message, images=images, voice_input=voice_input)
+        finally:
+            try:
+                set_sudo_password_callback(None)
+                set_approval_callback(None)
+                set_secret_capture_callback(None)
+                set_operator_verification_callback(None)
+            except BaseException:
+                pass
     
     def _clear_terminal_on_exit(self):
         """Clear screen + scrollback so nothing is stranded above the exit summary.

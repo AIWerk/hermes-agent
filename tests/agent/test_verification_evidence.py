@@ -84,6 +84,105 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert echoed is None
 
 
+def test_leading_cd_uses_project_cwd_for_verification_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path / "project"
+    project.mkdir()
+    _python_project(project)
+
+    evidence = classify_verification_command(
+        f"cd {project} && python3 -m py_compile app.py && uv run python -m pytest tests/test_calc.py -q",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 passed",
+    )
+
+    assert evidence is not None
+    assert evidence.cwd == str(project.resolve())
+    assert evidence.root == str(project.resolve())
+    assert evidence.canonical_command == "pytest"
+    assert evidence.scope == "targeted"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd child ; pytest",
+        "cd child || pytest",
+        "cd - && pytest",
+        "cd && pytest",
+    ],
+)
+def test_unproven_leading_cd_is_not_verification_evidence(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    (tmp_path / "child").mkdir()
+
+    evidence = classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 passed",
+    )
+
+    assert evidence is None
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_parts"),
+    [
+        ("prepare ; cd child && pytest", ("child",)),
+        ("prepare && cd child && pytest", ("child",)),
+        ("cd child && cd nested && pytest", ("child", "nested")),
+    ],
+)
+def test_proven_prefixed_and_repeated_cd_uses_final_project(
+    tmp_path, monkeypatch, command, expected_parts
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path.joinpath(*expected_parts)
+    project.mkdir(parents=True)
+    _python_project(project)
+
+    evidence = classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 passed",
+    )
+
+    assert evidence is not None
+    assert evidence.cwd == str(project.resolve())
+    assert evidence.root == str(project.resolve())
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "prepare && cd - && pytest",
+        "prepare ; cd - && pytest",
+        "prepare && cd && pytest",
+        "prepare && cd -- && pytest",
+    ],
+)
+def test_later_state_dependent_cd_is_not_verification_evidence(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    assert classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="1 passed",
+    ) is None
+
+
 @pytest.mark.parametrize(
     "command",
     [

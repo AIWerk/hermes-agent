@@ -3493,6 +3493,131 @@ def _text_to_speech_single(
         return tool_error(error_msg, success=False)
 
 
+# ===========================================================================
+# Conservative Hungarian/German spoken-form normalization
+# ===========================================================================
+_HU_SMALL_NUMBERS = {
+    0: "nulla", 1: "egy", 2: "kettő", 3: "három", 4: "négy",
+    5: "öt", 6: "hat", 7: "hét", 8: "nyolc", 9: "kilenc",
+    10: "tíz", 11: "tizenegy", 12: "tizenkettő", 13: "tizenhárom",
+    14: "tizennégy", 15: "tizenöt", 16: "tizenhat", 17: "tizenhét",
+    18: "tizennyolc", 19: "tizenkilenc", 20: "húsz", 30: "harminc",
+    40: "negyven", 50: "ötven", 60: "hatvan", 70: "hetven",
+    80: "nyolcvan", 90: "kilencven",
+}
+_DE_SMALL_NUMBERS = {
+    0: "null", 1: "eins", 2: "zwei", 3: "drei", 4: "vier",
+    5: "fünf", 6: "sechs", 7: "sieben", 8: "acht", 9: "neun",
+    10: "zehn", 11: "elf", 12: "zwölf", 13: "dreizehn",
+    14: "vierzehn", 15: "fünfzehn", 16: "sechzehn", 17: "siebzehn",
+    18: "achtzehn", 19: "neunzehn", 20: "zwanzig", 30: "dreißig",
+    40: "vierzig", 50: "fünfzig", 60: "sechzig", 70: "siebzig",
+    80: "achtzig", 90: "neunzig",
+}
+
+
+def _hungarian_int_to_words(value: int) -> str:
+    if value in _HU_SMALL_NUMBERS:
+        return _HU_SMALL_NUMBERS[value]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        prefix = "huszon" if tens == 2 else _HU_SMALL_NUMBERS[tens * 10]
+        return prefix + _HU_SMALL_NUMBERS[ones]
+    if value < 1000:
+        hundreds, rest = divmod(value, 100)
+        prefix = "száz" if hundreds == 1 else _hungarian_int_to_words(hundreds) + "száz"
+        return prefix if not rest else prefix + _hungarian_int_to_words(rest)
+    if value < 1_000_000:
+        thousands, rest = divmod(value, 1000)
+        prefix = "ezer" if thousands == 1 else _hungarian_int_to_words(thousands) + "ezer"
+        return prefix if not rest else prefix + "-" + _hungarian_int_to_words(rest)
+    return str(value)
+
+
+def _german_int_to_words(value: int) -> str:
+    if value in _DE_SMALL_NUMBERS:
+        return _DE_SMALL_NUMBERS[value]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        ones_word = "ein" if ones == 1 else _DE_SMALL_NUMBERS[ones]
+        return ones_word + "und" + _DE_SMALL_NUMBERS[tens * 10]
+    if value < 1000:
+        hundreds, rest = divmod(value, 100)
+        prefix = "einhundert" if hundreds == 1 else _german_int_to_words(hundreds) + "hundert"
+        return prefix if not rest else prefix + _german_int_to_words(rest)
+    if value < 1_000_000:
+        thousands, rest = divmod(value, 1000)
+        prefix = "eintausend" if thousands == 1 else _german_int_to_words(thousands) + "tausend"
+        return prefix if not rest else prefix + _german_int_to_words(rest)
+    return str(value)
+
+
+def _number_to_words(raw: str, *, language: str) -> str:
+    value = raw.strip()
+    negative = value.startswith("-")
+    if negative:
+        value = value[1:]
+    converter = _hungarian_int_to_words if language == "hu" else _german_int_to_words
+    sign = ("mínusz " if language == "hu" else "minus ") if negative else ""
+    if "," in value or "." in value:
+        left, right = re.split(r"[,.]", value, maxsplit=1)
+        separator = " egész " if language == "hu" else " Komma "
+        decimals = " ".join(converter(int(digit)) for digit in right if digit.isdigit())
+        return sign + converter(int(left or "0")) + separator + decimals
+    return sign + converter(int(value))
+
+
+_TTS_NUMERIC_TOKEN_RE = re.compile(r"(?<![\w/])-?\d+(?:[,.]\d+)?(?![\w/])")
+
+
+def _normalize_text_for_tts(text: str, language: Optional[str] = None) -> str:
+    """Expand common spoken forms for Hungarian and German only."""
+    if not text:
+        return text
+    lang = (language or "").strip().lower()
+    if not (lang.startswith("hu") or lang.startswith("de")):
+        return text
+    base_lang = "hu" if lang.startswith("hu") else "de"
+    if base_lang == "hu":
+        replacements = (
+            (r"\s*°\s*C\b|\s*℃", " Celsius fok"),
+            (r"\s*%", " százalék"),
+            (r"\s*€|\s*\bEUR\b", " euró"),
+            (r"\s*\bCHF\b", " svájci frank"),
+            (r"\s*\b(?:HUF|Ft)\b", " forint"),
+        )
+    else:
+        replacements = (
+            (r"\s*°\s*C\b|\s*℃", " Grad Celsius"),
+            (r"\s*%", " Prozent"),
+            (r"\s*€|\s*\bEUR\b", " Euro"),
+            (r"\s*\bCHF\b", " Schweizer Franken"),
+            (r"\s*\bHUF\b", " Ungarische Forint"),
+        )
+    normalized = text
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = _TTS_NUMERIC_TOKEN_RE.sub(
+        lambda match: _number_to_words(match.group(0), language=base_lang),
+        normalized,
+    )
+    return re.sub(r"\s{2,}", " ", normalized).strip()
+
+
+def _resolve_tts_language(tts_config: Optional[Dict[str, Any]], provider: str) -> Optional[str]:
+    if not isinstance(tts_config, dict):
+        return None
+    direct = tts_config.get("language") or tts_config.get("language_code")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    provider_config = tts_config.get(provider) or {}
+    if isinstance(provider_config, dict):
+        provider_language = provider_config.get("language_code") or provider_config.get("language")
+        if isinstance(provider_language, str) and provider_language.strip():
+            return provider_language.strip()
+    return None
+
+
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
@@ -3529,6 +3654,20 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    tts_config = _load_tts_config()
+
+    # Resolve the selected provider before normalization so its language
+    # configuration controls the spoken-form expansion.
+    if provider:
+        provider = provider.lower().strip()
+    else:
+        provider = _get_provider(tts_config)
+    if tts_config.get("normalize_text", True) is not False:
+        text = _normalize_text_for_tts(
+            text,
+            _resolve_tts_language(tts_config, provider),
+        )
+
     # Normalize text via the shared cleaner: markdown, emoji, think blocks,
     # verifier footer, units, newline flattening.
     try:
@@ -3539,20 +3678,12 @@ def text_to_speech_tool(
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
 
-    tts_config = _load_tts_config()
-
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
     if speed is not None:
         clamped = max(0.25, min(4.0, float(speed)))
         tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
         tts_config["speed"] = clamped
-
-    # Allow per-call provider override; fall back to the configured default.
-    if provider:
-        provider = provider.lower().strip()
-    else:
-        provider = _get_provider(tts_config)
 
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)

@@ -14,6 +14,12 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.openai_codex import (
+    OpenAICodexAdapter,
+    chat_payload_to_responses_payload,
+    responses_payload_to_chat_completion,
+    responses_stream_to_payload,
+)
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
@@ -26,6 +32,425 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# OpenAICodexAdapter + chat shim translation
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_auth_store(hermes_home: Path) -> Path:
+    auth_path = hermes_home / "auth.json"
+    auth_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                },
+                "auth_mode": "chatgpt",
+            }
+        },
+    }))
+    return auth_path
+
+
+def test_codex_adapter_metadata():
+    adapter = OpenAICodexAdapter()
+    assert adapter.name == "openai-codex"
+    assert adapter.display_name == "OpenAI Codex OAuth"
+    assert "/chat/completions" in adapter.allowed_paths
+    assert "/responses" in adapter.allowed_paths
+    assert "/models" in adapter.allowed_paths
+
+
+def test_codex_adapter_authentication_from_hermes_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert not OpenAICodexAdapter().is_authenticated()
+    _write_codex_auth_store(tmp_path)
+    assert OpenAICodexAdapter().is_authenticated()
+
+
+def test_codex_adapter_get_credential_uses_runtime_resolver(monkeypatch):
+    with patch(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        return_value={
+            "api_key": "codex-access-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+    ):
+        cred = OpenAICodexAdapter().get_credential()
+    assert cred.bearer == "codex-access-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.headers is not None
+    assert cred.headers["originator"] == "codex_cli_rs"
+    assert "Authorization" not in cred.headers
+
+
+def test_codex_adapter_falls_back_to_pooled_credential(monkeypatch):
+    class Entry:
+        provider = "openai-codex"
+        runtime_api_key = "pooled-codex-token"
+        runtime_base_url = "https://chatgpt.com/backend-api/codex"
+        source = "oauth:codex"
+        last_refresh = "2026-05-21T00:00:00Z"
+
+    class Pool:
+        _entries = [Entry()]
+
+        def peek(self):
+            return self._entries[0]
+
+    with patch(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        side_effect=RuntimeError("stale token store"),
+    ), patch("agent.credential_pool.load_pool", return_value=Pool()):
+        adapter = OpenAICodexAdapter()
+        assert adapter.is_authenticated()
+        cred = adapter.get_credential()
+
+    assert cred.bearer == "pooled-codex-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    assert cred.headers is not None
+    assert cred.headers["originator"] == "codex_cli_rs"
+
+
+def test_chat_payload_to_responses_payload_is_no_tools_boundary():
+    payload = chat_payload_to_responses_payload({
+        "model": "gpt-5.4-mini",
+        "messages": [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "hi"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "unsafe"}}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "Result", "schema": {"type": "object"}, "strict": True},
+        },
+    })
+    assert payload["model"] == "gpt-5.4-mini"
+    assert payload["instructions"] == "Be concise."
+    assert payload["input"] == [{"role": "user", "content": "hi"}]
+    assert "tools" not in payload
+    assert payload["store"] is False
+    assert payload["stream"] is True
+    assert payload["text"]["format"]["type"] == "json_schema"
+
+
+def test_responses_payload_to_chat_completion_extracts_text_and_usage():
+    chat = responses_payload_to_chat_completion({
+        "id": "resp_123",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "hello"}],
+        }],
+        "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    }, model="gpt-5.4-mini")
+    assert chat["object"] == "chat.completion"
+    assert chat["choices"][0]["message"]["content"] == "hello"
+    assert chat["usage"]["total_tokens"] == 5
+
+
+def test_responses_stream_to_payload_collapses_sse_text():
+    payload = responses_stream_to_payload(
+        b'data: {"type":"response.output_text.delta","delta":"proxy"}\n\n'
+        b'data: {"type":"response.output_text.delta","delta":" ok"}\n\n'
+        b'data: {"type":"response.completed","response":{"id":"resp_stream","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3},"output":[]}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    chat = responses_payload_to_chat_completion(payload, model="gpt-5.4-mini")
+    assert payload["id"] == "resp_stream"
+    assert chat["choices"][0]["message"]["content"] == "proxy ok"
+    assert chat["usage"]["total_tokens"] == 3
+
+
+def test_responses_payload_to_chat_completion_coerces_malformed_usage():
+    """A non-numeric upstream usage field must not raise (pre-fix: ValueError
+    escaped the server's try/except and the proxy returned a bare 500).
+
+    The conversion still yields a valid chat.completion with the bad count
+    coerced to 0 instead of crashing.
+    """
+    chat = responses_payload_to_chat_completion({
+        "id": "resp_bad_usage",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "still works"}],
+        }],
+        "usage": {
+            "input_tokens": "NOTANUMBER",
+            "output_tokens": 4,
+            "total_tokens": None,
+        },
+    }, model="gpt-5.4-mini")
+
+    assert chat["choices"][0]["message"]["content"] == "still works"
+    # Malformed input_tokens -> 0; total falls back to prompt+completion sum.
+    assert chat["usage"]["prompt_tokens"] == 0
+    assert chat["usage"]["completion_tokens"] == 4
+    assert chat["usage"]["total_tokens"] == 4
+
+
+def test_codex_adapter_retry_credential_rotates_on_401(monkeypatch):
+    """A 401 from Codex must rotate to a different pooled credential.
+
+    Pre-fix the adapter inherited the base no-op ``get_retry_credential``,
+    so the server's retry block could never rotate for Codex — a single
+    expired pool key took down every request.
+    """
+    class Entry:
+        def __init__(self, key, base_url="https://chatgpt.com/backend-api/codex"):
+            self.runtime_api_key = key
+            self.runtime_base_url = base_url
+
+    failed_entry = Entry("first-codex-token")
+    rotated_to = Entry("second-codex-token")
+
+    class Pool:
+        def __init__(self):
+            self.calls = []
+            # The failed bearer IS a pool entry, so mark-and-rotate must run.
+            self._entries = [failed_entry, rotated_to]
+
+        def mark_exhausted_and_rotate(self, *, status_code, api_key_hint=None):
+            self.calls.append((status_code, api_key_hint))
+            return rotated_to
+
+    pool = Pool()
+    with patch("agent.credential_pool.load_pool", return_value=pool):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(
+            bearer="first-codex-token",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        retry = adapter.get_retry_credential(failed_credential=failed, status_code=401)
+
+    assert retry is not None, "401 must rotate to next pooled Codex credential"
+    assert retry.bearer == "second-codex-token"
+    assert retry.base_url == "https://chatgpt.com/backend-api/codex"
+    # The failed bearer is pinned as the hint so the right entry is exhausted.
+    assert pool.calls == [(401, "first-codex-token")]
+
+
+def test_codex_adapter_retry_credential_skips_unrelated_status(monkeypatch):
+    """Non-{401, 429} statuses must not touch the pool at all."""
+    def _load_pool_must_not_run(*args, **kwargs):
+        raise AssertionError("pool must not be loaded for unrelated statuses")
+
+    with patch("agent.credential_pool.load_pool", _load_pool_must_not_run):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(bearer="x", base_url="https://example/codex")
+        assert adapter.get_retry_credential(failed_credential=failed, status_code=500) is None
+
+
+def test_codex_adapter_retry_credential_none_when_no_rotation(monkeypatch):
+    """If rotation yields nothing (or the same bearer), return None so the
+    upstream 401/429 flows back to the client unchanged."""
+    class Entry:
+        runtime_api_key = "only-token"
+        runtime_base_url = "https://example/codex"
+
+    class Pool:
+        _entries = [Entry()]  # failed bearer is the lone pool entry
+
+        def mark_exhausted_and_rotate(self, *, status_code, api_key_hint=None):
+            return None  # single-entry pool: nowhere to rotate
+
+    with patch("agent.credential_pool.load_pool", return_value=Pool()):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(bearer="only-token", base_url="https://example/codex")
+        assert adapter.get_retry_credential(failed_credential=failed, status_code=429) is None
+
+
+# ---------------------------------------------------------------------------
+# Codex pool selection / rotation — exercised against the REAL CredentialPool
+# (not a mock) so the actual exhaustion/cooldown and api_key_hint matching code
+# runs. These guard the three findings in the codex-proxy review group.
+# ---------------------------------------------------------------------------
+
+
+def _codex_jwt(exp: int, sub: str = "default") -> str:
+    """Build a minimal unsigned JWT carrying ``exp`` (epoch secs) and a ``sub``.
+
+    ``_jwt_claims`` only base64url-decodes the payload segment, so the header
+    and signature can be filler. ``sub`` makes otherwise-identical tokens
+    distinct (two entries with the same exp would collide otherwise).
+    """
+    import base64
+
+    def _b64(obj: Dict[str, Any]) -> str:
+        raw = json.dumps(obj).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+    return f"{_b64({'alg': 'none'})}.{_b64({'exp': exp, 'sub': sub})}.sig"
+
+
+def _real_codex_pool(entries):
+    """Construct a real ``CredentialPool`` of openai-codex entries."""
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    pooled = [
+        PooledCredential(
+            provider="openai-codex",
+            id=spec["id"],
+            label=spec.get("label", spec["id"]),
+            auth_type="api_key",
+            priority=idx,
+            source=spec.get("source", "manual:test"),
+            access_token=spec["access_token"],
+            base_url=spec.get("base_url", "https://chatgpt.com/backend-api/codex"),
+            last_status=spec.get("last_status"),
+            last_status_at=spec.get("last_status_at"),
+            last_error_code=spec.get("last_error_code"),
+            last_error_reset_at=spec.get("last_error_reset_at"),
+        )
+        for idx, spec in enumerate(entries)
+    ]
+    return CredentialPool("openai-codex", pooled)
+
+
+def test_pooled_codex_credential_skips_exhausted_even_when_jwt_valid(tmp_path, monkeypatch):
+    """Finding: _pooled_codex_credential must honor exhaustion/cooldown.
+
+    A future-exp JWT that the pool has marked EXHAUSTED with a cooldown still
+    in the future must NOT be handed back — the healthy second entry wins.
+    Run against the real CredentialPool so _available_entries() does the work.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import time as _time
+
+    future = int(_time.time()) + 3600
+    exhausted_token = _codex_jwt(future, sub="exhausted")  # JWT valid but rate-limited
+    healthy_token = _codex_jwt(future, sub="healthy")
+
+    pool = _real_codex_pool([
+        {
+            "id": "exhausted",
+            "access_token": exhausted_token,
+            "last_status": "exhausted",
+            "last_status_at": _time.time(),
+            "last_error_code": 429,
+            # cooldown ends ~50 minutes from now
+            "last_error_reset_at": _time.time() + 3000,
+        },
+        {
+            "id": "healthy",
+            "access_token": healthy_token,
+        },
+    ])
+
+    from hermes_cli.proxy.adapters.openai_codex import _pooled_codex_credential
+
+    with patch("agent.credential_pool.load_pool", return_value=pool):
+        creds = _pooled_codex_credential()
+
+    assert creds["api_key"] == healthy_token, (
+        "must not return the EXHAUSTED entry while its 429 cooldown is active"
+    )
+    assert creds["api_key"] != exhausted_token
+
+
+def test_pooled_codex_credential_returns_exhausted_after_cooldown_elapsed(tmp_path, monkeypatch):
+    """The cooldown is respected, not permanent: once last_error_reset_at is in
+    the past the previously-exhausted entry is selectable again."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import time as _time
+
+    future = int(_time.time()) + 3600
+    token = _codex_jwt(future)
+
+    pool = _real_codex_pool([
+        {
+            "id": "recovered",
+            "access_token": token,
+            "last_status": "exhausted",
+            "last_status_at": _time.time() - 7200,
+            "last_error_code": 429,
+            "last_error_reset_at": _time.time() - 60,  # cooldown already elapsed
+        },
+    ])
+
+    from hermes_cli.proxy.adapters.openai_codex import _pooled_codex_credential
+
+    with patch("agent.credential_pool.load_pool", return_value=pool):
+        creds = _pooled_codex_credential()
+
+    assert creds["api_key"] == token
+
+
+def test_get_retry_credential_api_key_hint_mismatch_spares_healthy_entry(tmp_path, monkeypatch):
+    """Finding: a singleton-sourced failure must NOT exhaust an unrelated
+    healthy pool entry.
+
+    The failed bearer ("singleton-token") is absent from the pool. With the
+    real pool, the pre-fix code would fall through mark_exhausted_and_rotate's
+    hint-miss path and exhaust the lone healthy entry. The fix must leave it
+    untouched (last_status stays None).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import time as _time
+
+    future = int(_time.time()) + 3600
+    healthy_token = _codex_jwt(future)
+
+    pool = _real_codex_pool([
+        {"id": "healthy", "access_token": healthy_token},
+    ])
+
+    from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
+
+    with patch("agent.credential_pool.load_pool", return_value=pool):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(
+            bearer="singleton-token",  # NOT a pool entry (singleton store)
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        retry = adapter.get_retry_credential(failed_credential=failed, status_code=429)
+
+    # The healthy entry was never marked exhausted.
+    healthy_entry = next(e for e in pool.entries() if e.id == "healthy")
+    assert healthy_entry.last_status is None, (
+        "an unrelated healthy entry must not be burned for a non-pool failure"
+    )
+    # It may still be offered as a retry credential (it is available + differs
+    # from the failed singleton bearer), but it must NOT be exhausted.
+    if retry is not None:
+        assert retry.bearer == healthy_token
+
+
+def test_get_retry_credential_pool_sourced_failure_exhausts_only_failed_entry(tmp_path, monkeypatch):
+    """A genuine pool-sourced 429 marks ONLY the failed entry exhausted and
+    rotates to the other healthy entry — confirmed on the real pool."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import time as _time
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    future = int(_time.time()) + 3600
+    failed_token = _codex_jwt(future, sub="failed")
+    other_token = _codex_jwt(future, sub="other")
+
+    pool = _real_codex_pool([
+        {"id": "failed", "access_token": failed_token},
+        {"id": "other", "access_token": other_token},
+    ])
+
+    from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
+
+    with patch("agent.credential_pool.load_pool", return_value=pool):
+        adapter = OpenAICodexAdapter()
+        failed = UpstreamCredential(
+            bearer=failed_token,
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        retry = adapter.get_retry_credential(failed_credential=failed, status_code=429)
+
+    assert retry is not None
+    assert retry.bearer == other_token
+    failed_entry = next(e for e in pool.entries() if e.id == "failed")
+    other_entry = next(e for e in pool.entries() if e.id == "other")
+    assert failed_entry.last_status == STATUS_EXHAUSTED
+    assert other_entry.last_status is None
 
 
 # ---------------------------------------------------------------------------

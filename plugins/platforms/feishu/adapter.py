@@ -61,7 +61,9 @@ import re
 import threading
 import time
 import uuid
+import warnings
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +116,19 @@ EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
+
+
+@contextmanager
+def _suppress_lark_pkg_resources_warning():
+    """Hide only lark-oapi's known setuptools deprecation warning."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"^pkg_resources is deprecated as an API(?:\.|$)",
+            category=UserWarning,
+            module=r"^lark_oapi(?:\.|$)",
+        )
+        yield
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -1394,25 +1409,26 @@ def _load_lark_oapi() -> bool:
         if FEISHU_AVAILABLE:
             return True
         try:
-            import lark_oapi as lark
-            from lark_oapi.api.application.v6 import GetApplicationRequest
-            from lark_oapi.api.im.v1 import (
-                CreateFileRequest, CreateFileRequestBody,
-                CreateImageRequest, CreateImageRequestBody,
-                CreateMessageRequest, CreateMessageRequestBody,
-                GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
-                P2ImMessageMessageReadV1,
-                ReplyMessageRequest, ReplyMessageRequestBody,
-                UpdateMessageRequest, UpdateMessageRequestBody,
-            )
-            from lark_oapi.core import AccessTokenType, HttpMethod
-            from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
-            from lark_oapi.core.model import BaseRequest
-            from lark_oapi.event.callback.model.p2_card_action_trigger import (
-                CallBackCard, P2CardActionTriggerResponse,
-            )
-            from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-            from lark_oapi.ws import Client as FeishuWSClient
+            with _suppress_lark_pkg_resources_warning():
+                import lark_oapi as lark
+                from lark_oapi.api.application.v6 import GetApplicationRequest
+                from lark_oapi.api.im.v1 import (
+                    CreateFileRequest, CreateFileRequestBody,
+                    CreateImageRequest, CreateImageRequestBody,
+                    CreateMessageRequest, CreateMessageRequestBody,
+                    GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+                    P2ImMessageMessageReadV1,
+                    ReplyMessageRequest, ReplyMessageRequestBody,
+                    UpdateMessageRequest, UpdateMessageRequestBody,
+                )
+                from lark_oapi.core import AccessTokenType, HttpMethod
+                from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+                from lark_oapi.core.model import BaseRequest
+                from lark_oapi.event.callback.model.p2_card_action_trigger import (
+                    CallBackCard, P2CardActionTriggerResponse,
+                )
+                from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+                from lark_oapi.ws import Client as FeishuWSClient
         except ImportError:
             return False
 
@@ -1475,8 +1491,11 @@ def check_feishu_requirements() -> bool:
     from tools.lazy_deps import ensure
 
     try:
-        ensure("platform.feishu", prompt=False)
+        with _suppress_lark_pkg_resources_warning():
+            ensure("platform.feishu", prompt=False)
         return True
+    except Warning:
+        raise
     except Exception:
         return False
 

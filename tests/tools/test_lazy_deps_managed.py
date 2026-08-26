@@ -107,8 +107,8 @@ def test_platform_unsupported_takes_precedence(monkeypatch):
     assert excinfo.value.reason == "unsupported on win32"
 
 
-def test_unreadable_config_fails_open(monkeypatch):
-    """A broken config must not block installs on a normal pip install."""
+def test_unreadable_config_fails_closed(monkeypatch):
+    """A broken config cannot authorize installs on a normal pip install."""
     def _raise():
         raise RuntimeError("config unreadable")
 
@@ -117,4 +117,4 @@ def test_unreadable_config_fails_open(monkeypatch):
     with pytest.raises(FeatureUnavailable) as excinfo:
         lazy_deps.ensure(FEATURE, prompt=False)
 
-    assert "managed" not in excinfo.value.reason.lower()
+    assert "lazy installs disabled" in excinfo.value.reason.lower()

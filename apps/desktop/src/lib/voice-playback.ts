@@ -75,6 +75,49 @@ export interface VoicePlaybackOptions {
   source: VoicePlaybackSource
 }
 
+function waitForAudioReadiness(audio: HTMLAudioElement): Promise<boolean> {
+  if (audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    return Promise.resolve(true)
+  }
+
+  const previousStop = currentStop
+
+  return new Promise<boolean>((resolve, reject) => {
+    const cleanup = () => {
+      audio.removeEventListener('canplay', onReady)
+      audio.removeEventListener('canplaythrough', onReady)
+      audio.removeEventListener('loadeddata', onReady)
+      audio.removeEventListener('error', onError)
+
+      if (currentStop === onCancel) {
+        currentStop = previousStop
+      }
+    }
+
+    const onReady = () => {
+      cleanup()
+      resolve(true)
+    }
+
+    const onError = () => {
+      cleanup()
+      reject(new Error('Playback failed'))
+    }
+
+    const onCancel = () => {
+      cleanup()
+      resolve(false)
+    }
+
+    currentStop = onCancel
+    audio.addEventListener('loadeddata', onReady, { once: true })
+    audio.addEventListener('canplay', onReady, { once: true })
+    audio.addEventListener('canplaythrough', onReady, { once: true })
+    audio.addEventListener('error', onError, { once: true })
+    audio.load()
+  })
+}
+
 export function stopVoicePlayback() {
   sequence += 1
   currentStop?.()
@@ -184,6 +227,8 @@ export interface SpeechStreamSession {
 // ---------------------------------------------------------------------------
 
 function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlaybackOptions): SpeechStreamSession {
+  const ownSequence = sequence
+  const isCurrent = () => ownSequence === sequence
   let buffer = ''
   let finished = false
   let settled = false
@@ -193,6 +238,7 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
   let playing: HTMLAudioElement | null = null
 
   let settle: (value: 'done' | 'fallback') => void = () => undefined
+  const stopSession = () => settle(started ? 'done' : 'fallback')
 
   const done = new Promise<'done' | 'fallback'>(resolve => {
     settle = value => {
@@ -201,7 +247,10 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
       }
 
       settled = true
-      currentStop = null
+
+      if (currentStop === stopSession) {
+        currentStop = null
+      }
 
       if (playing) {
         playing.pause()
@@ -213,7 +262,7 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
     }
   })
 
-  currentStop = () => settle(started ? 'done' : 'fallback')
+  currentStop = stopSession
 
   const pump = async () => {
     if (synthesizing || settled) {
@@ -251,9 +300,17 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
         const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }))
 
         try {
+          const audio = new Audio(url)
+          playing = audio
+          const ready = await waitForAudioReadiness(audio)
+
+          if (!ready || settled || !isCurrent()) {
+            settle(started ? 'done' : 'fallback')
+
+            return
+          }
+
           await new Promise<void>((resolve, reject) => {
-            const audio = new Audio(url)
-            playing = audio
             audio.addEventListener('ended', () => resolve(), { once: true })
             audio.addEventListener('error', () => reject(new Error('Playback failed')), { once: true })
             void audio.play().catch(reject)
@@ -563,6 +620,12 @@ async function playSpeechDataUrl(
   const audio = new Audio(response.data_url)
   currentAudio = audio
   setVoicePlaybackState(currentState('speaking', options, audio))
+
+  const ready = await waitForAudioReadiness(audio)
+
+  if (!ready || !isCurrent()) {
+    return false
+  }
 
   await new Promise<void>((resolve, reject) => {
     let stall: number | null = null

@@ -3317,12 +3317,9 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
       /root/.hermes/profiles/coder     → /home/alice/.hermes/profiles/coder
       /opt/custom-hermes               → /opt/custom-hermes  (kept as-is)
     """
-    current_hermes_raw = os.environ.get("HERMES_HOME", "").strip()
-    current_hermes = (
-        Path(current_hermes_raw).expanduser()
-        if current_hermes_raw
-        else get_hermes_home()
-    )
+    from hermes_constants import get_process_hermes_home
+
+    current_hermes = get_process_hermes_home().expanduser()
     # Keep explicit custom paths lexical. Resolving a non-existent custom path
     # can rewrite it through host-specific path mappings, which would bake a
     # different HERMES_HOME into the generated service unit.
@@ -3338,14 +3335,95 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         relative = current_hermes.relative_to(current_default)
         return str(target_default / relative)
     except ValueError:
-        # Completely custom path (not under ~/.hermes) — keep as-is
-        return str(current_hermes)
+        try:
+            return str(Path(target_home_dir) / current_hermes.relative_to(Path.home()))
+        except ValueError:
+            # Independently shared absolute root — keep as-is.
+            return str(current_hermes)
 
 
-def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
-    """Build PATH directory list for service units, excluding non-existent dirs."""
+def _verified_stable_project_root(service_home: str | Path) -> Path | None:
+    """Return the service home's stable project root after strict identity proof."""
+    try:
+        physical_root = PROJECT_ROOT.resolve(strict=True)
+        stable_root = Path(service_home) / "hermes-agent"
+        if stable_root.resolve(strict=True) == physical_root:
+            return stable_root
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def _service_project_path(
+    path: str | Path,
+    service_home: str | Path,
+    *,
+    omit_unverified: bool = False,
+    allow_missing: bool = False,
+) -> Path | None:
+    """Render a project-owned path through a strictly proven stable root.
+
+    Ownership is decided from canonical paths so lexical ``..`` components and
+    symlink escapes cannot be mistaken for project children.  A cross-user
+    service can request fail-closed omission instead of retaining a path owned
+    by the caller's physical release.
+    """
+    candidate = Path(path).expanduser()
+    try:
+        physical_root = PROJECT_ROOT.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None if omit_unverified else candidate
+
+    try:
+        lexical = Path(os.path.abspath(candidate))
+        lexical_relative = lexical.relative_to(physical_root)
+        lexically_project_owned = True
+    except ValueError:
+        lexical_relative = None
+        lexically_project_owned = False
+
+    try:
+        canonical = candidate.resolve(strict=not allow_missing)
+        relative = canonical.relative_to(physical_root)
+    except (OSError, RuntimeError, ValueError):
+        # A lexical directory child that resolves outside the physical project
+        # is a traversal/symlink escape. A final executable symlink (the normal
+        # venv ``bin/python`` layout) may still be spelled through the proven
+        # project root; its parent remains project-contained.
+        try:
+            final_file_symlink = (
+                lexically_project_owned
+                and candidate.is_symlink()
+                and not candidate.is_dir()
+                and candidate.parent.resolve(strict=True).is_relative_to(physical_root)
+            )
+        except (OSError, RuntimeError, ValueError):
+            final_file_symlink = False
+        if final_file_symlink and lexical_relative is not None:
+            relative = lexical_relative
+        else:
+            return None if lexically_project_owned or omit_unverified else candidate
+
+    stable_root = _verified_stable_project_root(service_home)
+    if stable_root is not None:
+        return stable_root / relative
+    if omit_unverified:
+        return None
+    return physical_root / relative
+
+
+def _build_service_path_dirs(
+    project_root: Path | None = None,
+    *,
+    service_home: str | Path | None = None,
+    omit_unverified_project: bool = False,
+) -> list[str]:
+    """Build PATH directories using one trust-bounded service-home context."""
     if project_root is None:
         project_root = PROJECT_ROOT
+    effective_service_home: str | Path = (
+        get_hermes_home() if service_home is None else service_home
+    )
 
     def _is_dir(path: Path) -> bool:
         try:
@@ -3353,19 +3431,31 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
         except OSError:
             return False
 
-    candidates = []
+    candidates: list[str] = []
 
-    venv_bin = project_root / "venv" / "bin"
-    if _is_dir(venv_bin):
-        candidates.append(str(venv_bin))
-    elif sys.prefix != sys.base_prefix:
-        candidates.append(str(Path(sys.prefix) / "bin"))
+    detected_venv = _detect_venv_dir()
+    if detected_venv is not None:
+        venv_bin = detected_venv / ("Scripts" if is_windows() else "bin")
+        if _is_dir(venv_bin):
+            rendered = _service_project_path(
+                venv_bin,
+                effective_service_home,
+                omit_unverified=omit_unverified_project,
+            )
+            if rendered is not None:
+                candidates.append(str(rendered))
 
     node_bin = project_root / "node_modules" / ".bin"
     if _is_dir(node_bin):
-        candidates.append(str(node_bin))
+        rendered = _service_project_path(
+            node_bin,
+            effective_service_home,
+            omit_unverified=omit_unverified_project,
+        )
+        if rendered is not None:
+            candidates.append(str(rendered))
 
-    hermes_home = get_hermes_home()
+    hermes_home = Path(effective_service_home)
     hermes_node = hermes_home / "node" / "bin"
     if _is_dir(hermes_node):
         candidates.append(str(hermes_node))
@@ -3443,7 +3533,10 @@ def _systemd_watchdog_service_fields(
 
 
 def _append_node_dir_for_service(
-    path_entries: list[str], hermes_root: Path | None = None
+    path_entries: list[str],
+    hermes_root: Path | None = None,
+    *,
+    allow_ambient_fallback: bool = True,
 ) -> None:
     """Add the Node directory a generated service unit should use to *path_entries*.
 
@@ -3462,7 +3555,9 @@ def _append_node_dir_for_service(
     candidate dir (hardened home) means "skip the rung", not "crash the
     generator".
 
-    PATH lookup remains the fallback rung for installs with no managed Node.
+    PATH lookup remains the fallback rung for user-scoped installs with no
+    managed Node. Cross-user system units disable that fallback because the
+    invoker's ambient PATH is not authority for the target service user.
     """
     from hermes_constants import (
         hermes_managed_node_tree_present,
@@ -3482,7 +3577,7 @@ def _append_node_dir_for_service(
     # Ambient PATH lookup is a fallback, not an additional rung. Once the
     # target Hermes home provides managed Node, consulting the invoker's PATH
     # makes a system unit differ between sudo/root and its service user.
-    if managed_node_present:
+    if managed_node_present or not allow_ambient_fallback:
         return
 
     resolved_node = shutil.which("node")
@@ -3503,12 +3598,39 @@ def _append_node_dir_for_service(
 
 
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
-    python_path = get_python_path()
     working_dir = _stable_service_working_dir()
     detected_venv = _detect_venv_dir()
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    venv_candidate = detected_venv if detected_venv else PROJECT_ROOT / "venv"
 
-    path_entries = _build_service_path_dirs()
+    system_identity: tuple[str, str, str] | None = None
+    if system:
+        system_identity = _system_service_identity(run_as_user)
+        service_home: str | Path = _hermes_home_for_target_user(system_identity[2])
+        path_entries = _build_service_path_dirs(
+            service_home=service_home,
+            omit_unverified_project=True,
+        )
+    else:
+        from hermes_constants import get_process_hermes_home
+
+        service_home = get_process_hermes_home()
+        path_entries = _build_service_path_dirs(service_home=service_home)
+
+    rendered_python = _service_project_path(
+        get_python_path(), service_home, omit_unverified=system
+    )
+    rendered_venv = _service_project_path(
+        venv_candidate,
+        service_home,
+        omit_unverified=system,
+        allow_missing=detected_venv is None,
+    )
+    if rendered_python is None or rendered_venv is None:
+        raise ValueError(
+            "refusing to generate cross-user service without a verified stable project runtime"
+        )
+    python_path = str(rendered_python)
+    venv_dir = str(rendered_venv)
     if not system:
         # System units append the managed Node dirs later, once the TARGET
         # user's Hermes home is known — probing here would stat the calling
@@ -3531,29 +3653,28 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     restart_timeout = max(60, _drain_timeout + 30)
 
     if system:
-        username, group_name, home_dir = _system_service_identity(run_as_user)
-        hermes_home = _hermes_home_for_target_user(home_dir)
+        assert system_identity is not None
+        username, group_name, home_dir = system_identity
+        hermes_home = str(service_home)
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
         profile_arg = _profile_arg_for_target_user(hermes_home, home_dir)
-        # Remap all paths that may resolve under the calling user's home
-        # (e.g. /root/) to the target user's home so the service can
-        # actually access them.
-        python_path = _remap_path_for_user(python_path, home_dir)
+        # Project-owned executable/venv fields already share the target-home
+        # proof above; external absolute paths remain unchanged.
         # Anchor cwd to the target user's HERMES_HOME (stable, always exists)
         # rather than a remapped source-checkout path that can rot. See
         # _stable_service_working_dir() for the full rationale.
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
-        venv_dir = _remap_path_for_user(venv_dir, home_dir)
-        path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
         # Managed Node for the TARGET user's tree (see the skip above): probe
         # the remapped hermes_home, not the calling user's. Prepend — the
         # managed Node must outrank remapped shell-PATH entries, matching the
         # user-unit ordering where it's appended before PATH capture.
         _target_node_entries: list[str] = []
         _append_node_dir_for_service(
-            _target_node_entries, Path(hermes_home) if hermes_home else None
+            _target_node_entries,
+            Path(hermes_home) if hermes_home else None,
+            allow_ambient_fallback=False,
         )
         path_entries = [
             e for e in _target_node_entries if e not in path_entries
@@ -3596,7 +3717,8 @@ StandardError=journal
 WantedBy=multi-user.target
 """
 
-    hermes_home = str(get_hermes_home().resolve())
+    hermes_home = str(Path(service_home).resolve())
+    working_dir = hermes_home
     systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
         hermes_home
     )
@@ -4800,9 +4922,12 @@ def generate_launchd_plist() -> str:
     # Stable cwd anchor — never the volatile source checkout. See
     # _stable_service_working_dir() for the rationale (same rot risk applies
     # to launchd's WorkingDirectory as to systemd's).
-    working_dir = _stable_service_working_dir()
-    hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
+    from hermes_constants import get_process_hermes_home
+
+    service_home = get_process_hermes_home()
+    working_dir = str(service_home)
+    hermes_home = str(service_home.resolve())
+    log_dir = service_home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     # Build a sane PATH for the launchd plist.  launchd provides only a
@@ -4811,11 +4936,20 @@ def generate_launchd_plist() -> str:
     # the systemd unit), then capture the user's full shell PATH so every
     # user-installed tool (node, ffmpeg, …) is reachable.
     detected_venv = _detect_venv_dir()
-    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    venv_candidate = detected_venv if detected_venv else PROJECT_ROOT / "venv"
+    rendered_venv = _service_project_path(
+        venv_candidate,
+        service_home,
+        allow_missing=detected_venv is None,
+    )
+    raw_python_path = get_python_path()
+    rendered_python = _service_project_path(raw_python_path, service_home)
+    assert rendered_venv is not None and rendered_python is not None
+    venv_dir = str(rendered_venv)
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = _build_service_path_dirs()
-    _append_node_dir_for_service(priority_dirs)
+    priority_dirs = _build_service_path_dirs(service_home=service_home)
+    _append_node_dir_for_service(priority_dirs, service_home)
     sane_path = ":".join(
         dict.fromkeys(
             priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
@@ -4827,11 +4961,13 @@ def generate_launchd_plist() -> str:
     # Build ProgramArguments array, including --profile when using a named profile.
     # The stderr wrapper preserves launchd's restart semantics while adding
     # timestamps to raw stderr lines before they land in gateway.error.log.
+    command = _timestamped_stderr_gateway_command(
+        err_path, external_supervisor=True
+    )
+    stable_python_path = str(rendered_python)
     prog_args = [
-        f"<string>{part}</string>"
-        for part in _timestamped_stderr_gateway_command(
-            err_path, external_supervisor=True
-        )
+        f"<string>{stable_python_path if part == raw_python_path else part}</string>"
+        for part in command
     ]
     prog_args_xml = "\n        ".join(prog_args)
 

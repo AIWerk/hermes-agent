@@ -33,6 +33,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.memory_router import MemorySensitivity, should_write_builtin_memory
 from utils import atomic_write_text, is_truthy_value
 from tools.registry import no_cache_check_fn
 
@@ -189,6 +190,7 @@ class MemoryStore:
         self.user_profile_enabled = user_profile_enabled
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self.operator_session_context: Dict[str, Any] | None = None
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -908,6 +910,83 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+def _memory_router_curation_enabled() -> bool:
+    """Return whether non-inject writes are blocked by curation policy."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
+        return bool(
+            cfg_get(config, "memory", "router", "enabled", default=True)
+        ) and bool(
+            cfg_get(
+                config,
+                "memory",
+                "router",
+                "block_non_inject_writes",
+                default=True,
+            )
+        )
+    except Exception:
+        # Curation is optional and must not suppress legitimate memory writes
+        # merely because configuration is temporarily unreadable. Credential
+        # rejection below remains unconditional.
+        return False
+
+
+def _memory_router_block(
+    content: str,
+    target: str,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    policy_block: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Reject credentials always and optional non-inject curation failures."""
+    allowed, route = should_write_builtin_memory(
+        content or "", target=target, metadata=metadata
+    )
+    if route.sensitivity == MemorySensitivity.CREDENTIAL:
+        return {
+            "success": False,
+            "error": (
+                "Memory router blocked a credential/secret from "
+                "prompt-injected memory."
+            ),
+            "route": route.to_dict(),
+        }
+    if allowed or not policy_block or not _memory_router_curation_enabled():
+        return None
+    return {
+        "success": False,
+        "error": "Memory router blocked this write from prompt-injected memory.",
+        "route": route.to_dict(),
+    }
+
+
+def _memory_router_block_batch(
+    target: str,
+    operations: List[Dict[str, Any]],
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Gate every content-producing operation before staging or mutation."""
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return {
+                "success": False,
+                "error": "Each operation must be an object.",
+            }
+        if operation.get("action") not in {"add", "replace"}:
+            continue
+        content = operation.get("content") or operation.get("new_text")
+        blocked = _memory_router_block(
+            content or "", target, metadata=metadata, policy_block=False
+        )
+        if blocked is not None:
+            return blocked
+    return None
+
+
 def load_on_disk_store() -> "MemoryStore":
     """Build a fresh on-disk :class:`MemoryStore`, honoring configured char limits.
 
@@ -1111,6 +1190,11 @@ def memory_tool(
     """
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+    if action in {"add", "replace", "remove"} and getattr(store, "operator_session_context", None):
+        return tool_error(
+            "Operator sessions cannot write to built-in prompt-injected user/memory stores.",
+            success=False,
+        )
 
     # Accept new_text as an alias for content (single-op path). See docstring.
     if content is None and new_text is not None:
@@ -1130,6 +1214,9 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        blocked = _memory_router_block_batch(target, operations)
+        if blocked is not None:
+            return json.dumps(blocked, ensure_ascii=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1152,6 +1239,11 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    if action in {"add", "replace"}:
+        blocked = _memory_router_block(content or "", target)
+        if blocked is not None:
+            return json.dumps(blocked, ensure_ascii=False)
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
@@ -1241,17 +1333,35 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     Returns the store's result dict.
     """
     action = payload.get("action")
+    if action in {"add", "replace", "remove", "batch"} and getattr(store, "operator_session_context", None):
+        return {
+            "success": False,
+            "error": "Operator sessions cannot write to built-in prompt-injected user/memory stores.",
+        }
     target = payload.get("target", "memory")
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return target_error
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
+    metadata = payload.get("metadata")
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
+        operations = payload.get("operations") or []
+        if not isinstance(operations, list):
+            return {"success": False, "error": "operations must be a list."}
+        blocked = _memory_router_block_batch(target, operations, metadata=metadata)
+        if blocked is not None:
+            return blocked
+        return store.apply_batch(target, operations)
     if action == "add":
+        blocked = _memory_router_block(content, target, metadata=metadata)
+        if blocked is not None:
+            return blocked
         return store.add(target, content)
     if action == "replace":
+        blocked = _memory_router_block(content, target, metadata=metadata)
+        if blocked is not None:
+            return blocked
         return store.replace(target, old_text, content)
     if action == "remove":
         return store.remove(target, old_text)

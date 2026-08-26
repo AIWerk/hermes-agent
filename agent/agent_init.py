@@ -533,6 +533,31 @@ def _refuse_checkpoint_required_on_codex_app_server(
         )
 
 
+def _stamp_authenticated_cui_session_owner(model_config: dict) -> None:
+    """Stamp only flow-bound, server-authenticated actor ownership."""
+    try:
+        from agent import cui_actor_context
+
+        bound = cui_actor_context._actor_context.get()
+        if bound is None:
+            return
+        actor = cui_actor_context.sanitize_cui_actor_context(bound)
+    except Exception:
+        return
+    tenant_id = actor.get("tenant_id", "")
+    actor_id = actor.get("actor_id", "")
+    role = actor.get("role", "").lower()
+    if not (tenant_id and actor_id and role):
+        return
+    model_config["_cui_actor_context"] = actor
+    model_config["_cui_visibility_scope"] = (
+        "admin" if role in {"admin", "owner", "operator"} else "customer"
+    )
+    model_config["_cui_actor_role"] = role
+    model_config["_cui_actor_id"] = actor_id
+    model_config["_cui_tenant_id"] = tenant_id
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -1777,6 +1802,7 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    _stamp_authenticated_cui_session_owner(agent._session_init_model_config)
     # Persist a process-scoped --yolo launch into the session row so a later
     # `hermes --resume <id>` can restore the bypass (CLI resume paths read
     # model_config.yolo_mode back via SessionDB.session_yolo_enabled).
@@ -1789,9 +1815,9 @@ def init_agent(
     except Exception:
         pass
     
-    # In-memory todo list for task planning (one per agent/session)
-    from tools.todo_tool import TodoStore
-    agent._todo_store = TodoStore()
+    # File-backed todo list for task planning (one per agent/session).
+    from tools.todo_tool import TodoStore, default_todo_markdown_path
+    agent._todo_store = TodoStore(markdown_path=default_todo_markdown_path())
     
     # Load config once for memory, skills, and compression sections
     try:

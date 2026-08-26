@@ -23,6 +23,20 @@ import tools.lazy_deps as ld
 # ---------------------------------------------------------------------------
 
 
+class _AllowedPolicyLease:
+    allowed = True
+
+    def validate(self):
+        return True
+
+
+def _allow_strict_lazy_installs(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_security_policy_bool_strict",
+        lambda *a, **k: _AllowedPolicyLease(),
+    )
+
+
 class TestSpecSafety:
     @pytest.mark.parametrize("spec", [
         "mistralai>=2.3.0,<3",
@@ -76,7 +90,7 @@ class TestSpecSafety:
 
 class TestAllowlist:
     def test_unknown_feature_raises(self, monkeypatch):
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        _allow_strict_lazy_installs(monkeypatch)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
             ld.ensure("not.a.real.feature")
 
@@ -114,15 +128,236 @@ class TestSecurityGating:
             ld.ensure("test.feat", prompt=False)
 
 
-    def test_config_failure_fails_open(self, monkeypatch):
-        # If config can't be read at all, we ALLOW installs rather than
-        # blocking the user out of their own backends.
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            "",
+            "null\n",
+            "- not-a-mapping\n",
+            "security: [\n",
+            "security: null\n",
+            "security: []\n",
+            "security:\n  allow_lazy_installs: null\n",
+            "security:\n  allow_lazy_installs: 1\n",
+            "security:\n  allow_lazy_installs: 'true'\n",
+        ],
+    )
+    def test_malformed_or_wrong_type_user_policy_fails_closed(
+        self, monkeypatch, tmp_path, contents
+    ):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(contents, encoding="utf-8")
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+
+        assert ld._allow_lazy_installs() is False
+
+    @pytest.mark.parametrize(
+        ("contents", "expected"),
+        [
+            ("security:\n  allow_lazy_installs: true\n", True),
+            ("security:\n  allow_lazy_installs: false\n", False),
+            ("security: {}\n", False),
+        ],
+    )
+    def test_only_explicit_boolean_policy_authorizes(
+        self, monkeypatch, tmp_path, contents, expected
+    ):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(contents, encoding="utf-8")
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+
+        assert ld._allow_lazy_installs() is expected
+
+    def test_missing_policy_source_fails_closed(self, monkeypatch, tmp_path):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
         monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: (_ for _ in ()).throw(RuntimeError("config broken")),
+            hermes_config, "get_config_path", lambda: tmp_path / "missing.yaml"
         )
-        assert ld._allow_lazy_installs() is True
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+
+        assert ld._allow_lazy_installs() is False
+
+    def test_selected_managed_source_or_leaf_absence_denies(self, monkeypatch, tmp_path):
+        import hermes_cli.config as hermes_config
+
+        user = tmp_path / "user.yaml"
+        user.write_text("security:\n  allow_lazy_installs: true\n")
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: user)
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        assert ld._allow_lazy_installs() is False
+        (managed / "config.yaml").write_text("security: {}\n")
+        assert ld._allow_lazy_installs() is False
+
+    def test_policy_switch_before_installer_consumes_no_authority(self, monkeypatch):
+        class SwitchedLease:
+            allowed = True
+
+            def validate(self):
+                return False
+
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.switched", ("zzzfake==1",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *a, **k: SwitchedLease(),
+        )
+        monkeypatch.setattr(ld, "_venv_pip_install", lambda *a, **k: pytest.fail("installer must not be called"))
+        with pytest.raises(ld.FeatureUnavailable, match="policy source changed"):
+            ld.ensure("test.switched", prompt=False)
+
+    def test_module_docs_describe_deny_default_and_exact_sources(self):
+        assert ld.__doc__ is not None
+        assert "default false" in ld.__doc__
+        assert "exact source" in ld.__doc__
+
+    @pytest.mark.parametrize(
+        ("user_value", "managed_value", "expected"),
+        [(False, True, True), (True, False, False)],
+    )
+    def test_managed_boolean_wins_at_policy_leaf(
+        self, monkeypatch, tmp_path, user_value, managed_value, expected
+    ):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
+        config_path = tmp_path / "user" / "config.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            f"security:\n  allow_lazy_installs: {str(user_value).lower()}\n",
+            encoding="utf-8",
+        )
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            f"security:\n  allow_lazy_installs: {str(managed_value).lower()}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed_dir)
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+
+        assert ld._allow_lazy_installs() is expected
+
+    @pytest.mark.parametrize("contents", ["", "null\n", "security: [\n"])
+    def test_malformed_managed_policy_cannot_fall_back_to_user_allow(
+        self, monkeypatch, tmp_path, contents
+    ):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
+        config_path = tmp_path / "user" / "config.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            "security:\n  allow_lazy_installs: true\n", encoding="utf-8"
+        )
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(contents, encoding="utf-8")
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed_dir)
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+
+        assert ld._allow_lazy_installs() is False
+
+    def test_normal_loader_lkg_cannot_bypass_managed_denial(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
+        config_path = tmp_path / "missing-user.yaml"
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "security:\n  allow_lazy_installs: false\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed_dir)
+        monkeypatch.setattr(
+            hermes_config,
+            "load_config",
+            lambda: {"security": {"allow_lazy_installs": True}},
+        )
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+
+        assert ld._allow_lazy_installs() is False
+
+    @pytest.mark.parametrize("api", ["ensure", "install_specs"])
+    @pytest.mark.parametrize("policy_error", [OSError("unreadable"), ValueError("bad yaml")])
+    def test_policy_error_never_reaches_installer(
+        self, monkeypatch, api, policy_error
+    ):
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.denied", ("zzzfake==1",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *args, **kwargs: (_ for _ in ()).throw(policy_error),
+        )
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *args, **kwargs: pytest.fail("installer must not be called"),
+        )
+
+        if api == "ensure":
+            with pytest.raises(ld.FeatureUnavailable, match="lazy installs disabled"):
+                ld.ensure("test.denied", prompt=False)
+        else:
+            result = ld.install_specs(["zzzfake==1"])
+            assert result.ok is False
+            assert result.blocked is True
+
+    @pytest.mark.parametrize("api", ["ensure", "install_specs"])
+    def test_denial_never_reaches_installer(self, monkeypatch, tmp_path, api):
+        import hermes_cli.config as hermes_config
+        import hermes_cli.managed_scope as managed_scope
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "security:\n  allow_lazy_installs: false\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(hermes_config, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.denied", ("zzzfake==1",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *args, **kwargs: pytest.fail("installer must not be called"),
+        )
+
+        if api == "ensure":
+            with pytest.raises(ld.FeatureUnavailable, match="lazy installs disabled"):
+                ld.ensure("test.denied", prompt=False)
+        else:
+            result = ld.install_specs(["zzzfake==1"])
+            assert result.ok is False
+            assert result.blocked is True
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +383,7 @@ class TestEnsure:
         # (e.g. site-packages caching, wrong python). Surface this.
         monkeypatch.setitem(ld.LAZY_DEPS, "test.cache", ("zzzfake>=1",))
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        _allow_strict_lazy_installs(monkeypatch)
         monkeypatch.setattr(
             ld, "_venv_pip_install",
             lambda specs, **kw: ld._InstallResult(True, "ok", ""),
@@ -276,7 +511,7 @@ class TestIsSatisfiedVersionAware:
         expected_repairs,
     ):
         self._fake_version(monkeypatch, installed_versions)
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        _allow_strict_lazy_installs(monkeypatch)
         installed = []
 
         def fake_install(specs, **kwargs):
@@ -338,7 +573,7 @@ class TestRefreshActiveFeatures:
         )
         monkeypatch.setattr(ld, "active_features", lambda: ["platform.matrix"])
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        _allow_strict_lazy_installs(monkeypatch)
         monkeypatch.setattr(
             ld,
             "_venv_pip_install",
@@ -403,7 +638,7 @@ class TestRefreshActiveFeatures:
         def fake_satisfied(spec):
             return ld._pkg_name_from_spec(spec) == "pkga"
         monkeypatch.setattr(ld, "_is_satisfied", fake_satisfied)
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        _allow_strict_lazy_installs(monkeypatch)
         monkeypatch.setattr(
             ld, "_venv_pip_install",
             lambda specs, **kw: ld._InstallResult(False, "", "nope"),
@@ -473,7 +708,9 @@ class TestInstallSpecs:
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
         monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *args, **kwargs: True,
+            raising=False,
         )
         # Contract: install_specs never raises — even an unexpected installer
         # crash comes back as a failed result the caller can render.

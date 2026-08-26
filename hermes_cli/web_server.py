@@ -10,6 +10,7 @@ Usage:
 """
 
 import contextlib
+import contextvars
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
@@ -563,6 +564,19 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
 # injection share a single, testable seam.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 
+# Managed autonomy is a server policy, never a browser/config/environment
+# assertion. The PTY producer strips inherited values for these keys and
+# re-injects them only for a server-consumed actor ticket with an explicit
+# operator/admin role and actor id. Internal reconnect credentials deliberately
+# never enter this path.
+_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED = True
+_CUI_MANAGED_AUTONOMY_ROLES = frozenset({"admin", "operator"})
+_CUI_MANAGED_AUTONOMY_ENV_KEYS = (
+    "HERMES_CUI_MANAGED_AUTONOMY",
+    "HERMES_CUI_MANAGED_ACTOR_ID",
+    "HERMES_CUI_MANAGED_ACTOR_ROLE",
+)
+
 # Desktop's file.attach compatibility transport sends a complete base64 data
 # URL in one JSON-RPC frame. Uvicorn defaults to 16 MiB, which rejects files at
 # the preview ceiling before the dispatcher sees them. Keep the gateway
@@ -924,6 +938,16 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 # the injected ``_SESSION_TOKEN``.  Registered between host_header and
 # auth_middleware so the order is: host check → cookie auth → token auth.
 # ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def _bind_authenticated_cui_actor(request: Request, call_next):
+    """Bind only the server-authenticated request principal for session access."""
+    token = _current_http_cui_actor.set(_cui_actor_context_from_request(request))
+    try:
+        return await call_next(request)
+    finally:
+        _current_http_cui_actor.reset(token)
 
 
 @app.middleware("http")
@@ -4846,6 +4870,29 @@ def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Po
     return proc, False
 
 
+def _resolve_gateway_restart_target(profile: Optional[str]) -> tuple[str, str]:
+    """Resolve one canonical profile and its server-owned tenant binding."""
+    from hermes_cli import profiles as profiles_mod
+
+    canonical = profiles_mod.normalize_profile_name(profile or "default")
+    profile_dir = _resolve_profile_dir(canonical).resolve(strict=True)
+    expected = profiles_mod.get_profile_dir(canonical).resolve(strict=True)
+    if profile_dir != expected:
+        raise HTTPException(status_code=403, detail="profile_target_ambiguous")
+    metadata_path = profile_dir / "profile.yaml"
+    try:
+        import yaml
+        metadata = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        metadata = {}
+    tenant_id = str(
+        metadata.get("tenant_id") or metadata.get("owner_tenant_id") or ""
+    ).strip() if isinstance(metadata, dict) else ""
+    if not tenant_id:
+        raise HTTPException(status_code=403, detail="profile_target_unowned")
+    return canonical, tenant_id
+
+
 def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict[str, Any]:
     """Best-effort gateway restart after enabling the webhook platform."""
     try:
@@ -4869,10 +4916,35 @@ def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict
 
 
 @app.post("/api/gateway/restart")
-async def restart_gateway(profile: Optional[str] = None):
+async def restart_gateway(request: Request, profile: Optional[str] = None):
     """Kick off a ``hermes gateway restart`` in the background."""
+    from hermes_cli.dashboard_auth.permissions import evaluate_cui_mutation
+
+    session = getattr(request.state, "session", None)
+    actor = {
+        "tenant_id": getattr(session, "tenant_id", None),
+        "actor_id": getattr(session, "actor_id", None),
+        "role": getattr(session, "role", None),
+    }
+    preliminary = evaluate_cui_mutation(
+        action="gateway.restart",
+        actor=actor,
+        target_tenant_id=actor.get("tenant_id"),
+        confirmed=True,
+    )
+    if not preliminary.allowed:
+        raise HTTPException(status_code=403, detail=preliminary.reason)
+    canonical_profile, target_tenant_id = _resolve_gateway_restart_target(profile)
+    decision = evaluate_cui_mutation(
+        action="gateway.restart",
+        actor=actor,
+        target_tenant_id=target_tenant_id,
+        confirmed=True,
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
     try:
-        proc, _reused = _spawn_gateway_restart(profile)
+        proc, _reused = _spawn_gateway_restart(canonical_profile)
     except HTTPException:
         raise
     except Exception as exc:
@@ -12404,6 +12476,154 @@ _session_db_heal_exhausted: set = set()
 _session_db_heal_warned: set = set()
 
 
+_current_http_cui_actor: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
+    "current_http_cui_actor", default={}
+)
+
+
+class _CuiSessionNotFound(LookupError):
+    """Invisible and absent sessions share one internal outcome."""
+
+
+_CUI_ADMIN_ROLES = frozenset({"admin", "owner", "operator"})
+_CUI_MUTATING_SESSION_METHODS = frozenset(
+    {
+        "archive_session",
+        "delete_session",
+        "end_session",
+        "rename_session",
+        "reopen_session",
+        "set_session_archived",
+        "set_session_hidden",
+        "set_session_pinned",
+        "set_session_title",
+        "update_session",
+    }
+)
+
+
+def _cui_actor_context_from_request(request) -> dict[str, str]:
+    session = getattr(getattr(request, "state", None), "session", None)
+    if session is None:
+        return {}
+    actor = {
+        key: str(getattr(session, key, "") or "").strip()
+        for key in ("tenant_id", "actor_id", "role", "display_name", "user_id", "provider")
+    }
+    actor = {key: value for key, value in actor.items() if value}
+    if not all(actor.get(key) for key in ("tenant_id", "actor_id", "role")):
+        return {"role": "user", "_restricted": "1"}
+    return actor
+
+
+def _session_cui_metadata(session: dict | None) -> dict[str, str]:
+    if not isinstance(session, dict):
+        return {}
+    raw = session.get("model_config")
+    try:
+        config = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(config, dict):
+        return {}
+    nested = config.get("_cui_actor_context")
+    nested = nested if isinstance(nested, dict) else {}
+    values = {
+        "visibility_scope": config.get("_cui_visibility_scope"),
+        "actor_role": config.get("_cui_actor_role") or nested.get("role"),
+        "actor_id": config.get("_cui_actor_id") or nested.get("actor_id"),
+        "tenant_id": config.get("_cui_tenant_id") or nested.get("tenant_id"),
+    }
+    return {
+        key: str(value).strip().lower() if key in {"visibility_scope", "actor_role"} else str(value).strip()
+        for key, value in values.items()
+        if value is not None and str(value).strip()
+    }
+
+
+def _session_visible_to_cui_actor(session: dict | None, actor: dict | None) -> bool:
+    actor = actor or {}
+    if not actor:
+        return True
+    if actor.get("_restricted"):
+        return False
+    tenant_id = str(actor.get("tenant_id") or "").strip()
+    actor_id = str(actor.get("actor_id") or "").strip()
+    role = str(actor.get("role") or "").strip().lower()
+    if not (tenant_id and actor_id and role):
+        return False
+    metadata = _session_cui_metadata(session)
+    if not metadata:
+        return role in _CUI_ADMIN_ROLES
+    if metadata.get("tenant_id") != tenant_id:
+        return False
+    if role not in _CUI_ADMIN_ROLES:
+        if (
+            metadata.get("visibility_scope") != "customer"
+            or metadata.get("actor_role") in _CUI_ADMIN_ROLES
+            or metadata.get("actor_role") != role
+        ):
+            return False
+        return metadata.get("actor_id") == actor_id
+    if metadata.get("actor_id"):
+        return metadata["actor_id"] == actor_id
+    if role in _CUI_ADMIN_ROLES:
+        return metadata.get("actor_role") in _CUI_ADMIN_ROLES
+    return False
+
+
+class _CuiActorScopedSessionDB:
+    """Fail-closed SessionDB view that filters before paging and mutation."""
+
+    def __init__(self, db, actor: dict):
+        self._db = db
+        self._actor = dict(actor)
+
+    def _visible_rows(self, kwargs: dict) -> list[dict]:
+        query = dict(kwargs)
+        query.pop("limit", None)
+        query.pop("offset", None)
+        query["compact_rows"] = False
+        rows: list[dict] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            page = self._db.list_sessions_rich(limit=page_size, offset=offset, **query)
+            rows.extend(row for row in page if _session_visible_to_cui_actor(row, self._actor))
+            if len(page) < page_size:
+                return rows
+            offset += len(page)
+
+    def list_sessions_rich(self, **kwargs):
+        limit = max(0, int(kwargs.get("limit", 20)))
+        offset = max(0, int(kwargs.get("offset", 0)))
+        return self._visible_rows(kwargs)[offset : offset + limit]
+
+    def session_count(self, **kwargs):
+        kwargs.pop("exclude_children", None)
+        return len(self._visible_rows(kwargs))
+
+    def get_session(self, session_id):
+        row = self._db.get_session(session_id)
+        return row if _session_visible_to_cui_actor(row, self._actor) else None
+
+    def get_session_by_title(self, title):
+        row = self._db.get_session_by_title(title)
+        return row if _session_visible_to_cui_actor(row, self._actor) else None
+
+    def __getattr__(self, name):
+        target = getattr(self._db, name)
+        if name not in _CUI_MUTATING_SESSION_METHODS:
+            return target
+
+        def guarded(session_id, *args, **kwargs):
+            if self.get_session(session_id) is None:
+                raise _CuiSessionNotFound("session not found")
+            return target(session_id, *args, **kwargs)
+
+        return guarded
+
+
 def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     """Open a SessionDB at an explicit path with an explicit access mode.
 
@@ -12499,7 +12719,9 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
         db_path = Path(home) / "state.db"
     else:
         db_path = Path(_default_db_path())
-    return _open_session_db_at_path(db_path, read_only=read_only)
+    db = _open_session_db_at_path(db_path, read_only=read_only)
+    actor = _current_http_cui_actor.get()
+    return _CuiActorScopedSessionDB(db, actor) if actor else db
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
@@ -16369,6 +16591,24 @@ def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     return (ticket, "ok") if ticket else ("", "invalid")
 
 
+def _trusted_ws_identity(info: dict[str, Any] | None) -> dict[str, str]:
+    """Project consumed server credentials onto the fixed actor allowlist."""
+    source = dict(info or {})
+    identity: dict[str, str] = {}
+    for key in (
+        "tenant_id",
+        "actor_id",
+        "role",
+        "display_name",
+        "user_id",
+        "provider",
+    ):
+        value = source.get(key)
+        if value is not None and str(value).strip():
+            identity[key] = str(value).strip()
+    return identity
+
+
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
 
@@ -16424,10 +16664,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 # impersonated by RPC params. Internal peers are marked
                 # ``server-internal`` and are excluded from privileged
                 # controller registration downstream.
-                ws._hermes_auth_identity = {
-                    "user_id": info.get("user_id"),
-                    "provider": info.get("provider"),
-                }
+                ws._hermes_auth_identity = _trusted_ws_identity(info)
                 return None, "internal"
             except TicketInvalid as exc:
                 audit_log(
@@ -16447,17 +16684,10 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 
         try:
             info = consume_ticket(ticket)
-            # The ticket binds a server-minted {user_id, provider}; stamp it
-            # onto the WS object so ``gateway_ws`` can hand it to the gateway
-            # transport, where it is the sole identity authority for
-            # browser-controller registration. A client can never supply or
-            # spoof this value through RPC params. Only the two identity
-            # fields are carried — bookkeeping (e.g. ``minted_at``) is not
-            # part of the identity contract.
-            ws._hermes_auth_identity = {
-                "user_id": info.get("user_id"),
-                "provider": info.get("provider"),
-            }
+            # Preserve only the explicit actor identity allowlist. Ticket
+            # bookkeeping and provider-specific fields are not transport
+            # authority and must never reach gateway dispatch.
+            ws._hermes_auth_identity = _trusted_ws_identity(info)
             if protocol_ticket:
                 # Select only the stable public protocol during accept. The
                 # ticket-bearing protocol is a credential and must never be
@@ -16499,6 +16729,7 @@ def _resolve_chat_argv(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    authenticated_actor: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -16573,6 +16804,22 @@ def _resolve_chat_argv(
             apply_terminal_config_to_env(env=env)
     except Exception:
         _log.warning("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
+
+    # Neither inherited process environment nor profile terminal config is
+    # authority. Strip both, then inject only the consumed ticket identity.
+    for env_key in _CUI_MANAGED_AUTONOMY_ENV_KEYS:
+        env.pop(env_key, None)
+    actor = authenticated_actor if isinstance(authenticated_actor, dict) else {}
+    actor_id = str(actor.get("actor_id") or "").strip()
+    actor_role = str(actor.get("role") or "").strip().lower()
+    if (
+        _CUI_MANAGED_AUTONOMY_FEATURE_ENABLED
+        and actor_id
+        and actor_role in _CUI_MANAGED_AUTONOMY_ROLES
+    ):
+        env["HERMES_CUI_MANAGED_AUTONOMY"] = "1"
+        env["HERMES_CUI_MANAGED_ACTOR_ID"] = actor_id
+        env["HERMES_CUI_MANAGED_ACTOR_ROLE"] = actor_role
     _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
     # Browser-embedded chat should prefer stable wheel-based scrollback over
@@ -16702,6 +16949,7 @@ async def _resolve_chat_argv_async(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    authenticated_actor: Optional[dict[str, str]] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv without blocking the dashboard event loop.
 
@@ -16720,6 +16968,8 @@ async def _resolve_chat_argv_async(
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if authenticated_actor is not None:
+        kwargs["authenticated_actor"] = authenticated_actor
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(
@@ -17480,6 +17730,13 @@ async def pty_ws(ws: WebSocket) -> None:
         "sidecar_url": sidecar_url,
         "profile": profile,
     }
+    # A consumed single-use actor ticket may authorize managed autonomy. The
+    # process-lifetime internal credential is reconnect authority only, while
+    # the legacy token has no authenticated actor provenance.
+    if cred in {"ticket", "ticket-subprotocol"}:
+        authenticated_actor = getattr(ws, "_hermes_auth_identity", None)
+        if authenticated_actor is not None:
+            resolve_kwargs["authenticated_actor"] = authenticated_actor
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
 

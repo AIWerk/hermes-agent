@@ -24,6 +24,93 @@ from tools.approval import (
 )
 
 
+def test_requires_flag_and_authenticated_actor_context(monkeypatch):
+    cases = (
+        (False, "operator-1", "operator"),
+        (True, "", "operator"),
+        (True, "operator-1", ""),
+    )
+    for context in cases:
+        monkeypatch.setattr(
+            approval_module, "_MANAGED_AUTONOMY_CONTEXT_FROZEN", context
+        )
+        assert approval_module._managed_autonomy_authorized() is False
+
+    monkeypatch.setattr(
+        approval_module,
+        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+        (True, "operator-1", "operator"),
+    )
+    assert approval_module._managed_autonomy_authorized() is True
+
+
+def test_lay_customer_roles_do_not_get_managed_autonomy(monkeypatch):
+    for role in (
+        "customer",
+        "user",
+        "support",
+        "internal",
+        "server-internal",
+        "admin-dashboard",
+    ):
+        monkeypatch.setattr(
+            approval_module,
+            "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+            (True, "actor-1", role),
+        )
+        assert approval_module._managed_autonomy_authorized() is False
+
+
+def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        approval_module,
+        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+        (True, "operator-1", "operator"),
+    )
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: True)
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+
+    managed = approval_module.check_all_command_guards(
+        'python -c "print(1)"', "local"
+    )
+    hardline = approval_module.check_all_command_guards("rm -rf /", "local")
+
+    assert managed["approved"] is True
+    assert managed["managed_autonomy"] is True
+    assert hardline["approved"] is False
+    assert hardline.get("hardline") is True
+
+
+def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(monkeypatch):
+    monkeypatch.setattr(
+        approval_module,
+        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
+        (True, "operator-1", "admin"),
+    )
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    approval_module._gateway_notify_cbs.clear()
+
+    result = approval_module.check_execute_code_guard(
+        "from pathlib import Path\nPath('changed.txt').write_text('changed')",
+        "local",
+    )
+
+    assert result["approved"] is False
+    assert result["status"] == "pending_approval"
+
+
 class TestApprovalModeParsing:
     def test_normalization_table(self):
         # Unquoted YAML `off`/`on` arrive as booleans; unknown/empty fall back

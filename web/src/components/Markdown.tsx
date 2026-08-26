@@ -83,6 +83,14 @@ function parseBlocks(text: string): BlockNode[] {
       continue;
     }
 
+    // A streaming response can temporarily end at a heading marker. Consume
+    // that line as literal text so the paragraph parser cannot stall on it.
+    if (/^#{1,4}\s*$/.test(line)) {
+      blocks.push({ type: "paragraph", content: line });
+      i++;
+      continue;
+    }
+
     // Heading
     const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
     if (headingMatch) {
@@ -179,10 +187,10 @@ function Block({
     case "heading": {
       const Tag = `h${Math.min(block.level, 4)}` as "h1" | "h2" | "h3" | "h4";
       const sizes: Record<string, string> = {
-        h1: "text-base font-bold",
-        h2: "text-sm font-bold",
-        h3: "text-sm font-semibold",
-        h4: "text-sm font-medium",
+        h1: "text-lg font-bold leading-snug",
+        h2: "text-base font-bold leading-snug",
+        h3: "text-[15px] font-semibold leading-snug",
+        h4: "text-sm font-medium leading-snug",
       };
       return (
         <Tag className={sizes[Tag]}>

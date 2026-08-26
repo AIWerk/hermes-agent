@@ -392,14 +392,7 @@ def _(rid, params: dict) -> dict:
     # takes it (see the ownership transfer at _init_session below); every path
     # that returns before that transfer must close it. Otherwise reuse the
     # shared launch db, which outlives the RPC and is never closed here.
-    owns_db = False
-    if profile_home is not None:
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=profile_home / "state.db")
-        owns_db = True
-    else:
-        db = _get_db()
+    db, owns_db = _db_for_profile(profile)
     try:
         if db is None:
             return _db_unavailable_error(rid, code=5000)
@@ -439,6 +432,8 @@ def _(rid, params: dict) -> dict:
                     want_home = str(home) if home is not None else None
                     for live_sid, record in list(_sessions.items()):
                         if not isinstance(record, dict):
+                            continue
+                        if not _live_record_visible_to_cui_actor(record):
                             continue
                         if (record.get("profile_home") or None) != want_home:
                             continue
@@ -558,7 +553,9 @@ def _(rid, params: dict) -> dict:
                 tip = target
             if tip and tip != target:
                 target = tip
-                found = db.get_session(target) or found
+                found = db.get_session(target)
+                if not found:
+                    return _err(rid, 4007, "session not found")
 
         # Every interactive resume path materializes the model history, even when
         # omit_messages suppresses the response copy. Count the complete lineage
@@ -1135,13 +1132,8 @@ def _(rid, params: dict) -> dict:
 
     # Snapshot under the lock — concurrent RPCs mutate _sessions (same pattern
     # as _cwd_for_session_key).
-    live = None
-    live_sid = ""
-    with _sessions_lock:
-        for sid, sess in list(_sessions.items()):
-            if sess.get("session_key") == target:
-                live, live_sid = sess, sid
-                break
+    found_live = _find_live_session_by_key(target)
+    live_sid, live = found_live if found_live is not None else ("", None)
 
     branch = _git_branch_for_cwd(resolved)
     root = _git_common_repo_root_for_cwd(resolved)
@@ -1212,6 +1204,7 @@ def _(rid, params: dict) -> dict:
         _session_live_item(sid, session, current)
         for sid, session in snapshot
         if not session.get("_finalized")
+        and _live_record_visible_to_cui_actor(session)
     ]
     return _ok(rid, {"sessions": rows})
 
@@ -1270,7 +1263,11 @@ def _(rid, params: dict) -> dict:
             snapshot = list(_sessions.values())
     except Exception as e:
         return _err(rid, 5036, f"could not enumerate active sessions: {e}")
-    active = {s.get("session_key") for s in snapshot if s.get("session_key")}
+    active = {
+        s.get("session_key")
+        for s in snapshot
+        if s.get("session_key") and _live_record_visible_to_cui_actor(s)
+    }
     if target in active:
         return _err(rid, 4023, "cannot delete an active session")
     profile = (params.get("profile") or "").strip() or None
@@ -1512,7 +1509,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4030, "llm.oneshot requires a template or instructions/input")
 
     # Optional: inherit the live session's model (no error if absent).
-    session = _sessions.get(params.get("session_id") or "")
+    session = _visible_live_session(params.get("session_id") or "")
     main_runtime = _main_runtime_from_agent(session.get("agent")) if session else None
 
     try:

@@ -101,3 +101,29 @@ def test_managed_bare_string_model_flattens_to_default_on_load(homes):
     _write(managed / "config.yaml", "model: managed/bare\n")
     cfg = load_config()
     assert cfg_get(cfg, "model", "default") == "managed/bare"
+
+
+def test_managed_override_rejects_symlink_directory(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "managed-link"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(link))
+    with pytest.raises(RuntimeError, match="symlink"):
+        managed_scope.get_managed_dir()
+
+
+def test_strict_policy_rejects_symlink_managed_config(tmp_path, monkeypatch):
+    from hermes_cli import config as cfg
+    user = tmp_path / "user.yaml"
+    user.write_text("security:\n  allow_lazy_installs: true\n")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("security:\n  allow_lazy_installs: true\n")
+    (managed / "config.yaml").symlink_to(outside)
+    monkeypatch.setattr(cfg, "get_config_path", lambda: user)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    with pytest.raises(OSError):
+        cfg.load_security_policy_bool_strict("allow_lazy_installs", default=False)

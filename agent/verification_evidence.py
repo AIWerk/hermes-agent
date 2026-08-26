@@ -304,11 +304,46 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
                 ["python", "-m", "pytest"],
                 ["python3", "-m", "pytest"],
                 ["uv", "run", "pytest"],
+                ["uv", "run", "python", "-m", "pytest"],
+                ["uv", "run", "python3", "-m", "pytest"],
                 ["poetry", "run", "pytest"],
                 ["pipenv", "run", "pytest"],
             ]
         )
     return candidates
+
+
+def _proven_segment_cwds(
+    command: str, cwd: str | Path | None
+) -> tuple[list[_ShellSegment], list[Path]]:
+    """Return parsed shell segments and the proven cwd before each segment.
+
+    Directory changes are accepted only as simple ``cd/chdir TARGET &&``
+    prerequisites. This lets the classifier apply prefixed and repeated changes
+    in order while rejecting semicolon, ``||``, argumentless, and stateful
+    forms whose success or target is not proven by the final shell status.
+    """
+    segments = _split_shell_segments(command)
+    if not segments:
+        raise ValueError("unparseable shell command")
+
+    current = Path(cwd or ".").expanduser().resolve()
+    segment_cwds: list[Path] = []
+    for segment in segments:
+        segment_cwds.append(current)
+        first = _strip_command_prefix(segment.tokens)
+        if not first or first[0] not in {"cd", "chdir"}:
+            continue
+        if segment.following_operator != "&&" or len(first) != 2:
+            raise ValueError("unproven directory change")
+        target = first[1]
+        if target in {"-", "--"}:
+            raise ValueError("state-dependent directory change")
+        path = Path(target).expanduser()
+        if not path.is_absolute():
+            path = current / path
+        current = path.resolve()
+    return segments, segment_cwds
 
 
 def _find_canonical_match(
@@ -528,36 +563,60 @@ def classify_verification_command(
     try:
         from agent.coding_context import project_facts_for
 
-        facts = project_facts_for(cwd)
+        segments, segment_cwds = _proven_segment_cwds(command, cwd)
     except Exception:
-        facts = None
-    if not facts:
         return None
 
-    verify_commands = list(facts.get("verifyCommands") or [])
-    match = _find_canonical_match(command, verify_commands, int(exit_code))
-    is_ad_hoc = False
-    if match is None and not verify_commands:
-        ad_hoc_args = _find_ad_hoc_match(command, facts.get("root"), int(exit_code))
-        if ad_hoc_args is not None:
-            match = ("ad-hoc verification script", ad_hoc_args)
-            is_ad_hoc = True
-    if match is None:
-        return None
+    for index, (segment, effective_cwd) in enumerate(zip(segments, segment_cwds)):
+        try:
+            facts = project_facts_for(effective_cwd)
+        except Exception:
+            facts = None
+        if not facts:
+            continue
 
-    canonical, trailing_args = match
-    return VerificationEvidence(
-        command=command,
-        canonical_command=canonical,
-        kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
-        scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
-        status="passed" if int(exit_code) == 0 else "failed",
-        exit_code=int(exit_code),
-        cwd=str(Path(cwd or ".").resolve()),
-        root=str(facts.get("root") or Path(cwd or ".").resolve()),
-        session_id=str(session_id or "default"),
-        output_summary=_summarize_output(output),
-    )
+        match: Optional[tuple[str, list[str]]] = None
+        is_ad_hoc = False
+        verify_commands = list(facts.get("verifyCommands") or [])
+        candidate_tokens = _strip_command_prefix(segment.tokens)
+        for canonical in verify_commands:
+            needle = _canonical_tokens(canonical)
+            if not needle:
+                continue
+            for candidate in _equivalent_needles(needle):
+                if (
+                    candidate_tokens[:len(candidate)] == candidate
+                    and _exit_status_is_attributable(segments, index, int(exit_code))
+                ):
+                    match = (canonical, candidate_tokens[len(candidate):])
+                    break
+            if match is not None:
+                break
+
+        if match is None and not verify_commands:
+            ad_hoc_args = _ad_hoc_script_args(segment.tokens, facts.get("root"))
+            if ad_hoc_args is not None and _exit_status_is_attributable(
+                segments, index, int(exit_code)
+            ):
+                match = ("ad-hoc verification script", ad_hoc_args)
+                is_ad_hoc = True
+        if match is None:
+            continue
+
+        canonical, trailing_args = match
+        return VerificationEvidence(
+            command=command,
+            canonical_command=canonical,
+            kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
+            scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
+            status="passed" if int(exit_code) == 0 else "failed",
+            exit_code=int(exit_code),
+            cwd=str(effective_cwd),
+            root=str(facts.get("root") or effective_cwd),
+            session_id=str(session_id or "default"),
+            output_summary=_summarize_output(output),
+        )
+    return None
 
 
 def record_terminal_result(

@@ -41,6 +41,14 @@ class TestTargetResolution:
         monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path / "lazy"))
         assert ld._lazy_install_target() == tmp_path / "lazy"
 
+    def test_symlink_target_is_rejected(self, monkeypatch, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = tmp_path / "lazy"
+        link.symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(link))
+        assert ld._lazy_install_target() is None
+
 
 class TestGatingWithTarget:
     """``HERMES_DISABLE_LAZY_INSTALLS=1`` must STOP blocking once a durable
@@ -50,10 +58,12 @@ class TestGatingWithTarget:
     def test_disable_env_blocks_without_target(self, monkeypatch):
         monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
-        # config unreadable → fails open on the config check, but the sealed
-        # env var with no target still blocks.
+        # Explicit policy authority still cannot bypass a sealed venv when no
+        # durable target is configured.
         monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *args, **kwargs: True,
+            raising=False,
         )
         assert ld._allow_lazy_installs() is False
 
@@ -61,7 +71,9 @@ class TestGatingWithTarget:
         monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
         monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path))
         monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *args, **kwargs: True,
+            raising=False,
         )
         assert ld._allow_lazy_installs() is True
 
@@ -71,7 +83,9 @@ class TestGatingWithTarget:
         monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
         monkeypatch.setattr(
-            "hermes_cli.config.load_config", lambda: {}, raising=False
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *args, **kwargs: True,
+            raising=False,
         )
         assert ld._allow_lazy_installs() is True
 
@@ -178,6 +192,16 @@ class TestInstallArgConstruction:
         assert "--constraint" in cmd
         # ...and the spec is last.
         assert cmd[-1] == "somepkg==1.2.3"
+
+    def test_stamp_symlink_cannot_write_outside_target(self, tmp_path):
+        target = tmp_path / "lazy"
+        target.mkdir()
+        outside = tmp_path / "outside"
+        outside.write_text("sentinel")
+        (target / ld._TARGET_STAMP_NAME).symlink_to(outside)
+        err = ld._ensure_target_ready(target)
+        assert err is not None
+        assert outside.read_text() == "sentinel"
 
     def test_no_target_args_in_venv_scoped_mode(self, monkeypatch):
         # Env unset → plain venv-scoped install, no --target / --constraint.

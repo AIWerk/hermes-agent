@@ -10109,6 +10109,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _BUSY_QUEUE_MAX_PENDING = 32
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+        from gateway.platforms.base import _pending_event_identity
+
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
@@ -10139,7 +10141,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for key in security_metadata_keys
             )
         )
-        if same_security_context and (
+        merge_identity_matches = existing is not None and (
+            _pending_event_identity(existing) is not None
+            and _pending_event_identity(existing) == _pending_event_identity(event)
+        )
+        if same_security_context and merge_identity_matches and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))

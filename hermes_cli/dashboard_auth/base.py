@@ -23,6 +23,9 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    tenant_id: str = ""
+    actor_id: str = ""
+    role: str = ""
 
 
 @dataclass(frozen=True)

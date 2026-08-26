@@ -632,15 +632,7 @@ def _auto_title_session(
     )
     source = "llm"
     if not title:
-        # No model title, so the derived one has to hold — and it may never have
-        # been written, since the inline attempt declines a name collision
-        # rather than scan the lineage on the turn's critical path. Off that
-        # path the scan is affordable, so spend it here and leave the session
-        # named rather than nameless.
-        title = derive_title(user_message)
-        source = "derived"
-        if not title:
-            return
+        return
 
     try:
         persisted = _persist_session_title(session_db, session_id, title, source=source)
@@ -721,6 +713,13 @@ def maybe_auto_title(
     """
     if not session_db or not session_id or not user_message:
         return
+    # A title is committed only after a successful first exchange. A user-only
+    # history can still fail or be cancelled and must remain untitled.
+    if not any(
+        isinstance(message, dict) and message.get("role") == "assistant"
+        for message in (conversation_history or [])
+    ):
+        return
 
     # Count the real questions behind us to detect the opening turn.
     # ``conversation_history`` is the state BEFORE this turn's message is
@@ -744,8 +743,6 @@ def maybe_auto_title(
     if not _auto_title_enabled():
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
-
-    apply_instant_title(session_db, session_id, user_message, title_callback)
 
     thread = threading.Thread(
         target=auto_title_session,

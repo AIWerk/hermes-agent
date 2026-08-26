@@ -37,6 +37,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
+    INFORMATION_RETRIEVAL_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     USER_PROFILE_GUIDANCE,
@@ -58,6 +59,11 @@ from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+OPERATOR_VERIFICATION_GUIDANCE = (
+    "Operator verification: for admin-sensitive CLI/TUI/SSH actions, call "
+    "verify_operator_identity. Never ask the user to paste the operator secret into chat. "
+    "Verification does not bypass independent command policy."
+)
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
@@ -422,6 +428,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
 
+    # Universal lookup order. Tool availability is fixed for the session, so
+    # this remains in the stable cached tier and never advertises extra tools.
+    if agent.valid_tool_names:
+        stable_parts.append(INFORMATION_RETRIEVAL_GUIDANCE)
+
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
     # MEMORY_GUIDANCE instructs the model to save facts to the built-in
@@ -443,6 +454,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    if "verify_operator_identity" in agent.valid_tool_names:
+        tool_guidance.append(OPERATOR_VERIFICATION_GUIDANCE)
+    _operator_ctx = getattr(agent, "operator_session_context", None)
+    if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator_session":
+        stable_parts.append(
+            "Operator session context: this trusted CLI bootstrap labels the current human "
+            f"as actor_id={_operator_ctx.get('actor_id', 'unknown_cli')!r}. It does not authenticate or authorize "
+            "the human, does not upgrade their role, and must not be persisted to customer memory, USER.md, "
+            "Honcho, transcripts, or wiki. Sensitive actions still require verify_operator_identity."
+        )
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

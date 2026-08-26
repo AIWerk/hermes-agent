@@ -7,6 +7,8 @@ declare global {
      * it directly and for parity with the server's bootstrap script.
      */
     __HERMES_DASHBOARD_EMBEDDED_CHAT__?: boolean;
+    /** Sanitized customer-facing agent label injected for browser-title branding. */
+    __HERMES_AGENT_DISPLAY_NAME__?: string | null;
   }
 }
 
@@ -21,4 +23,12 @@ declare global {
  */
 export function isDashboardEmbeddedChatEnabled(): boolean {
   return true;
+}
+
+export function getHermesAgentDisplayName(): string | null {
+  if (typeof window === "undefined") return null;
+  const value = window.__HERMES_AGENT_DISPLAY_NAME__;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }

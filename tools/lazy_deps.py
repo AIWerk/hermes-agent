@@ -17,7 +17,8 @@ two problems:
 
 The lazy-install pattern fixes both. Backends call :func:`ensure` at the
 top of their first-import path. If the deps are missing, ``ensure`` checks
-the ``security.allow_lazy_installs`` config flag (default true) and runs
+the ``security.allow_lazy_installs`` config flag (default false) from its
+exact source and runs
 a venv-scoped pip install. If the user has explicitly disabled lazy
 installs, ``ensure`` raises :class:`FeatureUnavailable` with a clear
 remediation hint pointing at ``hermes tools`` or the manual pip command.
@@ -406,7 +407,18 @@ def _lazy_install_target() -> Optional[Path]:
     raw = os.environ.get(_LAZY_TARGET_ENV, "").strip()
     if not raw:
         return None
-    return Path(raw)
+    target = Path(raw).expanduser().absolute()
+    probe = target
+    try:
+        while True:
+            if probe.is_symlink():
+                return None
+            if probe.exists() or probe.parent == probe:
+                break
+            probe = probe.parent
+    except OSError:
+        return None
+    return target
 
 
 def _ensure_target_ready(target: Path) -> Optional[str]:
@@ -424,7 +436,18 @@ def _ensure_target_ready(target: Path) -> Optional[str]:
     want = _python_abi_tag()
     stamp = target / _TARGET_STAMP_NAME
     try:
+        probe = target
+        while True:
+            if probe.is_symlink():
+                return f"lazy install target {target} contains a symlink component"
+            if probe.exists() or probe.parent == probe:
+                break
+            probe = probe.parent
         if target.exists():
+            if not target.is_dir():
+                return f"lazy install target {target} is not a directory"
+            if stamp.is_symlink():
+                return f"lazy install target stamp {stamp} must not be a symlink"
             have = ""
             try:
                 have = stamp.read_text(encoding="utf-8").strip()
@@ -445,7 +468,14 @@ def _ensure_target_ready(target: Path) -> Optional[str]:
                         except OSError:
                             pass
         target.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(want, encoding="utf-8")
+        if target.is_symlink() or stamp.is_symlink():
+            return f"lazy install target {target} changed identity"
+        fd = os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, want.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except OSError as e:
         return f"lazy install target {target} is not writable: {e}"
     return None
@@ -512,20 +542,21 @@ def _allow_lazy_installs() -> bool:
        redirected there (a path that structurally cannot break the sealed
        venv) and are therefore allowed.
 
-    Defaults to True. If config is unreadable we fail open (allow), because
-    refusing to install would lock people out of their own backends; the
-    decision to block is an explicit user opt-in.
+    Config loading and policy extraction fail closed. Installation requires
+    an explicit boolean allow from the strict policy authority.
     """
     # (1) Config kill switch wins in every mode.
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_security_policy_bool_strict
+
+        policy = load_security_policy_bool_strict(
+            "allow_lazy_installs",
+            default=False,
+        )
     except Exception:
-        cfg = None
-    if cfg is not None:
-        sec = cfg.get("security") or {}
-        if not bool(sec.get("allow_lazy_installs", True)):
-            return False
+        return False
+    if policy is not True:
+        return False
 
     # (2) Sealed-venv env var: blocks ONLY when there is no safe durable
     # target to redirect into. With a target set, the install goes to the
@@ -534,6 +565,29 @@ def _allow_lazy_installs() -> bool:
         return _lazy_install_target() is not None
 
     return True
+
+
+@dataclass(frozen=True)
+class _StaticPolicyAuthorization:
+    allowed: bool
+
+    def validate(self) -> bool:
+        return self.allowed
+
+
+def _lazy_install_authorization():
+    """Acquire a source-bound authorization for one installer side effect."""
+    try:
+        from hermes_cli.config import load_security_policy_bool_strict
+
+        authorization = load_security_policy_bool_strict(
+            "allow_lazy_installs", default=False, authorization=True
+        )
+    except Exception:
+        return _StaticPolicyAuthorization(False)
+    if isinstance(authorization, bool):
+        return _StaticPolicyAuthorization(authorization)
+    return authorization
 
 
 def _unsupported_feature_reason(feature: str) -> Optional[str]:
@@ -905,7 +959,8 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
                 f"refusing to install unsafe spec {spec!r}"
             )
 
-    if not _allow_lazy_installs():
+    authorization = _lazy_install_authorization()
+    if not authorization.allowed:
         raise FeatureUnavailable(
             feature, missing,
             "lazy installs disabled (security.allow_lazy_installs=false)"
@@ -941,6 +996,8 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
                 feature, missing, "user declined install at prompt"
             )
 
+    if not authorization.validate():
+        raise FeatureUnavailable(feature, missing, "policy source changed before installer")
     logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
     result = _venv_pip_install(missing)
     if not result.success:
@@ -1055,7 +1112,8 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
                 reason=f"refusing to install unsafe spec {spec!r}",
             )
 
-    if not _allow_lazy_installs():
+    authorization = _lazy_install_authorization()
+    if not authorization.allowed:
         target = _lazy_install_target()
         if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1" and target is None:
             reason = (
@@ -1072,6 +1130,8 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
         f"--target {target} " if target is not None else ""
     ) + " ".join(cleaned)
 
+    if not authorization.validate():
+        return InstallSpecsResult(ok=False, blocked=True, reason="policy source changed before installer")
     logger.info("Installing pip specs %s (target=%s)", " ".join(cleaned), target or "venv")
     try:
         result = _venv_pip_install(cleaned, timeout=timeout)

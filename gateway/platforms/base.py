@@ -2776,6 +2776,74 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _pending_event_identity(event: MessageEvent) -> tuple[str, ...] | None:
+    """Return server-derived routing identity for safe pending-event merging.
+
+    Pending slots are keyed by a session key whose grouping policy may be
+    broader than one Telegram actor or topic.  Media must never be coalesced
+    across those routing boundaries, so use only normalized adapter fields —
+    never message text — to decide whether two events may share a turn.
+    """
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    platform = _platform_name(getattr(source, "platform", None))
+    chat_id = getattr(source, "chat_id", None)
+    if not platform or chat_id is None:
+        return None
+    actor_id = (
+        getattr(source, "user_id_alt", None)
+        or getattr(source, "user_id", None)
+        or getattr(event, "user_id", None)
+    )
+    if actor_id is None or not str(actor_id).strip():
+        return None
+    return (
+        platform,
+        str(getattr(source, "scope_id", None) or ""),
+        str(chat_id),
+        str(getattr(source, "thread_id", None) or ""),
+        str(actor_id or ""),
+    )
+
+
+def _pending_event_token(event: MessageEvent) -> tuple[str, str] | None:
+    """Return a server-known event token suitable for replay deduplication."""
+    update_id = getattr(event, "platform_update_id", None)
+    if update_id is not None:
+        return ("update", str(update_id))
+    message_id = getattr(event, "message_id", None)
+    if message_id is not None:
+        return ("message", str(message_id))
+    return None
+
+
+def _pending_event_tokens(event: MessageEvent) -> set[tuple[str, str]]:
+    """Return the private replay-token ledger carried by a merged event."""
+    tokens = getattr(event, "_gateway_pending_event_tokens", None)
+    if not isinstance(tokens, set):
+        tokens = {
+            (kind, str(value))
+            for kind, value in (
+                ("update", getattr(event, "platform_update_id", None)),
+                ("message", getattr(event, "message_id", None)),
+            )
+            if value is not None
+        }
+        setattr(event, "_gateway_pending_event_tokens", tokens)
+    return tokens
+
+
+def _store_pending_message_event(
+    pending_messages: Dict[str, MessageEvent],
+    session_key: str,
+    event: MessageEvent,
+) -> None:
+    """Store one event and initialize its server-token replay ledger."""
+    _pending_event_tokens(event)
+    pending_messages[session_key] = event
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2789,6 +2857,12 @@ def merge_pending_message_event(
     events. Merge those into the existing queued event so the next turn sees
     the whole burst.
 
+    Merging is permitted only within the same server-derived platform,
+    scope/chat, topic, and actor identity.  Replayed platform events are
+    idempotent.  These guards prevent a broad session policy from mixing media
+    or text across Telegram users/topics and prevent retry delivery from
+    duplicating a queued attachment.
+
     When ``merge_text`` is enabled, rapid follow-up TEXT events are appended
     instead of replacing the pending turn. This is used for Telegram bursty
     follow-ups so a multi-part user thought is not silently truncated to only
@@ -2796,6 +2870,22 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        existing_identity = _pending_event_identity(existing)
+        incoming_identity = _pending_event_identity(event)
+        if (
+            existing_identity is None
+            or incoming_identity is None
+            or existing_identity != incoming_identity
+        ):
+            _store_pending_message_event(pending_messages, session_key, event)
+            return
+
+        incoming_tokens = _pending_event_tokens(event)
+        existing_tokens = _pending_event_tokens(existing)
+        if incoming_tokens & existing_tokens:
+            return
+        existing_tokens.update(incoming_tokens)
+
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2837,7 +2927,7 @@ def merge_pending_message_event(
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
 
-    pending_messages[session_key] = event
+    _store_pending_message_event(pending_messages, session_key, event)
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.

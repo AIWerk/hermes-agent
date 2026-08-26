@@ -23,6 +23,7 @@ from hermes_cli import web_server
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth.ws_tickets import (
     _reset_for_tests,
+    consume_ticket,
     consume_internal_credential,
     internal_ws_credential,
     mint_ticket,
@@ -120,6 +121,24 @@ class TestWsTicketEndpoint:
         assert isinstance(body["ticket"], str)
         assert len(body["ticket"]) >= 32
         assert body["ttl_seconds"] == 30
+
+    def test_ticket_preserves_verified_session_identity(self, gated_app):
+        _logged_in(gated_app)
+        r = gated_app.post("/api/auth/ws-ticket")
+        assert r.status_code == 200
+
+        info = consume_ticket(r.json()["ticket"])
+        assert info == {
+            "user_id": "stub-user-1",
+            "provider": "stub",
+            "tenant_id": "stub-org-1",
+            "actor_id": "stub-user-1",
+            "role": "user",
+            "display_name": "Stub User",
+            "email": "stub@example.test",
+            "org_id": "stub-org-1",
+            "minted_at": info["minted_at"],
+        }
 
     def test_unauthenticated_returns_401_or_redirect(self, gated_app):
         r = gated_app.post("/api/auth/ws-ticket", follow_redirects=False)

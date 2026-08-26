@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+import json
+import stat
+from pathlib import Path
+
+import pytest
+
+from plugins.self_learning_capture import (
+    _sanitize,
+    post_tool_call,
+    pre_llm_call,
+    register,
+)
+
+
+def _setup_paths(tmp_path: Path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-profile")
+    monkeypatch.setenv("WIKI_PATH", str(tmp_path / "legacy-wiki"))
+    return (
+        hermes_home
+        / "state"
+        / "self_learning_capture"
+        / "tenants"
+        / "local"
+        / "profiles"
+        / "test-profile"
+        / "feedback_inbox.md"
+    )
+
+
+def test_capture_is_disabled_by_default(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(user_message="Nem ezt kértem, jegyezd meg így.", session_id="disabled-default")
+
+    assert not inbox.exists()
+
+
+def test_pre_llm_call_captures_correction_candidate(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(
+        user_message="Ezt rosszul csináltad, legközelebb ne így.",
+        session_id="s1",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert "correction-detector" in text
+    assert "status: candidate" in text
+    assert "daily-memory-curator" in text
+    assert "rosszul" in text
+
+
+def test_pre_llm_call_ignores_and_deduplicates_non_corrections(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(user_message="Kérlek nézd meg a logot.", session_id="s1", config={"enabled": True})
+    assert not inbox.exists()
+
+    msg = "Nem ezt kértem, jegyezd meg így."
+    pre_llm_call(user_message=msg, session_id="s1", config={"enabled": True})
+    pre_llm_call(user_message=msg, session_id="s1", config={"enabled": True})
+
+    text = inbox.read_text(encoding="utf-8")
+    assert text.count("correction-detector") == 1
+
+
+def test_pre_llm_call_honors_disabled_config(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(user_message="Nem ezt kértem, jegyezd meg így.", session_id="s1", config={"enabled": False})
+
+    assert not inbox.exists()
+
+
+def test_configured_feedback_inbox_path_overrides_wiki_path(tmp_path, monkeypatch):
+    default_inbox = _setup_paths(tmp_path, monkeypatch)
+    custom_inbox = tmp_path / "custom" / "feedback.md"
+
+    pre_llm_call(
+        user_message="Nem ezt kértem, jegyezd meg így.",
+        session_id="s4",
+        config={"enabled": True, "feedback_inbox": str(custom_inbox)},
+    )
+
+    assert custom_inbox.exists()
+    assert "correction-detector" in custom_inbox.read_text(encoding="utf-8")
+    assert not default_inbox.exists()
+
+
+def test_post_tool_call_captures_failed_tool_and_sanitizes_secrets(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    post_tool_call(
+        tool_name="terminal",
+        args={"command": "curl -H 'Authorization: Bearer sk-testsecret1234567890' example.invalid"},
+        result={"success": False, "error": "token=abcd1234 failed", "exit_code": 1},
+        session_id="s2",
+        duration_ms=12,
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert "failure-capture" in text
+    assert "terminal" in text
+    assert "[REDACTED]" in text
+    assert "sk-testsecret" not in text
+    assert "abcd1234" not in text
+
+
+def test_post_tool_call_ignores_successful_result(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    post_tool_call(tool_name="terminal", result={"success": True, "exit_code": 0}, session_id="s3")
+
+    assert not inbox.exists()
+
+
+def test_default_inbox_is_tenant_and_profile_qualified(tmp_path, monkeypatch):
+    default_inbox = _setup_paths(tmp_path, monkeypatch)
+    tenant_inbox = Path(str(default_inbox).replace("/local/", "/tenant-example/"))
+
+    pre_llm_call(
+        user_message="Nem ezt kértem, jegyezd meg így.",
+        session_id="tenant-scope",
+        tenant_id="tenant-example",
+        profile="test-profile",
+        config={"enabled": True},
+    )
+
+    assert tenant_inbox.exists()
+    assert not default_inbox.exists()
+    assert not (tmp_path / "legacy-wiki" / "feedback" / "_inbox.md").exists()
+
+
+def test_capture_files_have_restrictive_permissions(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    pre_llm_call(
+        user_message="Nem ezt kértem, jegyezd meg így.",
+        session_id="private-mode",
+        config={"enabled": True},
+    )
+
+    assert stat.S_IMODE(inbox.stat().st_mode) == 0o600
+    current = inbox.parent
+    hermes_home = inbox.parents[6]
+    # Every directory created for the capture path, including HERMES_HOME and
+    # state/tenant/profile ancestors, is private.
+    while True:
+        assert stat.S_IMODE(current.stat().st_mode) == 0o700
+        if current == hermes_home:
+            break
+        current = current.parent
+
+
+def test_capture_allowlists_fields_and_redacts_pii(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+
+    post_tool_call(
+        tool_name="terminal",
+        args={
+            "command": "notify person@example.test at +41 79 123 45 67 from 192.0.2.44",
+            "headers": {"X-Private-Contact": "private@example.test"},
+        },
+        result={
+            "success": False,
+            "error": "person@example.test unavailable at +41 79 123 45 67",
+            "exit_code": 1,
+            "raw_customer_record": "Jane Example, private@example.test",
+        },
+        session_id="pii-filter",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert "person@example.test" not in text
+    assert "private@example.test" not in text
+    assert "+41 79 123 45 67" not in text
+    assert "192.0.2.44" not in text
+    assert "headers" not in text
+    assert "raw_customer_record" not in text
+    assert "[REDACTED:EMAIL]" in text
+    assert "[REDACTED:PHONE]" in text
+    assert "[REDACTED:IP]" in text
+
+
+def test_json_string_result_is_parsed_before_allowlisting(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+    result = json.dumps(
+        {
+            "success": False,
+            "error": "structured failure",
+            "raw_customer_record": "Private Person confidential dossier",
+        }
+    )
+
+    post_tool_call(
+        tool_name="terminal",
+        result=result,
+        session_id="json-result",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert "structured failure" in text
+    assert "raw_customer_record" not in text
+    assert "Private Person confidential dossier" not in text
+
+
+def test_unstructured_failure_result_does_not_persist_raw_text(tmp_path, monkeypatch):
+    inbox = _setup_paths(tmp_path, monkeypatch)
+    private_text = "error executing request for Private Person confidential dossier"
+
+    post_tool_call(
+        tool_name="terminal",
+        result=private_text,
+        session_id="plain-result",
+        config={"enabled": True},
+    )
+
+    text = inbox.read_text(encoding="utf-8")
+    assert private_text not in text
+    assert "Private Person" not in text
+
+
+def test_sanitize_redacts_formatted_phones_and_ipv6():
+    values = ["(555) 867-5309", "202-555-0100", "2001:db8::1"]
+    out = _sanitize("contact " + " or ".join(values))
+    for value in values:
+        assert value not in out
+    assert "[REDACTED:PHONE]" in out
+    assert "[REDACTED:IP]" in out
+
+
+# Synthetic secrets are assembled from fragments at runtime so the contiguous
+# token literal never appears in this file — that avoids GitHub secret-scanning
+# push-protection false positives on test fixtures while still exercising the
+# regexes on the full assembled value.
+@pytest.mark.parametrize(
+    "prefix,body",
+    [
+        ("ghp_", "0123456789abcdefghij"),       # bare GitHub token (was kept verbatim)
+        ("sk-", "anttest0123456789ABCDEF"),      # bare OpenAI/Anthropic-style token
+        ("AKIA", "ABCDEFGHIJKLMNOP"),            # AWS access key id
+        ("sk_live_", "0123456789abcdefABCD"),    # Stripe live key
+        ("xoxb-", "123456789012-abcdefghijkl"),  # Slack token
+    ],
+)
+def test_sanitize_redacts_bare_high_entropy_tokens(prefix, body):
+    secret = prefix + body
+    out = _sanitize(f"the value is {secret} ok")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_quoted_json_values():
+    # The exact shape _excerpt produces via json.dumps for dict args/results.
+    api_key = "AKIA" + "_my_real_key_value"
+    payload = '{"api_key": "' + api_key + '", "password": "hunter2"}'
+    out = _sanitize(payload)
+    assert api_key not in out
+    assert "hunter2" not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_url_embedded_password():
+    password = "p4ss" + "w0rd"
+    out = _sanitize(f"connection string postgres://user:{password}@db.host:5432/app")
+    assert password not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_single_quoted_secret():
+    # Single-quoting is the dominant shell form; the previous value class only
+    # made the double quote optional and excluded ``'`` from the value, so the
+    # secret leaked verbatim.
+    secret = "opaque" + "-secret-value"
+    out = _sanitize(f"export API_KEY='{secret}'")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_multi_word_quoted_passphrase():
+    # A quoted multi-word value previously leaked everything after the first
+    # space because the value class stopped at whitespace.
+    passphrase = "correct horse battery staple"
+    out = _sanitize(f'"password": "{passphrase}"')
+    for word in passphrase.split():
+        assert word not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_userless_url_password():
+    # ``scheme://:pass@host`` has no user segment; the previous regex required a
+    # non-empty user before ``:`` and left it unredacted.
+    password = "myp" + "assword"
+    out = _sanitize(f"redis://:{password}@cache:6379")
+    assert password not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_leaves_benign_text_untouched():
+    benign = "The token of appreciation was a small token; password reset is at 5pm."
+    assert _sanitize(benign) == benign
+
+
+def test_sanitize_redacts_jwt():
+    jwt = ".".join(
+        ["eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0", "SflKxwRJSMeKKF2QT4fwpMeJf36"]
+    )
+    out = _sanitize(f"token {jwt}")
+    assert jwt not in out
+    assert "[REDACTED]" in out
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "xai-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD",          # xAI / Grok
+        "SG." + "abcdefghij1234567890." + "ABCDEFGHIJ1234567890abcdefghij",  # SendGrid
+        "hf_" + "abcdefghijklmnopqrstuvwxyz1234",                     # HuggingFace
+        "pplx-" + "abcdefghijklmnopqrstuvwxyz1234",                   # Perplexity
+        "tvly-" + "abcdefghijklmnopqrstuvwxyz",                       # Tavily
+        "bot123456789:" + "AAEabcdefghijklmnopqrstuvwxyz1234567",     # Telegram bot token
+    ],
+)
+def test_sanitize_redacts_vendor_prefix_tokens(secret):
+    # These vendor shapes were previously KEPT verbatim and could be promoted by
+    # the curator into durable memory. They now share the canonical detector.
+    out = _sanitize(f"value {secret} here")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_bare_aws_secret():
+    # A bare 40-char base64 AWS secret with no label was previously missed here
+    # though session_notes caught it.
+    secret = "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert len(secret) == 40
+    out = _sanitize("the value is " + secret + " ok")
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_does_not_redact_lowercase_hex_git_sha():
+    sha = "a1b2c3d4e5f6a7b8c9d0" + "e1f2a3b4c5d6e7f8a9b0"
+    assert len(sha) == 40
+    text = "The commit hash is " + sha
+    assert _sanitize(text) == text
+
+
+def test_sanitize_redacts_unquoted_multi_word_value():
+    # An UNQUOTED multi-word value after a label kept only the first token; it
+    # now consumes to the next clear delimiter so the full passphrase is masked.
+    out = _sanitize("password = correct horse battery staple")
+    for word in ["correct", "horse", "battery", "staple"]:
+        assert word not in out
+    assert "[REDACTED]" in out
+
+
+def test_sanitize_redacts_url_password_containing_at_sign():
+    # A URL password containing '@' was truncated at the first '@', leaking the
+    # remainder of the password and the host. The matcher now backtracks to the
+    # LAST '@' before the host.
+    out = _sanitize("postgres://u:p@ss@host/db")
+    assert "p@ss" not in out
+    assert "@ss@host" not in out
+    assert "[REDACTED]" in out
+    assert out.endswith("@host/db")
+
+
+def test_register_hooks():
+    calls = []
+
+    class Ctx:
+        def register_hook(self, name, fn):
+            calls.append((name, fn.__name__))
+
+    register(Ctx())
+
+    assert calls == [("pre_llm_call", "pre_llm_call"), ("post_tool_call", "post_tool_call")]

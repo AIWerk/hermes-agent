@@ -103,7 +103,10 @@ import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import {
+  getHermesAgentDisplayName,
+  isDashboardEmbeddedChatEnabled,
+} from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
@@ -376,6 +379,11 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+
+  useEffect(() => {
+    const agentName = getHermesAgentDisplayName();
+    document.title = agentName ? `${agentName} AI Assistant` : "AI Assistant";
+  }, []);
 
   const [collapsed, setCollapsed] = useState(() => {
     try {

@@ -36,6 +36,23 @@ logger = logging.getLogger(__name__)
 # instantly bypass all approval checks — a prompt-injection escalation path.
 _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 
+# Freeze the server-derived context at import, just like YOLO. Reading these
+# keys per call would let prompt-driven code manufacture authority mid-session.
+_MANAGED_AUTONOMY_CONTEXT_FROZEN = (
+    is_truthy_value(os.getenv("HERMES_CUI_MANAGED_AUTONOMY", "")),
+    os.getenv("HERMES_CUI_MANAGED_ACTOR_ID", "").strip(),
+    os.getenv("HERMES_CUI_MANAGED_ACTOR_ROLE", "").strip().lower(),
+)
+_MANAGED_AUTONOMY_ROLES = frozenset({"admin", "operator"})
+_MANAGED_AUTONOMY_LOW_RISK_PATTERN_KEYS = frozenset(
+    {"script execution via -e/-c flag"}
+)
+
+
+def _managed_autonomy_authorized() -> bool:
+    enabled, actor_id, actor_role = _MANAGED_AUTONOMY_CONTEXT_FROZEN
+    return bool(enabled and actor_id and actor_role in _MANAGED_AUTONOMY_ROLES)
+
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
 # process-global env var for session identity is racy. Keep env fallback for
@@ -4844,6 +4861,25 @@ def check_all_command_guards(command: str, env_type: str,
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
+
+    # Proportional bypass: hardline, sudo-stdin, explicit deny, and Tirith have
+    # already run. Only the narrow interpreter prompt class is eligible;
+    # destructive patterns, SSRF/path/content findings, and execute_code retain
+    # their existing gates.
+    if (
+        warnings
+        and _managed_autonomy_authorized()
+        and all(
+            not is_tirith and key in _MANAGED_AUTONOMY_LOW_RISK_PATTERN_KEYS
+            for key, _description, is_tirith in warnings
+        )
+    ):
+        return {
+            "approved": True,
+            "message": None,
+            "managed_autonomy": True,
+            "description": "; ".join(desc for _, desc, _ in warnings),
+        }
 
     # Nothing to warn about
     if not warnings:

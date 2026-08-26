@@ -15,7 +15,18 @@ Design:
 """
 
 import json
+import os
+import re
+import tempfile
+from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+from utils import atomic_replace
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
 
 # Valid status values for todo items
@@ -41,6 +52,24 @@ _TRUNCATION_MARKER = "… [truncated]"
 TODO_INJECTION_HEADER = (
     "[Your active task list was preserved across context compression]"
 )
+_HERMES_META_COMMENT_RE = re.compile(
+    r"<!--\s*hermes:id=\S+\s+status=\S+\s*-->"
+)
+
+
+def default_todo_markdown_path() -> Path:
+    """Return the shared TODO.md path used by the agent and CUI."""
+    raw = os.environ.get("AIWERK_CUI_TODO_PATH") or os.environ.get(
+        "HERMES_TODO_PATH"
+    )
+    if raw:
+        return Path(raw).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "TODO.md"
+    except Exception:
+        return Path.home() / ".hermes" / "TODO.md"
 
 
 class TodoStore:
@@ -53,8 +82,13 @@ class TodoStore:
       - status: pending | in_progress | completed | cancelled
     """
 
-    def __init__(self):
+    def __init__(self, markdown_path: Optional[str | Path] = None):
         self._items: List[Dict[str, str]] = []
+        self._markdown_path = (
+            Path(markdown_path).expanduser() if markdown_path else None
+        )
+        self._markdown_mtime_ns: Optional[int] = None
+        self._load_markdown_if_available()
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -65,6 +99,7 @@ class TodoStore:
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        self._refresh_from_markdown_if_changed()
         if not merge:
             # Replace mode: new list entirely
             self._items = self._normalize_order(
@@ -74,7 +109,7 @@ class TodoStore:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
             for t in self._dedupe_by_id(todos):
-                item_id = str(t.get("id", "")).strip()
+                item_id = self._normalize_id(t.get("id", ""))
                 if not item_id:
                     continue  # Can't merge without an id
 
@@ -105,11 +140,25 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        self._sync_markdown()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
-        """Return a copy of the current list."""
-        return [item.copy() for item in self._items]
+        """Return a safe copy, refreshing file-backed state when changed."""
+        self._refresh_from_markdown_if_changed()
+        if self._markdown_path is None:
+            return [item.copy() for item in self._items]
+        return [self._sanitize_item_for_read(item) for item in self._items]
+
+    @classmethod
+    def _sanitize_item_for_read(cls, item: Dict[str, str]) -> Dict[str, str]:
+        safe = item.copy()
+        safe["content"] = cls._sanitize_for_injection(safe.get("content", ""))
+        safe["id"] = cls._normalize_id(safe.get("id", "")) or "?"
+        return safe
+
+    def markdown_path(self) -> Optional[Path]:
+        return self._markdown_path
 
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
@@ -122,10 +171,9 @@ class TodoStore:
         Returns a human-readable string to append to the compressed
         message history, or None if the list is empty.
         """
+        self._refresh_from_markdown_if_changed()
         if not self._items:
             return None
-
-        # Status markers for compact display
         markers = {
             "completed": "[x]",
             "in_progress": "[>]",
@@ -145,9 +193,27 @@ class TodoStore:
         lines = [TODO_INJECTION_HEADER]
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            content = self._sanitize_for_injection(item["content"])
+            safe_id = self._normalize_id(item["id"]) or "?"
+            lines.append(
+                f"- {marker} {safe_id}. {content} ({item['status']})"
+            )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _sanitize_for_injection(content: str) -> str:
+        if not content:
+            return content
+        from tools.threat_patterns import scan_for_threats
+
+        findings = scan_for_threats(content, scope="strict")
+        if findings:
+            return (
+                "[BLOCKED: TODO.md task contained threat pattern(s): "
+                f"{', '.join(findings)}. Removed from model context.]"
+            )
+        return content
 
     @staticmethod
     def _cap_content(content: str) -> str:
@@ -173,7 +239,7 @@ class TodoStore:
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
 
-        item_id = str(item.get("id", "")).strip()
+        item_id = TodoStore._normalize_id(item.get("id", ""))
         if not item_id:
             item_id = "?"
 
@@ -198,9 +264,14 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = str(item.get("id", "")).strip() or "?"
+            item_id = TodoStore._normalize_id(item.get("id", "")) or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
+
+    @staticmethod
+    def _normalize_id(item_id: Any) -> str:
+        collapsed = re.sub(r"\s+", "_", str(item_id or "").strip())
+        return re.sub(r"[^A-Za-z0-9_-]", "", collapsed)
 
     @staticmethod
     def _normalize_order(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -226,6 +297,167 @@ class TodoStore:
         active_item = normalized.pop(active_index)
         normalized.insert(pending_index, active_item)
         return normalized
+
+    @staticmethod
+    def _content_key(content: str) -> str:
+        return re.sub(r"\s+", " ", str(content or "")).strip().casefold()
+
+    @classmethod
+    def _parse_markdown_text(cls, text: str) -> List[Dict[str, str]]:
+        items: List[Dict[str, str]] = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$", line)
+            if not match:
+                continue
+            raw = match.group(2)
+            meta = re.search(
+                r"<!--\s*hermes:id=(\S+)\s+status=(\S+)\s*-->\s*$", raw
+            )
+            content = _HERMES_META_COMMENT_RE.sub("", raw).strip()
+            if not content:
+                continue
+            checked = match.group(1).lower() == "x"
+            meta_status = meta.group(2) if meta else None
+            if checked:
+                status = (
+                    meta_status
+                    if meta_status in {"completed", "cancelled"}
+                    else "completed"
+                )
+            else:
+                status = (
+                    meta_status
+                    if meta_status in {"pending", "in_progress"}
+                    else "pending"
+                )
+            item_id = cls._normalize_id(meta.group(1)) if meta else ""
+            items.append(
+                {
+                    "id": item_id or f"todo-{line_no}",
+                    "content": cls._cap_content(content),
+                    "status": status,
+                }
+            )
+        return cls._normalize_order(items[:MAX_TODO_ITEMS])
+
+    def _markdown_mtime(self) -> Optional[int]:
+        if self._markdown_path is None:
+            return None
+        try:
+            return self._markdown_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _load_markdown_if_available(self) -> None:
+        if self._markdown_path is None:
+            return
+        try:
+            text = self._markdown_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return
+        self._items = self._parse_markdown_text(text)
+        self._markdown_mtime_ns = self._markdown_mtime()
+
+    def _refresh_from_markdown_if_changed(self) -> bool:
+        current_mtime = self._markdown_mtime()
+        if current_mtime is None or current_mtime == self._markdown_mtime_ns:
+            return False
+        self._load_markdown_if_available()
+        return True
+
+    def _merge_external_open_items(
+        self, on_disk: List[Dict[str, str]]
+    ) -> None:
+        seen_ids = {item["id"] for item in self._items}
+        seen_content = {
+            self._content_key(item["content"]) for item in self._items
+        }
+        for item in on_disk:
+            if item["status"] not in {"pending", "in_progress"}:
+                continue
+            content_key = self._content_key(item["content"])
+            if item["id"] in seen_ids or content_key in seen_content:
+                continue
+            self._items.append(item.copy())
+            seen_ids.add(item["id"])
+            seen_content.add(content_key)
+        self._items = self._normalize_order(self._items[:MAX_TODO_ITEMS])
+
+    @staticmethod
+    def _strip_meta_comments(content: str) -> str:
+        return _HERMES_META_COMMENT_RE.sub("", str(content or "")).strip()
+
+    def _render_markdown(self) -> str:
+        lines = [
+            "# Agent TODO",
+            "",
+            "<!-- Managed by Hermes todo tool. -->",
+            "",
+        ]
+        for item in self._items:
+            marker = "x" if item["status"] in {"completed", "cancelled"} else " "
+            content = self._strip_meta_comments(
+                item["content"].replace("\n", " ")
+            )
+            meta = f"<!-- hermes:id={item['id']} status={item['status']} -->"
+            lines.append(f"- [{marker}] {content} {meta}")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _sync_markdown(self) -> None:
+        if self._markdown_path is None:
+            return
+        try:
+            self._markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self._markdown_path.with_name(
+                self._markdown_path.name + ".lock"
+            )
+            lock_fd = None
+            try:
+                if fcntl is not None:
+                    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                try:
+                    current_text = self._markdown_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    current_text = ""
+                self._merge_external_open_items(
+                    self._parse_markdown_text(current_text)
+                )
+                self._atomic_write_text(
+                    self._markdown_path, self._render_markdown()
+                )
+            finally:
+                if lock_fd is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_fd)
+            self._markdown_mtime_ns = self._markdown_mtime()
+        except Exception:
+            # Disk sync is supplementary and must not break the todo tool.
+            return
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".todo_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def todo_tool(

@@ -103,6 +103,26 @@ class TestCmdSetupLocalJwt:
 
 
 class TestCmdStatus:
+    def test_json_mode_never_falls_back_to_human_all_profiles_output(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_cmd_status_all",
+            lambda: (_ for _ in ()).throw(AssertionError("JSON mode must remain JSON")),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_cmd_status_json",
+            lambda: print(json.dumps({"mode": "json"})),
+        )
+
+        honcho_cli.cmd_status(SimpleNamespace(all=True, json=True))
+
+        assert json.loads(capsys.readouterr().out) == {"mode": "json"}
+
     def test_reports_connection_failure_when_session_setup_fails(self, monkeypatch, capsys, tmp_path):
         import plugins.memory.honcho.cli as honcho_cli
 
@@ -216,6 +236,404 @@ class TestCmdStatus:
         out = capsys.readouterr().out
         assert "Auth:           OAuth (hermes-agent" in out
         assert "API key:" not in out
+
+    def test_json_status_disabled_is_stable_truthful_and_secret_free(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg_path = tmp_path / "honcho.json"
+        cfg_path.write_text("{}")
+
+        class FakeConfig:
+            enabled = False
+            api_key = "super-secret-token"
+            base_url = None
+            environment = "production"
+            host = "hermes"
+            workspace_id = "workspace-one"
+            peer_name = "user-one"
+            ai_peer = "hermes"
+            pin_peer_name = True
+            user_peer_aliases = {"private-runtime-id": "user-one"}
+            runtime_peer_prefix = "telegram_"
+            session_strategy = "per-session"
+            recall_mode = "hybrid"
+            context_tokens = 800
+            raw = {"apiKey": "super-secret-token"}
+
+            def resolve_session_name(self):
+                return "session-one"
+
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"apiKey": "redacted"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("disabled status must not connect")),
+        )
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert payload["enabled"] is False
+        assert payload["configured"] is True
+        assert payload["backend"] == {"available": True, "kind": "cloud"}
+        assert payload["connection"] == {
+            "ok": False,
+            "state": "disabled",
+            "error": None,
+        }
+        assert payload["containment"] == {
+            "host": "hermes",
+            "workspace": "workspace-one",
+            "session": "session-one",
+            "sessionStrategy": "per-session",
+            "pinUserPeer": True,
+            "runtimePeerPrefixConfigured": True,
+            "userPeerAliasCount": 1,
+        }
+        assert payload["recall"]["mode"] == "hybrid"
+        assert payload["injection"]["enabled"] is False
+        assert "super-secret-token" not in captured.out
+        assert "private-runtime-id" not in captured.out
+
+    def test_json_status_uses_one_exact_peer_card_get_and_reports_counts_only(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg_path = tmp_path / "honcho.json"
+        cfg_path.write_text("{}")
+
+        class FakeConfig:
+            enabled = True
+            api_key = "super-secret-token"
+            base_url = None
+            environment = "production"
+            timeout = 9.0
+            host = "hermes"
+            workspace_id = "workspace-one"
+            peer_name = "user-one"
+            ai_peer = "hermes"
+            pin_peer_name = False
+            user_peer_aliases = {}
+            runtime_peer_prefix = ""
+            session_strategy = "per-session"
+            recall_mode = "hybrid"
+            context_tokens = None
+            raw = {}
+
+            def resolve_session_name(self):
+                return "session-one"
+
+        calls = []
+
+        class FailFastTransport:
+            def get(self, route, query=None):
+                calls.append((route, query))
+                return {"peer_card": ["private fact", "second fact"]}
+
+            def __getattr__(self, name):
+                if name in {"post", "put", "patch", "delete", "upload", "stream"}:
+                    return lambda *a, **kw: (_ for _ in ()).throw(
+                        AssertionError(f"status must not issue {name}")
+                    )
+                raise AttributeError(name)
+
+        class FakeHoncho:
+            def __init__(self, **kwargs):
+                assert kwargs == {
+                    "api_key": "super-secret-token",
+                    "environment": "production",
+                    "workspace_id": "workspace-one",
+                    "timeout": 9.0,
+                }
+                self._http = FailFastTransport()
+
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"apiKey": "redacted"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        import sys
+        fake_routes = SimpleNamespace(
+            peer_card=lambda workspace, peer: f"/v3/workspaces/{workspace}/peers/{peer}/card"
+        )
+        fake_response = SimpleNamespace(
+            model_validate=lambda data: SimpleNamespace(peer_card=data["peer_card"])
+        )
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(Honcho=FakeHoncho))
+        monkeypatch.setitem(sys.modules, "honcho.http", SimpleNamespace(routes=fake_routes))
+        monkeypatch.setitem(sys.modules, "honcho.api_types", SimpleNamespace(PeerCardResponse=fake_response))
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("status must not use cached client")),
+        )
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert calls == [("/v3/workspaces/workspace-one/peers/user-one/card", None)]
+        assert payload["connection"] == {"ok": True, "state": "read_ok", "error": None}
+        assert payload["recall"]["stored"] == {
+            "available": True,
+            "userPeerCard": {"count": 2, "present": True},
+        }
+        assert payload["injection"]["enabled"] is True
+        assert "super-secret-token" not in captured.out
+        assert "private fact" not in captured.out
+
+    def test_json_status_tools_only_is_hard_off_before_client_construction(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = SimpleNamespace(
+            enabled=True, api_key="secret", base_url=None, environment="production",
+            timeout=5.0, host="hermes", workspace_id="workspace-one",
+            peer_name="user-one", pin_peer_name=False, user_peer_aliases={},
+            runtime_peer_prefix="", session_strategy="per-session", recall_mode="tools",
+            context_tokens=None, resolve_session_name=lambda: "session-one",
+        )
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: tmp_path / "honcho.json")
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        import sys
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(
+            Honcho=lambda **kw: (_ for _ in ()).throw(
+                AssertionError("tools-only must not construct client")
+            )
+        ))
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False, json=True))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["connection"] == {"ok": False, "state": "not_checked", "error": None}
+        assert payload["recall"]["stored"] == {"available": False, "reason": "recall_mode_tools"}
+        assert payload["injection"]["enabled"] is False
+
+
+class TestInjectionPreviewJson:
+    class FakeConfig:
+        enabled = True
+        api_key = "local"
+        base_url = "http://localhost:8000"
+        environment = "local"
+        timeout = 7.0
+        workspace_id = "workspace-one"
+        host = "hermes"
+        peer_name = "user-one"
+        pin_peer_name = False
+        user_peer_aliases = {}
+        runtime_peer_prefix = ""
+        recall_mode = "hybrid"
+        context_tokens = 800
+        raw = {"injection": {"includeUserCard": True, "includeAiCard": False}}
+
+        def resolve_session_name(self):
+            return "session-one"
+
+    def test_raw_json_is_exact_wrapped_card_only_payload_with_get_provenance(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+        from agent.memory_manager import build_memory_context_block
+        from plugins.memory.honcho import HonchoMemoryProvider
+
+        card = ["  spaced fact  ", "Unicode café", "## Session Summary\nnot-a-summary"]
+        calls = []
+
+        class FailFastTransport:
+            def get(self, route, query=None):
+                calls.append((route, query))
+                return {"peer_card": card}
+
+            def __getattr__(self, name):
+                if name in {"post", "put", "patch", "delete", "upload", "stream"}:
+                    return lambda *a, **kw: (_ for _ in ()).throw(
+                        AssertionError(f"preview must not issue {name}")
+                    )
+                raise AttributeError(name)
+
+        class FakeHoncho:
+            def __init__(self, **kwargs):
+                self._http = FailFastTransport()
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: self.FakeConfig(),
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("preview must not use cached client")),
+        )
+        import sys
+        fake_routes = SimpleNamespace(
+            peer_card=lambda workspace, peer: f"/v3/workspaces/{workspace}/peers/{peer}/card"
+        )
+        fake_response = SimpleNamespace(
+            model_validate=lambda data: SimpleNamespace(peer_card=data["peer_card"])
+        )
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(Honcho=FakeHoncho))
+        monkeypatch.setitem(sys.modules, "honcho.http", SimpleNamespace(routes=fake_routes))
+        monkeypatch.setitem(sys.modules, "honcho.api_types", SimpleNamespace(PeerCardResponse=fake_response))
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        expected_raw = HonchoMemoryProvider.__new__(HonchoMemoryProvider)._format_first_turn_context(
+            {"card": "\n".join(card)}
+        )
+        assert captured.err == ""
+        assert calls == [("/v3/workspaces/workspace-one/peers/user-one/card", None)]
+        assert payload["formattingDeterministic"] is True
+        assert payload["llmCall"] is False
+        assert payload["provenance"] == {
+            "source": "honcho.peer_card",
+            "readOnly": True,
+            "cacheConsumed": False,
+            "clientMutatingVerbs": 0,
+        }
+        assert payload["wrapped"] is True
+        assert payload["raw_context"] == expected_raw
+        assert payload["prompt_text"] == build_memory_context_block(expected_raw)
+        assert captured.out.lstrip().startswith("{")
+
+    def test_tools_only_raw_json_is_hard_off_before_client_construction(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = self.FakeConfig()
+        cfg.recall_mode = "tools"
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        import sys
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(
+            Honcho=lambda **kw: (_ for _ in ()).throw(
+                AssertionError("tools-only must not construct client")
+            )
+        ))
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        assert json.loads(capsys.readouterr().out) == {
+            "enabled": True,
+            "available": False,
+            "reason": "recall_mode_tools",
+            "preview": None,
+        }
+
+    def test_disabled_raw_json_is_hard_off_and_never_constructs_client(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = self.FakeConfig()
+        cfg.enabled = False
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("disabled preview must not connect")),
+        )
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert payload == {
+            "enabled": False,
+            "available": False,
+            "reason": "disabled",
+            "preview": None,
+        }
+
+    def test_unconfigured_raw_json_keeps_enabled_state_truthful(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = self.FakeConfig()
+        monkeypatch.setattr(cfg, "api_key", None)
+        monkeypatch.setattr(cfg, "base_url", None)
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("unconfigured preview must not connect")),
+        )
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "enabled": True,
+            "available": False,
+            "reason": "unconfigured",
+            "preview": None,
+        }
+
+    def test_text_preview_keeps_origin_session_details(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: self.FakeConfig(),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_read_observability_user_card",
+            lambda cfg: ["Prefers concise answers"],
+        )
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=False, json=False))
+
+        out = capsys.readouterr().out
+        assert "Recall mode: hybrid" in out
+        assert "Context budget: 800 tokens" in out
+        assert "Exact prompt text: hermes honcho injection-preview --raw" in out
+
+    def test_text_raw_output_remains_uncontaminated(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: self.FakeConfig(),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_read_observability_user_card",
+            lambda cfg: ["Prefers concise answers"],
+        )
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=False))
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert captured.out.startswith("<memory-context>")
+        assert "Prefers concise answers" in captured.out
+        assert "Honcho injection preview" not in captured.out
 
 
 class TestCloneHonchoForProfile:

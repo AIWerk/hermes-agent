@@ -1123,6 +1123,10 @@ def cmd_status(args) -> None:
     """Show current Honcho config and connection status."""
     show_all = getattr(args, "all", False)
 
+    if getattr(args, "json", False):
+        _cmd_status_json()
+        return
+
     if show_all:
         _cmd_status_all()
         return
@@ -1224,6 +1228,274 @@ def cmd_status(args) -> None:
     else:
         reason = "disabled" if not hcfg.enabled else "no API key or base URL"
         print(f"\n  Not connected ({reason})\n")
+
+
+def _honcho_injection_flag(hcfg, name: str, default: bool) -> bool:
+    """Resolve a host-aware injection flag without exposing raw config."""
+    raw = getattr(hcfg, "raw", None) or {}
+    root = raw.get("injection") if isinstance(raw, dict) else None
+    root = root if isinstance(root, dict) else {}
+    hosts = raw.get("hosts") if isinstance(raw, dict) else None
+    host_block = hosts.get(getattr(hcfg, "host", ""), {}) if isinstance(hosts, dict) else {}
+    host = host_block.get("injection") if isinstance(host_block, dict) else None
+    host = host if isinstance(host, dict) else {}
+    if name in host:
+        return bool(host[name])
+    if name in root:
+        return bool(root[name])
+    return default
+
+
+def _status_section(included: bool, reason: str) -> dict:
+    return {"included": bool(included), "reason": reason}
+
+
+def _build_status_snapshot(hcfg, *, user_card: list[str]) -> dict:
+    """Describe the card-only observability read without returning card facts."""
+    return {
+        "stored": {
+            "userPeerCard": {"count": len(user_card or []), "present": bool(user_card)},
+        },
+        "sections": {
+            "User Peer Card": _status_section(bool(user_card), "peer_card read")
+        },
+    }
+
+
+def _observability_user_peer_id(hcfg, session_key: str) -> str:
+    """Reuse session identity semantics without constructing a manager or caches."""
+    from plugins.memory.honcho.session import HonchoSessionManager
+
+    resolver = object.__new__(HonchoSessionManager)
+    resolver._config = hcfg
+    resolver._runtime_user_peer_name = None
+    resolver._runtime_user_peer_name_alt = None
+    return resolver._resolve_user_peer_id(session_key)
+
+
+def _read_observability_user_card(hcfg) -> list[str]:
+    """Issue exactly one non-refreshing SDK peer-card GET."""
+    from honcho import Honcho
+    from honcho.api_types import PeerCardResponse
+    from honcho.http import routes
+
+    kwargs = {
+        "api_key": hcfg.api_key,
+        "environment": hcfg.environment,
+        "workspace_id": hcfg.workspace_id,
+    }
+    if getattr(hcfg, "base_url", None):
+        kwargs["base_url"] = hcfg.base_url
+    if getattr(hcfg, "timeout", None) is not None:
+        kwargs["timeout"] = hcfg.timeout
+    client = Honcho(**kwargs)
+    session_key = hcfg.resolve_session_name() or getattr(hcfg, "host", "hermes") or "hermes"
+    peer_id = _observability_user_peer_id(hcfg, session_key)
+    data = client._http.get(routes.peer_card(hcfg.workspace_id, peer_id), query=None)
+    response = PeerCardResponse.model_validate(data)
+    return [str(item) for item in (response.peer_card or [])]
+
+
+def _collect_peer_status_snapshot(hcfg) -> dict:
+    """Read card-only backend state; returned data contains no raw facts."""
+    return _build_status_snapshot(hcfg, user_card=_read_observability_user_card(hcfg))
+
+
+def _base_status_payload(hcfg) -> dict:
+    configured = bool(getattr(hcfg, "api_key", None) or getattr(hcfg, "base_url", None))
+    recall_mode = getattr(hcfg, "recall_mode", "")
+    return {
+        "enabled": bool(getattr(hcfg, "enabled", False)),
+        "configured": configured,
+        "backend": {
+            "available": configured,
+            "kind": "self-hosted" if getattr(hcfg, "base_url", None) else "cloud",
+        },
+        "connection": {"ok": False, "state": "not_checked", "error": None},
+        "containment": {
+            "host": getattr(hcfg, "host", ""),
+            "workspace": getattr(hcfg, "workspace_id", ""),
+            "session": hcfg.resolve_session_name(),
+            "sessionStrategy": getattr(hcfg, "session_strategy", ""),
+            "pinUserPeer": bool(getattr(hcfg, "pin_peer_name", False)),
+            "runtimePeerPrefixConfigured": bool(
+                getattr(hcfg, "runtime_peer_prefix", "")
+            ),
+            "userPeerAliasCount": len(getattr(hcfg, "user_peer_aliases", {}) or {}),
+        },
+        "recall": {
+            "mode": recall_mode,
+            "contextTokens": getattr(hcfg, "context_tokens", None),
+            "stored": {"available": False, "reason": "not_checked"},
+        },
+        "injection": {
+            "enabled": False,
+            "sections": {},
+        },
+    }
+
+
+def _cmd_status_json() -> None:
+    """Emit one stable JSON document for every status outcome."""
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig
+        hcfg = HonchoClientConfig.from_global_config(host=_host_key())
+        payload = _base_status_payload(hcfg)
+        if not payload["configured"]:
+            payload["connection"]["state"] = "unconfigured"
+            payload["recall"]["stored"]["reason"] = "unconfigured"
+        elif not payload["enabled"]:
+            payload["connection"]["state"] = "disabled"
+            payload["recall"]["stored"]["reason"] = "disabled"
+        elif getattr(hcfg, "recall_mode", "") == "tools":
+            payload["recall"]["stored"]["reason"] = "recall_mode_tools"
+        else:
+            try:
+                snapshot = _collect_peer_status_snapshot(hcfg)
+                payload["connection"] = {"ok": True, "state": "read_ok", "error": None}
+                payload["recall"]["stored"] = {
+                    "available": True,
+                    **snapshot["stored"],
+                }
+                payload["injection"] = {
+                    "enabled": True,
+                    "sections": snapshot["sections"],
+                }
+            except Exception as e:
+                payload["connection"] = {
+                    "ok": False,
+                    "state": "error",
+                    "error": type(e).__name__,
+                }
+                payload["recall"]["stored"] = {
+                    "available": False,
+                    "reason": "connection_error",
+                }
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    except Exception as e:
+        payload = {
+            "enabled": False,
+            "configured": False,
+            "backend": {"available": False, "kind": "unknown"},
+            "connection": {"ok": False, "state": "unavailable", "error": type(e).__name__},
+            "containment": None,
+            "recall": {"mode": None, "contextTokens": None, "stored": {"available": False, "reason": "backend_unavailable"}},
+            "injection": {"enabled": False, "sections": {}},
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _section_line_count(text: str) -> int:
+    return len([line for line in (text or "").splitlines() if line.strip()])
+
+
+def _build_injection_preview(hcfg, ctx: dict, *, wrapped: bool = False) -> dict:
+    """Reuse the production formatter and wrapper for card-only bytes."""
+    from plugins.memory.honcho import HonchoMemoryProvider
+
+    raw_context = HonchoMemoryProvider.__new__(
+        HonchoMemoryProvider
+    )._format_first_turn_context({"card": str((ctx or {}).get("card", ""))})
+    prompt_text = raw_context
+    if wrapped and raw_context:
+        from agent.memory_manager import build_memory_context_block
+        prompt_text = build_memory_context_block(raw_context)
+    return {
+        "included": [],
+        "excluded": [],
+        "raw_context": raw_context,
+        "prompt_text": prompt_text,
+        "line_count": _section_line_count(prompt_text),
+        "word_count": len(prompt_text.split()) if prompt_text else 0,
+        "estimated_tokens": _estimate_tokens(prompt_text),
+        "wrapped": wrapped,
+    }
+
+
+def _print_injection_preview(preview: dict, hcfg, session_key: str) -> None:
+    print("\nHoncho injection preview\n" + "─" * 40)
+    print(f"\n  Session\n    Host: {getattr(hcfg, 'host', '(unknown)')}")
+    print(f"    Workspace: {getattr(hcfg, 'workspace_id', '(unknown)')}")
+    print(f"    Session: {session_key}")
+    print(f"    Recall mode: {getattr(hcfg, 'recall_mode', '(unknown)')}")
+    budget = getattr(hcfg, "context_tokens", None) or "(Honcho default)"
+    print(f"    Context budget: {budget} tokens")
+    print("\n  Included sections")
+    for item in preview["included"]:
+        print(f"    - {item['label']}: included ({item['reason']}, {item['lines']} lines)")
+    if not preview["included"]:
+        print("    - none")
+    print("\n  Excluded sections")
+    for item in preview["excluded"]:
+        print(f"    - {item['label']}: excluded ({item['reason']})")
+    print("\n  Approx size")
+    print(f"    Lines: {preview['line_count']}")
+    print(f"    Words: {preview['word_count']}")
+    print(f"    Tokens: about {preview['estimated_tokens']}")
+    print("\n  Exact prompt text: hermes honcho injection-preview --raw\n")
+
+
+def cmd_injection_preview(args) -> None:
+    """Preview the next injected context without creating or mutating a session."""
+    json_mode = bool(getattr(args, "json", False))
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        hcfg = HonchoClientConfig.from_global_config(host=_host_key())
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url) or hcfg.recall_mode == "tools":
+            reason = (
+                "disabled" if not hcfg.enabled else
+                "unconfigured" if not (hcfg.api_key or hcfg.base_url) else
+                "recall_mode_tools"
+            )
+            if json_mode:
+                print(json.dumps({"enabled": bool(hcfg.enabled), "available": False, "reason": reason, "preview": None}, sort_keys=True))
+            else:
+                print("\n  Honcho not connected. Run: hermes honcho status\n")
+            return
+        session_key = hcfg.resolve_session_name() or getattr(hcfg, "host", "hermes") or "hermes"
+        ctx = {"card": "\n".join(_read_observability_user_card(hcfg))}
+        preview = _build_injection_preview(
+            hcfg, ctx, wrapped=bool(getattr(args, "raw", False))
+        )
+        if json_mode:
+            payload = {
+                "host": getattr(hcfg, "host", ""),
+                "workspace": getattr(hcfg, "workspace_id", ""),
+                "session": session_key,
+                "recallMode": getattr(hcfg, "recall_mode", ""),
+                "contextTokens": getattr(hcfg, "context_tokens", None),
+                "formattingDeterministic": True,
+                "llmCall": False,
+                "provenance": {
+                    "source": "honcho.peer_card",
+                    "readOnly": True,
+                    "cacheConsumed": False,
+                    "clientMutatingVerbs": 0,
+                },
+                **preview,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+        elif getattr(args, "raw", False):
+            print(preview["prompt_text"])
+        else:
+            _print_injection_preview(preview, hcfg, session_key)
+    except Exception as e:
+        if json_mode:
+            print(json.dumps({
+                "enabled": True,
+                "available": False,
+                "reason": type(e).__name__,
+                "preview": None,
+            }, sort_keys=True))
+        else:
+            print(f"\n  Honcho injection preview unavailable: {type(e).__name__}\n")
 
 
 def _show_peer_cards(hcfg, client) -> None:
@@ -1847,6 +2119,8 @@ def honcho_command(args) -> None:
         cmd_status(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "injection-preview":
+        cmd_injection_preview(args)
     elif sub == "peers":
         cmd_peers(args)
     elif sub == "sessions":
@@ -1899,6 +2173,20 @@ def register_cli(subparser) -> None:
     )
     status_parser.add_argument(
         "--all", action="store_true", help="Show config overview across all profiles",
+    )
+    status_parser.add_argument(
+        "--json", action="store_true", help="Print machine-readable status JSON",
+    )
+
+    preview_parser = subs.add_parser(
+        "injection-preview",
+        help="Preview Honcho context that would be injected into the next prompt",
+    )
+    preview_parser.add_argument(
+        "--raw", action="store_true", help="Print the exact memory-context prompt block",
+    )
+    preview_parser.add_argument(
+        "--json", action="store_true", help="Print structured preview JSON",
     )
 
     subs.add_parser("peers", help="Show peer identities across all profiles")

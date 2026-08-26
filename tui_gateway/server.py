@@ -38,6 +38,12 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.cui_actor_context import (
+    bind_cui_actor_context,
+    current_cui_actor_context,
+    reset_cui_actor_context,
+    sanitize_cui_actor_context,
+)
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -1735,6 +1741,171 @@ atexit.register(_shutdown_sessions)
 _start_idle_reaper()
 
 
+class _CuiSessionNotFound(LookupError):
+    """Invisible and absent sessions share one internal outcome."""
+
+
+_CUI_ADMIN_ROLES = frozenset({"admin", "owner", "operator"})
+_CUI_MUTATING_SESSION_METHODS = frozenset(
+    {
+        "archive_session",
+        "delete_session",
+        "end_session",
+        "rename_session",
+        "reopen_session",
+        "set_session_archived",
+        "set_session_hidden",
+        "set_session_pinned",
+        "set_session_title",
+        "update_session",
+    }
+)
+
+
+def _row_cui_metadata(row: dict | None) -> dict[str, str]:
+    if not isinstance(row, dict):
+        return {}
+    raw = row.get("model_config")
+    try:
+        config = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(config, dict):
+        return {}
+    nested = config.get("_cui_actor_context")
+    nested = nested if isinstance(nested, dict) else {}
+    values = {
+        "visibility_scope": config.get("_cui_visibility_scope"),
+        "actor_role": config.get("_cui_actor_role") or nested.get("role"),
+        "actor_id": config.get("_cui_actor_id") or nested.get("actor_id"),
+        "tenant_id": config.get("_cui_tenant_id") or nested.get("tenant_id"),
+    }
+    return {
+        key: str(value).strip().lower() if key in {"visibility_scope", "actor_role"} else str(value).strip()
+        for key, value in values.items()
+        if value is not None and str(value).strip()
+    }
+
+
+def _row_visible_to_cui_actor(row: dict | None, actor: dict | None) -> bool:
+    actor = actor or {}
+    if not actor:
+        return True
+    if actor.get("_restricted"):
+        return False
+    tenant_id = str(actor.get("tenant_id") or "").strip()
+    actor_id = str(actor.get("actor_id") or "").strip()
+    role = str(actor.get("role") or "").strip().lower()
+    if not (tenant_id and actor_id and role):
+        return False
+    metadata = _row_cui_metadata(row)
+    if not metadata:
+        return role in _CUI_ADMIN_ROLES
+    if metadata.get("tenant_id") != tenant_id:
+        return False
+    if role not in _CUI_ADMIN_ROLES:
+        if (
+            metadata.get("visibility_scope") != "customer"
+            or metadata.get("actor_role") in _CUI_ADMIN_ROLES
+            or metadata.get("actor_role") != role
+        ):
+            return False
+        return metadata.get("actor_id") == actor_id
+    if metadata.get("actor_id"):
+        return metadata["actor_id"] == actor_id
+    if role in _CUI_ADMIN_ROLES:
+        return metadata.get("actor_role") in _CUI_ADMIN_ROLES
+    return False
+
+
+def _visible_persisted_session_row(db, session_id: str, actor: dict | None):
+    row = db.get_session(session_id)
+    return row if _row_visible_to_cui_actor(row, actor) else None
+
+
+def _stamp_cui_actor_context(model_config: dict, actor_context: dict | None) -> None:
+    actor = sanitize_cui_actor_context(actor_context)
+    tenant_id = actor.get("tenant_id", "")
+    actor_id = actor.get("actor_id", "")
+    role = actor.get("role", "").lower()
+    if not (tenant_id and actor_id and role):
+        return
+    model_config["_cui_actor_context"] = actor
+    model_config["_cui_visibility_scope"] = (
+        "admin" if role in _CUI_ADMIN_ROLES else "customer"
+    )
+    model_config["_cui_actor_role"] = role
+    model_config["_cui_actor_id"] = actor_id
+    model_config["_cui_tenant_id"] = tenant_id
+
+
+class _CuiActorScopedSessionDB:
+    """Fail-closed SessionDB view filtering before pagination and side effects."""
+
+    def __init__(self, db, actor: dict):
+        self._db = db
+        self._actor = dict(actor)
+
+    def _visible_rows(self, kwargs: dict) -> list[dict]:
+        query = dict(kwargs)
+        query.pop("limit", None)
+        query.pop("offset", None)
+        query["compact_rows"] = False
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            page = self._db.list_sessions_rich(limit=1000, offset=offset, **query)
+            rows.extend(row for row in page if _row_visible_to_cui_actor(row, self._actor))
+            if len(page) < 1000:
+                return rows
+            offset += len(page)
+
+    def list_sessions_rich(self, **kwargs):
+        limit = max(0, int(kwargs.get("limit", 200)))
+        offset = max(0, int(kwargs.get("offset", 0)))
+        return self._visible_rows(kwargs)[offset : offset + limit]
+
+    def session_count(self, **kwargs):
+        kwargs.pop("exclude_children", None)
+        return len(self._visible_rows(kwargs))
+
+    def get_session(self, session_id):
+        return _visible_persisted_session_row(self._db, session_id, self._actor)
+
+    def get_session_by_title(self, title):
+        row = self._db.get_session_by_title(title)
+        return row if _row_visible_to_cui_actor(row, self._actor) else None
+
+    def create_session(self, session_id, *args, **kwargs):
+        config = kwargs.get("model_config")
+        config = dict(config) if isinstance(config, dict) else {}
+        _stamp_cui_actor_context(config, self._actor)
+        kwargs["model_config"] = config
+        return self._db.create_session(session_id, *args, **kwargs)
+
+    def adopt_session_lineage_from(self, donor_db, session_id):
+        if donor_db.get_session(session_id) is None:
+            raise _CuiSessionNotFound("session not found")
+        raw_donor = (
+            donor_db._db
+            if isinstance(donor_db, _CuiActorScopedSessionDB)
+            else donor_db
+        )
+        return self._db.adopt_session_lineage_from(raw_donor, session_id)
+
+    def __getattr__(self, name):
+        target = getattr(self._db, name)
+        if name not in _CUI_MUTATING_SESSION_METHODS:
+            return target
+
+        def guarded(session_id, *args, **kwargs):
+            if self.get_session(session_id) is None:
+                raise _CuiSessionNotFound("session not found")
+            return target(session_id, *args, **kwargs)
+
+        return guarded
+
+
 # ── Plumbing ──────────────────────────────────────────────────────────
 
 
@@ -1753,7 +1924,8 @@ def _get_db():
                 exc,
             )
             return None
-    return _db
+    actor = current_cui_actor_context()
+    return _CuiActorScopedSessionDB(_db, actor) if actor else _db
 
 
 def _db_for_profile(profile: str | None = None):
@@ -1772,7 +1944,9 @@ def _db_for_profile(profile: str | None = None):
     try:
         from hermes_state import SessionDB
 
-        return SessionDB(db_path=Path(profile_home) / "state.db"), True
+        db = SessionDB(db_path=Path(profile_home) / "state.db")
+        actor = current_cui_actor_context()
+        return (_CuiActorScopedSessionDB(db, actor) if actor else db), True
     except Exception as exc:
         logger.warning(
             "TUI profile session store unavailable for %s: %s",
@@ -2472,7 +2646,34 @@ def _current_session_steer_authority(
         return transport, session
 
 
-def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
+def _run_with_cui_actor_context(actor_context, fn, *args, **kwargs):
+    """Run one deferred/background owner with flow-local actor authority."""
+    token = bind_cui_actor_context(actor_context)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        reset_cui_actor_context(token)
+
+
+def _store_created_session_actor(req: dict, response: dict | None) -> None:
+    """Attach dispatch authority to a newly created live session."""
+    if req.get("method") != "session.create" or not isinstance(response, dict):
+        return
+    result = response.get("result")
+    sid = result.get("session_id") if isinstance(result, dict) else None
+    actor = current_cui_actor_context()
+    if sid and actor:
+        with _sessions_lock:
+            session = _sessions.get(str(sid))
+            if session is not None:
+                session["cui_actor_context"] = sanitize_cui_actor_context(actor)
+
+
+def dispatch(
+    req: dict,
+    transport: Optional[Transport] = None,
+    actor_context: dict | None = None,
+) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
     Returns a response dict when handled inline. Returns None when the
@@ -2486,6 +2687,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """
     t = transport or _stdio_transport
     token = bind_transport(t)
+    actor_token = bind_cui_actor_context(actor_context)
     try:
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
@@ -2493,7 +2695,9 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         _rid, method, _params = normalized
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            response = handle_request(req)
+            _store_created_session_actor(req, response)
+            return response
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
@@ -2510,6 +2714,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         return None
     finally:
+        reset_cui_actor_context(actor_token)
         reset_transport(token)
 
 
@@ -2678,6 +2883,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             return
 
         notify_registered = False
+        actor_token = bind_cui_actor_context(current.get("cui_actor_context"))
         home_token = None
         secret_token = None
         session_db = None
@@ -2837,6 +3043,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            reset_cui_actor_context(actor_token)
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -2880,9 +3087,40 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _live_record_visible_to_cui_actor(
+    session: dict | None, actor: dict | None = None
+) -> bool:
+    actor = current_cui_actor_context() if actor is None else (actor or {})
+    if not actor:
+        return True
+    if actor.get("_restricted") or not isinstance(session, dict):
+        return False
+    tenant_id = str(actor.get("tenant_id") or "").strip()
+    actor_id = str(actor.get("actor_id") or "").strip()
+    role = str(actor.get("role") or "").strip().lower()
+    owner = sanitize_cui_actor_context(session.get("cui_actor_context"))
+    owner_tenant = str(owner.get("tenant_id") or "").strip()
+    owner_actor = str(owner.get("actor_id") or "").strip()
+    owner_role = str(owner.get("role") or "").strip().lower()
+    if not all((tenant_id, actor_id, role, owner_tenant, owner_actor, owner_role)):
+        return False
+    if owner_tenant != tenant_id:
+        return False
+    if (role in _CUI_ADMIN_ROLES) != (owner_role in _CUI_ADMIN_ROLES):
+        return False
+    if owner_role != role:
+        return False
+    return owner_actor == actor_id
+
+
+def _visible_live_session(session_id: str) -> dict | None:
+    session = _sessions.get(session_id)
+    return session if _live_record_visible_to_cui_actor(session) else None
+
+
 def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
-    s = _sessions.get(sid)
+    s = _visible_live_session(sid)
     if s:
         return (s, None)
     # A session-scoped RPC hit a runtime id the gateway no longer holds
@@ -2957,9 +3195,10 @@ def _normalize_completion_path(path_part: str) -> str:
 
 def _completion_cwd(params: dict | None = None) -> str:
     params = params or {}
+    session = _visible_live_session(params.get("session_id") or "")
     raw = (
         params.get("cwd")
-        or _sessions.get(params.get("session_id") or "", {}).get("cwd")
+        or (session or {}).get("cwd")
         # A session bound to another profile resolves its workspace from THAT
         # profile's config before falling back to the launch profile's env var.
         or _profile_configured_cwd(_profile_home(params.get("profile")))
@@ -3391,6 +3630,7 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    _stamp_cui_actor_context(model_config, session.get("cui_actor_context"))
     try:
         db.create_session(
             key,
@@ -7831,6 +8071,7 @@ def _init_session(
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
             "cols": cols,
+            "cui_actor_context": sanitize_cui_actor_context(current_cui_actor_context()),
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
             "source": _resolve_session_source(source),
@@ -9224,6 +9465,7 @@ def _deferred_session_record(
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
+        "cui_actor_context": sanitize_cui_actor_context(current_cui_actor_context()),
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
@@ -9303,6 +9545,7 @@ def _claim_parked_runtimes(
             for old_sid, old in list(_sessions.items())
             if old_sid != keep_sid
             and not old.get("_finalized")
+            and _live_record_visible_to_cui_actor(old)
             and _session_lookup_key(old, fallback=old_sid) == session_key
             and old.get("transport") is _detached_ws_transport
         ]
@@ -9499,6 +9742,8 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
 def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if not _live_record_visible_to_cui_actor(session):
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
@@ -11428,6 +11673,7 @@ def _run_prompt_submit(
         # stored on this session generation before any tool can commission a
         # child; delegate_task then captures it as non-serializable authority.
         transport_token = bind_transport(session.get("transport"))
+        actor_token = bind_cui_actor_context(session.get("cui_actor_context"))
         runtime_session_token = _current_runtime_session_record.set(session)
         # Bound eagerly so the except/finally paths below always have an agent
         # even if turn setup throws; re-read after _sync_bot_capabilities,
@@ -12204,6 +12450,7 @@ def _run_prompt_submit(
                 reset_secret_scope(secret_token)
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
+            reset_cui_actor_context(actor_token)
             reset_transport(transport_token)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
@@ -12664,7 +12911,25 @@ def _respond(rid, params, key, *, allow_expired=False):
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
-    session = _sessions.get(params.get("session_id", ""))
+    session_id = params.get("session_id", "")
+    session = _visible_live_session(session_id)
+    reasoning_arg = str(value or "").strip().lower()
+    consumes_session = key in {"model", "fast", "verbose", "personality"}
+    if key == "focus":
+        from hermes_cli.focus_view import resolve_focus_arg
+
+        focus_action, _ = resolve_focus_arg(str(value or ""), False)
+        consumes_session = focus_action == "set"
+    consumes_session = consumes_session or (
+        key == "yolo"
+        and str(params.get("scope") or "session").strip().lower() != "global"
+    )
+    consumes_session = consumes_session or (
+        key == "reasoning"
+        and reasoning_arg not in {"full", "all", "clamp", "collapse", "short"}
+    )
+    if session_id and consumes_session and session is None:
+        return _err(rid, 4001, "session not found")
 
     if key == "model":
         try:

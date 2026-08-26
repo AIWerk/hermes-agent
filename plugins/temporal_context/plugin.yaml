@@ -1,0 +1,7 @@
+name: temporal_context
+version: 0.1.0
+description: Deterministic configurable local temporal context injected per turn.
+author: AIWerk
+kind: standalone
+provides_hooks:
+  - pre_llm_call

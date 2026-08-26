@@ -5772,6 +5772,69 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def push_side_session(
+        self,
+        source: str,
+        parent_session_id: str,
+        side_session_id: str,
+        title: Optional[str] = None,
+    ) -> int:
+        """Record an active topic-parking side session for *source*."""
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                """INSERT INTO session_stack
+                   (source, parent_session_id, side_session_id, title, pushed_at, status)
+                   VALUES (?, ?, ?, ?, ?, 'active')""",
+                (source, parent_session_id, side_session_id, title, now),
+            )
+            return int(cur.lastrowid)
+
+        return self._execute_write(_do)
+
+    def get_active_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
+        """Return the newest active side-session stack entry for *source*."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM session_stack
+                   WHERE source = ? AND status = 'active'
+                   ORDER BY id DESC LIMIT 1""",
+                (source,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def pop_side_session(
+        self, source: str = "cli", side_session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Pop the newest active entry, optionally bound to its side session."""
+        now = time.time()
+
+        def _do(conn):
+            if side_session_id is not None:
+                row = conn.execute(
+                    """SELECT * FROM session_stack
+                       WHERE source = ? AND side_session_id = ? AND status = 'active'
+                       ORDER BY id DESC LIMIT 1""",
+                    (source, side_session_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM session_stack
+                       WHERE source = ? AND status = 'active'
+                       ORDER BY id DESC LIMIT 1""",
+                    (source,),
+                ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE session_stack SET status = 'popped', popped_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+            return dict(row)
+
+        return self._execute_write(_do)
+
     def record_gateway_session_peer(
         self,
         session_id: str,
@@ -9338,6 +9401,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return row["title_source"]
 
+    def get_session_title_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Compatibility view for AIWerk title-lifecycle consumers."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        source = row["title_source"]
+        return {
+            "title": row["title"],
+            # Legacy AIWerk callers named upstream's user-authoritative source
+            # "manual"; preserve that compatibility view without changing the
+            # canonical storage provenance.
+            "title_source": "manual" if source == "user" else source,
+            "title_updated_at": None,
+            "title_turn_index": None,
+        }
+
     def set_session_title_source(self, session_id: str, source: str) -> bool:
         """Overwrite a title's provenance without touching the title text.
 
@@ -10101,6 +10184,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for row in rows:
             s = self._session_row_dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            summary = self.get_session_summary(s["id"])
+            if summary:
+                s["summary"] = summary["short_summary"]
+                s["topics"] = summary["topics"]
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -13858,6 +13945,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if needs_rebuild:
                     conn.executescript(
                         """
+                        DROP TABLE IF EXISTS telegram_dm_topic_bindings_new;
                         CREATE TABLE telegram_dm_topic_bindings_new (
                             chat_id TEXT NOT NULL,
                             thread_id TEXT NOT NULL,

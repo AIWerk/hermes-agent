@@ -742,6 +742,84 @@ class SessionSchemaMixin:
                             "SCHEMA_SQL: %s", table_name, col_name, exc,
                         )
 
+    def _reconcile_session_stack_fk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild session_stack if its session FKs lack ON DELETE CASCADE."""
+        try:
+            exists = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_stack'"
+            ).fetchone()
+            if not exists:
+                return
+            fk_rows = cursor.execute(
+                "PRAGMA foreign_key_list('session_stack')"
+            ).fetchall()
+            session_fks = [row for row in fk_rows if row[2] == "sessions"]
+            if not session_fks:
+                return
+            if all((str(row[6]) or "").upper() == "CASCADE" for row in session_fks):
+                return
+
+            # Keep DROP+RENAME atomic. executescript() would implicitly commit
+            # before running, so execute each statement inside an explicit txn.
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute("DROP TABLE IF EXISTS session_stack_new")
+                cursor.execute(
+                    """
+                    CREATE TABLE session_stack_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        side_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        title TEXT,
+                        pushed_at REAL NOT NULL,
+                        popped_at REAL,
+                        status TEXT NOT NULL DEFAULT 'active'
+                    )
+                    """
+                )
+                total = cursor.execute(
+                    "SELECT COUNT(*) FROM session_stack"
+                ).fetchone()[0]
+                cursor.execute(
+                    """
+                    INSERT INTO session_stack_new
+                        SELECT id, source, parent_session_id, side_session_id, title,
+                               pushed_at, popped_at, status
+                        FROM session_stack
+                        WHERE parent_session_id IN (SELECT id FROM sessions)
+                          AND side_session_id IN (SELECT id FROM sessions)
+                    """
+                )
+                kept = cursor.execute(
+                    "SELECT COUNT(*) FROM session_stack_new"
+                ).fetchone()[0]
+                cursor.execute("DROP TABLE session_stack")
+                cursor.execute(
+                    "ALTER TABLE session_stack_new RENAME TO session_stack"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_session_stack_active "
+                    "ON session_stack(source, status, id DESC)"
+                )
+                cursor.execute("COMMIT")
+            except BaseException:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            dropped = int(total) - int(kept)
+            if dropped > 0:
+                logger.warning(
+                    "session_stack rebuild dropped %d orphaned stack row(s) "
+                    "referencing missing sessions",
+                    dropped,
+                )
+            logger.info("session_stack rebuilt with ON DELETE CASCADE foreign keys")
+        except sqlite3.OperationalError as exc:
+            logger.warning("session_stack FK reconcile skipped: %s", exc)
+
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.
 
@@ -958,6 +1036,10 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # SQLite cannot ALTER existing foreign-key actions, so legacy
+        # session_stack tables require a one-time table-shape rebuild.
+        self._reconcile_session_stack_fk(cursor)
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is

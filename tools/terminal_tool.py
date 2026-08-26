@@ -3248,6 +3248,14 @@ def terminal_tool(
                         "smart_denied": approval.get("smart_denied", False),
                         "allow_permanent": approval.get("allow_permanent", True),
                     }, ensure_ascii=False)
+                if approval.get("status") == "policy_blocked":
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": -1,
+                        "error": approval.get("message", "blocked by command policy"),
+                        "status": "policy_blocked",
+                        "reason": approval.get("reason", "command_policy"),
+                    }, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")
                 fallback_msg = (
@@ -3268,6 +3276,35 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+
+        try:
+            from hermes_cli.operator_verification import (
+                current_operator_verification_subject,
+                operator_verification_block_reason_for_command,
+                required_operator_role_for_command,
+            )
+            required_role = required_operator_role_for_command(command)
+            trusted_subject = current_operator_verification_subject(
+                required_role, session_id=session_id
+            ) or {}
+            operator_block = operator_verification_block_reason_for_command(
+                command,
+                session_id=session_id,
+                interface=trusted_subject.get("interface", ""),
+                provenance=trusted_subject.get("provenance", ""),
+                actor_id=trusted_subject.get("actor_id", ""),
+                requested_role=required_role,
+            )
+        except Exception:
+            operator_block = "Operator verification policy could not be evaluated; failing closed."
+        if operator_block:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": operator_block,
+                "status": "operator_verification_required",
+                "requires_operator_verification": True,
+            }, ensure_ascii=False)
 
         # Prepare command for execution
         pty_disabled_reason = None

@@ -309,26 +309,112 @@ class TestMemoryToolDispatcher:
     def test_new_text_alias_for_content_on_replace(self, store):
         # A caller mirroring old_text with new_text (the patch tool's shape)
         # must succeed instead of erroring 'content is required'.
-        store.add("memory", "fact A")
+        store.add("memory", "Project uses pytest.")
         result = json.loads(
-            memory_tool(action="replace", old_text="fact A", new_text="fact A refined", store=store)
+            memory_tool(
+                action="replace",
+                old_text="Project uses pytest.",
+                new_text="Project uses pytest with xdist.",
+                store=store,
+            )
         )
         assert result["success"] is True
-        assert "fact A refined" in store.memory_entries
-        assert "fact A" not in [e for e in store.memory_entries if e == "fact A"]
+        assert "Project uses pytest with xdist." in store.memory_entries
+        assert "Project uses pytest." not in store.memory_entries
 
     def test_new_text_alias_for_content_on_add(self, store):
-        result = json.loads(memory_tool(action="add", new_text="added via new_text", store=store))
+        result = json.loads(
+            memory_tool(
+                action="add",
+                new_text="Project uses pytest with xdist.",
+                store=store,
+            )
+        )
         assert result["success"] is True
-        assert "added via new_text" in store.memory_entries
+        assert "Project uses pytest with xdist." in store.memory_entries
 
     def test_content_wins_when_both_content_and_new_text_set(self, store):
         result = json.loads(
-            memory_tool(action="add", content="the real one", new_text="ignored", store=store)
+            memory_tool(
+                action="add",
+                content="Project runtime uses Python 3.12.",
+                new_text="ignored",
+                store=store,
+            )
         )
         assert result["success"] is True
-        assert "the real one" in store.memory_entries
+        assert "Project runtime uses Python 3.12." in store.memory_entries
         assert "ignored" not in store.memory_entries
+
+    def test_router_fails_open_for_curation_on_config_error(
+        self, store, monkeypatch
+    ):
+        def unreadable_config():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", unreadable_config)
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="Just a plain note.",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+
+    def test_router_blocks_credential_even_on_config_error(
+        self, store, monkeypatch
+    ):
+        def unreadable_config():
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", unreadable_config)
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="password = hunter2supersecretvalue",
+                store=store,
+            )
+        )
+        assert result["success"] is False
+        assert "credential" in result["error"].lower()
+
+    def test_router_disabled_allows_generic_single_but_blocks_credential(
+        self, store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "memory": {
+                    "router": {
+                        "enabled": False,
+                        "block_non_inject_writes": False,
+                    }
+                }
+            },
+        )
+        allowed = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="Just a plain note.",
+                store=store,
+            )
+        )
+        assert allowed["success"] is True
+
+        blocked = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="password = hunter2supersecretvalue",
+                store=store,
+            )
+        )
+        assert blocked["success"] is False
+        assert "credential" in blocked["error"].lower()
 
 
 class TestMemoryBatch:
@@ -384,6 +470,34 @@ class TestMemoryBatch:
         assert result["success"] is True
         assert store.memory_entries.count("already here") == 1
         assert "brand new" in store.memory_entries
+
+    def test_batch_allows_generic_content_but_rejects_credentials_atomically(
+        self, store
+    ):
+        store.add("memory", "old entry")
+        allowed = json.loads(memory_tool(
+            target="memory",
+            operations=[
+                {"action": "replace", "old_text": "old entry", "content": "updated entry"},
+                {"action": "add", "content": "brand new"},
+            ],
+            store=store,
+        ))
+        assert allowed["success"] is True
+        assert store.memory_entries == ["updated entry", "brand new"]
+
+        before = list(store.memory_entries)
+        blocked = json.loads(memory_tool(
+            target="memory",
+            operations=[
+                {"action": "add", "content": "safe generic note"},
+                {"action": "add", "content": "password = hunter2supersecretvalue"},
+            ],
+            store=store,
+        ))
+        assert blocked["success"] is False
+        assert "credential" in blocked["error"].lower()
+        assert store.memory_entries == before
 
     def test_batch_injection_blocked_rejects_whole_batch(self, store):
         result = json.loads(memory_tool(

@@ -65,9 +65,18 @@ def get_managed_dir() -> Optional[Path]:
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
         p = Path(override)
-        return p if p.is_dir() else None
+        try:
+            if p.is_symlink():
+                raise RuntimeError(f"managed scope directory must not be a symlink: {p}")
+            if not p.is_dir():
+                raise RuntimeError(f"selected managed scope directory is unavailable: {p}")
+        except OSError as exc:
+            raise RuntimeError(f"selected managed scope directory cannot be read: {p}") from exc
+        return p
     if _under_pytest():
         return None
+    if _DEFAULT_MANAGED_DIR.is_symlink():
+        raise RuntimeError("managed scope directory must not be a symlink: /etc/hermes")
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
 
 

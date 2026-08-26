@@ -24,10 +24,18 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
+from agent.memory_router import contains_secret, should_mirror_to_honcho
 from plugins.memory.honcho.client import spawn_context_thread
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+_WITHHELD_SECRET_PLACEHOLDER = "[message withheld: contained a credential]"
+
+
+def _scrub_turn_message(text: str) -> str:
+    """Withhold an entire raw turn when the canonical detector finds a secret."""
+    return _WITHHELD_SECRET_PLACEHOLDER if contains_secret(text) else text
 
 
 # Gateway-internal notifications can arrive through the same user-role channel
@@ -1430,8 +1438,12 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
-        clean_user_content = sanitize_context(user_content or "").strip()
-        clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        clean_user_content = _scrub_turn_message(
+            sanitize_context(user_content or "")
+        ).strip()
+        clean_assistant_content = _scrub_turn_message(
+            sanitize_context(assistant_content or "")
+        ).strip()
         # Skip only when the whole turn is empty. An interrupted or tool-only
         # turn can legitimately have an empty assistant side; the user's
         # message must still be persisted (the manager already drops
@@ -1476,6 +1488,16 @@ class HonchoMemoryProvider(MemoryProvider):
         stays focused on the 7-PR consolidation and its review follow-ups.
         """
         if action != "add" or target != "user" or not content:
+            return
+        allowed, route = should_mirror_to_honcho(
+            content, target=target, metadata=metadata
+        )
+        if not allowed:
+            logger.debug(
+                "Honcho memory mirror skipped by router: destination=%s reason=%s",
+                [destination.value for destination in route.destinations],
+                route.reason,
+            )
             return
         if self._cron_skipped:
             return
@@ -1656,6 +1678,11 @@ class HonchoMemoryProvider(MemoryProvider):
                     if ok:
                         return json.dumps({"result": f"Conclusion {delete_id} deleted."})
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
+                if contains_secret(conclusion):
+                    return tool_error(
+                        "Memory router blocked a credential/secret from durable "
+                        "Honcho memory (conclusion not saved)."
+                    )
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})

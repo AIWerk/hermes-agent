@@ -3420,6 +3420,105 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
+@dataclass(frozen=True)
+class _PolicySourceSnapshot:
+    path: Path
+    device: int
+    inode: int
+    data: bytes
+
+    def validate(self) -> bool:
+        try:
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st = os.fstat(fd)
+                data = b""
+                while chunk := os.read(fd, 65536):
+                    data += chunk
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return (st.st_dev, st.st_ino, data) == (self.device, self.inode, self.data)
+
+
+@dataclass(frozen=True)
+class SecurityPolicyAuthorization:
+    allowed: bool
+    sources: tuple[_PolicySourceSnapshot, ...]
+
+    def validate(self) -> bool:
+        return self.allowed and all(source.validate() for source in self.sources)
+
+
+def load_security_policy_bool_strict(
+    key: str, *, default: bool, authorization: bool = False
+) -> bool | SecurityPolicyAuthorization:
+    """Resolve one boolean security policy from exact source files.
+
+    Unlike ``load_config()``, this authority path never uses defaults,
+    last-known-good state, or parse-error fallback.  User policy is applied
+    first and managed policy wins at the same leaf.  Present files and policy
+    values must have their exact expected types or the read raises so callers
+    can fail closed.
+    """
+
+    snapshots: list[_PolicySourceSnapshot] = []
+
+    def _read_mapping(path: Path, *, required: bool = False) -> Dict[str, Any]:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            if required:
+                raise
+            return {}
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(f"policy source is not a regular file: {path}")
+            raw = b""
+            while chunk := os.read(fd, 65536):
+                raw += chunk
+        finally:
+            os.close(fd)
+        snapshots.append(_PolicySourceSnapshot(path, st.st_dev, st.st_ino, raw))
+        parsed = fast_safe_load(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise TypeError(f"{path} must contain a YAML mapping")
+        return parsed
+
+    def _apply(source: Dict[str, Any], current: bool, path: Path, *, required: bool = False) -> bool:
+        if "security" not in source:
+            if required:
+                raise KeyError(f"security.{key} is required in selected managed policy {path}")
+            return current
+        security = source["security"]
+        if not isinstance(security, dict):
+            raise TypeError(f"security in {path} must be a YAML mapping")
+        if key not in security:
+            if required:
+                raise KeyError(f"security.{key} is required in selected managed policy {path}")
+            return current
+        value = security[key]
+        if not isinstance(value, bool):
+            raise TypeError(f"security.{key} in {path} must be a boolean")
+        return value
+
+    user_path = get_config_path()
+    resolved = _apply(_read_mapping(user_path), default, user_path)
+
+    from hermes_cli import managed_scope
+
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir is not None:
+        managed_path = managed_dir / "config.yaml"
+        resolved = _apply(
+            _read_mapping(managed_path, required=True), resolved, managed_path, required=True
+        )
+    lease = SecurityPolicyAuthorization(resolved is True, tuple(snapshots))
+    return lease if authorization else lease.allowed
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 

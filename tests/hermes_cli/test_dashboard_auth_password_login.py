@@ -251,6 +251,22 @@ class TestPasswordLoginRoute:
         assert SESSION_AT_COOKIE in set_cookie
         assert SESSION_RT_COOKIE in set_cookie
 
+    @pytest.mark.parametrize("unsafe_next", [r"/\evil.example", "/%5cevil.example"])
+    def test_password_login_rejects_backslash_next_target(
+        self, gated_app, unsafe_next
+    ):
+        resp = gated_app.post(
+            "/auth/password-login",
+            json={
+                "provider": "testpw",
+                "username": "admin",
+                "password": "hunter2",
+                "next": unsafe_next,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "next": "/"}
+
     def test_session_cookie_then_grants_authenticated_access(self, gated_app):
         # Log in, then hit an auth-required endpoint with the cookie jar
         # the TestClient retains — proving the minted session is accepted
@@ -349,12 +365,76 @@ class TestLoginPageRender:
         register_provider(PasswordProvider())
         try:
             html = render_login_html(next_path="/sessions")
+            unmet_provenance = []
+            if not (
+                ".brand {\n    text-align: center;\n    margin-bottom: 1.75rem;\n"
+                "    font-family: 'Rules Compressed', 'Collapse', sans-serif;"
+                in html
+                and "h1 {\n    margin: 0 0 0.4rem;\n"
+                "    font-family: 'Rules Compressed', 'Collapse', sans-serif;"
+                in html
+            ):
+                unmet_provenance.append("global typography")
+            if not (
+                "Mit Benutzername und Passwort anmelden — Test Password" in html
+                and 'aria-label="Mit Benutzername und Passwort anmelden — Test Password"'
+                in html
+            ):
+                unmet_provenance.append("password provider identity")
+            assert unmet_provenance == []
+
             assert '<form class="provider-form" data-provider="testpw"' in html
             assert 'name="username"' in html
             assert 'name="password"' in html
+            assert "Mit Benutzername und Passwort anmelden" in html
+            assert "Anmelden mit Benutzername und Passwort" not in html
+            assert "Anmelden mit Username &amp; Password" not in html
+            assert "Anmelden mit Username & Password" not in html
+            assert ".form-title {\n    font-family: inherit;" in html
+            assert ".field-label {\n    font-size: 0.82rem;\n    letter-spacing: 0;\n    text-transform: none;" in html
             assert 'value="/sessions"' in html
-            assert "<script>" in html
+            assert html.count("<script>") == 1
             assert "/auth/password-login" in html
+            assert 'autocomplete="on"' in html
+            assert 'autocomplete="username"' in html
+            assert 'autocomplete="current-password"' in html
+            assert html.count(" required>") == 2
+            assert 'role="alert" hidden' in html
+
+            clear_providers()
+            first_password = PasswordProvider()
+            first_password.name = "pw&one"
+            first_password.display_name = "Alpha & <One>"
+            second_password = PasswordProvider()
+            second_password.name = 'pw"two'
+            second_password.display_name = 'Beta "Two" & <Root>'
+            register_provider(StubAuthProvider())
+            register_provider(first_password)
+            register_provider(second_password)
+
+            mixed_html = render_login_html(next_path="/sessions?view=all&sort=asc")
+            assert mixed_html.count('<a class="provider-btn"') == 1
+            assert mixed_html.count('<form class="provider-form"') == 2
+            assert mixed_html.count("<script>") == 1
+            assert 'data-provider="pw&amp;one"' in mixed_html
+            assert 'data-provider="pw&quot;two"' in mixed_html
+            assert (
+                "Mit Benutzername und Passwort anmelden — Alpha &amp; &lt;One&gt;"
+                in mixed_html
+            )
+            assert (
+                'aria-label="Mit Benutzername und Passwort anmelden — '
+                'Alpha &amp; &lt;One&gt;"' in mixed_html
+            )
+            assert (
+                'Mit Benutzername und Passwort anmelden — Beta "Two" '
+                "&amp; &lt;Root&gt;" in mixed_html
+            )
+            assert (
+                'aria-label="Mit Benutzername und Passwort anmelden — '
+                'Beta &quot;Two&quot; &amp; &lt;Root&gt;"' in mixed_html
+            )
+            assert 'value="/sessions?view=all&amp;sort=asc"' in mixed_html
         finally:
             clear_providers()
 
