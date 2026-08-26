@@ -1360,32 +1360,8 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
 
 
 def reset_honcho_client() -> None:
-    """Reset and close all cached Honcho clients (tests, OAuth re-login)."""
+    """Reset all cached Honcho clients (tests, OAuth re-login)."""
     with _client_slots_lock:
-        slots = list(_client_slots.values())
         _client_slots.clear()
-    slots.append(_honcho_client_slot)
-    seen: set[int] = set()
-    for slot in slots:
-        client = slot.peek()
-        if client is not None and id(client) not in seen:
-            seen.add(id(client))
-            for attr in ("_async_http", "_http"):
-                try:
-                    http_client = getattr(client, attr, None)
-                    close = getattr(http_client, "close", None)
-                    if callable(close):
-                        result = close()
-                        if hasattr(result, "__await__"):
-                            try:
-                                import asyncio
-                                from typing import Coroutine, cast
-
-                                asyncio.run(cast(Coroutine[object, object, object], result))
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-        slot.reset()
     _honcho_client_slot.reset()
     _honcho_json_timeout_memo.clear()

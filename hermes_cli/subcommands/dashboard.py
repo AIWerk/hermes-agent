@@ -58,14 +58,6 @@ def _add_server_runtime_args(parser) -> None:
             "ONE machine-level server and preselect the profile."
         ),
     )
-    parser.add_argument(
-        "--assistant",
-        action="store_true",
-        help=(
-            "Serve the simplified AIWerk Customer UI surface and block "
-            "admin-only APIs. Recommended with --port 9120."
-        ),
-    )
     # Internal flag set by the unified-launch re-exec (cmd_dashboard) to
     # preselect the launching profile in the SPA switcher. Hidden from --help.
     parser.add_argument(

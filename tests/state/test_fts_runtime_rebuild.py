@@ -13,17 +13,25 @@ sync triggers, and retries the canonical write. Search degrades to ``LIKE``
 until a later open atomically rebuilds the index and restores the triggers.
 """
 
+import json
+import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
+import hermes_state
+import hermes_state_schema
 from hermes_state import (
+    FTS_REBUILD_DEFERRAL_KEY,
     FTS_STALE_KEY,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SessionDB,
     _FTS_TRIGGERS,
+    _concrete_state_db_holder_pids,
+    _is_inactive_orphan_desktop_holder,
 )
 
 
@@ -84,6 +92,189 @@ def _base_fts_triggers(db_path):
 
 
 class TestRuntimeFtsRebuild:
+    def test_reap_candidates_exclude_uninspectable_holder_suspicions(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+
+        assert _concrete_state_db_holder_pids(
+            db_path,
+            [
+                (222, "uninspectable holder: python -m hermes_cli.main serve --port 0"),
+                (-1, "open-file scan failed"),
+            ],
+        ) == []
+
+    def test_reap_candidates_deduplicate_multiple_proven_watched_fds(self, tmp_path):
+        db_path = tmp_path / "state.db"
+
+        assert _concrete_state_db_holder_pids(
+            db_path,
+            [
+                (222, str(db_path)),
+                (222, f"{db_path}-wal"),
+                (222, f"{db_path}-shm (deleted)"),
+            ],
+        ) == [222]
+
+    def test_inactive_orphan_reap_predicate_preserves_live_or_ambiguous_holders(self):
+        common = {
+            "ppid": 1,
+            "age_seconds": 120.0,
+            "min_age_seconds": 60.0,
+            "ephemeral_backend": True,
+            "connection_statuses": [],
+        }
+        assert _is_inactive_orphan_desktop_holder(**common)
+        assert not _is_inactive_orphan_desktop_holder(**{**common, "ppid": 42})
+        assert not _is_inactive_orphan_desktop_holder(
+            **{**common, "age_seconds": 10.0}
+        )
+        assert not _is_inactive_orphan_desktop_holder(
+            **{**common, "ephemeral_backend": False}
+        )
+        assert not _is_inactive_orphan_desktop_holder(
+            **{
+                **common,
+                "connection_statuses": ["ESTABLISHED"],
+            }
+        )
+
+    def test_foreign_holder_detection_includes_deleted_wal(
+        self, db, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+
+        class FakePsutil:
+            @staticmethod
+            def process_iter(_attrs):
+                return iter(
+                    (
+                        SimpleNamespace(
+                            info={
+                                "pid": 111,
+                                "open_files": [SimpleNamespace(path=str(db_path))],
+                            }
+                        ),
+                        SimpleNamespace(
+                            info={
+                                "pid": 222,
+                                "open_files": [
+                                    SimpleNamespace(path=f"{db_path}-wal (deleted)")
+                                ],
+                            }
+                        ),
+                        SimpleNamespace(
+                            info={
+                                "pid": 333,
+                                "open_files": [SimpleNamespace(path=str(tmp_path / "other.db"))],
+                            }
+                        ),
+                    )
+                )
+
+        monkeypatch.setattr(hermes_state, "psutil", FakePsutil)
+        monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
+        monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
+        # Force the macOS/psutil path even on Linux test runners
+        monkeypatch.setattr(hermes_state.sys, "platform", "darwin")
+
+        assert db._foreign_state_db_holders() == [
+            (222, f"{db_path}-wal (deleted)")
+        ]
+
+    def test_foreign_holder_detection_proc_readlink_deleted_wal(
+        self, db, tmp_path, monkeypatch
+    ):
+        """Linux /proc/<pid>/fd readlinks preserve '(deleted)' suffix.
+
+        psutil.open_files() drops these entries (isfile_strict stats the
+        literal path and fails).  The /proc path catches the split-brain
+        holder that psutil silently misses.
+        """
+        db_path = tmp_path / "state.db"
+        db_path_wal = str(db_path) + "-wal"
+
+        # Build a fake /proc with two PIDs: self (111) and foreign (222).
+        proc_root = tmp_path / "proc"
+        for pid in (111, 222, 333):
+            fd_dir = proc_root / str(pid) / "fd"
+            fd_dir.mkdir(parents=True)
+        # PID 222 holds the deleted WAL sidecar
+        os.symlink(db_path_wal + " (deleted)", str(proc_root / "222" / "fd" / "3"))
+        # PID 111 (self) holds the db — should be excluded
+        os.symlink(str(db_path), str(proc_root / "111" / "fd" / "3"))
+        # PID 333 holds an unrelated file
+        other = tmp_path / "other.db"
+        other.touch()
+        os.symlink(str(other), str(proc_root / "333" / "fd" / "3"))
+
+        monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
+        monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
+        monkeypatch.setattr(hermes_state.sys, "platform", "linux")
+        real_listdir = os.listdir
+        def _listdir(path):
+            if isinstance(path, str):
+                path = path.replace("/proc", str(proc_root))
+            return real_listdir(path)
+        monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
+        real_readlink = os.readlink
+        def _readlink(path):
+            path = path.replace("/proc", str(proc_root))
+            return real_readlink(path)
+        monkeypatch.setattr(hermes_state.os, "readlink", _readlink)
+
+        holders = db._foreign_state_db_holders()
+        assert holders == [(222, db_path_wal + " (deleted)")]
+
+    def test_foreign_holder_uninspectable_process_cmdline_fallback(
+        self, db, tmp_path, monkeypatch
+    ):
+        """A process whose fd table is unreadable (different user) is still
+        flagged when /proc/<pid>/cmdline identifies it as a Hermes process."""
+        db_path = tmp_path / "state.db"
+
+        proc_root = tmp_path / "proc"
+        for pid in (111, 222):
+            (proc_root / str(pid) / "fd").mkdir(parents=True)
+        # PID 222's fd dir is unreadable (PermissionError)
+        os.chmod(proc_root / "222" / "fd", 0o000)
+        # PID 222's cmdline is world-readable and looks like Hermes
+        cmdline_path = proc_root / "222" / "cmdline"
+        cmdline_path.write_bytes(b"python3\x00hermes_cli.main\x00chat\x00")
+
+        monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
+        monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
+        monkeypatch.setattr(hermes_state.sys, "platform", "linux")
+        real_listdir = os.listdir
+        def _listdir(path):
+            if isinstance(path, str):
+                path = path.replace("/proc", str(proc_root))
+            return real_listdir(path)
+        monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
+        # _read_proc_cmdline opens /proc/<pid>/cmdline directly; redirect
+        # it to our fake proc tree.
+        def _fake_cmdline(pid):
+            fake_path = str(proc_root / str(pid) / "cmdline")
+            try:
+                with open(fake_path, "rb") as f:
+                    raw = f.read()
+                if not raw:
+                    return None
+                return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+            except OSError:
+                return None
+        monkeypatch.setattr(hermes_state, "_read_proc_cmdline", _fake_cmdline)
+
+        holders = db._foreign_state_db_holders()
+        # Should include PID 222 with the cmdline info
+        assert len(holders) == 1
+        assert holders[0][0] == 222
+        assert "hermes_cli.main" in holders[0][1]
+
+        # Cleanup
+        os.chmod(proc_root / "222" / "fd", 0o755)
+
     def test_corruption_error_classification_covers_both_sqlite_messages(self):
         """SQLite's message for a corrupt FTS index varies by version: older
         builds raise the generic malformed-image error, newer builds raise an
@@ -181,7 +372,7 @@ class TestRuntimeFtsRebuild:
         assert any(">>>" in (r.get("snippet") or "") for r in results)
 
 
-    def test_second_corruption_requires_verified_offline_repair(
+    def test_second_corruption_fails_open_and_rebuilds_on_reopen(
         self, db, tmp_path
     ):
         if not db._fts_enabled:
@@ -211,23 +402,16 @@ class TestRuntimeFtsRebuild:
         assert results
         assert any("second corruption" in row["snippet"] for row in results)
 
-        # Reopening alone must preserve repair-required and detached triggers.
-        # Only an explicit verified offline repair may clear the breadcrumb.
+        # A later open atomically rebuilds all canonical rows before triggers
+        # return, then clears the durable breadcrumb.
         db.close()
         reopened = SessionDB(db_path=db_path)
         try:
-            assert reopened._fts_stale is True
-            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-            assert _base_fts_triggers(db_path) == set()
-            results = reopened.search_messages("second corruption")
-            assert results
-
-            report = reopened.repair_fts_offline()
-            assert report["repaired"] is True
-            assert report["verified"] is True
             assert reopened._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None
             assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+            results = reopened.search_messages("second corruption")
+            assert results
         finally:
             reopened.close()
 
@@ -246,6 +430,30 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "canonical survives")
 
         assert _message_contents(db_path)[-1] == "canonical survives"
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()
+
+    def test_foreign_holder_skips_runtime_rebuild_and_fails_open(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+
+        monkeypatch.setattr(
+            db,
+            "_foreign_state_db_holders",
+            lambda: [(4242, str(db_path) + "-wal")],
+            raising=False,
+        )
+
+        db.append_message("s1", "user", "canonical survives foreign holder")
+
+        assert _message_contents(db_path)[-1] == "canonical survives foreign holder"
+        assert db._fts_stale is True
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
@@ -331,6 +539,92 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
+    def test_foreign_holder_defers_startup_stale_rebuild(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: (_ for _ in ()).throw(sqlite3.DatabaseError("still corrupt")),
+        )
+        db.append_message("s1", "user", "before restart")
+        db.close()
+
+        monkeypatch.setattr(
+            SessionDB,
+            "_foreign_state_db_holders",
+            lambda self: [(4242, str(db_path) + "-wal")],
+            raising=False,
+        )
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+            assert _base_fts_triggers(db_path) == set()
+            reopened.append_message("s1", "user", "after deferred recovery")
+            assert _message_contents(db_path)[-1] == "after deferred recovery"
+        finally:
+            reopened.close()
+
+    def test_repeated_deferrals_reap_inactive_orphan_then_rebuild(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+        monkeypatch.setattr(
+            db,
+            "rebuild_fts",
+            lambda: (_ for _ in ()).throw(sqlite3.DatabaseError("still corrupt")),
+        )
+        db.append_message("s1", "user", "before restart")
+        db.close()
+
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (
+                FTS_REBUILD_DEFERRAL_KEY,
+                json.dumps({"first_seen": 1.0, "last_seen": 30.0, "attempts": 2}),
+            ),
+        )
+        raw.commit()
+        raw.close()
+
+        holder_scans = iter(([(4242, str(db_path) + "-wal")], []))
+        reaped = []
+        monkeypatch.setattr(
+            SessionDB,
+            "_foreign_state_db_holders",
+            lambda self: next(holder_scans),
+        )
+        monkeypatch.setattr(
+            SessionDB,
+            "_reap_inactive_orphan_desktop_holders",
+            lambda self, holders, *, min_age_seconds: reaped.extend(holders) or [4242],
+        )
+        monkeypatch.setattr(hermes_state_schema.time, "time", lambda: 120.0)
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reaped == [(4242, str(db_path) + "-wal")]
+            assert reopened._fts_stale is False
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _meta_value(db_path, FTS_REBUILD_DEFERRAL_KEY) is None
+            assert reopened.search_messages("before restart")
+        finally:
+            reopened.close()
+
     def test_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-state.db"
         raw = sqlite3.connect(str(db_path))
@@ -364,16 +658,8 @@ class TestRuntimeFtsRebuild:
 
         recovered = SessionDB(db_path=db_path)
         try:
-            assert recovered._fts_stale is True
-            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-            assert recovered.search_messages("canonical survives")
-
-            report = recovered.repair_fts_offline()
-            assert report["repaired"] is True
-            assert report["verified"] is True
             assert recovered._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None
             assert recovered.search_messages("canonical survives")
         finally:
             recovered.close()
-

@@ -558,10 +558,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
     <div class="layout {layout_class}">
         {sidebar_html}
-
+        
         <div class="main-content">
             {sessions_html}
-
+            
             <footer>
                 Built with ☤ Hermes Agent • Generated on {generated_at}
             </footer>
@@ -661,14 +661,14 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
     html_list = []
     for i, msg in enumerate(messages):
         role = msg.get("role", "unknown")
-
+        
         # Skip internal metadata messages
         if role == "session_meta":
             continue
-
+            
         content = msg.get("content") or ""
         timestamp = _format_timestamp(msg.get("timestamp", 0))
-
+        
         # Icon selection
         role_icon = ICON_TERMINAL
         if role == "user":
@@ -703,16 +703,16 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
         msg_class = f"message message-{role_class} active"
         # Delay animation for initial items
         delay_style = f' style="animation-delay: {min(i * 0.05, 1.0)}s"' if i < 10 else ""
-
+        
         chevron_html = ICON_CHEVRON_RIGHT.replace('class="', 'class="chevron ')
-
+        
         html = f'<div class="{msg_class}"{delay_style}>'
         html += f'  <div class="message-header">'
         html += f'    <div class="role-badge">{chevron_html} {role_icon} {safe_role}</div>'
         html += f'    <div class="timestamp">{timestamp}</div>'
         html += '  </div>'
         html += '  <div class="message-body">'
-
+        
         # Tool Calls
         tool_calls = msg.get("tool_calls")
         if tool_calls:
@@ -737,7 +737,7 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
                 html += f'  <div class="content"><pre><code>{_escape_html(content)}</code></pre></div>'
             else:
                 html += f'  <div class="content">{_escape_html(content)}</div>'
-
+        
         # Reasoning
         reasoning = msg.get("reasoning") or msg.get("reasoning_content")
         if reasoning:
@@ -752,7 +752,7 @@ def _generate_messages_html(messages: List[Dict[str, Any]]) -> str:
                 </div>
             </div>
             '''
-
+            
         html += '  </div>'
         html += '</div>'
         html_list.append(html)
@@ -764,7 +764,7 @@ def generate_multi_session_html_export(sessions: List[Dict[str, Any]]) -> str:
 
     is_multi = len(sessions) > 1
     generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    
     # Sidebar
     sidebar_html = ""
     if is_multi:
@@ -775,7 +775,7 @@ def generate_multi_session_html_export(sessions: List[Dict[str, Any]]) -> str:
             title = s.get("title") or s.get("preview") or "Untitled Session"
             if len(title) > 50: title = title[:47] + "..."
             date = _format_timestamp(s.get("started_at", 0)).split(" ")[0]
-
+            
             item = f'''
             <a class="session-item" data-id="{escaped_sid}" href="#{quote(sid, safe='')}">
                 <div class="session-item-title">{_escape_html(title)}</div>
@@ -786,7 +786,7 @@ def generate_multi_session_html_export(sessions: List[Dict[str, Any]]) -> str:
             </a>
             '''
             sidebar_items.append(item)
-
+        
         sidebar_html = f'''
         <aside class="sidebar">
             <div class="sidebar-header">
@@ -813,13 +813,14 @@ def generate_multi_session_html_export(sessions: List[Dict[str, Any]]) -> str:
         model = s.get("model") or "Unknown"
         started_at = _format_timestamp(s.get("started_at", 0))
         messages = s.get("messages", [])
-
+        
         messages_html = _generate_messages_html(messages)
-
+        
         view_class = "session-view"
         if not is_multi: view_class += " active"
+        
         session_view_id = f"view-{escaped_sid}"
-
+        
         system_prompt = s.get("system_prompt")
         system_html = ""
         if system_prompt:
@@ -834,7 +835,7 @@ def generate_multi_session_html_export(sessions: List[Dict[str, Any]]) -> str:
                 </div>
             </div>
             '''
-
+        
         session_html = f'''
         <div class="{view_class}" id="{session_view_id}">
             <header class="fade-in">

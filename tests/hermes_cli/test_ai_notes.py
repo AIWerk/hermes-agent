@@ -77,6 +77,37 @@ def test_publish_html_note_rejects_private_paths_and_secret_like_content(tmp_pat
         )
 
 
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<script>fetch('http://'+[127,0,0,1].join('.')+':9120/admin')</script>",
+        '<img src="safe.png" onerror="fetch(\'/admin\')">',
+        '<a href="javascript:fetch(\'/admin\')">run</a>',
+        '<iframe srcdoc="<script>alert(1)</script>"></iframe>',
+        '<meta http-equiv="refresh" content="0;url=/admin">',
+        "<style>body{width:expression(alert(1))}</style>",
+        r"<style>body{background:url(http://\31 27.0.0.1/admin)}</style>",
+        '<div style="color:red">styled</div>',
+        '<a href="jav&#x09;ascript:alert(1)">tab</a>',
+        '<a href="java&#x0a;script:alert(1)">newline</a>',
+        '<a href="java&#x0d;script:alert(1)">carriage-return</a>',
+    ],
+)
+def test_publish_html_note_rejects_active_content(tmp_path, html):
+    with pytest.raises(ValueError, match="active or unsupported HTML"):
+        publish_html_note(
+            html=html,
+            title="active",
+            slug="active",
+            config={
+                "enabled": True,
+                "public_base_url": "https://notes.example.test",
+                "publish_root": str(tmp_path / "public"),
+            },
+            today=date(2026, 6, 10),
+        )
+
+
 def test_publish_html_note_requires_enabled_config(tmp_path):
     with pytest.raises(ValueError, match="disabled"):
         publish_html_note(

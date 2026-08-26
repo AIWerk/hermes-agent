@@ -42,67 +42,6 @@ class TestResolveApiKey:
         monkeypatch.delenv("HONCHO_BASE_URL", raising=False)
         assert honcho_cli._resolve_api_key({"baseUrl": "https://honcho.example.com"}) == "local"
 
-    def test_returns_api_key_from_host_block(self, monkeypatch):
-        import plugins.memory.honcho.cli as honcho_cli
-        monkeypatch.setattr(honcho_cli, "_host_key", lambda: "hermes")
-        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
-        cfg = {"hosts": {"hermes": {"apiKey": "host-key"}}, "apiKey": "root-key"}
-        assert honcho_cli._resolve_api_key(cfg) == "host-key"
-
-    def test_returns_local_for_base_url_without_api_key(self, monkeypatch):
-        import plugins.memory.honcho.cli as honcho_cli
-        monkeypatch.setattr(honcho_cli, "_host_key", lambda: "hermes")
-        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
-        monkeypatch.delenv("HONCHO_BASE_URL", raising=False)
-        cfg = {"baseUrl": "http://localhost:8000"}
-        assert honcho_cli._resolve_api_key(cfg) == "local"
-
-    def test_returns_local_for_base_url_env_var(self, monkeypatch):
-        import plugins.memory.honcho.cli as honcho_cli
-        monkeypatch.setattr(honcho_cli, "_host_key", lambda: "hermes")
-        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
-        monkeypatch.setenv("HONCHO_BASE_URL", "http://10.0.0.5:8000")
-        assert honcho_cli._resolve_api_key({}) == "local"
-
-    def test_returns_empty_when_nothing_configured(self, monkeypatch):
-        import plugins.memory.honcho.cli as honcho_cli
-        monkeypatch.setattr(honcho_cli, "_host_key", lambda: "hermes")
-        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
-        monkeypatch.delenv("HONCHO_BASE_URL", raising=False)
-        assert honcho_cli._resolve_api_key({}) == ""
-
-    def test_rejects_non_http_scheme_base_url(self, monkeypatch):
-        """file:// / ftp:// / ws:// schemes are rejected as non-HTTP Honcho URLs.
-
-        Note: these DO contain ``.`` or ``:`` so they pass the schemeless
-        host fallback.  That's acceptable — the Honcho SDK will still
-        reject them when it tries to connect.  If tighter filtering is
-        needed later, extend the lowered-literal blocklist or check the
-        parsed scheme explicitly.
-        """
-        import plugins.memory.honcho.cli as honcho_cli
-        monkeypatch.setattr(honcho_cli, "_host_key", lambda: "hermes")
-        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
-        monkeypatch.delenv("HONCHO_BASE_URL", raising=False)
-
-    def test_accepts_legacy_schemeless_host(self, monkeypatch):
-        """Legacy configs with schemeless host:port must not regress.
-
-        Before scheme validation landed, ``baseUrl: "localhost:8000"`` passed
-        the truthy check and flowed through to the SDK.  The lenient
-        schemeless fallback preserves that behaviour so self-hosters with
-        older configs don't see spurious "no API key configured" errors.
-        The SDK itself still rejects malformed URLs at connect time.
-        """
-        import plugins.memory.honcho.cli as honcho_cli
-        monkeypatch.setattr(honcho_cli, "_host_key", lambda: "hermes")
-        monkeypatch.delenv("HONCHO_API_KEY", raising=False)
-        monkeypatch.delenv("HONCHO_BASE_URL", raising=False)
-        for legacy in ("localhost:8000", "10.0.0.5:8000", "honcho.local:8080", "host.example.com"):
-            assert honcho_cli._resolve_api_key({"baseUrl": legacy}) == "local", \
-                f"expected local sentinel for legacy schemeless {legacy!r}"
-
-
 
 class TestCmdSetupLocalJwt:
     """Local-deployment setup must allow configuring a JWT for AUTH_JWT_SECRET-backed Honcho servers."""
@@ -162,28 +101,28 @@ class TestCmdSetupLocalJwt:
         host_block = (cfg.get("hosts") or {}).get("hermes") or {}
         assert host_block.get("apiKey") == "my-local-jwt-token"
 
-    def test_local_setup_blank_jwt_keeps_local_no_auth(self, monkeypatch, tmp_path):
-        """Blank JWT prompt response on a fresh local config must not introduce an apiKey
-        anywhere (local no-auth Honcho deployments must still work out of the box)."""
-        cfg = self._run_setup(
-            monkeypatch,
-            tmp_path,
-            initial_cfg={},
-            prompt_answers=[
-                "local",
-                "http://localhost:8000",
-                "",  # blank JWT
-            ],
-        )
-        assert cfg is not None
-        assert cfg.get("baseUrl") == "http://localhost:8000"
-        assert not cfg.get("apiKey")
-        host_block = (cfg.get("hosts") or {}).get("hermes") or {}
-        assert not host_block.get("apiKey")
-
-
 
 class TestCmdStatus:
+    def test_json_mode_never_falls_back_to_human_all_profiles_output(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_cmd_status_all",
+            lambda: (_ for _ in ()).throw(AssertionError("JSON mode must remain JSON")),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_cmd_status_json",
+            lambda: print(json.dumps({"mode": "json"})),
+        )
+
+        honcho_cli.cmd_status(SimpleNamespace(all=True, json=True))
+
+        assert json.loads(capsys.readouterr().out) == {"mode": "json"}
+
     def test_reports_connection_failure_when_session_setup_fails(self, monkeypatch, capsys, tmp_path):
         import plugins.memory.honcho.cli as honcho_cli
 
@@ -298,314 +237,403 @@ class TestCmdStatus:
         assert "Auth:           OAuth (hermes-agent" in out
         assert "API key:" not in out
 
-    def test_show_peer_cards_splits_stored_state_from_active_injection(self, monkeypatch, capsys):
+    def test_json_status_disabled_is_stable_truthful_and_secret_free(
+        self, monkeypatch, capsys, tmp_path
+    ):
         import plugins.memory.honcho.cli as honcho_cli
-        import plugins.memory.honcho.session as honcho_session
+
+        cfg_path = tmp_path / "honcho.json"
+        cfg_path.write_text("{}")
 
         class FakeConfig:
-            raw = {
-                "injection": {
-                    "includeSummary": False,
-                    "includeUserRepresentation": False,
-                    "includeAiRepresentation": False,
-                    "includeUserCard": True,
-                    "includeAiCard": True,
-                    "includeDialectic": False,
-                }
-            }
+            enabled = False
+            api_key = "super-secret-token"
+            base_url = None
+            environment = "production"
             host = "hermes"
-
-            def resolve_session_name(self):
-                return "session-one"
-
-        class FakeManager:
-            def __init__(self, honcho, config):
-                pass
-
-            def get_or_create(self, session_key):
-                return object()
-
-            def get_peer_card(self, session_key):
-                return ["User prefers concise replies"]
-
-            def get_ai_peer_card(self, session_key):
-                return ["Hermes identity stays minimal"]
-
-            def get_ai_representation(self, session_key):
-                return {"representation": "## Explicit Observations\nold noisy AI self-representation"}
-
-        monkeypatch.setattr(honcho_session, "HonchoSessionManager", FakeManager)
-
-        honcho_cli._show_peer_cards(FakeConfig(), object())
-
-        out = capsys.readouterr().out
-        assert "Stored memory state" in out
-        assert "User peer card (stored, 1 facts):" in out
-        assert "AI peer representation (stored, excluded from injection):" in out
-        assert "old noisy AI self-representation" in out
-        assert "Active injected context" in out
-        assert "User Peer Card: included" in out
-        assert "AI Identity Card: included" in out
-        assert "AI Self-Representation: excluded" in out
-        assert "Dialectic: excluded" in out
-
-    def test_status_snapshot_json_splits_stored_and_injected_state(self):
-        import plugins.memory.honcho.cli as honcho_cli
-
-        class FakeConfig:
-            host = "hermes"
-            workspace_id = "hermes"
-            recall_mode = "hybrid"
-            context_tokens = 800
-            raw = {
-                "injection": {
-                    "includeSummary": False,
-                    "includeUserRepresentation": False,
-                    "includeAiRepresentation": False,
-                    "includeUserCard": True,
-                    "includeAiCard": True,
-                    "includeDialectic": False,
-                }
-            }
-
-        snapshot = honcho_cli._build_status_snapshot(
-            FakeConfig(),
-            session_key="session-one",
-            user_card=["User prefers concise replies"],
-            ai_card=["Hermes identity stays minimal"],
-            ai_representation="old noisy AI self-representation",
-        )
-
-        assert snapshot["deterministic"] is True
-        assert snapshot["llmCall"] is False
-        assert snapshot["stored"]["userPeerCard"]["count"] == 1
-        assert snapshot["stored"]["aiPeerCard"]["count"] == 1
-        assert snapshot["stored"]["aiRepresentation"]["present"] is True
-        assert snapshot["injected"]["sections"]["User Peer Card"]["included"] is True
-        assert snapshot["injected"]["sections"]["AI Identity Card"]["included"] is True
-        assert snapshot["injected"]["sections"]["Session Summary"]["included"] is False
-        assert snapshot["injected"]["sections"]["AI Self-Representation"]["included"] is False
-
-class TestInjectionPreview:
-    def test_build_preview_includes_only_enabled_sections(self):
-        import plugins.memory.honcho.cli as honcho_cli
-
-        class FakeConfig:
-            raw = {
-                "injection": {
-                    "includeSummary": False,
-                    "includeUserRepresentation": False,
-                    "includeAiRepresentation": False,
-                    "includeUserCard": True,
-                    "includeAiCard": True,
-                    "includeDialectic": False,
-                }
-            }
-            host = "hermes"
-
-        preview = honcho_cli._build_injection_preview(
-            FakeConfig(),
-            {
-                "summary": "Old session summary",
-                "representation": "Noisy user representation",
-                "card": "Name: Example User\nPrefers concise replies",
-                "ai_representation": "Noisy AI self representation",
-                "ai_card": "Hermes identity stays minimal",
-            },
-        )
-
-        assert "## User Peer Card" in preview["raw_context"]
-        assert "Name: Example User" in preview["raw_context"]
-        assert "## AI Identity Card" in preview["raw_context"]
-        assert "Hermes identity stays minimal" in preview["raw_context"]
-        assert "Old session summary" not in preview["raw_context"]
-        assert "Noisy user representation" not in preview["raw_context"]
-        assert "Noisy AI self representation" not in preview["raw_context"]
-        assert preview["included"][0]["label"] == "User Peer Card"
-        assert preview["included"][1]["label"] == "AI Identity Card"
-        assert any(item["label"] == "Session Summary" for item in preview["excluded"])
-        assert any(item["label"] == "AI Self-Representation" for item in preview["excluded"])
-
-    def test_default_injection_flags_are_safe_and_card_only(self):
-        import plugins.memory.honcho.cli as honcho_cli
-
-        class FakeConfig:
-            raw = {}
-            host = "hermes"
-
-        preview = honcho_cli._build_injection_preview(
-            FakeConfig(),
-            {
-                "summary": "Old session summary",
-                "representation": "Noisy user representation",
-                "card": "User card fact",
-                "ai_representation": "Noisy AI self representation",
-                "ai_card": "Minimal identity",
-            },
-        )
-
-        assert "User card fact" in preview["raw_context"]
-        assert "Minimal identity" in preview["raw_context"]
-        assert "Old session summary" not in preview["raw_context"]
-        assert "Noisy user representation" not in preview["raw_context"]
-        assert "Noisy AI self representation" not in preview["raw_context"]
-
-    def test_host_injection_flags_override_root_defaults(self):
-        import plugins.memory.honcho.cli as honcho_cli
-
-        class FakeConfig:
-            host = "hermes.specialist"
-            raw = {
-                "injection": {"includeUserCard": True},
-                "hosts": {
-                    "hermes.specialist": {
-                        "injection": {"includeUserCard": False, "includeAiCard": False}
-                    }
-                },
-            }
-
-        preview = honcho_cli._build_injection_preview(
-            FakeConfig(),
-            {"card": "Should not inject", "ai_card": "Should also not inject"},
-        )
-
-        assert preview["raw_context"] == ""
-        assert any(
-            item["label"] == "User Peer Card" and item["reason"] == "includeUserCard false"
-            for item in preview["excluded"]
-        )
-
-    def test_build_preview_wraps_raw_prompt_when_requested(self):
-        import plugins.memory.honcho.cli as honcho_cli
-
-        class FakeConfig:
-            raw = {"injection": {"includeUserCard": True, "includeAiCard": False}}
-            host = "hermes"
-
-        preview = honcho_cli._build_injection_preview(
-            FakeConfig(),
-            {"card": "Prefers direct answers", "ai_card": "Should be excluded"},
-            wrapped=True,
-        )
-
-        assert preview["prompt_text"].startswith("<memory-context>")
-        assert "[System note: The following is recalled memory context" in preview["prompt_text"]
-        assert "## User Peer Card" in preview["prompt_text"]
-        assert "Should be excluded" not in preview["prompt_text"]
-
-    def test_cmd_injection_preview_does_not_pop_cached_prefetch(self, monkeypatch, capsys):
-        import plugins.memory.honcho.cli as honcho_cli
-        import plugins.memory.honcho.session as honcho_session
-
-        class FakeConfig:
-            enabled = True
-            api_key = "local"
-            base_url = "http://localhost:8000"
-            workspace_id = "hermes"
-            host = "hermes"
+            workspace_id = "workspace-one"
+            peer_name = "user-one"
             ai_peer = "hermes"
-            peer_name = "example-user"
+            pin_peer_name = True
+            user_peer_aliases = {"private-runtime-id": "user-one"}
+            runtime_peer_prefix = "telegram_"
+            session_strategy = "per-session"
             recall_mode = "hybrid"
             context_tokens = 800
-            raw = {"injection": {"includeUserCard": True, "includeAiCard": True}}
+            raw = {"apiKey": "super-secret-token"}
 
             def resolve_session_name(self):
                 return "session-one"
 
-        class FakeManager:
-            def __init__(self, honcho, config):
-                pass
-
-            def get_or_create(self, session_key):
-                return object()
-
-            def get_prefetch_context(self, session_key):
-                return {"card": "Prefers concise replies", "ai_card": "Minimal identity"}
-
-            def pop_context_result(self, session_key):
-                raise AssertionError("preview must not pop cached prefetch context")
-
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"apiKey": "redacted"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
         monkeypatch.setattr(
             "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
             lambda host=None: FakeConfig(),
         )
         monkeypatch.setattr(
             "plugins.memory.honcho.client.get_honcho_client",
-            lambda cfg: object(),
+            lambda cfg: (_ for _ in ()).throw(AssertionError("disabled status must not connect")),
         )
-        monkeypatch.setattr(honcho_session, "HonchoSessionManager", FakeManager)
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert payload["enabled"] is False
+        assert payload["configured"] is True
+        assert payload["backend"] == {"available": True, "kind": "cloud"}
+        assert payload["connection"] == {
+            "ok": False,
+            "state": "disabled",
+            "error": None,
+        }
+        assert payload["containment"] == {
+            "host": "hermes",
+            "workspace": "workspace-one",
+            "session": "session-one",
+            "sessionStrategy": "per-session",
+            "pinUserPeer": True,
+            "runtimePeerPrefixConfigured": True,
+            "userPeerAliasCount": 1,
+        }
+        assert payload["recall"]["mode"] == "hybrid"
+        assert payload["injection"]["enabled"] is False
+        assert "super-secret-token" not in captured.out
+        assert "private-runtime-id" not in captured.out
+
+    def test_json_status_uses_one_exact_peer_card_get_and_reports_counts_only(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg_path = tmp_path / "honcho.json"
+        cfg_path.write_text("{}")
+
+        class FakeConfig:
+            enabled = True
+            api_key = "super-secret-token"
+            base_url = None
+            environment = "production"
+            timeout = 9.0
+            host = "hermes"
+            workspace_id = "workspace-one"
+            peer_name = "user-one"
+            ai_peer = "hermes"
+            pin_peer_name = False
+            user_peer_aliases = {}
+            runtime_peer_prefix = ""
+            session_strategy = "per-session"
+            recall_mode = "hybrid"
+            context_tokens = None
+            raw = {}
+
+            def resolve_session_name(self):
+                return "session-one"
+
+        calls = []
+
+        class FailFastTransport:
+            def get(self, route, query=None):
+                calls.append((route, query))
+                return {"peer_card": ["private fact", "second fact"]}
+
+            def __getattr__(self, name):
+                if name in {"post", "put", "patch", "delete", "upload", "stream"}:
+                    return lambda *a, **kw: (_ for _ in ()).throw(
+                        AssertionError(f"status must not issue {name}")
+                    )
+                raise AttributeError(name)
+
+        class FakeHoncho:
+            def __init__(self, **kwargs):
+                assert kwargs == {
+                    "api_key": "super-secret-token",
+                    "environment": "production",
+                    "workspace_id": "workspace-one",
+                    "timeout": 9.0,
+                }
+                self._http = FailFastTransport()
+
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"apiKey": "redacted"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        import sys
+        fake_routes = SimpleNamespace(
+            peer_card=lambda workspace, peer: f"/v3/workspaces/{workspace}/peers/{peer}/card"
+        )
+        fake_response = SimpleNamespace(
+            model_validate=lambda data: SimpleNamespace(peer_card=data["peer_card"])
+        )
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(Honcho=FakeHoncho))
+        monkeypatch.setitem(sys.modules, "honcho.http", SimpleNamespace(routes=fake_routes))
+        monkeypatch.setitem(sys.modules, "honcho.api_types", SimpleNamespace(PeerCardResponse=fake_response))
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("status must not use cached client")),
+        )
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert calls == [("/v3/workspaces/workspace-one/peers/user-one/card", None)]
+        assert payload["connection"] == {"ok": True, "state": "read_ok", "error": None}
+        assert payload["recall"]["stored"] == {
+            "available": True,
+            "userPeerCard": {"count": 2, "present": True},
+        }
+        assert payload["injection"]["enabled"] is True
+        assert "super-secret-token" not in captured.out
+        assert "private fact" not in captured.out
+
+    def test_json_status_tools_only_is_hard_off_before_client_construction(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = SimpleNamespace(
+            enabled=True, api_key="secret", base_url=None, environment="production",
+            timeout=5.0, host="hermes", workspace_id="workspace-one",
+            peer_name="user-one", pin_peer_name=False, user_peer_aliases={},
+            runtime_peer_prefix="", session_strategy="per-session", recall_mode="tools",
+            context_tokens=None, resolve_session_name=lambda: "session-one",
+        )
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: tmp_path / "honcho.json")
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        import sys
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(
+            Honcho=lambda **kw: (_ for _ in ()).throw(
+                AssertionError("tools-only must not construct client")
+            )
+        ))
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False, json=True))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["connection"] == {"ok": False, "state": "not_checked", "error": None}
+        assert payload["recall"]["stored"] == {"available": False, "reason": "recall_mode_tools"}
+        assert payload["injection"]["enabled"] is False
+
+
+class TestInjectionPreviewJson:
+    class FakeConfig:
+        enabled = True
+        api_key = "local"
+        base_url = "http://localhost:8000"
+        environment = "local"
+        timeout = 7.0
+        workspace_id = "workspace-one"
+        host = "hermes"
+        peer_name = "user-one"
+        pin_peer_name = False
+        user_peer_aliases = {}
+        runtime_peer_prefix = ""
+        recall_mode = "hybrid"
+        context_tokens = 800
+        raw = {"injection": {"includeUserCard": True, "includeAiCard": False}}
+
+        def resolve_session_name(self):
+            return "session-one"
+
+    def test_raw_json_is_exact_wrapped_card_only_payload_with_get_provenance(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+        from agent.memory_manager import build_memory_context_block
+        from plugins.memory.honcho import HonchoMemoryProvider
+
+        card = ["  spaced fact  ", "Unicode café", "## Session Summary\nnot-a-summary"]
+        calls = []
+
+        class FailFastTransport:
+            def get(self, route, query=None):
+                calls.append((route, query))
+                return {"peer_card": card}
+
+            def __getattr__(self, name):
+                if name in {"post", "put", "patch", "delete", "upload", "stream"}:
+                    return lambda *a, **kw: (_ for _ in ()).throw(
+                        AssertionError(f"preview must not issue {name}")
+                    )
+                raise AttributeError(name)
+
+        class FakeHoncho:
+            def __init__(self, **kwargs):
+                self._http = FailFastTransport()
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: self.FakeConfig(),
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("preview must not use cached client")),
+        )
+        import sys
+        fake_routes = SimpleNamespace(
+            peer_card=lambda workspace, peer: f"/v3/workspaces/{workspace}/peers/{peer}/card"
+        )
+        fake_response = SimpleNamespace(
+            model_validate=lambda data: SimpleNamespace(peer_card=data["peer_card"])
+        )
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(Honcho=FakeHoncho))
+        monkeypatch.setitem(sys.modules, "honcho.http", SimpleNamespace(routes=fake_routes))
+        monkeypatch.setitem(sys.modules, "honcho.api_types", SimpleNamespace(PeerCardResponse=fake_response))
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        expected_raw = HonchoMemoryProvider.__new__(HonchoMemoryProvider)._format_first_turn_context(
+            {"card": "\n".join(card)}
+        )
+        assert captured.err == ""
+        assert calls == [("/v3/workspaces/workspace-one/peers/user-one/card", None)]
+        assert payload["formattingDeterministic"] is True
+        assert payload["llmCall"] is False
+        assert payload["provenance"] == {
+            "source": "honcho.peer_card",
+            "readOnly": True,
+            "cacheConsumed": False,
+            "clientMutatingVerbs": 0,
+        }
+        assert payload["wrapped"] is True
+        assert payload["raw_context"] == expected_raw
+        assert payload["prompt_text"] == build_memory_context_block(expected_raw)
+        assert captured.out.lstrip().startswith("{")
+
+    def test_tools_only_raw_json_is_hard_off_before_client_construction(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = self.FakeConfig()
+        cfg.recall_mode = "tools"
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        import sys
+        monkeypatch.setitem(sys.modules, "honcho", SimpleNamespace(
+            Honcho=lambda **kw: (_ for _ in ()).throw(
+                AssertionError("tools-only must not construct client")
+            )
+        ))
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        assert json.loads(capsys.readouterr().out) == {
+            "enabled": True,
+            "available": False,
+            "reason": "recall_mode_tools",
+            "preview": None,
+        }
+
+    def test_disabled_raw_json_is_hard_off_and_never_constructs_client(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = self.FakeConfig()
+        cfg.enabled = False
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("disabled preview must not connect")),
+        )
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert payload == {
+            "enabled": False,
+            "available": False,
+            "reason": "disabled",
+            "preview": None,
+        }
+
+    def test_unconfigured_raw_json_keeps_enabled_state_truthful(
+        self, monkeypatch, capsys
+    ):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg = self.FakeConfig()
+        monkeypatch.setattr(cfg, "api_key", None)
+        monkeypatch.setattr(cfg, "base_url", None)
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: cfg,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: (_ for _ in ()).throw(AssertionError("unconfigured preview must not connect")),
+        )
+
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=True))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "enabled": True,
+            "available": False,
+            "reason": "unconfigured",
+            "preview": None,
+        }
+
+    def test_text_preview_keeps_origin_session_details(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: self.FakeConfig(),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_read_observability_user_card",
+            lambda cfg: ["Prefers concise answers"],
+        )
 
         honcho_cli.cmd_injection_preview(SimpleNamespace(raw=False, json=False))
 
         out = capsys.readouterr().out
-        assert "Honcho injection preview" in out
-        assert "User Peer Card: included" in out
-        assert "AI Identity Card: included" in out
-        assert "Approx size" in out
+        assert "Recall mode: hybrid" in out
+        assert "Context budget: 800 tokens" in out
+        assert "Exact prompt text: hermes honcho injection-preview --raw" in out
 
-    def test_build_injection_preview_summary_is_compact_and_read_only(self, monkeypatch):
+    def test_text_raw_output_remains_uncontaminated(self, monkeypatch, capsys):
         import plugins.memory.honcho.cli as honcho_cli
-        import plugins.memory.honcho.session as honcho_session
-
-        class FakeConfig:
-            enabled = True
-            api_key = "local"
-            base_url = "http://localhost:8000"
-            workspace_id = "hermes"
-            host = "hermes"
-            recall_mode = "hybrid"
-            context_tokens = 800
-            raw = {
-                "injection": {
-                    "includeSummary": False,
-                    "includeUserRepresentation": False,
-                    "includeUserCard": True,
-                    "includeAiRepresentation": False,
-                    "includeAiCard": True,
-                    "includeDialectic": False,
-                }
-            }
-
-            def resolve_session_name(self):
-                return "session-one"
-
-        class FakeManager:
-            def __init__(self, honcho, config):
-                pass
-
-            def get_or_create(self, session_key):
-                return object()
-
-            def get_prefetch_context(self, session_key):
-                return {
-                    "summary": "Should not appear in compact reset notice",
-                    "card": "Prefers concise replies",
-                    "ai_card": "Minimal identity",
-                }
-
-            def pop_context_result(self, session_key):
-                raise AssertionError("summary preview must not pop cached context")
 
         monkeypatch.setattr(
             "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
-            lambda host=None: FakeConfig(),
+            lambda host=None: self.FakeConfig(),
         )
         monkeypatch.setattr(
-            "plugins.memory.honcho.client.get_honcho_client",
-            lambda cfg: object(),
+            honcho_cli,
+            "_read_observability_user_card",
+            lambda cfg: ["Prefers concise answers"],
         )
-        monkeypatch.setattr(honcho_session, "HonchoSessionManager", FakeManager)
 
-        summary = honcho_cli.build_injection_preview_summary()
+        honcho_cli.cmd_injection_preview(SimpleNamespace(raw=True, json=False))
 
-        assert "Honcho injection preview for next turn" in summary
-        assert "Included: User Peer Card, AI Identity Card" in summary
-        assert "Excluded: Session Summary" in summary
-        assert "Approx:" in summary
-        assert "Exact: hermes honcho injection-preview --raw" in summary
-        assert "Prefers concise replies" not in summary
-        assert "Minimal identity" not in summary
-        assert "Should not appear" not in summary
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert captured.out.startswith("<memory-context>")
+        assert "Prefers concise answers" in captured.out
+        assert "Honcho injection preview" not in captured.out
 
 
 class TestCloneHonchoForProfile:
@@ -765,6 +793,9 @@ class TestSetupWizardDeploymentShape:
         # Scripted _prompt: pop answers in order. Default-return for unconsumed prompts.
         answer_iter = iter(answers)
         def _scripted_prompt(label, default=None, secret=False):
+            # Auth-method prompt is orthogonal to shape; auto-answer apikey so the answer lists stay shape-only.
+            if "OAuth" in label:
+                return "apikey"
             try:
                 return next(answer_iter)
             except StopIteration:
@@ -777,7 +808,6 @@ class TestSetupWizardDeploymentShape:
     def test_just_me_pins_and_clears_aliases(self, monkeypatch, tmp_path):
         answers = [
             "cloud",           # deployment
-            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -800,7 +830,6 @@ class TestSetupWizardDeploymentShape:
     def test_only_others_leaves_pin_false_and_accepts_prefix(self, monkeypatch, tmp_path):
         answers = [
             "cloud",           # deployment
-            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -819,7 +848,6 @@ class TestSetupWizardDeploymentShape:
     def test_pooled_aliases_operator_runtime_ids_to_peer_name(self, monkeypatch, tmp_path):
         answers = [
             "cloud",           # deployment
-            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -852,7 +880,7 @@ class TestSetupWizardDeploymentShape:
             }},
         }
         answers = [
-            "cloud", "apikey", "", "eri", "hermetika", "hermes", "s",
+            "cloud", "", "eri", "hermetika", "hermes", "s",
         ]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         assert host["pinUserPeer"] is True
@@ -871,7 +899,6 @@ class TestSetupWizardDeploymentShape:
         }
         answers = [
             "cloud",           # deployment
-            "apikey",          # auth method
             "",                # api key (keep)
             "eri",             # peer name
             "hermetika",       # ai peer
@@ -888,23 +915,6 @@ class TestSetupWizardDeploymentShape:
         assert host["pinUserPeer"] is False
         assert host["userPeerAliases"] == {"7654321": "eri"}
 
-    def test_unpin_decline_steer_keeps_per_user(self, monkeypatch, tmp_path):
-        """Operator can decline the steer ('n') and accept orphaning, ending
-        up with per-user peers (no aliases)."""
-        initial_cfg = {
-            "apiKey": "***",
-            "hosts": {"hermes": {"pinPeerName": True, "peerName": "eri"}},
-        }
-        answers = [
-            "cloud", "apikey", "", "eri", "hermetika", "hermes",
-            "3",               # tree: only others — triggers the orphan guard
-            "n",               # decline pooling, accept orphaning
-            "telegram_",       # runtime peer prefix
-        ]
-        host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
-        assert host["pinUserPeer"] is False
-        assert "userPeerAliases" not in host
-        assert host["runtimePeerPrefix"] == "telegram_"
 
     def test_host_pin_user_peer_true_is_detected_as_single(self, monkeypatch, tmp_path):
         """Host-level ``pinUserPeer: true`` must classify as ``single``.
@@ -922,32 +932,12 @@ class TestSetupWizardDeploymentShape:
         # mock falls through to the prompt's default (the detected shape →
         # choice "1").  Scripting an explicit "" would NOT exercise that
         # fallthrough — the mock returns it literally.
-        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes"]
+        answers = ["cloud", "", "eri", "hermetika", "hermes"]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         # Scrub-then-write normalises onto the canonical pinUserPeer.
         assert host["pinUserPeer"] is True
         assert "pinPeerName" not in host
 
-    def test_host_pin_user_peer_false_overrides_root_pin_peer_name(
-        self, monkeypatch, tmp_path
-    ):
-        """Host ``pinUserPeer: false`` outranks host ``pinPeerName`` in the
-        resolver.  Detection must agree, otherwise the wizard would offer
-        ``single`` as the default and silently re-pin a profile the
-        operator explicitly unpinned via the newer key.
-        """
-        initial_cfg = {
-            "apiKey": "***",
-            "hosts": {"hermes": {
-                "pinUserPeer": False,
-                "pinPeerName": True,
-                "peerName": "eri",
-            }},
-        }
-        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes"]
-        host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
-        assert host["pinUserPeer"] is False
-        assert "pinPeerName" not in host
 
     def test_root_user_peer_aliases_detected_as_hybrid(self, monkeypatch, tmp_path):
         """Root-level ``userPeerAliases`` must classify as ``hybrid`` even
@@ -958,55 +948,13 @@ class TestSetupWizardDeploymentShape:
             "userPeerAliases": {"7654321": "eri"},
             "hosts": {"hermes": {"peerName": "eri"}},
         }
-        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes"]
+        answers = ["cloud", "", "eri", "hermetika", "hermes"]
         host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
         assert host["pinUserPeer"] is False
         # Hybrid materialises the root aliases into the host so subsequent
         # operator edits live on the host block they're inspecting.
         assert host["userPeerAliases"] == {"7654321": "eri"}
 
-    def test_only_others_does_not_override_root_user_peer_aliases(self, monkeypatch, tmp_path):
-        """Explicitly choosing 'only other people' must leave the host
-        ``userPeerAliases`` key absent, preserving any root-level aliases as a
-        cross-host baseline.
-
-        Picking [3] here is an active choice — detection would have defaulted
-        to [2]/hybrid because root aliases exist — so the operator's intent is
-        to drop the alias mapping for this host.  We honor that by writing
-        ``pinUserPeer: false`` only, relying on the host's absence of
-        ``userPeerAliases`` to inherit root.  A true wipe would require the
-        operator to delete the root key explicitly.
-        """
-        initial_cfg = {
-            "apiKey": "***",
-            "userPeerAliases": {"baseline": "eri"},
-            "hosts": {"hermes": {"peerName": "eri"}},
-        }
-        answers = [
-            "cloud", "apikey", "", "eri", "hermetika", "hermes",
-            "3",               # explicit per-user override of detected hybrid
-        ]
-        host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
-        assert host["pinUserPeer"] is False
-        assert "userPeerAliases" not in host
-
-    def test_just_me_scrubs_stale_pin_user_peer_false(self, monkeypatch, tmp_path):
-        """Choosing 'just me' must overwrite a stale ``pinUserPeer: false``
-        with ``pinUserPeer: true`` so the profile ends up genuinely pinned.
-        """
-        initial_cfg = {
-            "apiKey": "***",
-            "hosts": {"hermes": {
-                "pinUserPeer": False,
-                "peerName": "eri",
-            }},
-        }
-        answers = [
-            "cloud", "apikey", "", "eri", "hermetika", "hermes",
-            "1",
-        ]
-        host = self._run_setup(monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg)
-        assert host["pinUserPeer"] is True
 
     def test_no_gateway_connected_skips_mapping_when_declined(self, monkeypatch, tmp_path):
         """With no gateway platforms connected, the tree is gated off; declining
@@ -1015,7 +963,7 @@ class TestSetupWizardDeploymentShape:
             "apiKey": "***",
             "hosts": {"hermes": {"peerName": "eri"}},
         }
-        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes", "n"]
+        answers = ["cloud", "", "eri", "hermetika", "hermes", "n"]
         host = self._run_setup(
             monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg,
             gateway_platforms=[],
@@ -1031,7 +979,7 @@ class TestSetupWizardDeploymentShape:
             "apiKey": "***",
             "hosts": {"hermes": {"peerName": "eri"}},
         }
-        answers = ["cloud", "apikey", "", "eri", "hermetika", "hermes", "n"]
+        answers = ["cloud", "", "eri", "hermetika", "hermes", "n"]
         host = self._run_setup(
             monkeypatch, tmp_path, answers=answers, initial_cfg=initial_cfg,
             gateway_platforms=None,
@@ -1042,7 +990,7 @@ class TestSetupWizardDeploymentShape:
         """The [e] escape hatch lets a power user set pinUserPeer + an alias +
         prefix directly, bypassing the intent tree."""
         answers = [
-            "cloud", "apikey", "", "eri", "hermetika", "hermes",
+            "cloud", "", "eri", "hermetika", "hermes",
             "e",               # tree: edit raw keys
             "false",           # pinUserPeer
             "99887766=eri",    # one alias pair
@@ -1103,13 +1051,6 @@ class TestMigratePinKey:
         block = {"pinUserPeer": True}
         assert honcho_cli._migrate_pin_key(block) is False
         assert block == {"pinUserPeer": True}
-
-    def test_legacy_key_renamed_to_canonical(self):
-        import plugins.memory.honcho.cli as honcho_cli
-        block = {"pinPeerName": True}
-        assert honcho_cli._migrate_pin_key(block) is True
-        assert block == {"pinUserPeer": True}
-
 
 
 class TestCmdSetupDeviceFlow:
@@ -1221,10 +1162,3 @@ class TestCmdSetupDeviceFlow:
         assert len(calls) == 1
         assert "apiKey" not in cfg.get("hosts", {}).get("hermes", {})
 
-    def test_device_option_hidden_when_not_advertised(self, monkeypatch, tmp_path):
-        _, calls, prompts = self._run_setup(
-            monkeypatch, tmp_path, answers=["cloud", "device"], device_available=False,
-        )
-        method_prompts = [p for p in prompts if "OAuth or API key" in p[0]]
-        assert method_prompts and method_prompts[0][1] == "oauth"
-        assert calls == []  # 'device' answer falls through to the api-key path

@@ -73,18 +73,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-
-@contextmanager
-def _suppress_lark_pkg_resources_warning():
-    """Silence lark-oapi#108's upstream pkg_resources UserWarning."""
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r"pkg_resources is deprecated as an API\..*",
-            category=UserWarning,
-        )
-        yield
-
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
 try:
@@ -128,6 +116,19 @@ EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
+
+
+@contextmanager
+def _suppress_lark_pkg_resources_warning():
+    """Hide only lark-oapi's known setuptools deprecation warning."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"^pkg_resources is deprecated as an API(?:\.|$)",
+            category=UserWarning,
+            module=r"^lark_oapi(?:\.|$)",
+        )
+        yield
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -1410,24 +1411,24 @@ def _load_lark_oapi() -> bool:
         try:
             with _suppress_lark_pkg_resources_warning():
                 import lark_oapi as lark
-            from lark_oapi.api.application.v6 import GetApplicationRequest
-            from lark_oapi.api.im.v1 import (
-                CreateFileRequest, CreateFileRequestBody,
-                CreateImageRequest, CreateImageRequestBody,
-                CreateMessageRequest, CreateMessageRequestBody,
-                GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
-                P2ImMessageMessageReadV1,
-                ReplyMessageRequest, ReplyMessageRequestBody,
-                UpdateMessageRequest, UpdateMessageRequestBody,
-            )
-            from lark_oapi.core import AccessTokenType, HttpMethod
-            from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
-            from lark_oapi.core.model import BaseRequest
-            from lark_oapi.event.callback.model.p2_card_action_trigger import (
-                CallBackCard, P2CardActionTriggerResponse,
-            )
-            from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-            from lark_oapi.ws import Client as FeishuWSClient
+                from lark_oapi.api.application.v6 import GetApplicationRequest
+                from lark_oapi.api.im.v1 import (
+                    CreateFileRequest, CreateFileRequestBody,
+                    CreateImageRequest, CreateImageRequestBody,
+                    CreateMessageRequest, CreateMessageRequestBody,
+                    GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+                    P2ImMessageMessageReadV1,
+                    ReplyMessageRequest, ReplyMessageRequestBody,
+                    UpdateMessageRequest, UpdateMessageRequestBody,
+                )
+                from lark_oapi.core import AccessTokenType, HttpMethod
+                from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+                from lark_oapi.core.model import BaseRequest
+                from lark_oapi.event.callback.model.p2_card_action_trigger import (
+                    CallBackCard, P2CardActionTriggerResponse,
+                )
+                from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+                from lark_oapi.ws import Client as FeishuWSClient
         except ImportError:
             return False
 
@@ -1490,8 +1491,11 @@ def check_feishu_requirements() -> bool:
     from tools.lazy_deps import ensure
 
     try:
-        ensure("platform.feishu", prompt=False)
+        with _suppress_lark_pkg_resources_warning():
+            ensure("platform.feishu", prompt=False)
         return True
+    except Warning:
+        raise
     except Exception:
         return False
 
@@ -3443,6 +3447,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3751,7 +3756,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     @staticmethod

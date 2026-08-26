@@ -46,17 +46,20 @@ def _coerce_result(payload: Any) -> dict[str, Any] | None:
         "verified_at": verified_at,
         "expires_at": expires_at,
         "reason": str(payload.get("reason") or ""),
+        "session_id": str(payload.get("session_id") or ""),
+        "interface": str(payload.get("interface") or ""),
+        "provenance": str(payload.get("provenance") or ""),
+        "requested_role": str(payload.get("requested_role") or ""),
     }
 
 
 def _request_key(raw_request: bytes) -> tuple[str, str]:
-    request_key = "__process__"
+    request_key = ""
     capability = ""
     try:
         request = json.loads(raw_request.decode("utf-8")) if raw_request else {}
         if isinstance(request, dict):
-            raw_session = request.get("session_id")
-            request_key = str(raw_session) if raw_session else "__process__"
+            request_key = str(request.get("key") or "")
             capability = str(request.get("capability") or "")
     except Exception:
         pass
@@ -98,7 +101,7 @@ def _serve(socket_path: Path, result: dict[str, Any], cache_key: str, capability
                     if not hmac.compare_digest(request_capability, capability):
                         conn.sendall(b"{}\n")
                         continue
-                    if cache_key not in {"__process__", request_key}:
+                    if not request_key or not hmac.compare_digest(cache_key, request_key):
                         conn.sendall(b"{}\n")
                         continue
                     conn.sendall(json.dumps(result, separators=(",", ":")).encode("utf-8") + b"\n")
@@ -124,10 +127,10 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:
         return 2
-    cache_key = str(payload.get("key") or "__process__") if isinstance(payload, dict) else "__process__"
+    cache_key = str(payload.get("key") or "") if isinstance(payload, dict) else ""
     capability = str(payload.get("capability") or "") if isinstance(payload, dict) else ""
     parent_pid = int(payload.get("parent_pid") or 0) if isinstance(payload, dict) else 0
-    if not capability or parent_pid <= 0:
+    if not cache_key or not capability or parent_pid <= 0:
         return 2
     result = _coerce_result(payload)
     if result is None:

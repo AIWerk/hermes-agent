@@ -12,7 +12,6 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -26,11 +25,6 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
-
-
-def _executions_file() -> Path:
-    """Resolve the profile-local ledger lazily after HERMES_HOME is selected."""
-    return get_hermes_home().resolve() / "cron" / "executions.db"
 
 
 def _connect() -> sqlite3.Connection:

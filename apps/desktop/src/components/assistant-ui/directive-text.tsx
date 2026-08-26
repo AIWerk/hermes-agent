@@ -8,7 +8,7 @@ import { Fragment, useEffect, useMemo, useState } from 'react'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
 import type { I18nContextValue } from '@/i18n'
 import { extractEmbeddedImages } from '@/lib/embedded-images'
-import { openExternalLink } from '@/lib/external-link'
+import { openLink } from '@/lib/external-link'
 import { triggerHaptic } from '@/lib/haptics'
 import { gatewayMediaDataUrl, isRemoteGateway } from '@/lib/media'
 import { useSessionLinkTitle } from '@/lib/session-link-title'
@@ -454,19 +454,15 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
  *  from under the chat you're reading). Lazy-imports so the composer's rich
  *  editor can pull this module in without booting the profile/REST stack. */
 export function openSessionRef(value: string) {
-  const { profile, sessionId } = parseSessionRefValue(value)
+  const { sessionId } = parseSessionRefValue(value)
 
   if (!sessionId) {
     return
   }
 
   triggerHaptic('selection')
-  void Promise.all([import('@/store/profile'), import('@/app/open-session')]).then(
-    async ([{ ensureGatewayProfile }, { openSession }]) => {
-      await ensureGatewayProfile(profile)
-      openSession(sessionId, () => undefined, 'tab')
-    }
-  )
+  // navigate is unused for the `tab` intent (focus-or-tile only).
+  void import('@/app/open-session').then(({ openSession }) => openSession(sessionId, () => undefined, 'tab'))
 }
 
 /** What activating a directive of a given kind does. The single source of truth
@@ -492,7 +488,7 @@ export const DIRECTIVE_ACTIONS: Record<string, DirectiveAction> = {
   url: {
     icon: 'link-external',
     label: t => t.composer.openDirective,
-    run: openExternalLink
+    run: openLink
   }
 }
 

@@ -65,7 +65,7 @@ import logging
 import os
 import secrets
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
@@ -105,6 +105,7 @@ _SIG_LEN = hashlib.sha256().digest_size
 
 
 LAST_SKIP_REASON: str = ""
+_ALLOWED_ROLES = frozenset({"admin", "user"})
 
 
 # ---------------------------------------------------------------------------
@@ -208,68 +209,29 @@ class BasicAuthProvider(DashboardAuthProvider):
     def __init__(
         self,
         *,
+        secret: bytes,
         username: str = "",
         password_hash: str = "",
-        secret: bytes,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
         users: Optional[dict[str, dict[str, str]]] = None,
+        authority_resolver: Optional[
+            Callable[[], dict[str, dict[str, str]]]
+        ] = None,
     ) -> None:
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
-        # Hold the SAME dict the caller passed (no copy): an explicit users table
-        # is a live config view — verify_session/refresh_session re-resolve from
-        # it so an operator's demotion/removal takes effect within seconds. The
-        # top-level-admin merge below mutates this dict in place to preserve that.
-        self._users = users if users is not None else {}
-        # True when an explicit multi-user table was configured. In that mode the
-        # users dict is the authoritative membership/role source: verify_session
-        # re-resolves role from it (so a demotion takes effect within seconds,
-        # not at access-token TTL) and refresh_session treats removal as
-        # revocation. The single-user fallback below is a fixed admin record with
-        # no membership concept, so those checks are skipped for it.
-        self._has_users_table = bool(self._users)
-        if self._users:
-            for uname, rec in self._users.items():
-                if not uname or not rec.get("password_hash"):
-                    raise ValueError("each user must have username and password_hash")
-            # Footgun guard: when a 'users:' table AND a top-level
-            # username/password_hash are BOTH configured, the top-level admin
-            # credential used to be silently dropped here — an operator who left
-            # their original admin login in place alongside a new users table
-            # could lock themselves out. Merge the top-level admin into the
-            # users set as an admin-role user instead of dropping it. On a
-            # username collision the explicit users entry wins (it is the more
-            # deliberate, role-bearing record) and we warn rather than overwrite.
-            if username and password_hash:
-                if username in self._users:
-                    logger.warning(
-                        "dashboard-auth-basic: top-level username %r also appears "
-                        "in the users table; keeping the explicit users entry and "
-                        "ignoring the top-level credential.",
-                        username,
-                    )
-                else:
-                    logger.warning(
-                        "dashboard-auth-basic: both a users table and a top-level "
-                        "username/password were configured; merging the top-level "
-                        "credential %r into the users set as an admin user so it "
-                        "stays usable. Move it under dashboard.basic_auth.users to "
-                        "silence this warning.",
-                        username,
-                    )
-                    self._users[username] = {
-                        "password_hash": password_hash,
-                        "display_name": username,
-                        "actor_id": username,
-                        "role": "admin",
-                        "tenant_id": "",
-                    }
+        if users:
+            static_users: dict[str, dict[str, str]] = {}
+            for configured_username, record in users.items():
+                if not configured_username or not isinstance(record, dict):
+                    raise ValueError("each user must have a username and record")
+                static_users[configured_username] = self._copy_valid_record(record)
         else:
             if not username:
                 raise ValueError("username must be non-empty")
             if not password_hash:
                 raise ValueError("password_hash must be non-empty")
-            self._users = {
+            static_users = {
                 username: {
                     "password_hash": password_hash,
                     "display_name": username,
@@ -278,8 +240,10 @@ class BasicAuthProvider(DashboardAuthProvider):
                     "tenant_id": "",
                 }
             }
-        self._username = username or next(iter(self._users))
-        self._password_hash = password_hash or self._users[self._username].get("password_hash", "")
+        # Legacy env/single-user authority is process-static. Copy every
+        # caller-owned record so later mutations cannot change authority.
+        self._static_users = static_users
+        self._authority_resolver = authority_resolver
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
 
@@ -304,11 +268,9 @@ class BasicAuthProvider(DashboardAuthProvider):
         self, *, username: str, password: str
     ) -> Session:
         # Constant-time-ish: always run a scrypt verify (against the real
-        # hash if the username matches, else a dummy hash) so an unknown
-        # username and a wrong password take comparable time. Compare the
-        # username with compare_digest too, to avoid a length/byte timing
-        # leak on the username itself.
-        record = self._users.get(username)
+        # hash if the username exists, else a dummy hash) so an unknown
+        # username and a wrong password take comparable time.
+        record = self._resolve_record(username)
         username_ok = record is not None
         target_hash = (record or {}).get("password_hash", _DUMMY_HASH)
         password_ok = _verify_password(password, target_hash)
@@ -326,19 +288,13 @@ class BasicAuthProvider(DashboardAuthProvider):
             or payload.get("exp", 0) <= int(time.time())
         ):
             return None
-        # When an explicit users table is configured it is the authoritative
-        # source for role/tenant/membership. Re-resolve from it on this
-        # per-request hot path so a config demotion (admin -> user) or a tenant
-        # change takes effect within seconds, instead of persisting until the
-        # access-token TTL (default 12h) lapses. A user removed from the table is
-        # no longer authenticated (treat removal as revocation).
-        if self._has_users_table:
-            sub = str(payload.get("sub", ""))
-            record = self._users.get(sub)
-            if record is None:
-                return None
-            return self._session_from_record(access_token, "", sub, record, int(payload["exp"]))
-        return self._session_from_payload(access_token, "", payload)
+        user_id = str(payload.get("sub", ""))
+        record = self._resolve_record(user_id)
+        if not record or not record.get("password_hash"):
+            return None
+        return self._session_from_record(
+            access_token, "", int(payload["exp"]), user_id, record
+        )
 
     def refresh_session(self, *, refresh_token: str) -> Session:
         if not refresh_token:
@@ -350,15 +306,11 @@ class BasicAuthProvider(DashboardAuthProvider):
             or payload.get("exp", 0) <= int(time.time())
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
-        sub = str(payload.get("sub", self._username))
-        # When a users table is configured, a refresh for a subject no longer in
-        # the table must be refused — otherwise a removed user keeps a valid
-        # 30-day refresh token and the middleware's transparent refresh-on-expiry
-        # would keep minting access tokens for them. Removal == revocation; this
-        # is the only revocation lever a stateless provider has.
-        if self._has_users_table and sub not in self._users:
-            raise RefreshExpiredError("user no longer exists")
-        return self._mint_session(sub, self._users.get(sub, {}))
+        user_id = str(payload.get("sub", ""))
+        record = self._resolve_record(user_id)
+        if not record or not record.get("password_hash"):
+            raise RefreshExpiredError("session membership no longer exists")
+        return self._mint_session(user_id, record)
 
     def revoke_session(self, *, refresh_token: str) -> None:
         # Stateless tokens — nothing to revoke server-side. The session
@@ -368,93 +320,76 @@ class BasicAuthProvider(DashboardAuthProvider):
 
     # ---- internals ---------------------------------------------------------
 
-    def _mint_session(self, user_id: str, record: Optional[dict[str, str]] = None) -> Session:
-        record = record or {}
+    @staticmethod
+    def _copy_valid_record(record: dict[str, str]) -> dict[str, str]:
+        """Copy one authority record and reject malformed privilege data."""
+        copied = dict(record)
+        password_hash = copied.get("password_hash")
+        if not isinstance(password_hash, str) or not password_hash:
+            raise ValueError("each user must have a password_hash")
+        role = copied.get("role", "user")
+        if not isinstance(role, str) or role.strip().lower() not in _ALLOWED_ROLES:
+            raise ValueError("each user role must be admin or user")
+        for key in ("tenant_id", "actor_id", "display_name", "email"):
+            value = copied.get(key, "")
+            if not isinstance(value, str):
+                raise ValueError(f"each user {key} must be a string")
+        copied["role"] = role.strip().lower()
+        return copied
+
+    def _resolve_record(self, username: str) -> Optional[dict[str, str]]:
+        """Resolve and copy one record from exactly one authority snapshot."""
+        try:
+            snapshot = (
+                self._authority_resolver()
+                if self._authority_resolver is not None
+                else self._static_users
+            )
+            if not isinstance(snapshot, dict):
+                return None
+            record = snapshot.get(username)
+            if not isinstance(record, dict):
+                return None
+            return self._copy_valid_record(record)
+        except Exception as exc:  # noqa: BLE001 - authority errors fail closed
+            logger.warning(
+                "dashboard-auth-basic: current authority resolution failed: %s",
+                exc,
+            )
+            return None
+
+    def _mint_session(self, user_id: str, record: dict[str, str]) -> Session:
         now = int(time.time())
         exp = now + self._ttl
-        tenant_id = str(record.get("tenant_id", "") or "")
-        actor_id = str(record.get("actor_id", "") or user_id)
-        role = str(record.get("role", "user") or "user")
-        display_name = str(record.get("display_name", "") or user_id)
-        email = str(record.get("email", "") or "")
-        payload_base = {
-            "sub": user_id,
-            "tenant_id": tenant_id,
-            "actor_id": actor_id,
-            "role": role,
-            "display_name": display_name,
-            "email": email,
-        }
         access_token = _sign(
-            {**payload_base, "kind": "access", "exp": exp}, self._secret
+            {"sub": user_id, "kind": "access", "exp": exp}, self._secret
         )
         refresh_token = _sign(
-            {**payload_base, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
+            {"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
             self._secret,
         )
-        return Session(
-            user_id=user_id,
-            email=email,
-            display_name=display_name,
-            org_id=tenant_id,
-            provider=self.name,
-            expires_at=exp,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            role=role,
+        return self._session_from_record(
+            access_token, refresh_token, exp, user_id, record
         )
 
     def _session_from_record(
         self,
         access_token: str,
         refresh_token: str,
+        expires_at: int,
         user_id: str,
-        record: dict,
-        exp: int,
+        record: dict[str, str],
     ) -> Session:
-        """Build a Session from the CURRENT config record (authoritative role).
-
-        Keeps the existing token's ``exp`` so verify_session does not extend the
-        session lifetime; it only re-resolves the privilege-bearing fields
-        (role/tenant) from ``self._users`` so config changes take effect now.
-        """
         tenant_id = str(record.get("tenant_id", "") or "")
         actor_id = str(record.get("actor_id", "") or user_id)
-        role = str(record.get("role", "user") or "user")
-        display_name = str(record.get("display_name", "") or user_id)
-        email = str(record.get("email", "") or "")
+        role = str(record.get("role", "user") or "user").lower()
         return Session(
             user_id=user_id,
-            email=email,
-            display_name=display_name,
+            email=str(record.get("email", "") or ""),
+            display_name=str(record.get("display_name", "") or user_id),
             org_id=tenant_id,
             provider=self.name,
-            expires_at=exp,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            role=role,
-        )
-
-    def _session_from_payload(
-        self, access_token: str, refresh_token: str, payload: dict
-    ) -> Session:
-        user_id = str(payload.get("sub", ""))
-        tenant_id = str(payload.get("tenant_id", "") or "")
-        actor_id = str(payload.get("actor_id", "") or user_id)
-        role = str(payload.get("role", "user") or "user")
-        display_name = str(payload.get("display_name", "") or user_id)
-        email = str(payload.get("email", "") or "")
-        return Session(
-            user_id=user_id,
-            email=email,
-            display_name=display_name,
-            org_id=tenant_id,
-            provider=self.name,
-            expires_at=int(payload["exp"]),
+            expires_at=expires_at,
             access_token=access_token,
             refresh_token=refresh_token,
             tenant_id=tenant_id,
@@ -498,14 +433,18 @@ def _resolve(env_name: str, cfg_section: dict, cfg_key: str) -> str:
 
 
 def _load_users_from_config(section: dict) -> dict[str, dict[str, str]]:
-    """Return optional multi-actor password users from dashboard.basic_auth.users."""
-    raw = section.get("users") or []
-    if isinstance(raw, dict):
-        raw = [{"username": k, **(v if isinstance(v, dict) else {})} for k, v in raw.items()]
+    """Return valid role-bearing records from dashboard.basic_auth.users."""
+    raw_users = section.get("users") or []
+    if isinstance(raw_users, dict):
+        raw_users = [
+            {"username": username, **(record if isinstance(record, dict) else {})}
+            for username, record in raw_users.items()
+        ]
+    if not isinstance(raw_users, list):
+        return {}
+
     users: dict[str, dict[str, str]] = {}
-    if not isinstance(raw, list):
-        return users
-    for item in raw:
+    for item in raw_users:
         if not isinstance(item, dict):
             continue
         username = str(item.get("username", "") or "").strip()
@@ -517,10 +456,13 @@ def _load_users_from_config(section: dict) -> dict[str, dict[str, str]]:
             "tenant_id": str(item.get("tenant_id", "") or "").strip(),
             "actor_id": str(item.get("actor_id", "") or username).strip(),
             "role": str(item.get("role", "user") or "user").strip().lower(),
-            "display_name": str(item.get("display_name", "") or username).strip(),
+            "display_name": str(
+                item.get("display_name", "") or username
+            ).strip(),
             "email": str(item.get("email", "") or "").strip(),
         }
     return users
+
 
 def _resolve_secret(cfg_section: dict) -> bytes:
     """Resolve the token-signing secret.
@@ -577,14 +519,14 @@ def register(ctx) -> None:
     ttl_raw = _resolve(
         "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS", section, "session_ttl_seconds"
     )
-
     users = _load_users_from_config(section)
 
     if not users and not username:
         LAST_SKIP_REASON = (
-            "dashboard.basic_auth.username is not set and dashboard.basic_auth.users is empty "
-            "(and HERMES_DASHBOARD_BASIC_AUTH_USERNAME is empty). Set a username/password "
-            "or configure users under dashboard.basic_auth in config.yaml."
+            "dashboard.basic_auth.username is not set and "
+            "dashboard.basic_auth.users is empty (and "
+            "HERMES_DASHBOARD_BASIC_AUTH_USERNAME is empty). Configure a "
+            "username/password or role-bearing users under dashboard.basic_auth."
         )
         logger.debug("dashboard-auth-basic: %s", LAST_SKIP_REASON)
         return
@@ -617,10 +559,8 @@ def register(ctx) -> None:
             "dashboard-auth-basic: hashed env-supplied password in-memory "
             "(overrides any config password_hash)."
         )
-    elif not password_hash and plaintext:
-        # config-only plaintext password. (Guarded by ``plaintext`` so a
-        # users-only config — no top-level credential — never hashes an empty
-        # string into a bogus top-level password_hash.)
+    elif not password_hash:
+        # config-only plaintext password.
         password_hash = hash_password(plaintext)
         logger.info(
             "dashboard-auth-basic: hashed plaintext password in-memory. "
@@ -642,6 +582,11 @@ def register(ctx) -> None:
             secret=secret,
             ttl_seconds=ttl,
             users=users or None,
+            authority_resolver=(
+                (lambda: _load_users_from_config(_load_config_basic_auth_section()))
+                if users
+                else None
+            ),
         )
     except ValueError as exc:
         LAST_SKIP_REASON = f"BasicAuthProvider construction failed: {exc}"

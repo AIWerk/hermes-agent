@@ -114,11 +114,11 @@ def test_early_recovery_module_is_stdlib_only(tmp_path):
             STDLIB = set(sys.stdlib_module_names) | {"hermes_cli"}
             real_import = builtins.__import__
 
-            def guard(name, globals=None, locals=None, fromlist=(), level=0):
+            def guard(name, *args, **kwargs):
                 top = name.split(".")[0]
-                if level == 0 and top not in STDLIB:
+                if top not in STDLIB:
                     raise ImportError(f"non-stdlib import blocked: {name}")
-                return real_import(name, globals, locals, fromlist, level)
+                return real_import(name, *args, **kwargs)
 
             builtins.__import__ = guard
             import hermes_cli._early_recovery  # noqa: F401

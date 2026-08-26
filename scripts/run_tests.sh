@@ -98,24 +98,6 @@ else
   exit 1
 fi
 
-PYTHON_EXECUTABLE="$("$PYTHON" -c 'import sys; print(sys.executable)')"
-read -r SQLITE_VERSION SQLITE_VULNERABLE < <(
-  "$PYTHON" -c '
-import sqlite3
-
-info = sqlite3.sqlite_version_info
-vulnerable = (
-    info >= (3, 7, 0)
-    and info < (3, 51, 3)
-    and not ((3, 50, 7) <= info < (3, 51, 0))
-    and not ((3, 44, 6) <= info < (3, 45, 0))
-)
-print(sqlite3.sqlite_version, "yes" if vulnerable else "no")
-'
-)
-echo "▶ selected python: $PYTHON_EXECUTABLE"
-echo "▶ linked SQLite: $SQLITE_VERSION (WAL-reset vulnerable: $SQLITE_VULNERABLE)"
-
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH=""
@@ -184,22 +166,16 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-# TMPDIR and HERMES_PYTHON are non-credential location variables; preserve
-# them when set so nested canonical runners keep the selected test interpreter.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
-  ${TMPDIR:+TMPDIR="$TMPDIR"} \
-  ${HERMES_PYTHON:+HERMES_PYTHON="$HERMES_PYTHON"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
-  ${LD_LIBRARY_PATH:+LD_LIBRARY_PATH="$LD_LIBRARY_PATH"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
   PYTHONUTF8=1 \
-  HERMES_DISABLE_LAZY_INSTALLS=1 \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \

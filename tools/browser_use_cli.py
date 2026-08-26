@@ -24,6 +24,54 @@ BACKEND_DISABLED = "off"
 # Cloud daemon names become the BU_NAME env var
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
+# Internal marker set by _resolve_backend_cdp on the env dict when the
+# resolved browser is EXCLUSIVE to this named session (per-name provider
+# browser, or a named Browser Use cloud browser). Popped before the
+# subprocess launches — never exported to the CLI.
+_PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
+
+# Preamble prepended to the model's code for named sessions on SHARED
+# browsers (local Chrome / CDP override). The harness daemon attaches to the
+# first existing page at startup, so two fresh named daemons can land on the
+# SAME tab; steering this daemon onto a tab it created keeps concurrent named
+# sessions from clobbering each other before their first new_tab(). Runs
+# once per daemon (marker file keyed by BU_NAME under the harness runtime
+# state), costs one IPC round-trip on later calls.
+_OWN_TAB_PREAMBLE = """\
+# hermes: pin this named session to its own tab (once per daemon process)
+def _hermes_ensure_own_tab():
+    import os as _os, tempfile as _tf
+    _name = _os.environ.get("BU_NAME", "default")
+    try:
+        # Key the marker by the daemon's pid so a daemon restart (which
+        # re-attaches to the first shared page) re-pins automatically,
+        # while agent-driven tab switches mid-session are left alone.
+        from browser_harness import _ipc as _bipc
+        _dpid = _bipc.pid_path(_name).read_text().strip() or "0"
+    except Exception:
+        _dpid = "0"
+    _uid = _os.getuid() if hasattr(_os, "getuid") else 0
+    _marker = _os.path.join(
+        _tf.gettempdir(), "hermes-bu-owntab-%s-%s-%s" % (_uid, _name, _dpid)
+    )
+    if _os.path.exists(_marker):
+        return
+    try:
+        # Force a fresh target: new_tab() would REUSE a blank current tab,
+        # which is exactly the tab a sibling daemon may also hold.
+        _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
+        if _tid:
+            switch_tab(_tid)
+    except Exception:
+        pass  # best-effort: worst case is pre-fix behavior
+    try:
+        open(_marker, "w").close()
+    except OSError:
+        pass
+_hermes_ensure_own_tab()
+del _hermes_ensure_own_tab
+"""
+
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
@@ -70,8 +118,49 @@ def _base_subprocess_env() -> dict:
     # needs Hermes's import path.
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
+    # Same class of hazard, PATH flavor: profile-spawned workers (kanban
+    # bots, cron jobs) can hand down a PATH of only version-manager dirs,
+    # which kills the uv trampoline before the CLI's Python starts. Floor
+    # the PATH so coreutils are always reachable (see below).
+    env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     return env
+
+
+def _floor_subprocess_path(path: str) -> str:
+    """Guarantee core system dirs survive onto the CLI subprocess PATH.
+
+    Profile workers can inherit a PATH holding only version-manager dirs
+    (observed: the nvm node dir repeated 7x, nothing else). That is fatal
+    for the uv-installed browser-use binary: its POSIX sh trampoline
+    resolves ``dirname``/``realpath`` through PATH, so without /usr/bin it
+    dies with ``realpath: not found … exec: /python: not found`` (exit
+    127) before its own Python ever starts. Reuses browser_tool's
+    ``_merge_browser_path`` floor — same hazard, same sane-dir list — and
+    falls back to appending FHS bin dirs if that import is unavailable.
+    Windows .cmd shims don't trampoline through PATH, so no-op there.
+    """
+    if os.name == "nt":
+        return path
+    try:
+        from tools.browser_tool import _merge_browser_path
+
+        return _merge_browser_path(path or "")
+    except Exception:
+        pass
+    parts = [p for p in (path or "").split(os.pathsep) if p]
+    existing = set(parts)
+    for directory in (
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ):
+        if directory not in existing and os.path.isdir(directory):
+            parts.append(directory)
+    return os.pathsep.join(parts)
 
 
 def _read_browser_cfg() -> dict:
@@ -370,13 +459,25 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
         from pathlib import Path
 
         from tools.vision_tools import (
+            _EMBED_MAX_DIMENSION,
+            _EMBED_TARGET_BYTES,
             _resize_image_for_vision,
             _should_use_native_vision_fast_path,
         )
 
         if not _should_use_native_vision_fast_path():
             return None
-        data_url = _resize_image_for_vision(Path(path))
+        # History-reuse cap (#92699): this data URL bakes into the tool
+        # result and is re-sent on every later turn — same policy as the
+        # vision_analyze / browser_vision native embeds (256 KB / 1568 px,
+        # JPEG quality ladder instead of PNG dimension-halving).
+        data_url = _resize_image_for_vision(
+            Path(path),
+            mime_type="image/png",
+            max_base64_bytes=_EMBED_TARGET_BYTES,
+            max_dimension=_EMBED_MAX_DIMENSION,
+            force_jpeg=True,
+        )
         text = json.dumps(result, ensure_ascii=False)
         return {
             "_multimodal": True,
@@ -465,6 +566,9 @@ def _resolve_backend_cdp(
     if provider_key == _BACKEND_KEY and not is_truthy_value(
         _read_browser_cfg().get("use_gateway"), default=False
     ):
+        # Named BU cloud browsers are exclusive to their daemon — no shared
+        # tab to isolate from.
+        env[_PRIVATE_BROWSER_SENTINEL] = "1"
         return None
 
     try:
@@ -487,6 +591,11 @@ def _resolve_backend_cdp(
             "the built-in browser tools for this provider."
         )
     env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
+    # A provider browser keyed bu-named-<name> is exclusive to this session —
+    # the own-tab preamble is unnecessary there (it would just leak a blank
+    # tab into a browser nobody else touches).
+    if session_name:
+        env[_PRIVATE_BROWSER_SENTINEL] = "1"
     return None
 
 
@@ -534,6 +643,15 @@ def browser_exec(
     backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
     if backend_err:
         return tool_error(backend_err)
+
+    # On a SHARED browser (local Chrome / CDP override) a fresh named daemon
+    # attaches to the first existing page — the same page a sibling daemon
+    # may hold. Pin each named session to a tab it created before running
+    # the model's code. Private per-name browsers (provider-keyed or BU
+    # cloud) skip this: no one to collide with, and the extra tab would leak.
+    private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
+    if session and not private_browser:
+        code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
     if workspace:

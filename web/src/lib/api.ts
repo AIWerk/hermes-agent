@@ -36,8 +36,6 @@ declare global {
      * WS-upgrade path from legacy ``?token=`` to single-use ``?ticket=``
      * fetched via :func:`getWsTicket`. */
     __HERMES_AUTH_REQUIRED__?: boolean;
-    /** Hidden/customer-configured locale for the AIWerk Customer UI. */
-    __AIWERK_CUI_LOCALE__?: string;
   }
 }
 const SESSION_HEADER = "X-Hermes-Session-Token";
@@ -184,24 +182,6 @@ export async function fetchJSON<T>(
   return res.json();
 }
 
-export async function fetchBlob(url: string, init?: RequestInit): Promise<Blob> {
-  const headers = new Headers(init?.headers);
-  const token = window.__HERMES_SESSION_TOKEN__;
-  if (token) {
-    setSessionHeader(headers, token);
-  }
-  const res = await fetch(`${BASE}${url}`, {
-    ...init,
-    headers,
-    credentials: init?.credentials ?? "include",
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status}: ${text}`);
-  }
-  return res.blob();
-}
-
 /** Encode a plugin registry key for URL paths (preserves `/` segment separators). */
 function pluginPath(name: string): string {
   return name.split("/").map(encodeURIComponent).join("/");
@@ -326,7 +306,6 @@ export interface SessionQueryOptions {
   source?: string | null;
   sources?: string[];
   excludeSources?: string[];
-  hideAutomated?: boolean;
 }
 
 function normalizeSessionQueryOptions(
@@ -351,9 +330,6 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
   }
   if (options.excludeSources && options.excludeSources.length > 0) {
     next = appendQueryParam(next, "exclude_sources", options.excludeSources.join(","));
-  }
-  if (options.hideAutomated) {
-    next = appendQueryParam(next, "hide_automated", "1");
   }
   return appendProfileParam(next, options.profile);
 }
@@ -407,86 +383,6 @@ export const api = {
       ),
     );
   },
-  uploadAssistantAttachments: async (files: File[], sessionId?: string) => {
-    const form = new FormData();
-    files.forEach((file) => form.append("files", file));
-    if (sessionId) form.append("session_id", sessionId);
-    return fetchJSON<AssistantAttachmentUploadResponse>("/api/assistant/attachments", {
-      method: "POST",
-      body: form,
-    });
-  },
-  attachAssistantResource: (body: AssistantResourceAttachmentRequest) =>
-    fetchJSON<AssistantAttachmentUploadResponse>("/api/assistant/attachments/resource", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  transcribeAssistantAudio: async (file: File, sessionId?: string) => {
-    const form = new FormData();
-    form.append("file", file);
-    if (sessionId) form.append("session_id", sessionId);
-    return fetchJSON<AssistantTranscriptionResponse>("/api/assistant/transcribe", {
-      method: "POST",
-      body: form,
-    });
-  },
-  synthesizeAssistantSpeech: async (text: string, sessionId?: string) =>
-    fetchBlob("/api/assistant/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, session_id: sessionId }),
-    }),
-  getAssistantResources: (options?: { refresh?: boolean; resource?: "email" | "calendar" | "shared_folder" | "vault" | "todos" | "contacts" | "connectors" }) => {
-    const params = new URLSearchParams();
-    if (options?.refresh) params.set("refresh", "1");
-    if (options?.resource) params.set("resource", options.resource);
-    const query = params.toString();
-    return fetchJSON<AssistantResourcesResponse>(`/api/assistant/resources${query ? `?${query}` : ""}`);
-  },
-  searchCuiContacts: (q: string) => {
-    const params = new URLSearchParams();
-    if (q.trim()) params.set("q", q.trim());
-    const query = params.toString();
-    return fetchJSON<{ items: AssistantContactItem[]; total_count: number; query: string }>(`/api/cui/contacts/search${query ? `?${query}` : ""}`);
-  },
-  createCuiContact: (body: AssistantContactCreateRequest) =>
-    fetchJSON<{ ok: boolean; contact: AssistantContactItem }>("/api/cui/contacts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  hideCuiContact: (contact: Pick<AssistantContactItem, "id" | "email" | "phone" | "display_name">) =>
-    fetchJSON<{ ok: boolean; hidden: string[] }>("/api/cui/contacts/hide", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: contact.id, email: contact.email ?? "", phone: contact.phone ?? "", display_name: contact.display_name ?? "" }),
-    }),
-  addAssistantTodo: (text: string) =>
-    fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/add", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    }),
-  updateAssistantTodo: (id: string, done: boolean) =>
-    fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, done }),
-    }),
-  editAssistantTodo: (id: string, text: string, done?: boolean) =>
-    fetchJSON<{ ok: boolean; todos: AssistantTodoSummary }>("/api/assistant/todos/edit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, text, done }),
-    }),
-  sendAssistantSupport: (body: AssistantSupportRequest) =>
-    fetchJSON<AssistantSupportResponse>("/api/assistant/support", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  openAssistantSharedFolder: () => fetchJSON<{ ok: boolean }>("/api/assistant/shared-folder/open-folder", { method: "POST" }),
   getSessionMessages: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionMessagesResponse>(
       appendProfileParam(
@@ -556,11 +452,18 @@ export const api = {
     source?: string,
     profile = getManagementProfile(),
   ) =>
-    fetchJSON<{ ok: boolean; removed: number }>("/api/sessions/prune", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ older_than_days, source, profile: profile || undefined }),
-    }),
+    fetchJSON<{ ok: boolean; removed: number; skipped_open: number }>(
+      "/api/sessions/prune",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          older_than_days,
+          source,
+          profile: profile || undefined,
+        }),
+      },
+    ),
   listFiles: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
     return fetchJSON<ManagedFilesResponse>(`/api/files${query}`);
@@ -2057,252 +1960,6 @@ export interface PaginatedSessions {
   offset: number;
 }
 
-export interface AssistantUploadedAttachment {
-  name: string;
-  path: string;
-  type: string;
-  size: number;
-  is_image: boolean;
-  open_url?: string | null;
-  download_url?: string | null;
-  preview_url?: string | null;
-  preview_kind?: "image" | "pdf" | "text" | "audio" | "video" | "file" | string;
-  safe_renderable?: boolean;
-  extracted_text: string;
-  extraction: string;
-}
-
-export interface AssistantAttachmentUploadResponse {
-  attachments: AssistantUploadedAttachment[];
-}
-
-
-export interface AssistantSupportRequest {
-  category: string;
-  message: string;
-  include_diagnostics: boolean;
-  session_id?: string;
-  session_title?: string;
-  connection?: string;
-  page_url?: string;
-  user_agent?: string;
-  diagnostics?: Record<string, unknown>;
-  agent_name?: string;
-}
-
-export interface AssistantSupportResponse {
-  ok: boolean;
-  support_id: string;
-  delivered: boolean;
-  queued?: boolean;
-  errors?: string[];
-}
-
-export interface AssistantResourceAttachmentRequest {
-  kind: "email" | "calendar_event" | "shared_file" | "contact";
-  item: Record<string, unknown>;
-  session_id?: string;
-}
-
-export interface AssistantTranscriptionResponse {
-  text: string;
-  provider?: string;
-}
-
-export type AssistantResourceStatus = "connected" | "limited" | "auth_required" | "not_configured" | "error";
-
-export interface AssistantResourceMailItem {
-  id?: string;
-  sender?: string;
-  subject?: string;
-  received_at?: string;
-  unread?: boolean;
-  has_attachment?: boolean;
-  message_id?: string;
-  open_url?: string | null;
-  gmail_web_url?: string | null;
-  account_label?: string;
-  account_address?: string;
-  source?: "gmail" | "imap" | string;
-}
-
-export interface AssistantResourceMailAccount {
-  label: string;
-  address?: string;
-  source?: "gmail" | "imap" | string;
-  status: AssistantResourceStatus;
-  unread_count: number;
-  summary: string;
-  items?: AssistantResourceMailItem[];
-}
-
-export interface AssistantResourceEventItem {
-  id?: string;
-  event_id?: string;
-  title?: string;
-  starts_at?: string;
-  ends_at?: string;
-  location_hint?: string;
-  account_label?: string;
-  account_address?: string;
-  source?: "google_calendar" | string;
-  html_link?: string;
-  open_url?: string | null;
-}
-
-export interface AssistantResourceCalendarAccount {
-  label: string;
-  address?: string;
-  calendar_id?: string;
-  source?: "google_calendar" | string;
-  status: AssistantResourceStatus;
-  summary: string;
-  items?: AssistantResourceEventItem[];
-}
-
-export interface AssistantSharedFolderItem {
-  id: string;
-  name: string;
-  kind: "file" | "folder";
-  mime?: string | null;
-  size_bytes?: number | null;
-  modified_at?: string | null;
-  open_url?: string | null;
-  cloud_url?: string | null;
-  reference_uri?: string | null;
-  child_count?: number;
-  children?: AssistantSharedFolderItem[];
-}
-
-export interface AssistantConnectorSummary {
-  id: string;
-  label: string;
-  status: AssistantResourceStatus;
-  status_label?: string;
-  capabilities?: string[];
-  description?: string | null;
-  children?: AssistantConnectorSummary[];
-  open_url?: string | null;
-}
-
-export interface AssistantVaultSummary {
-  status: AssistantResourceStatus;
-  vault_url: string;
-  summary: string;
-  item_count: number | null;
-  exposed_count?: number | null;
-  agent_created_count?: number | null;
-  weak_count: number | null;
-  reused_count: number | null;
-  compromised_count: number | null;
-  compromised_supported?: boolean;
-  two_factor_status?: "active" | "recommended" | "unknown" | string;
-  source?: "aiwerk_bridge" | "bw" | "link" | "none" | string;
-  checked_at?: string;
-}
-
-export interface AssistantTodoItem {
-  id: string;
-  text: string;
-  full_text?: string;
-  line?: number;
-  done?: boolean;
-}
-
-export interface AssistantTodoSummary {
-  status: AssistantResourceStatus;
-  summary: string;
-  path?: string;
-  items: AssistantTodoItem[];
-  open_count: number;
-  done_count: number;
-  total_count: number;
-  checked_at?: string;
-}
-
-export interface AssistantContactItem {
-  id: string;
-  display_name: string;
-  organization?: string;
-  role?: string;
-  email?: string;
-  phone?: string;
-  note?: string;
-  source_badges?: string[];
-  relevance?: "relevant" | "frequent" | string;
-}
-
-export interface AssistantContactSummary {
-  status: AssistantResourceStatus;
-  summary: string;
-  items: AssistantContactItem[];
-  relevant: AssistantContactItem[];
-  frequent: AssistantContactItem[];
-  total_count: number;
-  manual_count: number;
-  connected_count: number;
-  google_count?: number;
-  saved_count?: number;
-  interaction_count?: number;
-  relevance_window_days?: number;
-  saved_top_up_target?: number;
-  source_label?: string;
-  checked_at?: string;
-}
-
-export interface AssistantContactCreateRequest {
-  name: string;
-  organization?: string;
-  role?: string;
-  email?: string;
-  phone?: string;
-  note?: string;
-  link_current_context?: boolean;
-}
-
-export interface AssistantResourcesResponse {
-  checked_at: string;
-  email: {
-    status: AssistantResourceStatus;
-    unread_count: number;
-    summary: string;
-    items: AssistantResourceMailItem[];
-    accounts?: AssistantResourceMailAccount[];
-  };
-  calendar: {
-    status: AssistantResourceStatus;
-    summary: string;
-    items: AssistantResourceEventItem[];
-    accounts?: AssistantResourceCalendarAccount[];
-  };
-  shared_folder: {
-    status: AssistantResourceStatus;
-    root_label: string;
-    summary: string;
-    items: AssistantSharedFolderItem[];
-    total_count: number;
-    source?: "local" | "cloud" | "none";
-    can_open_folder?: boolean;
-    cloud_url?: string | null;
-  };
-  vault: AssistantVaultSummary;
-  todos: AssistantTodoSummary;
-  contacts: AssistantContactSummary;
-  connectors: AssistantConnectorSummary[];
-  warnings: string[];
-  cache?: {
-    cached: boolean;
-    resources: Record<string, {
-      cached: boolean;
-      stale?: boolean;
-      updated_at: string;
-      expires_at: string;
-      ttl_seconds: number;
-      last_error?: string;
-    }>;
-  };
-}
-
 export interface EnvVarInfo {
   is_set: boolean;
   redacted_value: string | null;
@@ -2523,6 +2180,7 @@ export interface ProfileInfo {
   gateway_running: boolean;
   description: string;
   description_auto: boolean;
+  display_name?: string;
   distribution_name: string | null;
   distribution_version: string | null;
   distribution_source: string | null;
@@ -2543,7 +2201,6 @@ export interface ModelsAnalyticsModelEntry {
   tool_calls: number;
   last_used_at: number;
   avg_tokens_per_session: number;
-  agent_name?: string;
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;
@@ -2619,6 +2276,7 @@ export interface CronJob {
   last_status?: string | null;
   last_error?: string | null;
   last_delivery_error?: string | null;
+  last_fire_error?: { at?: string | null; detail?: string | null } | null;
 }
 
 export interface CronDeliveryTarget {
@@ -2735,9 +2393,6 @@ export interface ModelInfoResponse {
   auto_context_length: number;
   config_context_length: number;
   effective_context_length: number;
-  agent_name?: string;
-  user_display_name?: string | null;
-  greeting_context?: "customer" | "admin" | "unknown";
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;

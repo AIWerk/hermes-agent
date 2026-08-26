@@ -77,7 +77,7 @@ export function fromLocalGit(repoRoot = REPO_ROOT, execFn = tryExec) {
   const dirty = status !== null && status.length > 0
   return {
     commit: sha,
-    branch: branch && branch !== "HEAD" ? branch : FALLBACK_BRANCH,
+    branch: branch === "HEAD" ? null : branch, // detached HEAD -> null
     dirty: dirty,
     source: "local"
   }

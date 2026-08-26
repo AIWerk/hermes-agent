@@ -47,6 +47,28 @@ class TestMintAndConsume:
         ticket = mint_ticket(user_id="u1", provider="nous")
         assert len(ticket) >= 32
 
+    def test_round_trip_preserves_allowlisted_actor_identity(self):
+        ticket = mint_ticket(
+            user_id="legacy-user",
+            provider="basic",
+            tenant_id="tenant-1",
+            actor_id="actor-1",
+            role="customer",
+            display_name="Alice",
+            email="alice@example.test",
+            org_id="legacy-org",
+        )
+
+        info = consume_ticket(ticket)
+        assert info["tenant_id"] == "tenant-1"
+        assert info["actor_id"] == "actor-1"
+        assert info["role"] == "customer"
+        assert info["display_name"] == "Alice"
+        assert info["email"] == "alice@example.test"
+        assert info["org_id"] == "legacy-org"
+        with pytest.raises(TicketInvalid, match="unknown"):
+            consume_ticket(ticket)
+
 
 # ---------------------------------------------------------------------------
 # Single-use

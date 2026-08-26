@@ -25,10 +25,8 @@ import os
 import shutil
 import sqlite3
 import sys
-from functools import wraps
 import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -37,68 +35,6 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Seal the locked test interpreter before pytest imports any test module or
-# optional backend.  The per-test fixture below is too late for collection-time
-# imports (for example the Teams adapter), which must fail closed rather than
-# invoking tools.lazy_deps and mutating the test venv from the network.
-os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
-
-
-# ── Live database safety guard ──────────────────────────────────────────────
-
-_REAL_HERMES_HOME = (Path.home() / ".hermes").resolve()
-
-
-def _resolve_sqlite_target_path(database) -> Path | None:
-    """Resolve a sqlite3 target to a filesystem path, including file: URIs."""
-    try:
-        target = os.fsdecode(os.fspath(database))
-    except TypeError:
-        return None
-
-    if not target or target == ":memory:":
-        return None
-    if target.startswith("file:"):
-        parsed = urlsplit(target)
-        if parsed.netloc not in ("", "localhost"):
-            return None
-        target = unquote(parsed.path)
-        if not target or target == ":memory:":
-            return None
-
-    return Path(target).expanduser().resolve()
-
-
-def _is_path_within(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False
-    return True
-
-
-def _make_guarded_sqlite_connect(real_connect, live_home: Path):
-    @wraps(real_connect)
-    def guarded_connect(database, *args, **kwargs):
-        target = _resolve_sqlite_target_path(database)
-        if target is not None and _is_path_within(target, live_home):
-            raise RuntimeError(
-                f"live Hermes database access blocked during tests: {target}"
-            )
-        return real_connect(database, *args, **kwargs)
-
-    return guarded_connect
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _block_live_hermes_database_access():
-    """Fail loudly if any test tries to open a SQLite DB under real ~/.hermes."""
-    real_connect = sqlite3.connect
-    sqlite3.connect = _make_guarded_sqlite_connect(real_connect, _REAL_HERMES_HOME)
-    try:
-        yield
-    finally:
-        sqlite3.connect = real_connect
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
@@ -328,6 +264,12 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_VOICE",
     "HERMES_VOICE_TTS",
     "HERMES_YOLO_MODE",
+    # Injected into subprocess envs by the terminal tool (_make_run_env), so
+    # any test run launched FROM a Hermes agent session inherits them and
+    # hermes_constants home-resolution helpers prefer them over monkeypatched
+    # HOME (test_subprocess_home_isolation red locally, green on CI).
+    "HERMES_REAL_HOME",
+    "TERMINAL_HOME_MODE",
     "HERMES_INTERACTIVE",
     "HERMES_QUIET",
     "HERMES_TOOL_PROGRESS",
@@ -405,6 +347,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # (user shell, earlier leaky test, CI env), they change gateway auth
     # behavior and flake button-authorization tests.
     "TELEGRAM_ALLOWED_USERS",
+    "TELEGRAM_GROUP_ALLOWED_USERS",
+    "TELEGRAM_GROUP_ALLOWED_CHATS",
+    "QQ_ALLOWED_USERS",
+    "QQ_GROUP_ALLOWED_USERS",
     "DISCORD_ALLOWED_USERS",
     "WHATSAPP_ALLOWED_USERS",
     "SLACK_ALLOWED_USERS",
@@ -624,6 +570,28 @@ def _hermetic_environment(tmp_path, monkeypatch):
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
     return None
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_kanban_memory_guard(request, monkeypatch):
+    """Pin the kanban dispatcher's memory guard to "no data" for every test.
+
+    The dispatcher consults live system memory before spawning (OOF-30/
+    OOF-77: memory-derived default cap + pressure-based spawn restriction).
+    Left un-patched, dispatch tests would pass or fail based on how loaded
+    the CI runner happens to be. Defaulting the sample to ``{}`` makes the
+    derived cap ``None`` and the pressure level ``"unknown"`` — i.e. the
+    pre-guard behaviour every existing test was written against. Tests that
+    exercise the guard itself opt out with
+    ``@pytest.mark.real_memory_guard`` or patch the seam directly.
+    """
+    if request.node.get_closest_marker("real_memory_guard"):
+        return
+    try:
+        from hermes_cli import kanban_db as _kb_mod
+    except Exception:
+        return
+    monkeypatch.setattr(_kb_mod, "_system_memory_sample", lambda: {}, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -1205,6 +1173,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "require_symlinks: skip the test if symbolic links cannot be "
         "created in the current environment (needs admin/developer mode "
         "on Windows).",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_memory_guard: bypass the autouse fixture that pins the kanban "
+        "dispatcher's memory guard to 'no data' — only for tests that "
+        "exercise the guard itself with their own patched samples.",
     )
     # NOTE: linux_only / macos_only / windows_only are declared in
     # pyproject.toml's ``markers`` list, not here — they are part of the

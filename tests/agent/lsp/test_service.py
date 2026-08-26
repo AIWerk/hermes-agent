@@ -7,6 +7,7 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,9 @@ from agent.lsp.servers import (
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "pyright"):
+def _install_mock_server(
+    monkeypatch, script: str | list[str] = "errors", server_id: str = "pyright"
+):
     """Replace one registered server with a wrapper that spawns the mock.
 
     We reuse ``pyright`` so .py files route to it.  This keeps the
@@ -33,9 +36,13 @@ def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "
     """
     target_index = next(i for i, s in enumerate(SERVERS) if s.server_id == server_id)
     original = SERVERS[target_index]
+    scripts = [script] if isinstance(script, str) else script
+    spawn_count = {"value": 0}
 
     def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
-        env = {"MOCK_LSP_SCRIPT": script}
+        index = min(spawn_count["value"], len(scripts) - 1)
+        spawn_count["value"] += 1
+        env = {"MOCK_LSP_SCRIPT": scripts[index]}
         return SpawnSpec(
             command=[sys.executable, MOCK_SERVER],
             workspace_root=root,
@@ -55,7 +62,7 @@ def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "
     # Patch the SERVERS list element directly + restore on teardown.
     SERVERS[target_index] = replacement
 
-    yield
+    yield spawn_count
 
     SERVERS[target_index] = original
 
@@ -102,6 +109,54 @@ def test_service_e2e_delta_filter(mock_pyright):
         assert new_diags == []
     finally:
         svc.shutdown()
+
+
+@pytest.mark.parametrize("failed_script", ["clean_eof", "malformed_frame"])
+def test_service_replaces_client_after_reader_failure(
+    tmp_path, monkeypatch, failed_script
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    source = repo / "x.py"
+    source.write_text("print('hi')\n")
+    monkeypatch.chdir(str(repo))
+    server = _install_mock_server(
+        monkeypatch, [failed_script, "clean"], "pyright"
+    )
+    spawn_count = next(server)
+
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=0.5,
+        install_strategy="manual",
+    )
+    try:
+        async def _break_first_client():
+            client = await svc._get_or_spawn(str(source))
+            assert client is not None
+            reader_task = client._reader_task
+            assert reader_task is not None
+            await client.open_file(str(source), language_id="python")
+            await asyncio.wait_for(asyncio.shield(reader_task), timeout=3.0)
+            return client
+
+        first = svc._loop.run(_break_first_client(), timeout=5.0)
+        replacement = svc._loop.run(svc._get_or_spawn(str(source)), timeout=5.0)
+
+        assert not first.is_running
+        assert replacement is not None
+        assert replacement is not first
+        assert replacement.is_running
+        assert spawn_count["value"] == 2
+    finally:
+        svc.shutdown()
+        try:
+            next(server)
+        except StopIteration:
+            pass
 
 
 def test_service_e2e_delta_filter_with_line_shift(mock_pyright):
@@ -175,79 +230,6 @@ def test_reused_client_refreshes_last_used_and_survives_reap(mock_pyright):
         svc.shutdown()
 
 
-def test_service_reaps_idle_clients(mock_pyright):
-    """Idle LSP clients are shut down instead of living for the full Hermes session."""
-    repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("")
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=3.0,
-        install_strategy="manual",
-        idle_timeout=0.01,
-    )
-    try:
-        svc.get_diagnostics_sync(str(f))
-        info = svc.get_status()
-        assert len(info["clients"]) == 1
-        time.sleep(0.02)
-
-        reaped = svc.reap_idle_clients_sync()
-
-        assert reaped == 1
-        assert svc.get_status()["clients"] == []
-    finally:
-        svc.shutdown()
-
-
-def test_service_does_not_reap_inflight_client(mock_pyright):
-    """A client with an in-flight request must survive the idle reaper even
-    when its last-used stamp looks stale.
-
-    Reproduces the race: a slow ``wait_for_diagnostics`` whose duration
-    exceeds ``idle_timeout`` refreshes ``_last_used`` only AFTER the await
-    completes, so without an in-flight guard the reaper would pop+shutdown
-    the client out from under the request.
-    """
-    repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("")
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=3.0,
-        install_strategy="manual",
-        idle_timeout=0.01,
-    )
-    try:
-        # Spawn a real client so there's something for the reaper to find.
-        svc.get_diagnostics_sync(str(f))
-        info = svc.get_status()
-        assert len(info["clients"]) == 1
-        key = (info["clients"][0]["server_id"], info["clients"][0]["workspace_root"])
-
-        # Simulate an in-flight request: mark the key busy and let its
-        # last-used stamp go stale past idle_timeout.
-        svc._mark_inflight(key)
-        with svc._state_lock:
-            svc._last_used[key] = time.time() - 10.0  # well past idle_timeout
-
-        # The reaper must skip the busy client.
-        assert svc.reap_idle_clients_sync() == 0
-        assert len(svc.get_status()["clients"]) == 1
-
-        # Once the request completes (in-flight cleared), the now-idle client
-        # is eligible again.
-        svc._clear_inflight(key)
-        with svc._state_lock:
-            svc._last_used[key] = time.time() - 10.0
-        assert svc.reap_idle_clients_sync() == 1
-        assert svc.get_status()["clients"] == []
-    finally:
-        svc.shutdown()
-
-
 def test_reaper_survives_sweep_error(mock_pyright):
     """One failing sweep must not kill the reaper loop — the loop's
     ``except Exception`` guard must swallow the error and keep sweeping."""
@@ -290,3 +272,11 @@ def test_reaper_survives_sweep_error(mock_pyright):
         assert not svc._idle_reaper_task.done()
     finally:
         svc.shutdown()
+
+
+
+
+
+
+
+

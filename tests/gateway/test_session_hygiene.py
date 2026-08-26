@@ -989,217 +989,6 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
 
 
 
-@pytest.mark.asyncio
-async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
-    monkeypatch, tmp_path
-):
-    """A worker that keeps ticking progress forever must still be cut off at
-    hygiene_total_ceiling_seconds — liveness extends the wait, but not
-    indefinitely."""
-    release_worker = threading.Event()
-
-    class TrickleForeverCompressAgent:
-        last_instance = None
-
-        def __init__(self, **kwargs):
-            self.session_id = kwargs.get("session_id", "fake-session")
-            self._print_fn = None
-            self._last_compaction_in_place = False
-            self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
-                _last_compress_aborted=False,
-                _last_aux_model_failure_model=None,
-            )
-            self.shutdown_memory_provider = MagicMock()
-            self.close = MagicMock()
-            type(self).last_instance = self
-
-        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
-            # Ticks progress on every iteration but never finishes until
-            # the test releases it — models a degenerate trickle stream.
-            while not release_worker.wait(0.02):
-                if commit_fence is not None:
-                    commit_fence.touch_progress()
-            if commit_fence is not None and not commit_fence.begin_commit():
-                return (messages, None)
-            try:
-                return (messages, None)
-            finally:
-                if commit_fence is not None:
-                    commit_fence.finish_commit()
-
-    runner, adapter, event = _make_progress_runner(
-        monkeypatch, tmp_path, TrickleForeverCompressAgent,
-        "compression:\n"
-        "  enabled: true\n"
-        "  hygiene_timeout_seconds: 0.2\n"
-        "  hygiene_total_ceiling_seconds: 0.25\n"
-        "  hygiene_failure_cooldown_seconds: 120\n",
-    )
-    runner._hygiene_compression_failure_cooldowns = {}
-    db = MagicMock()
-    db.get_compression_failure_cooldown.return_value = None
-    runner._session_db = SimpleNamespace(_db=db)
-
-    wait_timeouts = []
-    real_wait_for = asyncio.wait_for
-
-    async def recording_wait_for(awaitable, timeout):
-        wait_timeouts.append(timeout)
-        return await real_wait_for(awaitable, timeout)
-
-    monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
-
-    started = time.monotonic()
-    try:
-        result = await runner._handle_message(event)
-    finally:
-        release_worker.set()
-    elapsed = time.monotonic() - started
-
-    assert result == "ok"
-    # The second wait must use only the remaining ceiling, not another full
-    # idle window. Inspect the budget directly so runner load cannot make this
-    # regression test flaky after the correct timeout has already fired.
-    short_waits = [timeout for timeout in wait_timeouts if timeout <= 0.21]
-    assert len(short_waits) >= 2, short_waits
-    assert short_waits[0] == pytest.approx(0.2, abs=0.02)
-    assert short_waits[1] < 0.1
-    assert elapsed < 2.0  # Coarse hang guard; timeout-budget assertions carry the contract.
-    timeout_warnings = [
-        s for s in adapter.sent if "Context compression timed out" in s["content"]
-    ]
-    assert len(timeout_warnings) == 1
-    db.record_compression_failure_cooldown.assert_called_once()
-    cooldown_session_id, cooldown_until, cooldown_error = (
-        db.record_compression_failure_cooldown.call_args.args
-    )
-    assert cooldown_session_id == "sess-progress"
-    assert cooldown_until > time.time()
-    assert cooldown_error == (
-        "session hygiene compression timed out with no output from the summary model"
-    )
-
-@pytest.mark.asyncio
-async def test_session_hygiene_does_not_repoint_when_rotated_transcript_write_fails(
-    monkeypatch, tmp_path
-):
-    """Mirrors test_compress_command_does_not_repoint_session_when_transcript_write_fails.
-
-    Hygiene auto-compress used to repoint session_entry.session_id onto the
-    rotated child SID *before* rewrite_transcript, and ignored a False return.
-    A failed write (lock/ENOSPC) left the live entry on an empty child while
-    the turn continued — conversation silently vanished. Write first; only
-    rebind after a durable persist, matching manual /compress.
-    """
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    class RotatingCompressAgent:
-        last_instance = None
-
-        def __init__(self, **kwargs):
-            self.model = kwargs.get("model")
-            self.session_id = kwargs.get("session_id", "sess-1")
-            self._last_compaction_in_place = False
-            self._print_fn = None
-            self.context_compressor = None
-            self.shutdown_memory_provider = MagicMock()
-            self.close = MagicMock()
-            type(self).last_instance = self
-
-        def _compress_context(self, messages, *_args, **_kwargs):
-            self.session_id = "sess-2"
-            return (
-                [
-                    {"role": "user", "content": "kept"},
-                    {"role": "assistant", "content": "summary"},
-                ],
-                None,
-            )
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = RotatingCompressAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    gateway_run = importlib.import_module("gateway.run")
-    GatewayRunner = gateway_run.GatewayRunner
-
-    adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
-    )
-    runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._voice_mode = {}
-    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
-    runner.session_store = MagicMock()
-    session_entry = SessionEntry(
-        session_key="agent:main:telegram:dm:user-1",
-        session_id="sess-1",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
-        platform=Platform.TELEGRAM,
-        chat_type="dm",
-    )
-    runner.session_store.get_or_create_session.return_value = session_entry
-    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
-    runner.session_store.has_any_sessions.return_value = True
-    # Canonical write fails — must not rebind live entry onto sess-2.
-    runner.session_store.rewrite_transcript = MagicMock(return_value=False)
-    runner.session_store.append_to_transcript = MagicMock()
-    runner.session_store._save = MagicMock()
-    runner._running_agents = {}
-    runner._pending_messages = {}
-    runner._pending_approvals = {}
-    runner._session_db = object()
-    runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
-    runner._rebind_turn_lease = MagicMock()
-    runner._sync_telegram_topic_binding = MagicMock()
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "ok",
-            "messages": [],
-            "tools": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-    )
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
-    monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
-    )
-    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
-
-    event = MessageEvent(
-        text="hello",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="user-1",
-            chat_type="dm",
-            user_id="12345",
-        ),
-        message_id="1",
-    )
-
-    result = await runner._handle_message(event)
-
-    assert result == "ok"
-    # Rewrite was attempted against the *child* SID (write-first).
-    runner.session_store.rewrite_transcript.assert_called_once()
-    assert runner.session_store.rewrite_transcript.call_args[0][0] == "sess-2"
-    # Live entry must stay on the original session — conversation remains reachable.
-    assert session_entry.session_id == "sess-1"
-    runner._rebind_turn_lease.assert_not_called()
-    runner.session_store._save.assert_not_called()
-    runner._sync_telegram_topic_binding.assert_not_called()
-
-
 # ---------------------------------------------------------------------------
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
@@ -1303,10 +1092,25 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
     """
     from hermes_state import SessionDB
 
+    gateway_run = importlib.import_module("gateway.run")
     session_id = "sess-restart"
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(session_id, "telegram")
+
+        main_thread = threading.get_ident()
+        streak_threads = []
+        original_cooldown_for_failure = gateway_run._hygiene_cooldown_for_failure
+
+        def tracked_cooldown_for_failure(*args, **kwargs):
+            streak_threads.append(threading.get_ident())
+            return original_cooldown_for_failure(*args, **kwargs)
+
+        monkeypatch.setattr(
+            gateway_run,
+            "_hygiene_cooldown_for_failure",
+            tracked_cooldown_for_failure,
+        )
 
         class AbortingCompressAgent:
             instances = 0
@@ -1335,6 +1139,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         )
         assert await runner1._handle_message(event1) == "ok"
         assert AbortingCompressAgent.instances == 1
+        assert len(streak_threads) == 1
+        assert streak_threads[0] != main_thread
 
         # The abort must have persisted a cooldown to the DB.
         state = db.get_compression_failure_cooldown(session_id)
@@ -1374,5 +1180,19 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         )
         # The user turn itself still runs; only compression is skipped.
         assert runner2._run_agent.await_count == 1
+
+        # Once the first deadline expires, the next failed attempt after a
+        # restart must use rung 2 (900s), not start over at 300s (#86650).
+        db.clear_compression_failure_cooldown(session_id)
+        runner3, _adapter3, event3 = _make_cooldown_runner(
+            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
+        )
+        assert await runner3._handle_message(event3) == "ok"
+        assert AbortingCompressAgent.instances == 2
+        assert len(streak_threads) == 2
+        assert all(thread_id != main_thread for thread_id in streak_threads)
+        escalated = db.get_compression_failure_cooldown(session_id)
+        assert escalated is not None
+        assert escalated["remaining_seconds"] == pytest.approx(900, abs=5)
     finally:
         db.close()

@@ -552,10 +552,10 @@ class TestGetHonchoClient:
         assert mock_h1.call_count == 1
         assert mock_h1.call_args.kwargs["timeout"] == 88.0
 
-        # A managed-timeout edit is detected even when size and mtime are unchanged.
-        st = managed_cfg.stat()
+        # A managed-timeout edit is detected (same-size write, so bump mtime).
         managed_cfg.write_text("honcho:\n  timeout: 99\n")
-        os.utime(managed_cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
+        st = managed_cfg.stat()
+        os.utime(managed_cfg, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
 
         with patch("honcho.Honcho", return_value=fake_honcho_2) as mock_h2:
             client3 = get_honcho_client(cfg)

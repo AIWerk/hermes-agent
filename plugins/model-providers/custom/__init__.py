@@ -13,21 +13,9 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
 """
 
 from typing import Any
-from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
-
-
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
-
-
-def _is_local_custom_endpoint(base_url: object) -> bool:
-    """Return whether a custom endpoint is a local Ollama-style service."""
-    if not isinstance(base_url, str) or not base_url.strip():
-        return True
-    host = (urlparse(base_url).hostname or "").lower()
-    return host in _LOOPBACK_HOSTS or host.startswith("127.")
 
 
 class CustomProfile(ProviderProfile):
@@ -66,18 +54,28 @@ class CustomProfile(ProviderProfile):
         if reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
-            _base_url = ctx.get("base_url")
-            _local_endpoint = _is_local_custom_endpoint(_base_url)
-            if (_effort == "none" or _enabled is False) and _local_endpoint:
+            if _effort == "none" or _enabled is False:
                 # Ollama's /v1/chat/completions silently ignores
                 # extra_body.think (only /api/chat honours it — ollama#14820)
                 # but respects the top-level reasoning_effort field, so both
                 # are needed to actually stop a thinking-capable model from
-                # reasoning (#25758).
+                # reasoning (#25758). Endpoints that recognize neither simply
+                # ignore them.
                 top_level["reasoning_effort"] = "none"
                 extra_body["think"] = False
-            elif _effort and _local_endpoint:
-                top_level["reasoning_effort"] = _effort
+            elif _effort:
+                # Clamp the internal ladder onto the widest OpenAI-compatible
+                # wire vocabulary (shared policy in agent.reasoning_effort) —
+                # GLM/ARK, vLLM and SGLang all top out at "max"; forwarding
+                # "ultra" verbatim is a guaranteed 400 (#89503).
+                from agent.reasoning_effort import (
+                    OPENAI_COMPAT_WIRE_EFFORTS,
+                    clamp_effort,
+                )
+
+                top_level["reasoning_effort"] = clamp_effort(
+                    _effort, OPENAI_COMPAT_WIRE_EFFORTS
+                )
 
         return extra_body, top_level
 

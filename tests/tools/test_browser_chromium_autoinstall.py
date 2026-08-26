@@ -7,8 +7,19 @@ import pytest
 import tools.browser_tool as bt
 
 
+class _AllowedLease:
+    allowed = True
+
+    def validate(self):
+        return True
+
+
 @pytest.fixture(autouse=True)
-def _reset_state():
+def _reset_state(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_security_policy_bool_strict",
+        lambda *a, **k: _AllowedLease(),
+    )
     bt._chromium_autoinstall_attempted = False
     bt._cached_chromium_installed = None
     yield
@@ -25,13 +36,39 @@ def _no_subprocess(monkeypatch):
 class TestGating:
     def test_disabled_lazy_installs_skips(self, monkeypatch):
         monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
-        monkeypatch.setattr("tools.lazy_deps._allow_lazy_installs", lambda: False)
+        class DisabledLease:
+            allowed = False
+
+            def validate(self):
+                return True
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *a, **k: DisabledLease(),
+        )
         calls = _no_subprocess(monkeypatch)
         assert bt._maybe_autoinstall_chromium() is False
         assert calls == []
 
     def test_docker_skips(self, monkeypatch):
         monkeypatch.setattr(bt, "_running_in_docker", lambda: True)
+        calls = _no_subprocess(monkeypatch)
+        assert bt._maybe_autoinstall_chromium() is False
+        assert calls == []
+
+    def test_policy_switch_before_subprocess_skips(self, monkeypatch):
+        class SwitchedLease:
+            allowed = True
+
+            def validate(self):
+                return False
+
+        monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_security_policy_bool_strict",
+            lambda *a, **k: SwitchedLease(),
+        )
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/x/agent-browser")
         calls = _no_subprocess(monkeypatch)
         assert bt._maybe_autoinstall_chromium() is False
         assert calls == []

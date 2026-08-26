@@ -1,211 +1,110 @@
 import json
-import os
 from types import SimpleNamespace
 
+import pytest
 
-def test_cui_actor_model_config_is_stamped_for_sessions(monkeypatch):
-    from run_agent import AIAgent
+
+ACTOR_A = {"tenant_id": "tenant-a", "actor_id": "actor-a", "role": "user"}
+ACTOR_B = {"tenant_id": "tenant-a", "actor_id": "actor-b", "role": "user"}
+
+
+def _row(session_id, actor=None, *, source="tui", visibility_scope="customer"):
+    config = None
+    if actor is not None:
+        config = json.dumps(
+            {
+                "_cui_visibility_scope": visibility_scope,
+                "_cui_actor_role": actor["role"],
+                "_cui_actor_id": actor["actor_id"],
+                "_cui_tenant_id": actor["tenant_id"],
+            }
+        )
+    return {"id": session_id, "source": source, "model_config": config}
+
+
+def test_agent_owner_stamp_uses_bound_authenticated_context_not_environment(monkeypatch):
+    from agent import agent_init
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
 
     monkeypatch.setenv(
         "AIWERK_CUI_ACTOR_CONTEXT",
-        json.dumps({"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}),
+        json.dumps({"tenant_id": "evil", "actor_id": "evil", "role": "admin"}),
     )
-    agent = AIAgent(provider="openai", model="gpt-4.1", api_key="test-key", base_url="http://127.0.0.1:9/v1", skip_memory=True)
+    token = bind_cui_actor_context(ACTOR_A)
+    try:
+        config = {}
+        agent_init._stamp_authenticated_cui_session_owner(config)
+    finally:
+        reset_cui_actor_context(token)
 
-    cfg = agent._session_init_model_config
-    assert cfg["_cui_visibility_scope"] == "admin"
-    assert cfg["_cui_actor_role"] == "admin"
-    assert cfg["_cui_actor_id"] == "aiwerk:operator:admin"
-    assert cfg["_cui_tenant_id"] == "example-tenant"
+    assert config["_cui_actor_context"] == ACTOR_A
+    assert config["_cui_actor_id"] == "actor-a"
+    assert config["_cui_tenant_id"] == "tenant-a"
+    assert config["_cui_visibility_scope"] == "customer"
 
 
-def test_customer_cui_actor_cannot_see_tagged_admin_sessions():
+def test_confined_visibility_requires_exact_owner_and_hides_all_untagged_rows():
     from hermes_cli import web_server
 
-    admin_session = {
-        "id": "admin-session",
-        "model_config": json.dumps(
-            {
-                "_cui_visibility_scope": "admin",
-                "_cui_actor_role": "admin",
-                "_cui_actor_id": "aiwerk:operator:admin",
-                "_cui_tenant_id": "example-tenant",
-            }
+    assert web_server._session_visible_to_cui_actor(_row("own", ACTOR_A), ACTOR_A)
+    for hidden in (
+        _row("foreign", ACTOR_B),
+        _row("untagged"),
+        _row("legacy", source="cli"),
+        _row("admin", {"tenant_id": "tenant-a", "actor_id": "admin", "role": "admin"}),
+        _row(
+            "same-id-admin",
+            {**ACTOR_A, "role": "admin"},
+            visibility_scope="admin",
         ),
-    }
-    user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
-    other_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:other-admin:admin", "role": "admin"}
-    same_admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
-
-    assert web_server._session_visible_to_cui_actor(admin_session, user_actor) is False
-    assert web_server._session_visible_to_cui_actor(admin_session, other_admin_actor) is False
-    assert web_server._session_visible_to_cui_actor(admin_session, same_admin_actor) is True
+    ):
+        assert not web_server._session_visible_to_cui_actor(hidden, ACTOR_A)
+    assert web_server._session_visible_to_cui_actor(_row("legacy"), {})
 
 
-def test_customer_cui_actor_cannot_see_legacy_untagged_internal_sessions():
+def test_actor_scoped_db_filters_before_count_and_pagination_and_blocks_side_effects():
     from hermes_cli import web_server
 
-    user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
-    admin_actor = {"tenant_id": "example-tenant", "actor_id": "aiwerk:operator:admin", "role": "admin"}
+    rows = [_row("foreign", ACTOR_B), _row("own-1", ACTOR_A), _row("own-2", ACTOR_A)]
 
-    for source in ["cli", "tui", "cron", "classifier", "reflection", "system", "internal"]:
-        session = {"id": f"legacy-{source}", "source": source, "model_config": None}
-        assert web_server._session_visible_to_cui_actor(session, user_actor) is False
-        assert web_server._session_visible_to_cui_actor(session, admin_actor) is True
+    class DB:
+        def __init__(self):
+            self.renamed = []
 
-    legacy_human_session = {"id": "legacy-web", "source": "web", "model_config": None}
-    assert web_server._session_visible_to_cui_actor(legacy_human_session, user_actor) is False
+        def list_sessions_rich(self, *, limit, offset=0, **_kwargs):
+            return rows[offset : offset + limit]
+
+        def get_session(self, sid):
+            return next((row for row in rows if row["id"] == sid), None)
+
+        def get_session_by_title(self, title):
+            return self.get_session("foreign" if title == "guessed" else title)
+
+        def rename_session(self, sid, title):
+            self.renamed.append((sid, title))
+            return True
+
+    raw = DB()
+    db = web_server._CuiActorScopedSessionDB(raw, ACTOR_A)
+    assert [row["id"] for row in db.list_sessions_rich(limit=1, offset=0)] == ["own-1"]
+    assert db.session_count() == 2
+    assert db.get_session("foreign") is None
+    assert db.get_session_by_title("guessed") is None
+    with pytest.raises(web_server._CuiSessionNotFound):
+        db.rename_session("foreign", "stolen")
+    assert raw.renamed == []
 
 
-def test_customer_cui_actor_only_sees_own_tagged_customer_sessions():
+def test_authenticated_request_context_fails_closed_when_identity_incomplete():
     from hermes_cli import web_server
 
-    customer_session = {
-        "id": "customer-session",
-        "model_config": json.dumps(
-            {
-                "_cui_visibility_scope": "customer",
-                "_cui_actor_role": "user",
-                "_cui_actor_id": "example-tenant:customer:user",
-                "_cui_tenant_id": "example-tenant",
-            }
-        ),
-    }
-    other_customer_session = {
-        "id": "other-session",
-        "model_config": json.dumps(
-            {
-                "_cui_visibility_scope": "customer",
-                "_cui_actor_role": "user",
-                "_cui_actor_id": "example-tenant:other:user",
-                "_cui_tenant_id": "example-tenant",
-            }
-        ),
-    }
-    user_actor = {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user", "role": "user"}
-
-    assert web_server._session_visible_to_cui_actor(customer_session, user_actor) is True
-    assert web_server._session_visible_to_cui_actor(other_customer_session, user_actor) is False
-
-
-def test_cui_actor_context_from_authenticated_request(monkeypatch):
-    from hermes_cli import web_server
-
-    monkeypatch.setattr(web_server, "_assistant_mode_enabled", lambda: True)
-    request = SimpleNamespace(
+    complete = SimpleNamespace(
         state=SimpleNamespace(
-            session=SimpleNamespace(
-                tenant_id="example-tenant",
-                org_id="",
-                actor_id="example-tenant:customer:user",
-                user_id="Customer",
-                role="user",
-            )
+            session=SimpleNamespace(tenant_id="tenant-a", actor_id="actor-a", role="user")
         )
     )
-
-    assert web_server._cui_actor_context_from_request(request) == {
-        "tenant_id": "example-tenant",
-        "actor_id": "example-tenant:customer:user",
-        "role": "user",
-    }
-
-
-def test_cui_actor_context_fails_closed_when_metadata_empty(monkeypatch):
-    # A logged-in customer in assistant mode whose auth provider does NOT
-    # populate tenant/actor/role must NOT yield {} (which the visibility filter
-    # reads as the trusted admin/loopback path). It returns the restricted
-    # sentinel so the customer view fails closed.
-    from hermes_cli import web_server
-
-    monkeypatch.setattr(web_server, "_assistant_mode_enabled", lambda: True)
-    request = SimpleNamespace(
-        state=SimpleNamespace(
-            session=SimpleNamespace(
-                tenant_id="", org_id="", actor_id="", user_id="", role="",
-            )
-        )
+    incomplete = SimpleNamespace(
+        state=SimpleNamespace(session=SimpleNamespace(tenant_id="", actor_id="", role="user"))
     )
-    actor = web_server._cui_actor_context_from_request(request)
-    assert actor.get("_restricted") == "1"
-
-
-def test_restricted_actor_sees_no_sessions(monkeypatch):
-    # The restricted sentinel must make every session invisible (fail closed),
-    # including customer-tagged ones with no proven ownership.
-    from hermes_cli import web_server
-
-    restricted = {"role": "user", "_restricted": "1"}
-    tagged_customer = {
-        "id": "cust-session",
-        "model_config": json.dumps(
-            {
-                "_cui_visibility_scope": "customer",
-                "_cui_actor_role": "user",
-                "_cui_actor_id": "example-tenant:customer:user",
-                "_cui_tenant_id": "example-tenant",
-            }
-        ),
-    }
-    untagged = {"id": "x", "source": "tui", "model_config": None}
-    assert web_server._session_visible_to_cui_actor(tagged_customer, restricted) is False
-    assert web_server._session_visible_to_cui_actor(untagged, restricted) is False
-    # And the unconfined path (no actor at all) is unchanged.
-    assert web_server._session_visible_to_cui_actor(untagged, {}) is True
-
-
-def test_incomplete_actor_sees_no_sessions():
-    from hermes_cli import web_server
-
-    tagged_customer = {
-        "id": "cust-session",
-        "model_config": json.dumps(
-            {
-                "_cui_visibility_scope": "customer",
-                "_cui_actor_role": "user",
-                "_cui_actor_id": "example-tenant:customer:user",
-                "_cui_tenant_id": "example-tenant",
-            }
-        ),
-    }
-    incomplete = [
-        {"role": "user"},
-        {"tenant_id": "example-tenant", "role": "user"},
-        {"actor_id": "example-tenant:customer:user", "role": "user"},
-        {"tenant_id": "example-tenant", "actor_id": "example-tenant:customer:user"},
-    ]
-    for actor in incomplete:
-        assert web_server._session_visible_to_cui_actor(tagged_customer, actor) is False
-
-
-def test_customer_cui_actor_only_sees_linked_telegram_sessions(monkeypatch):
-    from hermes_cli import web_server
-
-    cfg = {
-        "dashboard": {
-            "basic_auth": {
-                "users": [
-                    {
-                        "actor_id": "example-tenant:customer:user",
-                        "user_id": "Customer",
-                        "tenant_id": "example-tenant",
-                        "role": "user",
-                        "telegram_user_ids": ["1461953838"],
-                    }
-                ]
-            }
-        }
-    }
-    monkeypatch.setattr(web_server, "load_config", lambda: cfg)
-    user_actor = {
-        "tenant_id": "example-tenant",
-        "actor_id": "example-tenant:customer:user",
-        "role": "user",
-        "user_id": "Customer",
-    }
-
-    own_telegram = {"id": "own-tg", "source": "telegram", "user_id": "1461953838", "model_config": None}
-    other_telegram = {"id": "other-tg", "source": "telegram", "user_id": "1392690488", "model_config": None}
-
-    assert web_server._session_visible_to_cui_actor(own_telegram, user_actor) is True
-    assert web_server._session_visible_to_cui_actor(other_telegram, user_actor) is False
+    assert web_server._cui_actor_context_from_request(complete) == ACTOR_A
+    assert web_server._cui_actor_context_from_request(incomplete)["_restricted"] == "1"

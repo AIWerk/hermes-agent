@@ -1,149 +1,72 @@
-"""Authenticated AIWerk CUI actor-context helpers."""
+"""Canonical authenticated actor context for CUI gateway flows."""
 
 from __future__ import annotations
 
 import contextvars
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Mapping
 
-_ADMIN_ROLES = {"admin", "operator", "owner", "support"}
-
-_ACTOR_KEYS = (
+ACTOR_IDENTITY_KEYS = (
     "tenant_id",
     "actor_id",
     "role",
     "display_name",
     "user_id",
     "provider",
-    "_restricted",
 )
 
-# Per-turn actor context, bound by in-process gateway turns. ``os.environ`` is
-# process-global, so concurrent in-process turns in the TUI gateway would clobber
-# each other's actor identity (cross-customer context bleed). The contextvar is
-# isolated per logical flow (thread / asyncio task / copied context), so it is
-# race-free across concurrent turns. ``os.environ`` stays as the fallback for the
-# subprocess CLI/cron/test paths, where the child receives the context via its
-# environment rather than an in-process binding.
-_cui_actor_context_var: contextvars.ContextVar[Dict[str, str] | None] = (
-    contextvars.ContextVar("cui_actor_context", default=None)
+_actor_context: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "cui_actor_context",
+    default=None,
 )
 
 
-def _sanitize_actor(data: Dict[str, Any] | None) -> Dict[str, str]:
-    clean: Dict[str, str] = {}
-    for key in _ACTOR_KEYS:
-        value = (data or {}).get(key)
+def sanitize_cui_actor_context(actor: Mapping[str, Any] | None) -> dict[str, str]:
+    """Return only non-empty values from the fixed actor identity allowlist."""
+    clean: dict[str, str] = {}
+    for key in ACTOR_IDENTITY_KEYS:
+        value = (actor or {}).get(key)
         if value is not None and str(value).strip():
             clean[key] = str(value).strip()
     return clean
 
 
-def bind_cui_actor_context(actor: Dict[str, str] | None) -> contextvars.Token:
-    """Bind a sanitized actor context for the current logical flow.
-
-    Returns a token; pass it to :func:`reset_cui_actor_context` (try/finally) to
-    restore the previous binding. An empty/None actor binds ``None`` so reads
-    fall through to the ``os.environ`` path.
-    """
-    clean = _sanitize_actor(actor)
-    return _cui_actor_context_var.set(clean or None)
+def bind_cui_actor_context(
+    actor: Mapping[str, Any] | None,
+) -> contextvars.Token[dict[str, str] | None]:
+    """Bind sanitized server identity for this logical flow, including empty."""
+    return _actor_context.set(sanitize_cui_actor_context(actor))
 
 
-def reset_cui_actor_context(token: contextvars.Token) -> None:
-    """Restore the actor context to the value captured in ``token``."""
-    _cui_actor_context_var.reset(token)
+def reset_cui_actor_context(
+    token: contextvars.Token[dict[str, str] | None],
+) -> None:
+    """Restore the binding captured by *token*."""
+    _actor_context.reset(token)
 
 
-def current_cui_actor_context() -> Dict[str, str]:
-    """Return sanitized actor context injected by the authenticated CUI.
-
-    Prefers the per-turn contextvar (race-free across concurrent in-process
-    turns); falls back to the ``os.environ`` bridge for CLI/cron/subprocess/test
-    paths where no contextvar is bound.
-    """
-    bound = _cui_actor_context_var.get()
-    if bound:
+def current_cui_actor_context() -> dict[str, str]:
+    """Read flow-local identity, or the subprocess/CLI environment fallback."""
+    bound = _actor_context.get()
+    if bound is not None:
         return dict(bound)
-    raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "") or ""
-    data: Dict[str, Any] = {}
+
+    data: dict[str, Any] = {}
+    raw = os.getenv("AIWERK_CUI_ACTOR_CONTEXT", "")
     if raw:
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 data = parsed
-        except Exception:
-            data = {}
-    for env_key, out_key in (
+        except (TypeError, ValueError):
+            pass
+    for env_key, actor_key in (
         ("AIWERK_CUI_TENANT_ID", "tenant_id"),
         ("AIWERK_CUI_ACTOR_ID", "actor_id"),
         ("AIWERK_CUI_ACTOR_ROLE", "role"),
     ):
         value = os.getenv(env_key, "")
-        if value and not data.get(out_key):
-            data[out_key] = value
-    return _sanitize_actor(data)
-
-
-def is_aiwerk_admin_actor(actor: Dict[str, str] | None = None) -> bool:
-    """True for authenticated AIWerk admin/operator/support actors."""
-    actor = actor if actor is not None else current_cui_actor_context()
-    role = (actor.get("role") or "").strip().lower()
-    actor_id = (actor.get("actor_id") or "").strip().lower()
-    return role in _ADMIN_ROLES or actor_id.startswith("aiwerk:")
-
-
-def cui_actor_system_prompt(actor: Dict[str, str] | None = None) -> str:
-    """Prompt-visible boundary between customer and admin CUI sessions."""
-    actor = actor if actor is not None else current_cui_actor_context()
-    if not actor:
-        return ""
-    tenant_id = actor.get("tenant_id", "")
-    actor_id = actor.get("actor_id") or actor.get("user_id", "")
-    role = actor.get("role", "")
-    display_name = actor.get("display_name") or actor.get("user_id") or actor_id
-    base = (
-        "Authenticated AIWerk CUI actor context: "
-        f"current_human={display_name!r}, actor_id={actor_id!r}, "
-        f"role={role!r}, tenant_id={tenant_id!r}."
-    )
-    if is_aiwerk_admin_actor(actor):
-        return (
-            base + " The current human is an AIWerk admin/operator, not the primary customer user. "
-            "Do NOT address or model the current human as the customer user. "
-            "Treat customer profile/memory as information about the tenant customer, not as the current speaker's identity. "
-            "Do not write admin/operator conversation facts to customer USER.md, customer memory, or Honcho 'user' peer. "
-            "Durable admin/support notes belong only in explicit audit/operator notes or sanitized AIWerk wiki/SOP after approval."
-        )
-    return (
-        base + " The current human is the authenticated customer/user for this tenant. "
-        "Customer-scoped memory may be used according to the tenant memory policy."
-    )
-
-
-def memory_write_blocked_for_cui_admin(function_name: str, args: dict | None) -> bool:
-    """Block customer-memory writes from authenticated CUI admin sessions."""
-    if not is_aiwerk_admin_actor():
-        return False
-    name = (function_name or "").lower()
-    action = str((args or {}).get("action") or "").lower()
-    if name == "memory" and action in {"add", "replace", "remove"}:
-        return True
-    if name in {"honcho_conclude", "mem0_conclude"}:
-        return True
-    if name == "fact_store" and action in {"add", "update", "remove", "delete"}:
-        return True
-    return False
-
-
-def cui_admin_memory_block_result(function_name: str) -> str:
-    return json.dumps({
-        "success": False,
-        "error": (
-            f"{function_name} writes are disabled in AIWerk CUI admin/operator sessions. "
-            "Admin/support conversation facts must not be stored in the customer user's memory. "
-            "Use an explicit audit/operator note or sanitized AIWerk wiki/SOP route instead."
-        ),
-        "blocked_by": "cui_admin_actor_memory_guard",
-    })
+        if value and not data.get(actor_key):
+            data[actor_key] = value
+    return sanitize_cui_actor_context(data)

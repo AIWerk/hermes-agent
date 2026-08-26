@@ -33,13 +33,15 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
     INFORMATION_RETRIEVAL_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
-    OPERATOR_VERIFICATION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
@@ -57,6 +59,11 @@ from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+OPERATOR_VERIFICATION_GUIDANCE = (
+    "Operator verification: for admin-sensitive CLI/TUI/SSH actions, call "
+    "verify_operator_identity. Never ask the user to paste the operator secret into chat. "
+    "Verification does not bypass independent command policy."
+)
 _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"^## Plugin Context: (?P<id>[a-z0-9][a-z0-9._-]{0,127})\n"
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
@@ -362,8 +369,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
-    # None falls back to the flat default. This value is stable for the life of
-    # the conversation, so it does not threaten prompt caching.
+    # None falls back to the historical flat default. This value is stable for
+    # the life of the conversation, so it does not threaten prompt caching.
     _ctx_len: Optional[int] = None
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None:
@@ -391,8 +398,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # Pointer to the hermes-agent skill + docs for user questions about Hermes
+    # itself. When the session has no skill tools (Blank Slate with the skills
+    # toolset off), skill_view() would be a dangling reference — inject the
+    # docs-only variant instead. Toolset is fixed per-session, so cache-safe.
+    _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
+    stable_parts.append(
+        HERMES_AGENT_HELP_GUIDANCE if _has_skill_view
+        else HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS
+    )
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -414,15 +428,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
 
-    # Universal lookup-order guidance.  Keep it stable and compact so agents
-    # search the right layer before asking the user to repeat retrievable facts.
+    # Universal lookup order. Tool availability is fixed for the session, so
+    # this remains in the stable cached tier and never advertises extra tools.
     if agent.valid_tool_names:
         stable_parts.append(INFORMATION_RETRIEVAL_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
+    # MEMORY_GUIDANCE instructs the model to save facts to the built-in
+    # MEMORY.md/USER.md stores. With both disabled in config no store is built,
+    # so the guidance would steer the model at a tool whose every call returns
+    # "Memory is not available". Defaults to True for the rare code paths that
+    # build an agent view without going through agent_init.
+    # When only the user profile store is enabled, the narrower
+    # USER_PROFILE_GUIDANCE is injected instead — the full block instructs the
+    # model to write notes to a MEMORY.md store that does not exist.
+    _mem_enabled = getattr(agent, "_memory_enabled", True)
+    _profile_enabled = getattr(agent, "_user_profile_enabled", True)
     if "memory" in agent.valid_tool_names:
-        tool_guidance.append(MEMORY_GUIDANCE)
+        if _mem_enabled:
+            tool_guidance.append(MEMORY_GUIDANCE)
+        elif _profile_enabled:
+            tool_guidance.append(USER_PROFILE_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
@@ -430,13 +457,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "verify_operator_identity" in agent.valid_tool_names:
         tool_guidance.append(OPERATOR_VERIFICATION_GUIDANCE)
     _operator_ctx = getattr(agent, "operator_session_context", None)
-    if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator":
+    if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator_session":
         stable_parts.append(
-            "Operator session context: the local human was verified before the first turn. "
-            f"Treat the human as actor_id={_operator_ctx.get('actor_id', '')!r}, "
-            f"role={_operator_ctx.get('role', '')!r}, acting_for={_operator_ctx.get('acting_for', 'aiwerk')!r}. "
-            "Route durable notes from this session to operator memory/sanitized AIWerk wiki as appropriate, "
-            "not to customer/end-user memory. Do not ask for or record operator secrets."
+            "Operator session context: this trusted CLI bootstrap labels the current human "
+            f"as actor_id={_operator_ctx.get('actor_id', 'unknown_cli')!r}. It does not authenticate or authorize "
+            "the human, does not upgrade their role, and must not be persisted to customer memory, USER.md, "
+            "Honcho, transcripts, or wiki. Sensitive actions still require verify_operator_identity."
         )
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -495,13 +521,37 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # paths, parallel tool calls, verify-before-edit, etc.)
             if "gemini" in _model_lower or "gemma" in _model_lower:
                 stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-            # OpenAI GPT/Codex execution discipline (tool persistence,
-            # prerequisite checks, verification, anti-hallucination).
-            # Also applied to xAI Grok — same failure modes (claims completion
-            # without tool calls, suggests workarounds instead of using
-            # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
-                stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+
+    # Execution-discipline guidance (tool persistence, mandatory tool use
+    # for arithmetic, external-write read-back, count reconciliation,
+    # literal preservation, verification-gated completion).  Historically
+    # nested inside the tool-use-enforcement branch and fenced to
+    # gpt/codex/grok; now an independent gate so DeepSeek/Kimi/Qwen-class
+    # models receive it even when tool_use_enforcement is off.  Controlled
+    # by config.yaml agent.execution_guidance:
+    #   "auto" (default) — matches EXECUTION_GUIDANCE_MODELS
+    #   true  — always inject (all models)
+    #   false — never inject
+    #   list  — custom model-name substrings to match
+    # Resolved once at session start keyed on the (fixed) model name, so
+    # the system prompt stays byte-stable for the life of the conversation.
+    if agent.valid_tool_names:
+        _exec_guidance = getattr(agent, "_execution_guidance", "auto")
+        _exec_inject = False
+        if _exec_guidance is True or (isinstance(_exec_guidance, str) and _exec_guidance.lower() in {"true", "always", "yes", "on"}):
+            _exec_inject = True
+        elif _exec_guidance is False or (isinstance(_exec_guidance, str) and _exec_guidance.lower() in {"false", "never", "no", "off"}):
+            _exec_inject = False
+        elif isinstance(_exec_guidance, list):
+            model_lower = (agent.model or "").lower()
+            _exec_inject = any(p.lower() in model_lower for p in _exec_guidance if isinstance(p, str))
+        else:
+            # "auto" or any unrecognised value — use hardcoded defaults
+            model_lower = (agent.model or "").lower()
+            _exec_inject = any(p in model_lower for p in EXECUTION_GUIDANCE_MODELS)
+        if _exec_inject:
+            from agent.prompt_builder import execution_guidance_text
+            stable_parts.append(execution_guidance_text(agent.valid_tool_names))
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
@@ -570,6 +620,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 platform=agent.platform,
                 cwd=resolve_context_cwd(),
                 model=agent.model,
+                valid_tool_names=agent.valid_tool_names,
             )
             stable_parts.extend(coding_prefix_parts)
         except Exception:
@@ -600,6 +651,43 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 post_workspace_parts.append(_probe_line)
         except Exception:
             # Probe failure must never block prompt build.
+            pass
+
+    # Bot Mode teammate protocol — injected ONLY into a bot's canonical
+    # "Bot Chat" session (the conversation teammate bots message into via
+    # `hermes -p <bot> chat --in ~ -c "Bot Chat"` and the desktop pins), on
+    # installs where Bot Mode manages profiles (ui_meta['hermes-bots']).
+    # Regular sessions never carry it — the desktop's composer middleware
+    # owns the @mention send path. Title is read once at first build and the
+    # rendered prompt is cached + DB-restored, so this is cache-safe.
+    # Gated by config.yaml ``agent.bot_mode_protocol`` (default True).
+    if getattr(agent, "_bot_mode_protocol", True):
+        try:
+            from tools.bot_mode_probe import (
+                BOT_CHAT_TITLE,
+                epoch_line,
+                get_bot_mode_protocol_section,
+            )
+            _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+            if not _title:
+                _sdb = getattr(agent, "_session_db", None)
+                _sid = getattr(agent, "session_id", None)
+                _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
+            if _title == BOT_CHAT_TITLE:
+                _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
+                if _bot_section:
+                    post_workspace_parts.append(_bot_section)
+                    # Eternal-session support: stamp the capability epoch so
+                    # the restore path can detect user-initiated capability
+                    # changes (skills/toolsets/MCP/SOUL/roster) and rebuild
+                    # ONCE per change instead of waiting for /new or
+                    # compression. Also marks this prompt as timeless — the
+                    # volatile timestamp line is omitted (see below), since a
+                    # birth date pinned in a session that lives for months is
+                    # misinformation.
+                    post_workspace_parts.append(epoch_line(_agent_home(agent)))
+                    agent._bot_chat_timeless_prompt = True
+        except Exception:
             pass
 
     # Active-profile hint — names the Hermes profile the agent is running
@@ -760,44 +848,33 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         volatile_parts.append(skills_prompt)
 
-    try:
-        from agent.cui_actor_context import (
-            cui_actor_system_prompt,
-            current_cui_actor_context,
-            is_aiwerk_admin_actor,
-        )
-        _cui_actor = current_cui_actor_context()
-        _cui_admin_actor = is_aiwerk_admin_actor(_cui_actor)
-        _cui_actor_block = cui_actor_system_prompt(_cui_actor)
-    except Exception:
-        _cui_actor = {}
-        _cui_admin_actor = False
-        _cui_actor_block = ""
-    if _cui_actor_block:
-        volatile_parts.append(_cui_actor_block)
-
     if agent._memory_store:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
-        # USER.md describes the primary customer. In CUI admin/operator
-        # sessions, omit it so the assistant cannot confuse the admin with the
-        # customer or leak customer user-memory into support chat.
-        if agent._user_profile_enabled and not _cui_admin_actor:
+        # USER.md is always included when enabled.
+        if agent._user_profile_enabled:
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in).
-    # Admin/operator sessions do not receive customer external-memory context.
-    if agent._memory_manager and not _cui_admin_actor:
+    # Gated on the same check ``inject_memory_provider_tools`` uses so we
+    # never advertise provider tools that the agent's toolset configuration
+    # has already gated off (#81014).
+    if agent._memory_manager:
         try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
+            from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
-            pass
+            _mem_exposed = None
+        if _mem_exposed is None or _mem_exposed(agent):
+            try:
+                _ext_mem_block = agent._memory_manager.build_system_prompt()
+                if _ext_mem_block:
+                    volatile_parts.append(_ext_mem_block)
+            except Exception:
+                pass
 
     # Plugin sections are intentionally confined to one coarse anchor in the
     # volatile tail. This preserves deterministic ordering and lets a resumed
@@ -806,7 +883,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory")
     )
 
-    from hermes_time import now as _hermes_now
+    from hermes_time import get_timezone as _hermes_tz, now as _hermes_now
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
@@ -814,7 +891,37 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    #
+    # Zone and UTC offset ARE included: tools that accept instants reject naive
+    # datetimes and require an explicit offset, and with the bare date the model
+    # has to infer EST vs EDT on its own (a coin-flip near a DST boundary, and a
+    # wrong guess silently writes the record onto the wrong day).  Both values
+    # are constant for the whole day -- they shift only at a DST transition --
+    # so the byte-stability the comment above depends on is preserved.
+    # ``get_timezone()`` returns None when no timezone is configured, in which
+    # case we fall back to the abbreviation of the server-local (still tz-aware)
+    # time.
+    _tz = _hermes_tz()
+    _zone_bits = []
+    _iana = getattr(_tz, "key", None)
+    if _iana:
+        _zone_bits.append(_iana)
+    _abbrev = now.strftime("%Z")
+    if _abbrev and _abbrev != _iana:
+        _zone_bits.append(_abbrev)
+    _offset = now.strftime("%z")
+    if _offset:  # '-0400' -> 'UTC-04:00'
+        _zone_bits.append(f"UTC{_offset[:3]}:{_offset[3:]}")
+    _zone_suffix = f" ({', '.join(_zone_bits)})" if _zone_bits else ""
+    timestamp_line = (
+        f"Conversation started: {now.strftime('%A, %B %d, %Y')}{_zone_suffix}"
+    )
+    # Bot Chat sessions are effectively eternal — a birth date frozen in the
+    # prompt becomes confidently-wrong misinformation within days. Timeless
+    # prompts keep the identity lines but drop the date (the timezone still
+    # rides workspace context; live time comes from the terminal tool).
+    if getattr(agent, "_bot_chat_timeless_prompt", False):
+        timestamp_line = f"Timezone: {', '.join(_zone_bits)}" if _zone_bits else ""
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:

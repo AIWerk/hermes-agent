@@ -18,13 +18,11 @@ Attribution: do not reference any third-party product by name in this file.
 from __future__ import annotations
 
 import copy
-import hashlib
-import io
 import logging
 import os
 import threading
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import yaml
 
@@ -35,7 +33,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (mtime_ns, size, content_digest, parsed)
+# path_key -> (mtime_ns, size, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
@@ -67,9 +65,18 @@ def get_managed_dir() -> Optional[Path]:
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
         p = Path(override)
-        return p if p.is_dir() else None
+        try:
+            if p.is_symlink():
+                raise RuntimeError(f"managed scope directory must not be a symlink: {p}")
+            if not p.is_dir():
+                raise RuntimeError(f"selected managed scope directory is unavailable: {p}")
+        except OSError as exc:
+            raise RuntimeError(f"selected managed scope directory cannot be read: {p}") from exc
+        return p
     if _under_pytest():
         return None
+    if _DEFAULT_MANAGED_DIR.is_symlink():
+        raise RuntimeError("managed scope directory must not be a symlink: /etc/hermes")
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
 
 
@@ -80,21 +87,27 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read_snapshot(path: Path, cache: Dict[str, tuple], parse):
-    """Read, fingerprint, and parse one immutable byte snapshot."""
+def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+    """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
+
+    Returns ``None`` when the file is absent or fails to parse (fail-open). A
+    parse failure is logged LOUDLY — the admin needs to know their policy isn't
+    being applied — but never raises, so a malformed managed file can't brick
+    startup.
+    """
     try:
         st = path.stat()
-        raw = path.read_bytes()
     except OSError:
-        return None, (0, 0, b"")
-    key = (st.st_mtime_ns, st.st_size, hashlib.blake2b(raw, digest_size=16).digest())
+        return None  # absent
+    key = (st.st_mtime_ns, st.st_size)
     path_key = str(path)
     with _CACHE_LOCK:
         hit = cache.get(path_key)
-        if hit is not None and hit[:3] == key:
-            return copy.deepcopy(hit[3]), key
+        if hit is not None and hit[:2] == key:
+            return copy.deepcopy(hit[2])
     try:
-        parsed = parse(io.StringIO(raw.decode("utf-8")))
+        with open(path, encoding="utf-8") as f:
+            parsed = parse(f)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
@@ -102,41 +115,23 @@ def _cached_read_snapshot(path: Path, cache: Dict[str, tuple], parse):
             path,
             exc,
         )
-        return None, key
+        return None
     with _CACHE_LOCK:
-        cache[path_key] = (*key, copy.deepcopy(parsed))
-    return parsed, key
-
-
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared stat + content-keyed read. Returns a deepcopy of the parsed value.
-
-    Returns ``None`` when the file is absent or fails to parse (fail-open). A
-    parse failure is logged LOUDLY — the admin needs to know their policy isn't
-    being applied — but never raises, so a malformed managed file can't brick
-    startup.
-    """
-    parsed, _signature = _cached_read_snapshot(path, cache, parse)
+        cache[path_key] = (key[0], key[1], copy.deepcopy(parsed))
     return parsed
 
 
 def load_managed_config() -> dict:
     """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    parsed, _signature = load_managed_config_with_signature()
-    return parsed
-
-
-def load_managed_config_with_signature() -> Tuple[dict, Tuple[int, int, bytes]]:
-    """Return managed config and the signature of the exact parsed bytes."""
     managed_dir = get_managed_dir()
     if managed_dir is None:
-        return {}, (0, 0, b"")
-    parsed, signature = _cached_read_snapshot(
+        return {}
+    parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
         lambda f: yaml.safe_load(f) or {},
     )
-    return (parsed if isinstance(parsed, dict) else {}), signature
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def load_managed_env() -> Dict[str, str]:

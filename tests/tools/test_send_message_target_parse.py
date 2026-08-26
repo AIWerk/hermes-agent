@@ -118,6 +118,7 @@ def test_resolved_opaque_plugin_target_uses_directory_id() -> None:
         force_document=False,
     )
 
+
 def test_unresolved_plugin_target_requires_explicit_parser() -> None:
     from gateway.platform_registry import PlatformEntry, platform_registry
 
@@ -175,6 +176,7 @@ def test_unresolved_plugin_target_requires_explicit_parser() -> None:
     discover_mock.assert_called_once_with()
     send_mock.assert_not_awaited()
 
+
 def test_unresolved_builtin_target_keeps_directory_error() -> None:
     telegram_cfg = SimpleNamespace(enabled=True, token="***", extra={})
     config = SimpleNamespace(
@@ -204,6 +206,8 @@ def test_unresolved_builtin_target_keeps_directory_error() -> None:
     }
     send_mock.assert_not_awaited()
 
+
+
 def test_unresolved_builtin_target_passes_through_when_requested() -> None:
     """Cron and react keep the old pass-through behavior for unresolved
     built-in targets: with no model in the loop to react to an error, the
@@ -220,6 +224,7 @@ def test_unresolved_builtin_target_passes_through_when_requested() -> None:
     assert chat_id == "ops-room"
     assert thread_id is None
 
+
 def test_unresolved_builtin_target_still_errors_for_the_model_tool() -> None:
     """The model-facing default stays strict: unresolved targets error with a hint."""
     from tools.send_message_tool import resolve_send_target
@@ -229,6 +234,7 @@ def test_unresolved_builtin_target_still_errors_for_the_model_tool() -> None:
 
     assert chat_id is None
     assert error is not None
+
 
 def test_photon_group_guid_passes_through_when_requested() -> None:
     """The reported regression case: a photon group GUID matches no parser
@@ -249,6 +255,7 @@ def test_photon_group_guid_passes_through_when_requested() -> None:
     assert error is None
     assert chat_id == "iMessage;+;chat527148912345"
     assert thread_id is None
+
 
 def test_parserless_plugin_target_passes_through_when_requested() -> None:
     """A plugin platform that declares no parser has no explicit syntax at
@@ -275,6 +282,7 @@ def test_parserless_plugin_target_passes_through_when_requested() -> None:
     assert error is None
     assert chat_id == "dm:panyaozhen"
     assert thread_id is None
+
 
 def test_plugin_parser_stays_authoritative_despite_fallback() -> None:
     """A plugin that DOES declare a parser stays strict for every caller:

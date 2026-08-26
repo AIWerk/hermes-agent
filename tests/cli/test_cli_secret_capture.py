@@ -142,11 +142,6 @@ def test_cli_chat_registers_secret_capture_callback():
             cli_obj.chat("hello")
 
     try:
-        # Registration happens on this (main) thread, so the thread-local
-        # slot read here observes the callback the CLI just registered.
-        assert (
-            skills_tool_module._get_secret_capture_callback()
-            == cli_obj._secret_capture_callback
-        )
+        assert skills_tool_module._secret_capture_callback == cli_obj._secret_capture_callback
     finally:
         set_secret_capture_callback(None)

@@ -21,10 +21,8 @@ def test_session_finalize_on_reset(mock_finalize_session, mock_invoke_hook):
     cli.agent = MagicMock()
     cli.agent.session_id = "test-session-id"
 
-    cli._notify_session_boundary("on_session_finalize")
-    cli.agent.session_id = "new-session-id"
-    cli.session_id = "new-session-id"
-    cli._notify_session_boundary("on_session_reset")
+    # Simulate /new command which triggers on_session_finalize for the old session
+    cli.new_session(silent=True)
 
     # Check if on_session_finalize was called for the old session
     assert any(

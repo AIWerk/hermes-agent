@@ -1,143 +1,139 @@
-import sys
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
-
-
-def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-    telegram_mod = MagicMock()
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.constants.ChatType.GROUP = "group"
-    telegram_mod.constants.ChatType.SUPERGROUP = "supergroup"
-    telegram_mod.constants.ChatType.CHANNEL = "channel"
-    telegram_mod.constants.ChatType.PRIVATE = "private"
-    telegram_mod.error.NetworkError = type("NetworkError", (OSError,), {})
-    telegram_mod.error.TimedOut = type("TimedOut", (OSError,), {})
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, telegram_mod)
-    sys.modules.setdefault("telegram.error", telegram_mod.error)
-
-
-_ensure_telegram_mock()
-
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
-@pytest.mark.asyncio
-async def test_happy_path_connect_attempt_logs_at_info_not_warning(monkeypatch, caplog):
-    """Normal Telegram startup progress should not look like a warning."""
+def _mock_connect_dependencies(monkeypatch):
     fake_app = MagicMock()
     fake_app.bot = MagicMock()
-    fake_app.initialize = AsyncMock(return_value=None)
+    fake_app.initialize = MagicMock()
     fake_app.start = AsyncMock()
-    fake_app.add_handler = MagicMock()
 
-    chainable = MagicMock()
-    chainable.token.return_value = chainable
-    chainable.request.return_value = chainable
-    chainable.get_updates_request.return_value = chainable
-    chainable.build.return_value = fake_app
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.request.return_value = builder
+    builder.get_updates_request.return_value = builder
+    builder.build.return_value = fake_app
 
-    builder_root = MagicMock()
-    builder_root.builder.return_value = chainable
-    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    application = MagicMock()
+    application.builder.return_value = builder
+    monkeypatch.setattr(tg_adapter, "Application", application)
     monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
     monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
-    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
-    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", lambda awaitable, timeout, **_: awaitable)
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tg_adapter, "_shutdown_abandoned_app", AsyncMock())
 
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
-    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args, **kwargs: True)
     monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+    monkeypatch.setattr(adapter, "_instrument_polling_request", lambda request: request)
+    monkeypatch.setattr(adapter, "_register_handlers", lambda app: None)
     monkeypatch.setattr(adapter, "_delete_webhook_best_effort", AsyncMock())
     monkeypatch.setattr(adapter, "_start_polling_resilient", AsyncMock(return_value=True))
     monkeypatch.setattr(adapter, "_polling_heartbeat_loop", AsyncMock(return_value=None))
     monkeypatch.setattr(adapter, "_start_post_connect_housekeeping", MagicMock())
-
-    caplog.set_level("INFO", logger=tg_adapter.logger.name)
-
-    assert await adapter.connect() is True
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("Connecting to Telegram (attempt 1/8)" in msg for msg in messages)
-    assert not any(
-        record.levelname == "WARNING" and "Connecting to Telegram" in record.getMessage()
-        for record in caplog.records
-    )
-    assert not any(
-        record.levelname == "WARNING" and "Discovering Telegram API fallback IPs" in record.getMessage()
-        for record in caplog.records
-    )
+    return adapter, fake_app
 
 
 @pytest.mark.asyncio
-async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch):
-    """A wedged initialize() attempt must not trap startup on attempt 1/8."""
-    fake_app = MagicMock()
-    fake_app.bot = MagicMock()
-    fake_app.initialize = AsyncMock(return_value=None)
-    fake_app.start = AsyncMock()
-    fake_app.add_handler = MagicMock()
+async def test_normal_startup_progress_logs_at_info_not_warning(monkeypatch, caplog):
+    """Fallback discovery and an ordinary connect attempt are INFO progress."""
+    adapter, fake_app = _mock_connect_dependencies(monkeypatch)
 
-    chainable = MagicMock()
-    chainable.token.return_value = chainable
-    chainable.request.return_value = chainable
-    chainable.get_updates_request.return_value = chainable
-    chainable.build.return_value = fake_app
+    async def _initialize():
+        return None
 
-    builder_root = MagicMock()
-    builder_root.builder.return_value = chainable
-    monkeypatch.setattr(tg_adapter, "Application", builder_root)
-    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
-    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
-    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    fake_app.initialize.side_effect = _initialize
+    caplog.set_level(logging.INFO, logger=tg_adapter.logger.name)
+
+    assert await adapter.connect() is True
+
+    progress_fragments = (
+        "Discovering Telegram API fallback IPs",
+        "Connecting to Telegram (attempt 1/8)",
+    )
+    for fragment in progress_fragments:
+        matching = [
+            record for record in caplog.records if fragment in record.getMessage()
+        ]
+        assert matching
+        assert {record.levelno for record in matching} == {logging.INFO}
+
+
+@pytest.mark.asyncio
+async def test_deadline_timeout_and_retry_exhaustion_retain_warning_and_error(
+    monkeypatch, caplog
+):
+    """Real deadline trouble stays noisy through retry exhaustion."""
+    adapter, fake_app = _mock_connect_dependencies(monkeypatch)
+    monkeypatch.setenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "1")
     monkeypatch.setattr(tg_adapter.asyncio, "sleep", AsyncMock())
 
-    deadline_calls = 0
+    async def _timeout(awaitable, timeout, **kwargs):
+        awaitable.close()
+        raise tg_adapter.asyncio.TimeoutError()
 
-    async def _fake_deadline(awaitable, timeout, *, on_abandon=None):
-        nonlocal deadline_calls
-        deadline_calls += 1
-        # The first bounded await is fallback-IP discovery. Timeout the first
-        # initialize attempt (second bounded await), then let retry succeed.
-        if deadline_calls == 2:
-            awaitable.close()
-            raise tg_adapter.asyncio.TimeoutError()
-        return await awaitable
+    fake_app.initialize.side_effect = lambda: _never_awaited()
+    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", _timeout)
+    caplog.set_level(logging.INFO, logger=tg_adapter.logger.name)
 
-    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", _fake_deadline)
+    assert await adapter.connect() is False
 
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
-    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
-    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
-    monkeypatch.setattr(adapter, "_delete_webhook_best_effort", AsyncMock())
-    monkeypatch.setattr(adapter, "_start_polling_resilient", AsyncMock(return_value=True))
-    monkeypatch.setattr(adapter, "_polling_heartbeat_loop", AsyncMock(return_value=None))
-    monkeypatch.setattr(adapter, "_start_post_connect_housekeeping", MagicMock())
-
-    assert await adapter.connect() is True
-
-    assert fake_app.initialize.call_count == 2
-    assert fake_app.initialize.await_count == 1
-    assert deadline_calls == 3
-    tg_adapter.asyncio.sleep.assert_awaited_once_with(1)
-    fake_app.start.assert_awaited_once()
+    timeout_records = [
+        record
+        for record in caplog.records
+        if "timed out after" in record.getMessage()
+        and "retrying" in record.getMessage()
+    ]
+    assert len(timeout_records) == 7
+    assert {record.levelno for record in timeout_records} == {logging.WARNING}
+    exhausted = [
+        record
+        for record in caplog.records
+        if "Failed to connect to Telegram" in record.getMessage()
+    ]
+    assert exhausted
+    assert {record.levelno for record in exhausted} == {logging.ERROR}
 
 
 @pytest.mark.asyncio
-async def test_await_with_thread_deadline_returns_value_on_happy_path():
-    """The real helper returns the awaited result and raises no timeout."""
-    async def _ok():
-        return 42
+async def test_failed_attempt_retains_warning(monkeypatch, caplog):
+    """A transient initialize failure remains a warning before recovery."""
+    adapter, fake_app = _mock_connect_dependencies(monkeypatch)
+    monkeypatch.setenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "1")
+    monkeypatch.setattr(tg_adapter.asyncio, "sleep", AsyncMock())
+    attempts = 0
 
-    result = await tg_adapter._await_with_thread_deadline(_ok(), timeout=5.0)
-    assert result == 42
+    async def _deadline(awaitable, timeout, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            awaitable.close()
+            raise OSError("temporary transport failure")
+        return await awaitable
+
+    fake_app.initialize.side_effect = lambda: _never_awaited()
+    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", _deadline)
+    caplog.set_level(logging.INFO, logger=tg_adapter.logger.name)
+
+    assert await adapter.connect() is True
+
+    failures = [
+        record
+        for record in caplog.records
+        if "Connect attempt 1/8 failed" in record.getMessage()
+    ]
+    assert failures
+    assert {record.levelno for record in failures} == {logging.WARNING}
+
+
+async def _never_awaited():
+    return None
 
 
 @pytest.mark.asyncio
@@ -214,13 +210,15 @@ async def test_blocked_loop_after_expiry_dumps_diagnostics(monkeypatch):
     import asyncio as _asyncio
     import time as _time
 
+    from agent import deadline as _deadline
+
     dumps = []
     monkeypatch.setattr(
-        tg_adapter,
-        "_dump_loop_blocked_diagnostics",
-        lambda timeout, grace: dumps.append((timeout, grace)),
+        _deadline,
+        "_dump_blocked_loop_diagnostics",
+        lambda label, timeout_s: dumps.append((label, timeout_s)),
     )
-    monkeypatch.setattr(tg_adapter, "_LOOP_BLOCKED_DUMP_GRACE", 0.15)
+    monkeypatch.setattr(_deadline, "_LOOP_BLOCKED_DUMP_GRACE_S", 0.15)
 
     hung = _asyncio.get_running_loop().create_future()  # never completes
     task = _asyncio.ensure_future(
@@ -238,5 +236,7 @@ async def test_blocked_loop_after_expiry_dumps_diagnostics(monkeypatch):
     with pytest.raises(_asyncio.TimeoutError):
         await task
 
-    assert dumps == [(0.05, 0.15)]
+    assert dumps == [("telegram-init", 0.05)]
     hung.cancel()
+
+

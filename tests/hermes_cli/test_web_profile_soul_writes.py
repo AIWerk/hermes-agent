@@ -22,8 +22,101 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
 
 SOUL = "# Persona\n\nYou are a careful, terse assistant.\n"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _normalize_prose(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _extract_single_body(text: str, opening: str, closing: str) -> str:
+    assert text.count(opening) == 1
+    remainder = text.split(opening, 1)[1]
+    assert closing in remainder
+    return remainder.split(closing, 1)[0].replace("\r\n", "\n").strip()
+
+
+def test_default_soul_concise_guidance_is_synchronized():
+    canonical = (
+        "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+        "You are helpful, knowledgeable, direct, and concise. You assist users with a "
+        "wide range of tasks including answering questions, writing and editing code, "
+        "analyzing information, creative work, and executing actions via your tools. "
+        "You communicate clearly, admit uncertainty when appropriate, and prioritize "
+        "being genuinely useful over being verbose unless otherwise directed below. "
+        "Optimize for useful signal over verbosity: keep answers tight, summarize tool "
+        "outputs instead of pasting long raw logs, and avoid unnecessary explanation. "
+        "Be targeted and token-efficient in your exploration and investigations. When "
+        "the conversation context is close to the limit, warn the user briefly."
+    )
+    required_phrases = (
+        "You communicate clearly",
+        "admit uncertainty when appropriate",
+        "prioritize being genuinely useful over being verbose unless otherwise directed below",
+        "direct, and concise",
+        "Optimize for useful signal over verbosity",
+        "summarize tool outputs instead of pasting long raw logs",
+        "avoid unnecessary explanation",
+        "targeted and token-efficient",
+        "conversation context is close to the limit",
+    )
+    for identity in (DEFAULT_SOUL_MD, DEFAULT_AGENT_IDENTITY):
+        assert all(fragment in identity for fragment in required_phrases)
+    assert DEFAULT_SOUL_MD == DEFAULT_AGENT_IDENTITY == canonical
+
+    docker_soul = (REPO_ROOT / "docker" / "SOUL.md").read_text(encoding="utf-8")
+    assert docker_soul.rstrip("\r\n") == canonical
+
+    install_sh = (REPO_ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+    assert (
+        _extract_single_body(
+            install_sh,
+            'cat > "$HERMES_HOME/SOUL.md" << \'SOUL_EOF\'\n',
+            "\nSOUL_EOF",
+        )
+        == canonical
+    )
+
+    install_ps1 = (REPO_ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
+    assert _extract_single_body(install_ps1, '$soulContent = @"\n', '\n"@') == canonical
+
+    english_docs = (REPO_ROOT / "website/docs/developer-guide/prompt-assembly.md").read_text(
+        encoding="utf-8"
+    )
+    assert _normalize_prose(
+        "You are Hermes Agent"
+        + _extract_single_body(english_docs, "```\nYou are Hermes Agent", "\n```")
+    ) == _normalize_prose(canonical)
+
+    chinese_docs = (
+        REPO_ROOT
+        / "website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/developer-guide/prompt-assembly.md"
+    ).read_text(encoding="utf-8")
+    chinese_fallback = "You are Hermes Agent" + _extract_single_body(
+        chinese_docs, "```\nYou are Hermes Agent", "\n```"
+    )
+    assert _normalize_prose(chinese_fallback) == _normalize_prose(canonical)
+    chinese_explanation = chinese_docs.split(chinese_fallback + "\n```", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    for phrase in (
+        "清晰沟通",
+        "在适当情况下坦诚不确定性",
+        "真正有用",
+        "后续明确指示可覆盖这些默认偏好",
+        "简洁",
+        "信息密度高",
+        "概括冗长的工具输出",
+        "不必要的解释",
+        "token",
+        "上下文接近上限",
+    ):
+        assert phrase in chinese_explanation
 
 
 @pytest.fixture()

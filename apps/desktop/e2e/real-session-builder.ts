@@ -35,7 +35,8 @@ export interface RealSessionTurn {
 }
 
 export interface RealSessionSpec {
-  /** Explicit durable sidebar label for the seeded session. */
+  /** Session label. The durable row stores no title, so clients fall back to
+   * the preview (the first 60 characters of the first user message). */
   title: string
   /** Each item becomes one real user prompt followed by the mock provider's reply. */
   turns: readonly (RealSessionTurn | string)[]
@@ -62,14 +63,11 @@ export class RealSessionBuilder {
   private readonly pending = new Map<number, { reject: (reason: Error) => void; resolve: (value: unknown) => void }>()
   private readonly events: JsonRpcFrame[] = []
   private readonly eventWaiters: Array<{
-    operation: string
     predicate: (frame: JsonRpcFrame) => boolean
     reject: (reason: Error) => void
     resolve: (frame: JsonRpcFrame) => void
   }> = []
   private readonly stderr: string[] = []
-  private readonly observedEvents: string[] = []
-  private readonly startedAt = Date.now()
   private closed = false
 
   private constructor(hermesHome: string) {
@@ -98,7 +96,7 @@ export class RealSessionBuilder {
 
   static async start(hermesHome: string): Promise<RealSessionBuilder> {
     const builder = new RealSessionBuilder(hermesHome)
-    await builder.waitForEvent(frame => frame.params?.type === 'gateway.ready', 'gateway.ready event')
+    await builder.waitForEvent(frame => frame.params?.type === 'gateway.ready')
     return builder
   }
 
@@ -116,14 +114,7 @@ export class RealSessionBuilder {
     const runtimeId = requireString(created, 'session_id')
     const sessionId = requireString(created, 'stored_session_id')
 
-    // Consume session.create's initial metadata event so per-turn settle waits
-    // cannot accidentally match stale state from before prompt submission.
-    await this.waitForEvent(
-      frame => frame.params?.type === 'session.info' && frame.params.session_id === runtimeId,
-      `initial session.info event for ${runtimeId}`,
-    )
-
-    for (const [turnIndex, turn] of spec.turns.entries()) {
+    for (const turn of spec.turns) {
       const { images = [], text } = typeof turn === 'string' ? { text: turn } : turn
 
       for (const image of images) {
@@ -132,11 +123,6 @@ export class RealSessionBuilder {
 
       const completion = this.waitForEvent(
         frame => frame.params?.type === 'message.complete' && frame.params.session_id === runtimeId,
-        `message.complete event for ${runtimeId} turn ${turnIndex + 1}`,
-      )
-      const settled = this.waitForEvent(
-        frame => frame.params?.type === 'session.info' && frame.params.session_id === runtimeId,
-        `session.info event for ${runtimeId} turn ${turnIndex + 1}`,
       )
       await this.request('prompt.submit', { session_id: runtimeId, text })
       const frame = await completion
@@ -144,7 +130,6 @@ export class RealSessionBuilder {
       if (status !== 'complete') {
         throw new Error(`real session turn failed with status ${status ?? 'unknown'}: ${JSON.stringify(frame.params?.payload)}`)
       }
-      await settled
     }
 
     await this.request('session.close', { session_id: runtimeId })
@@ -180,17 +165,14 @@ export class RealSessionBuilder {
     }), `request ${method}`)
   }
 
-  private waitForEvent(
-    predicate: (frame: JsonRpcFrame) => boolean,
-    operation = 'gateway event',
-  ): Promise<JsonRpcFrame> {
+  private waitForEvent(predicate: (frame: JsonRpcFrame) => boolean): Promise<JsonRpcFrame> {
     const index = this.events.findIndex(predicate)
     if (index >= 0) {
       return Promise.resolve(this.events.splice(index, 1)[0])
     }
     return this.withTimeout(new Promise<JsonRpcFrame>((resolve, reject) => {
-      this.eventWaiters.push({ operation, predicate, resolve, reject })
-    }), operation)
+      this.eventWaiters.push({ predicate, resolve, reject })
+    }), 'gateway event')
   }
 
   private handleLine(line: string): void {
@@ -214,27 +196,18 @@ export class RealSessionBuilder {
     }
 
     if (frame.method !== 'event') return
-    const waiterIndex = this.eventWaiters.findIndex(candidate => candidate.predicate(frame))
-    const matchedOperation = waiterIndex >= 0 ? this.eventWaiters[waiterIndex].operation : 'buffered'
-    this.observedEvents.push(
-      `+${Date.now() - this.startedAt}ms ${frame.params?.type ?? 'unknown'}:` +
-      `${JSON.stringify(frame.params?.session_id ?? '')} [${matchedOperation}]`,
-    )
-    if (this.observedEvents.length > 30) this.observedEvents.shift()
-    if (waiterIndex < 0) {
+    const waiter = this.eventWaiters.find(candidate => candidate.predicate(frame))
+    if (!waiter) {
       this.events.push(frame)
       return
     }
-    const [waiter] = this.eventWaiters.splice(waiterIndex, 1)
+    this.eventWaiters.splice(this.eventWaiters.indexOf(waiter), 1)
     waiter.resolve(frame)
   }
 
   private withTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(
-        `Timed out after ${DEFAULT_TIMEOUT_MS / 1000}s waiting for ${operation}. ` +
-        `Observed events: ${this.observedEvents.join(', ') || '(none)'}\n${this.stderr.join('\n')}`,
-      )), DEFAULT_TIMEOUT_MS)
+      const timer = setTimeout(() => reject(new Error(`Timed out after ${DEFAULT_TIMEOUT_MS / 1000}s waiting for ${operation}:\n${this.stderr.join('\n')}`)), DEFAULT_TIMEOUT_MS)
       promise.then(value => {
         clearTimeout(timer)
         resolve(value)

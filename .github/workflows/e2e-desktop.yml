@@ -17,7 +17,10 @@ concurrency:
 jobs:
   e2e:
     name: Playwright E2E (Linux)
-    runs-on: ubuntu-latest
+    # This job builds the renderer and the electron bundle, then drives a real
+    # Electron app under xvfb. vite, tsc and the Playwright workers all scale
+    # with the core count.
+    runs-on: ubuntu-latest-32-core
     timeout-minutes: 20
     outputs:
       review_status: ${{ steps.review-status.outputs.review_status }}
@@ -37,7 +40,7 @@ jobs:
             xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
 
       # ── Node ───────────────────────────────────────────────────────────
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 26
           cache: npm
@@ -89,7 +92,7 @@ jobs:
       # cache to avoid cold starts on unrelated PRs.
       - name: Restore visual baseline screenshots
         id: restore-baselines
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: apps/desktop/e2e/*-snapshots
           key: visual-baselines-${{ github.ref_name }}
@@ -124,7 +127,7 @@ jobs:
       # ── Save updated baselines to cache (main only) ───────────────────
       - name: Save updated baselines to cache
         if: github.ref_name == 'main' && always()
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: apps/desktop/e2e/*-snapshots
           key: visual-baselines-main

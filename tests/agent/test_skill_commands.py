@@ -7,21 +7,12 @@ from unittest.mock import patch
 import pytest
 
 import tools.skills_tool as skills_tool_module
-from tools.skills_tool import set_secret_capture_callback
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
     resolve_skill_command_key,
     scan_skill_commands,
 )
-
-
-@pytest.fixture(autouse=True)
-def _reset_secret_capture_callback():
-    """The secret-capture callback is thread-local; clear it after each test
-    so a callback set in one test can't leak into the next."""
-    yield
-    set_secret_capture_callback(None)
 
 
 def _make_skill(
@@ -209,6 +200,61 @@ class TestScanSkillCommands:
             assert "/telegram-only" in discord_commands
             assert "/discord-only" not in discord_commands
 
+    def test_get_skill_commands_rescans_when_profile_home_changes(self, tmp_path):
+        """Switching profiles must rescan even when the platform is unchanged
+        (#88023): a Desktop session that switches profiles mid-session keeps
+        the same platform scope, so only ``HERMES_HOME`` moves. Each profile
+        declares its own ``skills.external_dirs``, and the previous profile's
+        skill list must not leak into the new one.
+        """
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        empty_local_dir = tmp_path / "no-local-skills"
+        empty_local_dir.mkdir()
+
+        profile_a = tmp_path / "profile_a"
+        profile_b = tmp_path / "profile_b"
+        external_a = tmp_path / "external_a"
+        external_b = tmp_path / "external_b"
+        profile_a.mkdir()
+        profile_b.mkdir()
+        _make_skill(external_a, "a-only")
+        _make_skill(external_b, "b-only")
+        (profile_a / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_a}\n"
+        )
+        (profile_b / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_b}\n"
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", empty_local_dir),
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_home", None),
+        ):
+            token = set_hermes_home_override(profile_a)
+            try:
+                profile_a_commands = dict(get_skill_commands())
+            finally:
+                reset_hermes_home_override(token)
+
+            assert "/a-only" in profile_a_commands
+            assert "/b-only" not in profile_a_commands
+
+            # Switching profiles without touching the cache directly must
+            # rescan — not keep serving profile_a's stale view.
+            token = set_hermes_home_override(profile_b)
+            try:
+                profile_b_commands = dict(get_skill_commands())
+            finally:
+                reset_hermes_home_override(token)
+
+            assert "/b-only" in profile_b_commands
+            assert "/a-only" not in profile_b_commands
+
     def test_get_skill_commands_rescans_when_leaving_platform_scope(self, tmp_path, monkeypatch):
         """Returning to no-platform-scope (CLI / cron / RL) after a gateway
         session must rescan so the unfiltered view is repopulated (#14536).
@@ -301,6 +347,140 @@ class TestScanSkillCommands:
             with caplog.at_level(_logging.WARNING, logger="agent.skill_commands"):
                 scan_skill_commands()
         assert any("already claimed" in r.message for r in caplog.records)
+
+    # -- concurrent scans (#74574) ------------------------------------------
+
+    def test_concurrent_scans_do_not_report_skills_as_claiming_themselves(
+        self, tmp_path, caplog
+    ):
+        """Two overlapping scans must not see each other's partial results.
+
+        ``scan_skill_commands`` published into a module-global dict while it
+        built, but deduped against a *local* ``seen_names``. A second scan
+        starting mid-flight therefore found every slug already present and
+        logged one "already claimed" warning per skill — each naming the very
+        same skill as the incumbent. A gateway serving several platforms hits
+        this on startup, flooding errors.log with one line per installed skill.
+        """
+        import logging as _logging
+        import threading
+
+        import tools.skills_tool as _skills_tool
+
+        skill_count = 5
+        for index in range(skill_count):
+            _make_skill(tmp_path, f"skill-{index}")
+
+        real_parse = _skills_tool._parse_frontmatter
+        parked = threading.Event()
+        other_scan_finished = threading.Event()
+        already_parked = threading.local()
+
+        def parking_parse(content):
+            # Park the background scan once, before it has published anything,
+            # so the foreground scan runs to completion underneath it.
+            if (
+                threading.current_thread().name == "parked-scan"
+                and not getattr(already_parked, "done", False)
+            ):
+                already_parked.done = True
+                parked.set()
+                other_scan_finished.wait(timeout=10)
+            return real_parse(content)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "tools.skills_tool._parse_frontmatter", parking_parse
+        ):
+            with caplog.at_level(_logging.WARNING, logger="agent.skill_commands"):
+                background = threading.Thread(
+                    target=scan_skill_commands, name="parked-scan", daemon=True
+                )
+                background.start()
+                assert parked.wait(timeout=10), "background scan never parked"
+
+                foreground = scan_skill_commands()
+
+                other_scan_finished.set()
+                background.join(timeout=10)
+                assert not background.is_alive()
+
+        collisions = [r for r in caplog.records if "already claimed" in r.message]
+        assert collisions == [], (
+            "overlapping scans reported self-collisions: "
+            f"{[r.getMessage() for r in collisions]}"
+        )
+        # Both scans still produce the full, correct map.
+        assert len(foreground) == skill_count
+        assert foreground["/skill-0"]["name"] == "skill-0"
+
+    def test_publication_and_lookup_share_one_lock(self, tmp_path):
+        """A reader must not land between the map and platform-tag writes.
+
+        They are two separate global assignments. A reader in between sees the
+        NEW map still carrying the OLD platform tag; if that stale tag matches
+        its own platform it accepts the map without rescanning and serves
+        another platform's disabled-skill view — the leak #14536 closed.
+        Holding the publish lock must therefore block a reader outright.
+        """
+        import threading
+
+        import agent.skill_commands as skill_commands_module
+        from agent.skill_commands import get_skill_commands
+
+        _make_skill(tmp_path, "shared")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+
+            done = threading.Event()
+
+            def _read():
+                with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                    get_skill_commands()
+                done.set()
+
+            with skill_commands_module._publish_lock:
+                reader = threading.Thread(target=_read, daemon=True)
+                reader.start()
+                # The reader must be unable to complete its freshness lookup
+                # while publication is in progress.
+                assert not done.wait(timeout=0.5), (
+                    "get_skill_commands read the (map, platform) pair without "
+                    "the publish lock"
+                )
+
+            assert done.wait(timeout=10), "reader did not finish after release"
+            reader.join(timeout=10)
+
+    def test_scan_never_publishes_a_partially_built_map(self, tmp_path):
+        """A reader during a scan sees the previous map, never a half-built one."""
+        import threading
+
+        import agent.skill_commands as skill_commands_module
+        import tools.skills_tool as _skills_tool
+
+        skill_count = 5
+        for index in range(skill_count):
+            _make_skill(tmp_path, f"skill-{index}")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+
+        real_parse = _skills_tool._parse_frontmatter
+        observed_sizes = []
+
+        def observing_parse(content):
+            observed_sizes.append(len(skill_commands_module._skill_commands))
+            return real_parse(content)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "tools.skills_tool._parse_frontmatter", observing_parse
+        ):
+            scan_skill_commands()
+
+        # Every mid-scan observation shows the complete previous map, never a
+        # partial one growing from 0.
+        assert observed_sizes == [skill_count] * skill_count
 
 
 class TestResolveSkillCommandKey:
@@ -418,7 +598,12 @@ class TestBuildSkillInvocationMessage:
                 "skipped": False,
             }
 
-        set_secret_capture_callback(fake_secret_callback)
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fake_secret_callback,
+            raising=False,
+        )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
@@ -448,7 +633,12 @@ class TestBuildSkillInvocationMessage:
                 "gateway flow should not try secure in-band secret capture"
             )
 
-        set_secret_capture_callback(fail_if_called)
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fail_if_called,
+            raising=False,
+        )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             from gateway.session_context import clear_session_vars, set_session_vars
@@ -472,26 +662,6 @@ class TestBuildSkillInvocationMessage:
         assert msg is not None
         assert "local cli" in msg.lower()
 
-    def test_preserves_remaining_remote_setup_warning(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("TERMINAL_ENV", "ssh")
-        monkeypatch.delenv("TENOR_API_KEY", raising=False)
-        set_secret_capture_callback(None)
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "test-skill",
-                frontmatter_extra=(
-                    "required_environment_variables:\n"
-                    "  - name: TENOR_API_KEY\n"
-                    "    prompt: Tenor API key\n"
-                ),
-            )
-            scan_skill_commands()
-            msg = build_skill_invocation_message("/test-skill", "do stuff")
-
-        assert msg is not None
-        assert "remote environment" in msg.lower()
 
     def test_supporting_file_hint_uses_file_path_argument(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

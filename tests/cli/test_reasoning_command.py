@@ -122,7 +122,6 @@ class TestHandleReasoningCommand(unittest.TestCase):
             _resumed=False,
             reasoning_config={"enabled": True, "effort": "high"},
             _notify_session_boundary=MagicMock(),
-            _set_fresh_carryover_context=MagicMock(),
         )
 
         with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "medium"}):
@@ -160,7 +159,6 @@ class TestHandleReasoningCommand(unittest.TestCase):
             api_key="k",
             base_url="",
             api_mode="",
-            _set_fresh_carryover_context=MagicMock(),
         )
 
         fake_result = SimpleNamespace(

@@ -29,9 +29,12 @@ import json
 import logging
 import socket
 import threading
-from typing import Any, Callable, Optional
+import time
+from typing import Any
 
+from agent.cui_actor_context import sanitize_cui_actor_context
 from tui_gateway import server
+from tui_gateway.event_replay import replay_epoch
 
 _log = logging.getLogger(__name__)
 
@@ -89,11 +92,21 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        auth_identity: dict | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        #: Server-verified identity carried from the WS-upgrade credential
+        #: (dashboard ticket / internal credential) — stamped by
+        #: ``hermes_cli.web_server._ws_auth_reason`` onto the WS object and
+        #: passed through ``handle_ws``. None for transports that
+        #: authenticated via the legacy token path or stdio. RPC params can
+        #: never populate this: it is the only identity authority for
+        #: browser-controller registration.
+        self.auth_identity = auth_identity
         self._closed = False
+        self._last_inbound_at = time.monotonic()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
         # "armed" flag against the worker threads that call write(); the timer
@@ -106,6 +119,17 @@ class WSTransport:
         # writes need an async boundary because several batches can be queued on
         # the owning loop while it recovers from a stall.
         self._send_lock = asyncio.Lock()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def last_inbound_at(self) -> float:
+        return self._last_inbound_at
+
+    def mark_inbound(self) -> None:
+        self._last_inbound_at = time.monotonic()
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -279,24 +303,38 @@ def _disable_nagle(ws: Any) -> None:
         sock = transport.get_extra_info("socket") if transport is not None else None
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Dead-peer detection: without keepalive a silently-dropped client
+            # (SSH tunnel reset, client sleep) leaves the TCP leg half-open
+            # forever, receive_text() blocks indefinitely, and the disconnect
+            # teardown (detach + orphan reap + resume replay) never runs.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            elif hasattr(socket, "TCP_KEEPALIVE"):  # macOS idle seconds
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30)
     except Exception as exc:  # pragma: no cover - best-effort tuning
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
 async def handle_ws(
-    ws: Any, request_gate: Optional[Callable[[Any], Optional[str]]] = None
+    ws: Any,
+    *,
+    auth_identity: dict | None = None,
+    subprotocol: str | None = None,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
 
-    ``request_gate``, when provided, is invoked with each inbound JSON-RPC
-    request dict *before* it reaches :func:`server.dispatch`. Returning a
-    non-``None`` string refuses that request with a JSON-RPC error carrying the
-    string as the message; returning ``None`` lets it through. The web
-    entrypoint injects this in customer "assistant" mode to confine /api/ws to
-    the handful of chat methods the UI needs — WS routes bypass the HTTP
-    middleware, so the admin-API allowlist is not otherwise enforced here.
+    *auth_identity* is the server-minted ``{user_id, provider}`` recorded at
+    WS-upgrade authentication (``hermes_cli.web_server._ws_auth_reason``); it
+    is stored on the transport as ``WSTransport.auth_identity`` and is the
+    only identity authority for browser-controller registration. Existing
+    callers (stdio-free harnesses, the embedded TUI child) omit it and get a
+    ``None`` transport identity — unchanged behaviour.
     """
     peer = _ws_peer_label(ws)
+    trusted_actor_context = sanitize_cui_actor_context(auth_identity)
     transport: WSTransport | None = None
     messages = 0
     parse_errors = 0
@@ -305,14 +343,22 @@ async def handle_ws(
     disconnect_reason = "not_connected"
 
     try:
-        await ws.accept()
+        if subprotocol:
+            await ws.accept(subprotocol=subprotocol)
+        else:
+            await ws.accept()
         disconnect_reason = "connected"
         # Push small streamed frames out immediately instead of letting Nagle
         # batch them — keeps the live token cadence intact for GUI clients.
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            auth_identity=trusted_actor_context or None,
+        )
 
         # resolve_skin() reads config + initializes the skin engine —
         # synchronous I/O + CPU work that should not block the event loop
@@ -331,7 +377,15 @@ async def handle_ws(
                     # change_events: this backend broadcasts pet.changed /
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
-                    "payload": {"skin": skin_payload, "change_events": True},
+                    "payload": {
+                        "skin": skin_payload,
+                        "change_events": True,
+                        "heartbeat": True,
+                        # Replay-contract process identity: lets reconnecting
+                        # clients detect a backend restart and reset their
+                        # per-session seq watermarks (see event_replay).
+                        "replay_epoch": replay_epoch(),
+                    },
                 },
             }
         )
@@ -341,6 +395,15 @@ async def handle_ws(
             # Track this peer for session-less global broadcasts (skin.changed
             # from the background watcher) — write_json can't route those.
             server.register_live_transport(transport)
+        # Same once-per-process startup pass for session rows orphaned by a
+        # previous gateway process (#65194): the desktop app and web dashboard
+        # reach the agent through this WS sidecar, not entry.main(). Idempotent
+        # + config-gated inside, so a stdio TUI that already scheduled is a
+        # no-op.
+        try:
+            server._schedule_startup_orphan_sweep()
+        except Exception:
+            _log.warning("startup orphan sweep scheduling failed", exc_info=True)
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1
@@ -365,6 +428,7 @@ async def handle_ws(
             line = raw.strip()
             if not line:
                 continue
+            transport.mark_inbound()
             messages += 1
 
             try:
@@ -400,40 +464,28 @@ async def handle_ws(
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
 
-            # Refuse requests the injected gate rejects (assistant-mode
-            # confinement) before they ever reach dispatch.
-            if request_gate is not None:
-                deny_reason = request_gate(req)
-                if deny_reason is not None:
-                    _log.warning(
-                        "ws request refused peer=%s id=%s method=%s reason=%s",
-                        peer,
-                        req_id,
-                        req_method,
-                        deny_reason,
-                    )
-                    ok = await transport.write_async(
-                        {
-                            "jsonrpc": "2.0",
-                            "error": {"code": -32601, "message": deny_reason},
-                            "id": req_id if req_id is not None else None,
-                        }
-                    )
-                    if not ok:
-                        disconnect_reason = "send_failed_after_gate_refusal"
-                        send_failures += 1
-                        _log.warning(
-                            "ws gate-refusal reply send failed peer=%s id=%s method=%s",
-                            peer,
-                            req_id,
-                            req_method,
-                        )
-                        break
-                    continue
+            if req_method == "gateway.ping":
+                ok = await transport.write_async(
+                    {
+                        "jsonrpc": "2.0",
+                        "result": {"ok": True},
+                        "id": req_id,
+                    }
+                )
+                if not ok:
+                    disconnect_reason = "send_failed_after_heartbeat"
+                    send_failures += 1
+                    _log.warning("ws heartbeat reply send failed peer=%s id=%s", peer, req_id)
+                    break
+                continue
 
             try:
-                actor_context = getattr(getattr(ws, "state", None), "auth_info", None)
-                resp = await asyncio.to_thread(server.dispatch, req, transport, actor_context)
+                resp = await asyncio.to_thread(
+                    server.dispatch,
+                    req,
+                    transport,
+                    auth_identity,
+                )
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(
@@ -475,6 +527,28 @@ async def handle_ws(
         detached_sessions = 0
         if transport is not None:
             server.unregister_live_transport(transport)
+
+            # Owner-safely park browser controllers this transport registered.
+            # A reconnect with the same stable identity may deliver a terminal
+            # result for work already in flight; no new dispatch is admitted
+            # while the controller is offline.
+            #
+            # Offloaded via to_thread: disconnect acquires the controller's
+            # send_lock, which a worker-thread dispatch may hold while blocking
+            # on THIS loop to transmit its frame (run_coroutine_threadsafe +
+            # result(timeout=10)). Acquiring it synchronously here would park
+            # the whole event loop behind that 10s send bridge.
+            try:
+                from gateway.browser_control_broker import (
+                    get_browser_control_broker,
+                )
+
+                await asyncio.to_thread(
+                    get_browser_control_broker().disconnect_owner, transport
+                )
+            except Exception:
+                _log.exception("ws browser-controller disconnect failed peer=%s", peer)
+
             transport.close()
 
             try:

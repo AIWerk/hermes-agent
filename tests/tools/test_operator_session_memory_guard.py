@@ -6,12 +6,13 @@ from tools.memory_tool import MemoryStore, apply_memory_pending, memory_tool
 def _operator_store():
     store = MemoryStore()
     store.operator_session_context = {
-        "mode": "operator",
-        "actor_id": "operator",
-        "role": "operator",
+        "mode": "operator_session",
+        "actor_id": "unknown_cli",
+        "role": "unknown",
         "acting_for": "aiwerk",
-        "memory_scope": "operator",
-        "verified_at": 1,
+        "memory_scope": "none",
+        "authorizing": False,
+        "issued_at": 1,
         "expires_at": 9999999999,
     }
     return store

@@ -23,6 +23,60 @@ from gateway.session import build_session_key
 from unittest.mock import MagicMock
 
 
+def _media_event(text, *, user_id, chat_id="c1", thread_id=None):
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    return MessageEvent(
+        text=text,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            chat_id=chat_id,
+            chat_type="group",
+            thread_id=thread_id,
+        ),
+        message_id=text,
+        message_type=MessageType.PHOTO,
+        media_urls=[f"/tmp/{text}.jpg"],
+        media_types=["image/jpeg"],
+    )
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        _media_event("actor-2", user_id="u2"),
+        _media_event("chat-2", user_id="u1", chat_id="c2"),
+        _media_event("topic-2", user_id="u1", thread_id="t2"),
+    ],
+)
+def test_busy_media_with_different_identity_uses_fifo_without_overwrite(second):
+    runner, adapter = _make_runner(_session_entry())
+    sk = "shared-session"
+    first = _media_event("first", user_id="u1", thread_id="t1")
+
+    runner._queue_or_replace_pending_event(sk, first)
+    runner._queue_or_replace_pending_event(sk, second)
+
+    assert adapter._pending_messages[sk] is first
+    assert runner._queued_events[sk] == [second]
+
+
+def test_busy_media_without_actor_authority_uses_fifo_without_merging():
+    runner, adapter = _make_runner(_session_entry())
+    sk = "shared-session"
+    first = _media_event("first", user_id=None)
+    second = _media_event("second", user_id=None)
+
+    runner._queue_or_replace_pending_event(sk, first)
+    runner._queue_or_replace_pending_event(sk, second)
+
+    assert adapter._pending_messages[sk] is first
+    assert runner._queued_events[sk] == [second]
+
+
 def _prequeue(runner, adapter, sk):
     """Pre-stage Q1 in the pending slot and Q2 in the overflow tail."""
     from gateway.platforms.base import MessageEvent, MessageType
