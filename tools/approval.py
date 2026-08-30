@@ -2529,6 +2529,15 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    try:
+        from cron.lifecycle_guard import is_safe_named_transient_gateway_restart
+
+        if is_safe_named_transient_gateway_restart(command):
+            return (False, None, None)
+    except Exception:
+        # Import/parser failure must not create an allow. Continue through the
+        # ordinary dangerous-command classifiers below.
+        pass
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()

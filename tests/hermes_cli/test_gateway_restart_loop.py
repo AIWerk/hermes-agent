@@ -527,6 +527,57 @@ class TestTerminalToolGatewayLifecycleGuard:
             lambda: inside_gateway,
         )
 
+    @pytest.mark.parametrize("command", [
+        (
+            "systemd-run --user --collect "
+            "--unit=hermes-rocky-noop-attempt1-restart "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user "
+            "--unit=hermes-rocky-noop-attempt1-restart --collect "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+    ])
+    def test_allows_exact_named_transient_restart_inside_gateway(
+        self, monkeypatch, command
+    ):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, cmd, **kwargs):
+                calls.append(cmd)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.operator_verification.operator_verification_block_reason_for_command",
+            lambda *args, **kwargs: None,
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0, result
+        assert calls == [command]
+
+    def test_generic_lifecycle_detector_still_flags_named_transient_restart(self):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        command = (
+            "systemd-run --user --collect "
+            "--unit=hermes-rocky-noop-attempt1-restart "
+            "systemctl --user restart hermes-gateway.service"
+        )
+
+        assert contains_gateway_lifecycle_command(command)
+
     @pytest.mark.parametrize("cmd", [
         "systemctl restart hermes-gateway",
         "systemctl --user restart hermes-gateway",
@@ -540,6 +591,59 @@ class TestTerminalToolGatewayLifecycleGuard:
         "launchctl submit -l com.foo -- /path/gateway",
         "launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.hermes.gateway.restart-once.plist",
         "pkill -f hermes.*gateway",
+        # The named transient exception is deliberately exact. Every missing,
+        # widened, scheduled, shell-mediated, or multi-command shape remains
+        # a self-lifecycle block.
+        (
+            "systemd-run --collect --unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --collect "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --collect --unit=not-hermes "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --scope --collect "
+            "--unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --collect --on-calendar=now "
+            "--unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --collect --unit=hermes-rocky-restart "
+            "sh -c 'systemctl --user restart hermes-gateway.service'"
+        ),
+        (
+            "systemd-run --user --collect --unit=hermes-rocky-restart "
+            "/usr/bin/systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user --collect --unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service extra.service"
+        ),
+        (
+            "systemd-run --user --collect --unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service; echo widened"
+        ),
+        (
+            "systemd-run --user --collect --unit=hermes-rocky-restart "
+            "systemctl --user restart hermes-gateway.service > /tmp/result"
+        ),
+        (
+            "systemd-run --user --collect --unit=hermes-rocky-restart "
+            "systemctl --user restart $(printf hermes-gateway.service)"
+        ),
     ])
     def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
         import tools.terminal_tool as tt

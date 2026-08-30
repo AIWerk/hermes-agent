@@ -3079,6 +3079,7 @@ def terminal_tool(
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
+                is_safe_named_transient_gateway_restart,
             )
             if contains_launchctl_submit_command(command):
                 return json.dumps({
@@ -3157,10 +3158,13 @@ def terminal_tool(
                     pass
                 return None
 
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
+            if (
+                not is_safe_named_transient_gateway_restart(command)
+                and contains_gateway_lifecycle_command_or_referenced_script(
+                    command,
+                    cwd=guard_cwd,
+                    read_remote_script=_read_script_in_env,
+                )
             ):
                 return json.dumps({
                     "output": "",

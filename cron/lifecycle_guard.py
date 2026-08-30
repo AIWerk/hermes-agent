@@ -115,6 +115,45 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 # across genuinely separate lines.
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
+_NAMED_TRANSIENT_RESTART_UNIT = re.compile(
+    r"hermes-[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"
+)
+_NAMED_TRANSIENT_RESTART_PAYLOAD = (
+    "systemctl",
+    "--user",
+    "restart",
+    "hermes-gateway.service",
+)
+
+
+def is_safe_named_transient_gateway_restart(command: str) -> bool:
+    """Recognize the sole systemd-owned gateway restart terminal exception.
+
+    The generic lifecycle detector intentionally continues to classify the
+    inner ``systemctl restart`` as self-lifecycle.  Terminal and approval
+    callers may use this narrower predicate to admit only an immediate,
+    named user transient service whose manager survives the gateway process.
+    """
+    if any(marker in command for marker in ("\n", "\r", ";", "&", "|", "<", ">", "`", "$")):
+        return False
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if len(argv) != 8 or argv[0] != "systemd-run":
+        return False
+    if tuple(argv[-4:]) != _NAMED_TRANSIENT_RESTART_PAYLOAD:
+        return False
+
+    options = argv[1:-4]
+    unit_options = [option for option in options if option.startswith("--unit=")]
+    if len(options) != 3 or len(unit_options) != 1:
+        return False
+    if set(options) != {"--user", "--collect", unit_options[0]}:
+        return False
+    unit_name = unit_options[0].removeprefix("--unit=")
+    return _NAMED_TRANSIENT_RESTART_UNIT.fullmatch(unit_name) is not None
+
 # Python argv-list punctuation (#68289): `subprocess.run(["launchctl",
 # "bootout", ...])` separates the words the OS will exec with brackets and
 # commas rather than spaces. Stripped before the token-join re-scan only —

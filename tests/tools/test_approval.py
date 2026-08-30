@@ -782,6 +782,24 @@ class TestGatewayProtection:
         assert dangerous is True
         assert "stop/restart" in desc
 
+    @pytest.mark.parametrize("cmd", [
+        (
+            "systemd-run --user --collect "
+            "--unit=hermes-rocky-noop-attempt1-restart "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+        (
+            "systemd-run --user "
+            "--unit=hermes-rocky-noop-attempt1-restart --collect "
+            "systemctl --user restart hermes-gateway.service"
+        ),
+    ])
+    def test_exact_named_transient_gateway_restart_is_ordinary_safe(self, cmd):
+
+        dangerous, key, desc = detect_dangerous_command(cmd)
+
+        assert (dangerous, key, desc) == (False, None, None)
+
 
     def test_pkill_unrelated_not_flagged(self):
         """pkill targeting unrelated processes should not be flagged."""
