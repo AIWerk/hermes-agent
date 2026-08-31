@@ -49,6 +49,11 @@ def _add_server_runtime_args(parser) -> None:
         ),
     )
     parser.add_argument(
+        "--assistant",
+        action="store_true",
+        help="Serve the restricted AIWerk customer assistant surface",
+    )
+    parser.add_argument(
         "--isolated",
         action="store_true",
         help=(

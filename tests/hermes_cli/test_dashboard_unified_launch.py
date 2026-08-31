@@ -60,6 +60,65 @@ class TestUnifiedDashboardRouting:
         from hermes_constants import get_default_hermes_root
         assert env.get("HERMES_HOME") == str(get_default_hermes_root())
 
+    def test_profile_assistant_refuses_existing_machine_dashboard(
+        self, main_mod, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda _host, _port: True)
+        opened = []
+        monkeypatch.setitem(
+            sys.modules,
+            "webbrowser",
+            types.SimpleNamespace(open=lambda url: opened.append(url)),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod.cmd_dashboard(_args(assistant=True, no_open=False))
+
+        assert exc.value.code == 2
+        assert opened == []
+        assert "cannot attach assistant mode" in capsys.readouterr().err.lower()
+
+    def test_profile_admin_still_attaches_existing_machine_dashboard(
+        self, main_mod, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda _host, _port: True)
+        opened = []
+        monkeypatch.setitem(
+            sys.modules,
+            "webbrowser",
+            types.SimpleNamespace(open=lambda url: opened.append(url)),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod.cmd_dashboard(_args(no_open=False))
+
+        assert exc.value.code == 0
+        assert opened == ["http://127.0.0.1:9119/?profile=worker_x"]
+
+    def test_profile_launch_reexec_preserves_assistant_mode(self, main_mod, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda _host, _port: False)
+        captured = []
+
+        def fake_exec(_exe, argv, _env):
+            captured.append(argv)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+
+        with pytest.raises(SystemExit):
+            main_mod.cmd_dashboard(_args(assistant=True))
+
+        assert captured and "--assistant" in captured[0]
+
 
     def test_desktop_profile_backend_skips_machine_dashboard_reroute(self, main_mod, monkeypatch):
         """A desktop-spawned named-profile backend (HERMES_DESKTOP=1) must NOT

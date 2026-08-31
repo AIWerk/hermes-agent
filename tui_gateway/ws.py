@@ -30,7 +30,7 @@ import logging
 import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from agent.cui_actor_context import sanitize_cui_actor_context
 from tui_gateway import server
@@ -323,6 +323,7 @@ async def handle_ws(
     *,
     auth_identity: dict | None = None,
     subprotocol: str | None = None,
+    request_gate: Callable[[Any], str | None] | None = None,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
 
@@ -463,6 +464,29 @@ async def handle_ws(
             # response dict, which we write here from the loop.
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
+
+            if request_gate is not None:
+                deny_reason = request_gate(req)
+                if deny_reason is not None:
+                    _log.warning(
+                        "ws request refused peer=%s id=%s method=%s reason=%s",
+                        peer,
+                        req_id,
+                        req_method,
+                        deny_reason,
+                    )
+                    ok = await transport.write_async(
+                        {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32601, "message": deny_reason},
+                            "id": req_id,
+                        }
+                    )
+                    if not ok:
+                        disconnect_reason = "send_failed_after_request_gate"
+                        send_failures += 1
+                        break
+                    continue
 
             if req_method == "gateway.ping":
                 ok = await transport.write_async(
