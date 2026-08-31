@@ -11592,6 +11592,14 @@ def cmd_dashboard(args):
     ):
         url = f"http://{args.host or '127.0.0.1'}:{args.port}/?profile={_launch_profile}"
         if _dashboard_listening(args.host, args.port):
+            if getattr(args, "assistant", False):
+                print(
+                    "Cannot attach assistant mode to an existing machine dashboard; "
+                    "its active mode cannot be verified. Stop it explicitly or choose "
+                    "a different port.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
             print(f"Machine dashboard already running on port {args.port}.")
             print(f"  Managing profile '{_launch_profile}': {url}")
             if not args.no_open:
@@ -11626,6 +11634,8 @@ def cmd_dashboard(args):
             reexec_argv.append("--insecure")
         if getattr(args, "skip_build", False):
             reexec_argv.append("--skip-build")
+        if getattr(args, "assistant", False):
+            reexec_argv.append("--assistant")
         from tools.environments.local import build_subprocess_env
         # Exact env preservation: HERMES_HOME is explicitly pinned to the
         # machine root below — the factory must not re-inject a profile home.
@@ -11824,6 +11834,7 @@ def cmd_dashboard(args):
         port=args.port,
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
+        mode="assistant" if bool(getattr(args, "assistant", False)) else "admin",
         initial_profile=getattr(args, "open_profile", "") or "",
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,

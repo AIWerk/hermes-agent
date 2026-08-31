@@ -7,6 +7,10 @@ declare global {
      * it directly and for parity with the server's bootstrap script.
      */
     __HERMES_DASHBOARD_EMBEDDED_CHAT__?: boolean;
+    /** Server-owned dashboard surface; browser values are not authority. */
+    __HERMES_DASHBOARD_MODE__?: "admin" | "assistant";
+    /** Hidden customer locale injected by tenant/profile configuration. */
+    __AIWERK_CUI_LOCALE__?: string;
     /** Sanitized customer-facing agent label injected for browser-title branding. */
     __HERMES_AGENT_DISPLAY_NAME__?: string | null;
   }
@@ -23,6 +27,10 @@ declare global {
  */
 export function isDashboardEmbeddedChatEnabled(): boolean {
   return true;
+}
+
+export function isAssistantDashboardMode(): boolean {
+  return typeof window !== "undefined" && window.__HERMES_DASHBOARD_MODE__ === "assistant";
 }
 
 export function getHermesAgentDisplayName(): string | null {

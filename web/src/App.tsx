@@ -75,6 +75,8 @@ import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
 import { MemoryPressureBanner } from "@/components/MemoryPressureBanner";
 import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
+import AiwerkAssistantPage from "@/pages/AiwerkAssistantPage";
+import { isAssistantDashboardMode } from "@/lib/dashboard-flags";
 // Route pages are lazy-loaded so the initial dashboard shell does not pay for
 // every admin surface (and heavy deps like xterm) up front.
 const ConfigPage = lazy(() => import("@/pages/ConfigPage"));
@@ -372,7 +374,13 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
-export default function App() {
+export function DashboardRoot() {
+  return isAssistantDashboardMode() ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
+}
+
+export default DashboardRoot;
+
+function AdminDashboardApp() {
   const { t } = useI18n();
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();

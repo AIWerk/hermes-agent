@@ -564,6 +564,135 @@ def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
 # injection share a single, testable seam.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 
+# Dashboard surface authority. ``admin`` preserves the full upstream dashboard;
+# ``assistant`` exposes only the explicitly enumerated customer chat contract.
+_DASHBOARD_MODE = "admin"
+
+_ASSISTANT_ALLOWED_HTTP: dict[str, frozenset[str]] = {
+    "/api/status": frozenset({"GET"}),
+    "/api/auth/me": frozenset({"GET"}),
+    "/api/auth/ws-ticket": frozenset({"POST"}),
+}
+_ASSISTANT_ALLOWED_RPC_METHODS = frozenset(
+    {
+        "gateway.ping",
+        "session.create",
+        "prompt.submit",
+        "approval.respond",
+        "slash.exec",
+    }
+)
+_ASSISTANT_ALLOWED_RPC_PARAMS: dict[str, frozenset[str]] = {
+    "gateway.ping": frozenset(),
+    "session.create": frozenset({"source", "close_on_disconnect"}),
+    "prompt.submit": frozenset({"session_id", "text"}),
+    "approval.respond": frozenset({"session_id", "request_id", "choice"}),
+    "slash.exec": frozenset({"session_id", "command"}),
+}
+_ASSISTANT_ALLOWED_SLASH_COMMANDS = frozenset({"stop", "compress", "reload-mcp"})
+_ASSISTANT_ACTOR_PARAM_KEYS = (
+    "_cui_actor_role",
+    "_cui_actor_id",
+    "_cui_tenant_id",
+    "actor_role",
+)
+
+
+def _assistant_mode_enabled() -> bool:
+    return _DASHBOARD_MODE == "assistant"
+
+
+def _set_dashboard_mode(mode: str) -> None:
+    global _DASHBOARD_MODE
+    if mode not in {"admin", "assistant"}:
+        raise SystemExit(f"Unsupported dashboard mode: {mode}")
+    _DASHBOARD_MODE = mode
+
+
+def _assistant_api_allowed(path: str, method: str) -> bool:
+    return method.upper() in _ASSISTANT_ALLOWED_HTTP.get(path, frozenset())
+
+
+def _inject_trusted_cui_actor(params: dict, auth_identity: dict | None) -> None:
+    """Replace client actor claims with the server-authenticated WS identity."""
+    for key in _ASSISTANT_ACTOR_PARAM_KEYS:
+        params.pop(key, None)
+    identity = auth_identity if isinstance(auth_identity, dict) else {}
+    role = str(identity.get("role") or "").strip()
+    actor_id = str(identity.get("actor_id") or identity.get("user_id") or "").strip()
+    tenant_id = str(identity.get("tenant_id") or "").strip()
+    if role:
+        params["_cui_actor_role"] = role
+    if actor_id:
+        params["_cui_actor_id"] = actor_id
+    if tenant_id:
+        params["_cui_tenant_id"] = tenant_id
+
+
+def _assistant_identity_complete(auth_identity: dict | None) -> bool:
+    if not isinstance(auth_identity, dict):
+        return False
+    return all(
+        isinstance(auth_identity.get(key), str) and bool(auth_identity[key].strip())
+        for key in ("role", "actor_id", "tenant_id")
+    )
+
+
+def _assistant_ws_request_gate(
+    request: Any, auth_identity: dict | None = None
+) -> Optional[str]:
+    """Default-deny the structured customer WebSocket before dispatch."""
+    if not _assistant_identity_complete(auth_identity):
+        return "authenticated customer identity required in assistant mode"
+    if not isinstance(request, dict):
+        return "invalid request in assistant mode"
+    method = request.get("method")
+    if not isinstance(method, str) or method not in _ASSISTANT_ALLOWED_RPC_METHODS:
+        return f"method not available in assistant mode: {method or '(none)'}"
+    params = request.get("params")
+    if params is None:
+        params = {}
+        request["params"] = params
+    if not isinstance(params, dict):
+        return "request params must be an object in assistant mode"
+
+    client_keys = set(params).difference(_ASSISTANT_ACTOR_PARAM_KEYS)
+    expected_keys = _ASSISTANT_ALLOWED_RPC_PARAMS[method]
+    if client_keys != expected_keys:
+        return f"invalid parameter contract for assistant method: {method}"
+
+    if method == "session.create":
+        if params.get("source") != "web" or params.get("close_on_disconnect") is not True:
+            return "invalid session.create contract in assistant mode"
+    elif method in {"prompt.submit", "slash.exec"}:
+        if not isinstance(params.get("session_id"), str) or not params["session_id"].strip():
+            return f"session_id required for assistant method: {method}"
+    if method == "prompt.submit":
+        if not isinstance(params.get("text"), str) or not params["text"].strip():
+            return "prompt text required in assistant mode"
+    elif method == "approval.respond":
+        if (
+            not isinstance(params.get("session_id"), str)
+            or not params["session_id"].strip()
+            or not isinstance(params.get("request_id"), str)
+            or not params["request_id"].strip()
+            or params.get("choice") not in {"once", "deny"}
+        ):
+            return "invalid approval response in assistant mode"
+    elif method == "slash.exec":
+        raw = str(params.get("command") or "").strip()
+        command = raw.lstrip("/").split(maxsplit=1)[0].lower() if raw else ""
+        if command not in _ASSISTANT_ALLOWED_SLASH_COMMANDS:
+            return f"slash command not available in assistant mode: /{command or '(none)'}"
+
+    _inject_trusted_cui_actor(params, auth_identity)
+    return None
+
+
+def _dashboard_mode_bootstrap_js() -> str:
+    return f'window.__HERMES_DASHBOARD_MODE__="{_DASHBOARD_MODE}";'
+
+
 # Managed autonomy is a server policy, never a browser/config/environment
 # assertion. The PTY producer strips inherited values for these keys and
 # re-injects them only for a server-consumed actor ticket with an explicit
@@ -958,7 +1087,14 @@ async def _dashboard_auth_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require auth and confine every assistant-mode HTTP API."""
+    path = request.url.path
+    if (
+        path.startswith("/api/")
+        and _assistant_mode_enabled()
+        and not _assistant_api_allowed(path, request.method)
+    ):
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
     # A request already authenticated by the token-auth seam (a service caller
     # presenting a bearer token on a registered token route) carries
     # ``token_authenticated`` — never bounce it through the cookie/session gate.
@@ -5623,6 +5759,9 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
       server → ``{"type": "fallback"}`` when the configured provider has no
                chunked API — the client uses the POST endpoint instead.
     """
+    if _assistant_mode_enabled():
+        await ws.close(code=4403, reason="websocket disabled in assistant mode")
+        return
     if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
@@ -17297,6 +17436,9 @@ def _console_json_payload(msg: Any) -> tuple[Optional[dict[str, Any]], Optional[
 
 @app.websocket("/api/console")
 async def console_ws(ws: WebSocket) -> None:
+    if _assistant_mode_enabled():
+        await ws.close(code=4403, reason="websocket disabled in assistant mode")
+        return
     peer = ws.client.host if ws.client else "?"
 
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
@@ -17649,6 +17791,13 @@ async def console_ws(ws: WebSocket) -> None:
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
 
+    if _assistant_mode_enabled():
+        _log.warning(
+            "pty refused: raw terminal disabled in assistant mode peer=%s", peer
+        )
+        await ws.close(code=4403, reason="pty disabled in assistant mode")
+        return
+
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         _log.info("pty refused: embedded chat disabled peer=%s", peer)
         await ws.close(code=4404, reason="embedded chat disabled")
@@ -17868,10 +18017,20 @@ async def gateway_ws(ws: WebSocket) -> None:
     # onto the WS object by _ws_auth_reason; carry it into the gateway
     # transport where it becomes the identity authority for privileged RPCs
     # (browser.controller.register). None on the legacy token path.
+    auth_identity = getattr(ws, "_hermes_auth_identity", None)
+    if _assistant_mode_enabled() and not _assistant_identity_complete(auth_identity):
+        await ws.close(code=4403, reason="authenticated customer identity required")
+        return
+    request_gate = None
+    if _assistant_mode_enabled():
+        request_gate = lambda request: _assistant_ws_request_gate(
+            request, auth_identity
+        )
     await handle_ws(
         ws,
-        auth_identity=getattr(ws, "_hermes_auth_identity", None),
+        auth_identity=auth_identity,
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
+        request_gate=request_gate,
     )
 
 
@@ -17889,6 +18048,9 @@ async def gateway_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/pub")
 async def pub_ws(ws: WebSocket) -> None:
+    if _assistant_mode_enabled():
+        await ws.close(code=4403, reason="websocket disabled in assistant mode")
+        return
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return
@@ -17917,6 +18079,9 @@ async def pub_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
+    if _assistant_mode_enabled():
+        await ws.close(code=4403, reason="websocket disabled in assistant mode")
+        return
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return
@@ -18114,6 +18279,7 @@ def mount_spa(application: FastAPI):
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+                f"{_dashboard_mode_bootstrap_js()}"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"</script>"
@@ -18122,6 +18288,7 @@ def mount_spa(application: FastAPI):
             bootstrap_script = (
                 f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+                f"{_dashboard_mode_bootstrap_js()}"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"</script>"
@@ -19660,6 +19827,7 @@ def start_server(
     port: int = 9119,
     open_browser: bool = True,
     allow_public: bool = False,
+    mode: str = "admin",
     initial_profile: str = "",
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
@@ -19679,6 +19847,7 @@ def start_server(
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
     """
+    _set_dashboard_mode(mode)
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
