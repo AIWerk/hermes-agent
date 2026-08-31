@@ -1,0 +1,606 @@
+{
+  "accepted_upstream_commit": "cbd8de8ad64530be01efea23b7764d5c37c634ed",
+  "baseline_id": "aiwerk-main-content-r7a-v1",
+  "bootstrap": {
+    "path_count": 10354,
+    "source_commit": "d7bcbd9b5feee34c321b38919a6f0cffc4437a83",
+    "source_tree": "e38b6cc0f405d65b5075ae37a99e0f81dbea05d8"
+  },
+  "markers": [
+    {
+      "decrease": "report",
+      "id": "aiwerk-brand",
+      "needle": "aiwerk",
+      "normalization": "unicode-nfkc-casefold",
+      "zero_transition": "block"
+    }
+  ],
+  "protected_controls": [
+    ".github/workflows/aiwerk-content-loss-guard.yml",
+    ".ci/content-loss/baseline.json",
+    ".ci/content-loss/retirements.json",
+    "scripts/ci/content_loss_guard.py",
+    "tests/ci/test_content_loss_guard.py"
+  ],
+  "protected_paths": [
+    {
+      "id": "immutable-release-contract",
+      "path": "immutable-release-build.json",
+      "required": true
+    }
+  ],
+  "recovery_ledger": {
+    "canonical_ledger_sha256": "b99ea555b9ee0eeac3e60ce702502b217f5aa130e89ec2c8cecb0d24b8dba894",
+    "canonical_recovery_complete": false,
+    "deleted": 100,
+    "entries": [
+      {
+        "incident_kind": "deleted",
+        "path": ".github/workflows/ci.yml"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "agent/tool_argument_projection.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/electron/image-context-menu.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/electron/image-context-menu.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/scripts/run-ui-shard.mjs"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/app/chat/right-rail/preview-strip-tools.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/app/settings/connections-settings.test.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/app/settings/connections-settings.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/app/shell/shell-context-menu.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/app/skills/hub.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/components/assistant-ui/thread/duplicate-stall-indicator.test.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/components/pane-shell/tree/renderer/lone-header.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/components/pane-shell/tree/renderer/lone-header.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/lib/chat-messages.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "apps/desktop/src/plugins/example/plugin.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "contributors/emails/agent@agents-Mac-mini.local"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "contributors/emails/b@b"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "contributors/emails/bergsmann@gmail.com"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "docs/aiwerk/mockups/INTEGRATION.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "docs/aiwerk/mockups/README.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "docs/aiwerk/mockups/hermes-agent-dashboard.html"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "docs/aiwerk/mockups/hermes-dashboard-backend-integration-plan.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "hermes_cli/dashboard_auth/identity.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "hermes_cli/subcommands/version.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "log.txt"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "notes/phase6-full-verify-and-merge-evidence-20260801.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "plugins/observability/nemo_relay/README.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "plugins/observability/nemo_relay/__init__.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "plugins/observability/nemo_relay/plugin.yaml"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "plugins/temporal_context/README.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "scripts/local-browser-connector/linux/rocky-browser.sh"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "sqlite_leak_fix.png"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/acp_adapter/test_tool_argument_projection.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/agent/test_cui_actor_context.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/agent/test_session_notes_redaction.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/agent/test_session_notes_runtime.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/agent/test_session_summarizer_incremental_notes.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/agent/test_session_summarizer_security.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/agent/test_usage_counter_accounting.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/cli/test_language_command.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/cli/test_oneshot_cleanup.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/cli/test_surrogate_sanitization.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/gateway/test_approval_ssrf.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_cli/test_cui_actor_greeting.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_cli/test_cui_image_artifacts.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_cli/test_immutable_release_build_contract.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_cli/test_rank19_fts_repair_command.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_cli/test_release_bound_systemd_units.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_conversation_root_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_get_anchored_view_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_get_messages_around_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_resolve_resume_session_id_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_restore_alternation_repair_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_session_md_export_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/hermes_state/test_side_session_scope.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/plugins/test_nemo_relay_mark_turn_parenting.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/plugins/test_nemo_relay_plugin.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/run_agent/test_memory_write_bridge.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/state/test_attachment_lifecycle_measurement.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/state/test_compression_lineage_guard_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/state/test_fts_repair_required_rank19.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/state/test_fts_runtime_rebuild_aiwerk_regressions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/state/test_session_compact_visibility.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/README.md"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/_fake_worker.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/conftest.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_atypical_scenarios.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_benchmarks.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_concurrency.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_concurrency_mixed.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_concurrency_parent_gate.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_concurrency_reclaim_race.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_property_fuzzing.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/stress/test_subprocess_e2e.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/test_conftest_live_db_guard.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/test_mcp_tool_keepalive.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/test_state_db_notadb_selfheal.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/test_test_environment_containment.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/test_tool_argument_projection.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tools/test_flux3_video_tool.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tools/test_operator_verification_registration.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tools/test_session_search_rank19.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tools/test_website_policy.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tui_gateway/test_attachment_processing.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tui_gateway/test_rank19_storage_health.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tests/tui_gateway/test_side_sessions.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "tools/flux3_video_tool.py"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/aiwerk-cui-i18n.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/aiwerk-cui-i18n.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/cui-greeting-session-order.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/cui-greeting.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/cui-greeting.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/cui-slash.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/cui-slash.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/safe-open.test.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/lib/safe-open.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/pages/AiwerkAssistantPage.tsx"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "web/src/types/jsdom.d.ts"
+      },
+      {
+        "incident_kind": "deleted",
+        "path": "website/docs/guides/local-browser-launcher.md"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "agent/agent_init.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "agent/skill_commands.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "agent/system_prompt.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "agent/title_generator.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "gateway/config.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "gateway/platforms/base.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "gateway/run.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_cli/banner.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_cli/commands.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_cli/dashboard_auth/login_page.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_cli/main.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_cli/subcommands/dashboard.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_cli/web_server.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "hermes_state_schema.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "plugins/memory/honcho/__init__.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "run_agent.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "scripts/release.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/agent/test_prompt_builder.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/cli/test_cli_browser_connect.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/gateway/test_base_auto_tts_output_format.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/gateway/test_base_topic_sessions.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/hermes_cli/test_proxy.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/test_tui_gateway_server.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/tools/test_approval.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/tools/test_execute_code_approval_cluster.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/tools/test_memory_tool.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/tools/test_write_approval.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tests/tui_gateway/test_cui_actor_gateway_context.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tools/approval.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tools/memory_tool.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "tui_gateway/server.py"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "web/src/App.tsx"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "web/src/lib/api.test.ts"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "web/src/lib/api.ts"
+      },
+      {
+        "incident_kind": "aiwerk_content_removed",
+        "path": "web/src/lib/dashboard-flags.ts"
+      }
+    ],
+    "marker_zeroed": 35,
+    "source_packet_sha256": "8262d0e5fac12fc0b6f856f0e7e7091fe9e089e78310aec7f16dc2d120a089ec",
+    "status": "incomplete-bootstrap",
+    "total": 135
+  },
+  "schema_version": 1,
+  "selectors": [
+    {
+      "id": "release-preserve-repository",
+      "path": "immutable-release-build.json",
+      "pointer": "/build/preserve_complete_repository",
+      "type": "json_pointer_equals",
+      "value": true
+    },
+    {
+      "id": "release-dashboard-closing-gate",
+      "path": "immutable-release-build.json",
+      "pointer": "/closing_gate/scenarios",
+      "required_keys": [
+        "startup_modules",
+        "late_modules"
+      ],
+      "type": "json_array_contains_object",
+      "where": {
+        "name": "dashboard-entry"
+      }
+    }
+  ]
+}
