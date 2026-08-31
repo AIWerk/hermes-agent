@@ -83,6 +83,7 @@ class MockAudio {
 }
 
 const readinessEvents = ['loadeddata', 'canplay', 'canplaythrough'] as const
+
 const directConfig = {
   api_key: 'test-key',
   base_url: 'https://tts.invalid',
