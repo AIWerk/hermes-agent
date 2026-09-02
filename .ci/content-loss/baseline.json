@@ -27,6 +27,14 @@
       "id": "immutable-release-contract",
       "path": "immutable-release-build.json",
       "required": true
+    },
+    {
+      "id": "aiwerk-operator-session-authority",
+      "markers": [
+        "mode\": \"operator\""
+      ],
+      "path": "hermes_cli/operator_session.py",
+      "required": true
     }
   ],
   "recovery_ledger": {
