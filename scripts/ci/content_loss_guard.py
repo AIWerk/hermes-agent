@@ -280,13 +280,23 @@ def _validate_baseline(value: Any) -> dict[str, Any]:
     protected_ids: set[str] = set()
     protected_names: set[str] = set()
     for item in protected_paths:
-        _require_exact_keys(item, {"id", "path", "required"}, "protected path")
+        item_keys = set(item)
+        base_keys = {"id", "path", "required"}
+        if item_keys not in {frozenset(base_keys), frozenset(base_keys | {"markers"})}:
+            raise ContentLossError(
+                "protected path keys mismatch: expected id/path/required with optional markers"
+            )
         if not isinstance(item["id"], str) or not item["id"]:
             raise ContentLossError("protected path id must be a non-empty string")
         if not isinstance(item["path"], str) or not item["path"]:
             raise ContentLossError("protected path path must be a non-empty string")
         if item["required"] is not True:
             raise ContentLossError("protected path required must be true")
+        item_markers = item.get("markers", [])
+        if not isinstance(item_markers, list) or not all(
+            isinstance(marker, str) and marker for marker in item_markers
+        ):
+            raise ContentLossError("protected path markers must be non-empty strings")
         if item["id"] in protected_ids or item["path"] in protected_names:
             raise ContentLossError("protected path records must be unique")
         protected_ids.add(item["id"])
@@ -692,6 +702,19 @@ def evaluate_range(
         for item in baseline["protected_paths"]
         if isinstance(item.get("path"), str) and item.get("required") is True
     }
+    protected_marker_losses: list[dict[str, Any]] = []
+    for path, item in sorted(protected.items()):
+        required_markers = item.get("markers", [])
+        target_entry = target_entries.get(path)
+        if not required_markers or target_entry is None or target_entry.get("type") != "blob":
+            continue
+        target_text = _read_blob(root, target_entry["oid"]).decode("utf-8", "replace")
+        missing_markers = [marker for marker in required_markers if marker not in target_text]
+        if missing_markers:
+            reasons.append("PROTECTED_PATH_MARKER_REMOVED")
+            protected_marker_losses.append(
+                {"path": path, "missing_markers": missing_markers}
+            )
     missing_items: list[dict[str, Any]] = []
     for path in sorted(active_entries.keys() - target_entries.keys()):
         old = active_entries[path]
@@ -858,6 +881,7 @@ def evaluate_range(
             "marker_zero_transitions": zeroes,
             "missing_paths": missing_items,
             "mode_type_transitions": mode_type_transitions,
+            "protected_marker_losses": protected_marker_losses,
         },
         "mode": "range",
         "pr_number": pr_number,

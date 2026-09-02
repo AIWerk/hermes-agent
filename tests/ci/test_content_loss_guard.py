@@ -181,6 +181,36 @@ def test_fork_only_file_deletion_is_blocked(repo: tuple[Path, str, str]) -> None
     assert report["measurements"]["missing_paths"][0]["path"] == "fork-only.txt"
 
 
+def test_protected_path_marker_removal_is_blocked(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["protected_paths"].append(
+        {
+            "id": "operator-session-authority",
+            "markers": ["AIWerk integration"],
+            "path": "marker.txt",
+            "required": True,
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    active = _commit(root, "protect marker content")
+
+    _write(root, "marker.txt", "generic integration\n")
+    target = _commit(root, "remove protected marker")
+
+    report = evaluate_range(root, active, target, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert "PROTECTED_PATH_MARKER_REMOVED" in _codes(report)
+    assert report["measurements"]["protected_marker_losses"] == [
+        {"path": "marker.txt", "missing_markers": ["AIWerk integration"]}
+    ]
+    assert report["measurements"]["missing_paths"] == []
+
+
 def test_upstream_origin_deletion_is_reported_but_not_mislabeled_as_fork_loss(
     repo: tuple[Path, str, str],
 ) -> None:
