@@ -98,8 +98,18 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    # cache identity HEAD probe + origin probe + is-shallow probe + git fetch + git rev-list
-    assert mock_run.call_count == 5
+    git_commands = [
+        call.args[0]
+        for call in mock_run.call_args_list
+        if call.args and call.args[0][0] == "git"
+    ]
+    assert git_commands == [
+        ["git", "rev-parse", "HEAD"],
+        ["git", "remote", "get-url", "origin"],
+        ["git", "rev-parse", "--is-shallow-repository"],
+        ["git", "fetch", "origin", "main", "--quiet"],
+        ["git", "rev-list", "--count", "HEAD..origin/main"],
+    ]
 
 
 def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
