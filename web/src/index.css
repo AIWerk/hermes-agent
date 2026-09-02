@@ -146,8 +146,14 @@ code, kbd, pre, samp, .font-mono, .font-mono-ui {
 small { font-size: 1.0625rem; }
 code { font-size: 0.875rem; }
 
-/* Keep markdown text on the message bubble's typography scale. This must
-   remain scoped: global paragraph/list rules would affect the dashboard. */
+/* AIWerk CUI assistant bubbles render lightweight markdown inside a warm
+   light chat surface. Override the dashboard-global markdown utility colors
+   so **bold**, lists, and links inherit the customer UI bubble palette instead
+   of the dark admin dashboard theme. */
+.aiwerk-message-markdown,
+.aiwerk-message-markdown .text-foreground {
+  color: inherit;
+}
 .aiwerk-message-markdown > div,
 .aiwerk-message-markdown p,
 .aiwerk-message-markdown ul,
@@ -156,6 +162,17 @@ code { font-size: 0.875rem; }
   color: inherit;
   font-size: inherit !important;
   line-height: inherit !important;
+}
+.aiwerk-message-markdown strong {
+  font-weight: 700;
+}
+.aiwerk-message-markdown a {
+  color: #5f4f36;
+  text-decoration-color: rgba(95, 79, 54, 0.35);
+}
+.aiwerk-message-markdown code {
+  background: rgba(255, 250, 242, 0.65);
+  color: #4f4436;
 }
 
 /* Shadcn-compat tokens.

@@ -5,3 +5,4 @@ author: AIWerk
 kind: standalone
 provides_hooks:
   - pre_llm_call
+  - transform_llm_output

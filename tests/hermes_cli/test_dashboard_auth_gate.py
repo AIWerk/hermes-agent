@@ -59,23 +59,22 @@ def test_should_require_auth_truth_table(host, allow_public, expected):
     assert should_require_auth(host, allow_public) is expected
 
 
-def test_empty_provider_login_page_shows_supported_auth_paths():
+def test_empty_provider_login_page_fails_closed_without_operator_internals():
     from hermes_cli.dashboard_auth import clear_providers
     from hermes_cli.dashboard_auth.login_page import render_login_html
 
     clear_providers()
     html = render_login_html()
 
-    assert "--insecure" not in html
     assert "username/password provider" in html
     assert "OAuth provider" in html
-    assert "127.0.0.1" in html
-    assert "SSH tunnel" in html
-    assert "Tailscale" in html
-    assert (
-        'href="https://hermes-agent.nousresearch.com/docs/'
-        'user-guide/features/web-dashboard#authentication-gated-mode"'
-    ) in html
+    assert "AIWerk Support" in html
+    assert "Zugriff bleibt bis zur Korrektur geschlossen" in html
+    assert "--insecure" not in html
+    assert "127.0.0.1" not in html
+    assert "SSH tunnel" not in html
+    assert "Tailscale" not in html
+    assert "hermes-agent.nousresearch.com" not in html
 
 
 # ---------------------------------------------------------------------------

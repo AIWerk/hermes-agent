@@ -126,6 +126,59 @@ def cmd_sessions(args, sessions_parser=None):
 
     action = args.sessions_action
 
+    # 'repair', 'recover', and 'repair-search' must run BEFORE opening
+    # SessionDB(): a malformed schema is exactly the case where SessionDB()
+    # cannot open, and search repair must verify that every other process is
+    # stopped before this process becomes a holder itself.
+    if action == "repair-search":
+        from hermes_state import DEFAULT_DB_PATH, SessionDB, count_db_holders
+
+        db_path = DEFAULT_DB_PATH
+        if not db_path.exists():
+            print(f"No session database at {db_path} (nothing to repair).")
+            return
+        holders = count_db_holders(db_path)
+        if holders != 0:
+            print(
+                "✗ Search-index repair is offline-only: stop the gateway and "
+                f"every Hermes process first (detected holders: {holders})."
+            )
+            return 2
+        db = None
+        try:
+            db = SessionDB(db_path=db_path)
+            report = db.repair_fts_offline()
+        except Exception as exc:
+            print(f"✗ Verified offline search-index repair failed: {exc}")
+            return 2
+        finally:
+            if db is not None:
+                db.close()
+        if report.get("verified") and report.get("reason") == "not-required":
+            print(
+                "✓ Search-index repair not required; "
+                "repair-required is already clear."
+            )
+            return 0
+        if not report.get("verified") or not report.get("repaired"):
+            reason = report.get("reason", "verification-failed")
+            print(
+                "✗ Search-index repair was not verified; repair-required "
+                f"remains set ({reason})."
+            )
+            return 2
+        print(
+            "✓ Verified offline search-index repair completed; "
+            "repair-required was cleared."
+        )
+        if report.get("connection_restored") is False:
+            detail = report.get("connection_restore_error", "unknown error")
+            print(
+                "⚠ The durable repair succeeded, but writer connection "
+                f"restoration failed ({detail}). A fresh invocation may reopen it."
+            )
+        return 0
+
     # 'repair' and 'recover' must run BEFORE opening SessionDB(): a
     # malformed schema is exactly the case where SessionDB() can't open.
     # Recovery additionally promises never to open the supplied source

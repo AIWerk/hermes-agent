@@ -124,6 +124,7 @@ def contrast(a: str, b: str) -> float:
 # the look the maintainers standardized on. Generated paired palettes are
 # explicitly NOT wanted; only ship one when a human tuned it.
 LIGHT_AUTHORED = frozenset({"daylight", "warm-lightmode"})
+BRANDING_ONLY_ALIASES = frozenset({"default-hu", "default-de"})
 
 
 # A `light_colors`/`dark_colors` block is an OVERLAY on `colors`, not a full
@@ -135,6 +136,9 @@ LIGHT_AUTHORED = frozenset({"daylight", "warm-lightmode"})
 def _base_palettes():
     """Yield (skin, palette, is_light) for every built-in's base `colors`."""
     for name, skin in _BUILTIN_SKINS.items():
+        if name in BRANDING_ONLY_ALIASES:
+            assert "colors" not in skin
+            continue
         yield name, skin.get("colors", {}), name in LIGHT_AUTHORED
 
 

@@ -231,6 +231,9 @@ class TestCliApprovalUi:
                 self.thinking_callback = None
 
             def run_conversation(self, **kwargs):
+                from hermes_cli.operator_verification import (
+                    get_operator_verification_callback,
+                )
                 from tools.terminal_tool import (
                     _get_approval_callback,
                     _get_sudo_password_callback,
@@ -238,6 +241,7 @@ class TestCliApprovalUi:
 
                 seen["approval"] = _get_approval_callback()
                 seen["sudo"] = _get_sudo_password_callback()
+                seen["operator"] = get_operator_verification_callback()
                 return {
                     "final_response": "done",
                     "messages": [],
@@ -261,6 +265,8 @@ class TestCliApprovalUi:
         assert seen["approval"].__func__ is HermesCLI._approval_callback
         assert seen["sudo"].__self__ is cli
         assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
+        assert seen["operator"].__self__ is cli
+        assert seen["operator"].__func__ is HermesCLI._operator_verification_callback
         assert not cli._background_tasks
 
 

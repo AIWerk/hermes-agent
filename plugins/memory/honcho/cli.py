@@ -1418,6 +1418,76 @@ def _build_injection_preview(hcfg, ctx: dict, *, wrapped: bool = False) -> dict:
     }
 
 
+def build_injection_preview_summary(*, fail_quietly: bool = True) -> str:
+    """Return a compact, read-only next-turn injection summary.
+
+    The summary never consumes the provider prefetch cache and never includes
+    stored peer content. It reports only enabled section labels and size.
+    """
+    try:
+        from plugins.memory.honcho.client import (
+            HonchoClientConfig,
+            get_honcho_client,
+        )
+        from plugins.memory.honcho.session import HonchoSessionManager
+
+        hcfg = HonchoClientConfig.from_global_config(host=_host_key())
+        if (
+            not hcfg.enabled
+            or not (hcfg.api_key or hcfg.base_url)
+            or getattr(hcfg, "recall_mode", "") == "tools"
+        ):
+            return ""
+
+        client = get_honcho_client(hcfg)
+        manager = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = (
+            hcfg.resolve_session_name()
+            or getattr(hcfg, "host", "hermes")
+            or "hermes"
+        )
+        context = manager.get_prefetch_context(session_key) or {}
+        sections = (
+            ("Session Summary", "summary", "includeSummary", False),
+            ("User Representation", "representation", "includeUserRepresentation", False),
+            ("User Peer Card", "card", "includeUserCard", True),
+            ("AI Self-Representation", "ai_representation", "includeAiRepresentation", False),
+            ("AI Identity Card", "ai_card", "includeAiCard", True),
+        )
+        included: list[str] = []
+        excluded: list[str] = []
+        preview_parts: list[str] = []
+        for label, key, flag, default in sections:
+            value = context.get(key, "")
+            if isinstance(value, list):
+                value = "\n".join(
+                    str(item) for item in value if str(item).strip()
+                )
+            text = str(value or "").strip()
+            if text and _honcho_injection_flag(hcfg, flag, default):
+                included.append(label)
+                preview_parts.append(text)
+            else:
+                excluded.append(label)
+        excluded.append("Dialectic")
+        preview_text = "\n\n".join(preview_parts)
+        return "\n".join(
+            [
+                "Honcho injection preview for next turn",
+                f"  Included: {', '.join(included) or 'none'}",
+                f"  Excluded: {', '.join(excluded) or 'none'}",
+                "  Approx: "
+                f"{_estimate_tokens(preview_text)} tokens, "
+                f"{_section_line_count(preview_text)} lines",
+                "  Exact: hermes honcho injection-preview --raw",
+            ]
+        )
+    except Exception as exc:
+        if fail_quietly:
+            return ""
+        return f"Honcho injection preview unavailable: {type(exc).__name__}"
+
+
 def _print_injection_preview(preview: dict, hcfg, session_key: str) -> None:
     print("\nHoncho injection preview\n" + "─" * 40)
     print(f"\n  Session\n    Host: {getattr(hcfg, 'host', '(unknown)')}")

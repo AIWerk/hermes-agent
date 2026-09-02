@@ -44,6 +44,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
 import contextlib
 import contextvars
 import copy
@@ -53,13 +54,14 @@ import inspect
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, NamedTuple, NoReturn, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -9176,16 +9178,87 @@ def _aggregate_chat_stream(
     :class:`_ChatStreamAccumulator`.
     """
     acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
+    abandoned: Optional[threading.Event] = None
+    completed = False
     try:
-        for chunk in chunks:
-            acc.feed(chunk)
+        if total_ceiling is None:
+            for chunk in chunks:
+                acc.feed(chunk)
+        else:
+            events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+            abandoned = threading.Event()
+            consumed = threading.Event()
+
+            def _emit(kind: str, value: Any) -> bool:
+                while not abandoned.is_set():
+                    try:
+                        events.put((kind, value), timeout=0.05)
+                        return True
+                    except queue.Full:
+                        continue
+                return False
+
+            def _pump() -> None:
+                iterator = iter(chunks)
+                try:
+                    while not abandoned.is_set():
+                        try:
+                            chunk = next(iterator)
+                        except StopIteration:
+                            _emit("eof", None)
+                            return
+                        if abandoned.is_set():
+                            return
+                        consumed.clear()
+                        if not _emit("chunk", chunk):
+                            return
+                        while not abandoned.is_set():
+                            if consumed.wait(timeout=0.05):
+                                break
+                except BaseException as exc:
+                    _emit("error", exc)
+
+            threading.Thread(
+                target=_pump,
+                name="hermes-aux-stream-pump",
+                daemon=True,
+            ).start()
+            while True:
+                remaining = acc.remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    acc.raise_timeout()
+                try:
+                    kind, value = events.get(timeout=remaining)
+                except queue.Empty:
+                    acc.raise_timeout()
+                if kind == "chunk":
+                    acc.feed(value)
+                    consumed.set()
+                    continue
+                if kind == "error":
+                    raise value
+                acc.ensure_within_ceiling()
+                completed = True
+                break
     finally:
+        if abandoned is not None:
+            abandoned.set()
         close_fn = getattr(chunks, "close", None)
         if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:
-                pass
+            def _close_stream() -> None:
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+            if abandoned is not None and not completed:
+                threading.Thread(
+                    target=_close_stream,
+                    name="hermes-aux-stream-close",
+                    daemon=True,
+                ).start()
+            else:
+                _close_stream()
     return acc.finish()
 
 
@@ -9210,14 +9283,7 @@ class _ChatStreamAccumulator:
 
     def feed(self, chunk: Any) -> None:
         _notify_aux_progress()
-        if (
-            self._total_ceiling is not None
-            and (time.monotonic() - self._started) >= self._total_ceiling
-        ):
-            raise TimeoutError(
-                f"Auxiliary streamed call timed out after {self._total_ceiling:.0f}s "
-                "total ceiling (stream still open but over budget)"
-            )
+        self.ensure_within_ceiling()
         self.resp_id = getattr(chunk, "id", None) or self.resp_id
         self.resp_model = getattr(chunk, "model", None) or self.resp_model
         chunk_usage = getattr(chunk, "usage", None)
@@ -9254,7 +9320,24 @@ class _ChatStreamAccumulator:
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
 
+    def remaining_seconds(self) -> Optional[float]:
+        if self._total_ceiling is None:
+            return None
+        return self._total_ceiling - (time.monotonic() - self._started)
+
+    def raise_timeout(self) -> NoReturn:
+        raise TimeoutError(
+            f"Auxiliary streamed call timed out after {self._total_ceiling:.0f}s "
+            "total ceiling (stream still open but over budget)"
+        )
+
+    def ensure_within_ceiling(self) -> None:
+        remaining = self.remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            self.raise_timeout()
+
     def finish(self) -> Any:
+        self.ensure_within_ceiling()
         tool_calls = None
         if self.tool_calls_acc:
             tool_calls = [
@@ -9301,16 +9384,71 @@ async def _aggregate_chat_stream_async(
     :class:`_ChatStreamAccumulator`.
     """
     acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
-    try:
-        async for chunk in chunks:
-            acc.feed(chunk)
-    finally:
+    ceiling_expired = False
+
+    def _consume_background_result(task: asyncio.Future[Any]) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def _close_stream() -> None:
         close_fn = getattr(chunks, "close", None) or getattr(chunks, "aclose", None)
         if callable(close_fn):
+            result = close_fn()
+            if inspect.isawaitable(result):
+                await result
+
+    try:
+        iterator = chunks.__aiter__()
+        while True:
+            remaining = acc.remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                ceiling_expired = True
+                acc.raise_timeout()
             try:
-                result = close_fn()
-                if inspect.isawaitable(result):
-                    await result
+                if remaining is None:
+                    chunk = await iterator.__anext__()
+                else:
+                    next_chunk = asyncio.ensure_future(iterator.__anext__())
+                    deadline = asyncio.create_task(asyncio.sleep(remaining))
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {next_chunk, deadline},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except BaseException:
+                        next_chunk.cancel()
+                        deadline.cancel()
+                        next_chunk.add_done_callback(_consume_background_result)
+                        deadline.add_done_callback(_consume_background_result)
+                        raise
+                    if next_chunk not in done:
+                        ceiling_expired = True
+                        next_chunk.cancel()
+                        next_chunk.add_done_callback(_consume_background_result)
+                        acc.raise_timeout()
+                    deadline.cancel()
+                    deadline.add_done_callback(_consume_background_result)
+                    chunk = next_chunk.result()
+            except StopAsyncIteration:
+                remaining = acc.remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    ceiling_expired = True
+                acc.ensure_within_ceiling()
+                break
+            try:
+                acc.feed(chunk)
+            except TimeoutError:
+                ceiling_expired = True
+                raise
+    finally:
+        if ceiling_expired:
+            cleanup = asyncio.create_task(_close_stream())
+            cleanup.add_done_callback(_consume_background_result)
+        else:
+            try:
+                await _close_stream()
             except Exception:
                 pass
     return acc.finish()
@@ -9338,6 +9476,53 @@ async def _acreate_with_stream(
     return await _aggregate_chat_stream_async(
         chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
     )
+
+
+def _sync_progress_create_for(
+    client: Any,
+    task: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str] = None,
+) -> Callable[[Dict[str, Any]], Any]:
+    """Bind progress-aware creation to the client used by a retry/fallback."""
+    force_stream = _provider_requires_stream(
+        provider, base_url or str(getattr(client, "base_url", "") or "")
+    )
+
+    def _create(kwargs: Dict[str, Any]) -> Any:
+        return _create_with_progress(
+            client, kwargs, task, force_stream=force_stream,
+        )
+
+    return _create
+
+
+def _async_progress_create_for(
+    client: Any,
+    task: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str] = None,
+) -> Callable[[Dict[str, Any]], Any]:
+    """Async counterpart bound to the actual rebuilt/fallback client."""
+    force_stream = (
+        _provider_requires_stream(
+            provider, base_url or str(getattr(client, "base_url", "") or "")
+        )
+        and not isinstance(client, (
+            AsyncCodexAuxiliaryClient,
+            AsyncAnthropicAuxiliaryClient,
+            AsyncBedrockAuxiliaryClient,
+        ))
+    )
+
+    async def _create(kwargs: Dict[str, Any]) -> Any:
+        _notify_aux_progress()
+        if force_stream:
+            return await _acreate_with_stream(client, kwargs, task)
+        return await client.chat.completions.create(**kwargs)
+
+    return _create
+
 
 
 @_relay_auxiliary_call
@@ -9629,6 +9814,9 @@ def _call_llm_impl(
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
+    _create = _sync_progress_create_for(
+        client, task, resolved_provider, _base_info or resolved_base_url,
+    )
     try:
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
@@ -9653,14 +9841,7 @@ def _call_llm_impl(
                     kwargs,
                     provider=request_provider,
                     api_mode=resolved_api_mode,
-                    create=lambda request: _create_with_progress(
-                        client,
-                        request,
-                        task,
-                        force_stream=_provider_requires_stream(
-                            request_provider, _base_info or resolved_base_url,
-                        ),
-                    ),
+                    create=_create,
                 ),
                 task,
                 provider=request_provider, base_url=_base_info)
@@ -9732,6 +9913,7 @@ def _call_llm_impl(
                         retry_kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_create,
                     ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
@@ -10481,6 +10663,7 @@ async def _async_call_llm_impl(
                         retry_kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_acreate,
                     ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)

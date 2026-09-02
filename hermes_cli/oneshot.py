@@ -473,6 +473,14 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        operator_session_context = None
+        try:
+            from hermes_cli.operator_session import get_current_operator_session_context
+
+            operator_session_context = get_current_operator_session_context()
+        except Exception:
+            operator_session_context = None
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -484,6 +492,7 @@ def _run_agent(
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            operator_session_context=operator_session_context,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             ephemeral_system_prompt=skills_prompt,

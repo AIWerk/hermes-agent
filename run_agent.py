@@ -522,6 +522,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        operator_session_context: Dict[str, Any] | None = None,
         requested_provider: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
@@ -613,6 +614,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            operator_session_context=operator_session_context,
         )
 
     def _get_session_db_for_recall(self):
@@ -651,6 +653,10 @@ class AIAgent:
             return
         source = _session_source_for_agent(self.platform)
         try:
+            _operator_ctx = getattr(self, "operator_session_context", None)
+            _session_user_id = None
+            if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator":
+                _session_user_id = str(_operator_ctx.get("actor_id") or "") or None
             try:
                 from hermes_cli.profiles import get_active_profile_name
                 _profile_for_session = get_active_profile_name()
@@ -677,7 +683,7 @@ class AIAgent:
                 model=self.model,
                 model_config=_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                user_id=_session_user_id,
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
@@ -1971,6 +1977,19 @@ class AIAgent:
             tool_call_id=tool_call_id,
         )
 
+    @staticmethod
+    def _memory_write_succeeded(result: Any) -> bool:
+        """Return true only for a completed, non-staged built-in memory write."""
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("success") is True
+            and payload.get("staged") is not True
+        )
+
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
 
@@ -2016,6 +2035,19 @@ class AIAgent:
                     msg["content"] = override
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
+
+    def _record_incremental_session_notes(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]] = None,
+        final_response: Optional[str] = None,
+    ) -> None:
+        """Forward to deterministic post-persist session note capture."""
+        from agent.conversation_loop import _record_incremental_session_notes
+
+        return _record_incremental_session_notes(
+            self, messages, conversation_history, final_response
+        )
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
@@ -3534,20 +3566,30 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+        steer_lock = getattr(self, "_pending_steer_lock", None)
+        admission_lock = getattr(self, "_pending_redirect_lock", None)
+
+        def _admit() -> bool:
+            if not getattr(self, "_steer_admission_open", True):
+                return False
+            if steer_lock is None:
+                existing = getattr(self, "_pending_steer", None)
+                self._pending_steer = (
+                    existing + "\n" + cleaned if existing else cleaned
+                )
+                return True
+            with steer_lock:
+                self._pending_steer = (
+                    self._pending_steer + "\n" + cleaned
+                    if self._pending_steer
+                    else cleaned
+                )
             return True
-        with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
-        return True
+
+        if admission_lock is None:
+            return _admit()
+        with admission_lock:
+            return _admit()
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3593,9 +3635,17 @@ class AIAgent:
             return self.steer(cleaned)
 
         _model_active = getattr(self, "_model_request_active", None)
+        _response_pending = getattr(self, "_response_commit_pending", None)
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-        if _redirect_lock is None:
-            if _model_active is None or not _model_active.is_set():
+        abort_request = False
+
+        def _admit_redirect() -> bool:
+            nonlocal abort_request
+            abort_request = bool(_model_active is not None and _model_active.is_set())
+            at_commit_fence = bool(
+                _response_pending is not None and _response_pending.is_set()
+            )
+            if not (abort_request or at_commit_fence):
                 return False
             existing = getattr(self, "_pending_redirect", None)
             if self._interrupt_requested and not existing:
@@ -3605,25 +3655,20 @@ class AIAgent:
                 if existing
                 else cleaned
             )
-            self._interrupt_requested = True
-            self._interrupt_message = None
-        else:
-            with _redirect_lock:
-                if _model_active is None or not _model_active.is_set():
-                    # The response completed before we acquired the state lock.
-                    # Reject so the surface queues a new turn.
-                    return False
-                if self._interrupt_requested and not self._pending_redirect:
-                    return False
-                if self._pending_redirect:
-                    self._pending_redirect = (
-                        f"{self._pending_redirect}\n\n"
-                        f"[Additional user correction]\n{cleaned}"
-                    )
-                else:
-                    self._pending_redirect = cleaned
+            if abort_request:
                 self._interrupt_requested = True
                 self._interrupt_message = None
+            return True
+
+        if _redirect_lock is None:
+            accepted = _admit_redirect()
+        else:
+            with _redirect_lock:
+                accepted = _admit_redirect()
+        if not accepted:
+            return False
+        if not abort_request:
+            return True
 
         # Interrupt only the model request. Do not fan out to tool workers or
         # child agents as interrupt() does.
@@ -3640,6 +3685,85 @@ class AIAgent:
             except Exception:
                 logger.debug("Failed to abort request for redirect", exc_info=True)
         return True
+
+    def _take_pending_redirect_and_close_response_window(self) -> Optional[str]:
+        redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        response_pending = getattr(self, "_response_commit_pending", None)
+
+        def _take() -> Optional[str]:
+            if response_pending is not None:
+                response_pending.clear()
+            text = getattr(self, "_pending_redirect", None)
+            self._pending_redirect = None
+            return text
+
+        if redirect_lock is None:
+            return _take()
+        with redirect_lock:
+            return _take()
+
+    def _open_turn_correction_admission(self) -> None:
+        lock = getattr(self, "_pending_redirect_lock", None)
+        if lock is None:
+            self._steer_admission_open = True
+            return
+        with lock:
+            self._steer_admission_open = True
+
+    def _take_text_commit_correction_and_close_admission(self) -> Optional[str]:
+        redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        steer_lock = getattr(self, "_pending_steer_lock", None)
+
+        def _take() -> Optional[str]:
+            response_pending = getattr(self, "_response_commit_pending", None)
+            if response_pending is not None:
+                response_pending.clear()
+            self._steer_admission_open = False
+            redirect = getattr(self, "_pending_redirect", None)
+            self._pending_redirect = None
+            if steer_lock is None:
+                steer = getattr(self, "_pending_steer", None)
+                self._pending_steer = None
+            else:
+                with steer_lock:
+                    steer = self._pending_steer
+                    self._pending_steer = None
+            if redirect and steer:
+                return f"{redirect}\n\n[Additional user correction]\n{steer}"
+            return redirect or steer
+
+        if redirect_lock is None:
+            return _take()
+        with redirect_lock:
+            return _take()
+
+    def _close_turn_correction_admission(
+        self, *, preserve_pending: bool = False
+    ) -> None:
+        redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        steer_lock = getattr(self, "_pending_steer_lock", None)
+
+        def _close() -> None:
+            response_pending = getattr(self, "_response_commit_pending", None)
+            if response_pending is not None:
+                response_pending.clear()
+            model_active = getattr(self, "_model_request_active", None)
+            if model_active is not None:
+                model_active.clear()
+            self._steer_admission_open = False
+            if not preserve_pending:
+                self._pending_redirect = None
+                if steer_lock is None:
+                    self._pending_steer = None
+                else:
+                    with steer_lock:
+                        self._pending_steer = None
+
+        if redirect_lock is None:
+            _close()
+        else:
+            with redirect_lock:
+                _close()
 
     def _has_pending_redirect(self) -> bool:
         """Return whether an active-turn redirect is waiting to be applied."""
@@ -8556,6 +8680,7 @@ class AIAgent:
         acct_token = None
         task_started = False
         task_finished = False
+        preserve_exception_correction = False
         relay_outcome = "failed"
 
         def _stop_durable_turn_lease_refresher() -> None:
@@ -8864,6 +8989,7 @@ class AIAgent:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
                         durable_turn_lease_thread.start()
+                    self._open_turn_correction_admission()
                     result = run_conversation(
                         self,
                         user_message,
@@ -8901,6 +9027,15 @@ class AIAgent:
                 finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            correction = self._take_text_commit_correction_and_close_admission()
+            if isinstance(correction, str) and correction.strip():
+                preserve_exception_correction = True
+                pending = getattr(self, "_pending_steer", None)
+                self._pending_steer = (
+                    f"{pending}\n\n{correction.strip()}"
+                    if isinstance(pending, str) and pending.strip()
+                    else correction.strip()
+                )
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):
@@ -8917,6 +9052,9 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            self._close_turn_correction_admission(
+                preserve_pending=preserve_exception_correction
+            )
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

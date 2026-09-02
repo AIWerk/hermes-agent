@@ -337,6 +337,7 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    auto_reset = _rotate_cui_session_if_expired(sid, session)
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -354,6 +355,19 @@ def _(rid, params: dict) -> dict:
         # instead of the skill it originally loaded.
         text = _expand_skill_invocation_for_replay(
             text, str(session.get("session_key") or "")
+        )
+    attachments = (
+        list(params.get("attachments") or [])
+        if isinstance(params.get("attachments"), list)
+        else []
+    )
+    attachments.extend(_shared_uri_prompt_attachments(text, sid))
+    uploaded_images, attachment_context = _process_prompt_attachments(attachments, sid)
+    if attachment_context:
+        text = (
+            f"{text}\n\n{attachment_context}"
+            if str(text).strip()
+            else attachment_context
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
@@ -809,6 +823,8 @@ def _(rid, params: dict) -> dict:
                             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        if uploaded_images:
+            session.setdefault("attached_images", []).extend(uploaded_images)
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -928,6 +944,17 @@ def _(rid, params: dict) -> dict:
             **(
                 {"survivor_row_id_map": survivor_row_id_map}
                 if survivor_row_id_map is not None
+                else {}
+            ),
+            **(
+                {
+                    "auto_reset": True,
+                    "session_key": auto_reset["to"],
+                    "stored_session_id": auto_reset["to"],
+                    "previous_session_key": auto_reset["from"],
+                    "auto_reset_reason": auto_reset["reason"],
+                }
+                if auto_reset
                 else {}
             ),
         },

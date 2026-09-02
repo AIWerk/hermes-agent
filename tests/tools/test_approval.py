@@ -10,6 +10,7 @@ from unittest.mock import patch as mock_patch
 import pytest
 
 import tools.approval as approval_module
+from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
 from hermes_constants import get_hermes_home
 from tools.approval import (
     _get_approval_mode,
@@ -24,27 +25,86 @@ from tools.approval import (
 )
 
 
-def test_requires_flag_and_authenticated_actor_context(monkeypatch):
+def test_managed_autonomy_rejects_unbound_aiwerk_actor_environment(monkeypatch):
+    monkeypatch.setenv(
+        "AIWERK_CUI_ACTOR_CONTEXT",
+        '{"tenant_id":"spoofed-tenant","actor_id":"spoofed-admin","role":"operator"}',
+    )
+    monkeypatch.setenv("AIWERK_CUI_TENANT_ID", "spoofed-tenant")
+    monkeypatch.setenv("AIWERK_CUI_ACTOR_ID", "spoofed-admin")
+    monkeypatch.setenv("AIWERK_CUI_ACTOR_ROLE", "operator")
+
+    assert approval_module._managed_autonomy_authorized() is False
+
+
+def test_managed_autonomy_ignores_environment_when_bound_actor_is_customer(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_CUI_MANAGED_AUTONOMY", "1")
+    monkeypatch.setenv("HERMES_CUI_MANAGED_ACTOR_ID", "spoofed-operator")
+    monkeypatch.setenv("HERMES_CUI_MANAGED_ACTOR_ROLE", "operator")
+    token = bind_cui_actor_context(
+        {
+            "tenant_id": "tenant-1",
+            "actor_id": "customer-1",
+            "role": "customer",
+        }
+    )
+    try:
+        assert approval_module._managed_autonomy_authorized() is False
+    finally:
+        reset_cui_actor_context(token)
+
+
+def test_managed_autonomy_follows_complete_bound_admin_lifecycle(monkeypatch):
+    for key in (
+        "HERMES_CUI_MANAGED_AUTONOMY",
+        "HERMES_CUI_MANAGED_ACTOR_ID",
+        "HERMES_CUI_MANAGED_ACTOR_ROLE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    token = bind_cui_actor_context(
+        {
+            "tenant_id": "tenant-1",
+            "actor_id": "admin-1",
+            "role": "aiwerk_admin",
+        }
+    )
+    try:
+        assert approval_module._managed_autonomy_authorized() is True
+    finally:
+        reset_cui_actor_context(token)
+    assert approval_module._managed_autonomy_authorized() is False
+
+
+def test_requires_complete_authenticated_admin_actor_context():
     cases = (
-        (False, "operator-1", "operator"),
-        (True, "", "operator"),
-        (True, "operator-1", ""),
+        None,
+        {},
+        {"tenant_id": "tenant-1", "actor_id": "operator-1"},
+        {"tenant_id": "tenant-1", "role": "operator"},
     )
     for context in cases:
-        monkeypatch.setattr(
-            approval_module, "_MANAGED_AUTONOMY_CONTEXT_FROZEN", context
-        )
-        assert approval_module._managed_autonomy_authorized() is False
+        token = bind_cui_actor_context(context)
+        try:
+            assert approval_module._managed_autonomy_authorized() is False
+        finally:
+            reset_cui_actor_context(token)
 
-    monkeypatch.setattr(
-        approval_module,
-        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
-        (True, "operator-1", "operator"),
+    token = bind_cui_actor_context(
+        {
+            "tenant_id": "tenant-1",
+            "actor_id": "operator-1",
+            "role": "operator",
+        }
     )
-    assert approval_module._managed_autonomy_authorized() is True
+    try:
+        assert approval_module._managed_autonomy_authorized() is True
+    finally:
+        reset_cui_actor_context(token)
 
 
-def test_lay_customer_roles_do_not_get_managed_autonomy(monkeypatch):
+def test_lay_customer_roles_do_not_get_managed_autonomy():
     for role in (
         "customer",
         "user",
@@ -52,22 +112,27 @@ def test_lay_customer_roles_do_not_get_managed_autonomy(monkeypatch):
         "internal",
         "server-internal",
         "admin-dashboard",
+        "owner",
+        "tenant_admin",
     ):
-        monkeypatch.setattr(
-            approval_module,
-            "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
-            (True, "actor-1", role),
+        token = bind_cui_actor_context(
+            {"tenant_id": "tenant-1", "actor_id": "actor-1", "role": role}
         )
-        assert approval_module._managed_autonomy_authorized() is False
+        try:
+            assert approval_module._managed_autonomy_authorized() is False
+        finally:
+            reset_cui_actor_context(token)
 
 
 def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(
     monkeypatch,
 ):
-    monkeypatch.setattr(
-        approval_module,
-        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
-        (True, "operator-1", "operator"),
+    actor_token = bind_cui_actor_context(
+        {
+            "tenant_id": "tenant-1",
+            "actor_id": "operator-1",
+            "role": "operator",
+        }
     )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
@@ -78,22 +143,27 @@ def test_approves_dangerous_prompt_in_authenticated_cui_but_keeps_hardline(
         lambda _command: {"action": "allow", "findings": [], "summary": ""},
     )
 
-    managed = approval_module.check_all_command_guards(
-        'python -c "print(1)"', "local"
-    )
-    hardline = approval_module.check_all_command_guards("rm -rf /", "local")
+    try:
+        managed = approval_module.check_all_command_guards(
+            'python -c "print(1)"', "local"
+        )
+        hardline = approval_module.check_all_command_guards("rm -rf /", "local")
 
-    assert managed["approved"] is True
-    assert managed["managed_autonomy"] is True
-    assert hardline["approved"] is False
-    assert hardline.get("hardline") is True
+        assert managed["approved"] is True
+        assert managed["managed_autonomy"] is True
+        assert hardline["approved"] is False
+        assert hardline.get("hardline") is True
+    finally:
+        reset_cui_actor_context(actor_token)
 
 
 def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(monkeypatch):
-    monkeypatch.setattr(
-        approval_module,
-        "_MANAGED_AUTONOMY_CONTEXT_FROZEN",
-        (True, "operator-1", "admin"),
+    actor_token = bind_cui_actor_context(
+        {
+            "tenant_id": "tenant-1",
+            "actor_id": "operator-1",
+            "role": "admin",
+        }
     )
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
@@ -102,13 +172,16 @@ def test_execute_code_still_prompts_for_mutating_code_in_cui_autonomy(monkeypatc
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     approval_module._gateway_notify_cbs.clear()
 
-    result = approval_module.check_execute_code_guard(
-        "from pathlib import Path\nPath('changed.txt').write_text('changed')",
-        "local",
-    )
+    try:
+        result = approval_module.check_execute_code_guard(
+            "from pathlib import Path\nPath('changed.txt').write_text('changed')",
+            "local",
+        )
 
-    assert result["approved"] is False
-    assert result["status"] == "pending_approval"
+        assert result["approved"] is False
+        assert result["status"] == "pending_approval"
+    finally:
+        reset_cui_actor_context(actor_token)
 
 
 class TestApprovalModeParsing:

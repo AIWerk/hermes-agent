@@ -40,6 +40,9 @@ from agent.skill_utils import (
     skill_matches_environment,
     skill_matches_platform,
     skill_matches_platform_list,
+    skill_visibility_from_frontmatter,
+    skill_visibility_scope_for_current_actor,
+    skill_visible_for_current_actor,
 )
 from utils import atomic_json_write
 
@@ -1830,6 +1833,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "visibility": skill_visibility_from_frontmatter(frontmatter),
     }
     if org_id:
         entry["org_id"] = org_id
@@ -2012,6 +2016,7 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        skill_visibility_scope_for_current_actor(),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -2047,6 +2052,8 @@ def _build_skills_system_prompt_inner(
                 available_toolsets,
             ):
                 continue
+            if not skill_visible_for_current_actor(entry.get("visibility")):
+                continue
             visible_entries.append(entry)
         category_descriptions = {
             str(k): str(v)
@@ -2068,6 +2075,8 @@ def _build_skills_system_prompt_inner(
                 available_tools,
                 available_toolsets,
             ):
+                continue
+            if not skill_visible_for_current_actor(entry.get("visibility")):
                 continue
             visible_entries.append(entry)
 
@@ -2099,6 +2108,8 @@ def _build_skills_system_prompt_inner(
                         available_tools,
                         available_toolsets,
                     ):
+                        continue
+                    if not skill_visible_for_current_actor(entry.get("visibility")):
                         continue
                     project_names.add(fm_name)
                     skills_by_category.setdefault(entry["category"], []).append(
@@ -2198,6 +2209,8 @@ def _build_skills_system_prompt_inner(
                     available_tools,
                     available_toolsets,
                 ):
+                    continue
+                if not skill_visible_for_current_actor(entry.get("visibility")):
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(

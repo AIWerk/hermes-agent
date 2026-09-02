@@ -4741,7 +4741,7 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     assert "token=" in gateway_url
 
 
-def test_resolve_chat_argv_injects_managed_autonomy_for_authenticated_assistant(
+def test_resolve_chat_argv_never_exports_managed_autonomy_authority(
     monkeypatch,
 ):
     import hermes_cli.main as cli_main
@@ -4759,9 +4759,9 @@ def test_resolve_chat_argv_injects_managed_autonomy_for_authenticated_assistant(
     )
 
     assert env is not None
-    assert env["HERMES_CUI_MANAGED_AUTONOMY"] == "1"
-    assert env["HERMES_CUI_MANAGED_ACTOR_ID"] == "operator-1"
-    assert env["HERMES_CUI_MANAGED_ACTOR_ROLE"] == "operator"
+    assert "HERMES_CUI_MANAGED_AUTONOMY" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ID" not in env
+    assert "HERMES_CUI_MANAGED_ACTOR_ROLE" not in env
 
 
 def test_resolve_chat_argv_does_not_inject_managed_autonomy_in_admin_dashboard(

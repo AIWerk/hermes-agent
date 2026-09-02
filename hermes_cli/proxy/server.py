@@ -12,9 +12,11 @@ or rewrite request/response bodies. It's a credential-attaching forwarder.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
-from typing import Optional
+import time
+from typing import Any, Optional
 
 try:
     import aiohttp
@@ -28,6 +30,7 @@ except ImportError:
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
 logger = logging.getLogger(__name__)
+_ACCESS_LOG_NAME = "proxy.log"
 
 # Headers we strip when forwarding to the upstream. ``host``/``content-length``
 # are recomputed by aiohttp; ``authorization`` is replaced with our bearer.
@@ -85,6 +88,290 @@ def _filter_response_headers(headers) -> dict:
     return out
 
 
+def _usage_from_payload(payload: Any) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    out: dict[str, int] = {}
+    mapping = {
+        "prompt_tokens": "prompt_tokens",
+        "completion_tokens": "completion_tokens",
+        "total_tokens": "total_tokens",
+        "input_tokens": "input_tokens",
+        "output_tokens": "output_tokens",
+    }
+    for src, dst in mapping.items():
+        val = usage.get(src)
+        if isinstance(val, (int, float)):
+            out[dst] = int(val)
+    return out
+
+
+def _request_id_from_headers(headers: Any) -> Optional[str]:
+    for key in ("x-oai-request-id", "openai-request-id", "x-request-id"):
+        try:
+            val = headers.get(key)
+        except Exception:
+            val = None
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _safe_model_from_body(body: bytes) -> Optional[str]:
+    if not body:
+        return None
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    model = parsed.get("model")
+    return str(model).strip() if model else None
+
+
+def _log_proxy_event(
+    *,
+    method: str,
+    path: str,
+    provider: str,
+    status: int,
+    start_time: float,
+    model: Optional[str] = None,
+    usage: Optional[dict[str, int]] = None,
+    upstream_request_id: Optional[str] = None,
+    error_code: Optional[str] = None,
+) -> None:
+    """Append one safe JSONL proxy access event without request or token data."""
+    try:
+        from hermes_constants import get_hermes_home
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        event: dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "method": method,
+            "path": path,
+            "provider": provider,
+            "status": int(status),
+            "latency_ms": int((time.monotonic() - start_time) * 1000),
+        }
+        if model:
+            event["model"] = model
+        if usage:
+            event["usage"] = usage
+        if upstream_request_id:
+            event["upstream_request_id"] = upstream_request_id
+        if error_code:
+            event["error_code"] = error_code
+        with (log_dir / _ACCESS_LOG_NAME).open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.debug("proxy: failed to write access log: %s", exc)
+
+
+async def _handle_codex_chat_completion(
+    *,
+    request: "web.Request",
+    adapter: UpstreamAdapter,
+    credential: UpstreamCredential,
+    headers_for_credential,
+    body: bytes,
+    provider: str,
+    start_time: float,
+) -> "web.Response":
+    """Serve /v1/chat/completions by translating to Codex /responses.
+
+    This path exists for OpenAI-compatible clients such as Honcho. It is a
+    strict no-tools shim: tools from the caller are intentionally not forwarded
+    to the Codex backend.
+
+    On a 401/429 from the upstream the shim performs a single credential
+    rotation via ``adapter.get_retry_credential`` and re-issues the request
+    once. The generic forward path already does this, but this shim returns
+    before that block — so without an explicit rotation here the documented
+    primary consumer (Honcho's memory deriver, wired to /chat/completions)
+    would get an un-rotated 401/429 straight through.
+    """
+    try:
+        incoming: Any = json.loads(body.decode("utf-8") if body else "{}")
+        if not isinstance(incoming, dict):
+            raise ValueError("request JSON must be an object")
+    except Exception as exc:
+        _log_proxy_event(
+            method=request.method,
+            path="/chat/completions",
+            provider=provider,
+            status=400,
+            start_time=start_time,
+            model=_safe_model_from_body(body),
+            error_code="invalid_request",
+        )
+        return _json_error(400, f"invalid JSON request body: {exc}", code="invalid_request")
+
+    model = str(incoming.get("model") or "").strip() or None
+    if incoming.get("stream") is True:
+        _log_proxy_event(
+            method=request.method,
+            path="/chat/completions",
+            provider=provider,
+            status=400,
+            start_time=start_time,
+            model=model,
+            error_code="stream_not_supported",
+        )
+        return _json_error(
+            400,
+            "The OpenAI-compatible Codex proxy chat shim does not support stream=true. Use non-streaming chat.completions or call /v1/responses directly.",
+            code="stream_not_supported",
+        )
+
+    try:
+        from hermes_cli.proxy.adapters.openai_codex import (
+            chat_payload_to_responses_payload,
+            responses_payload_to_chat_completion,
+            responses_stream_to_payload,
+        )
+        responses_payload = chat_payload_to_responses_payload(incoming)
+    except Exception as exc:
+        _log_proxy_event(
+            method=request.method,
+            path="/chat/completions",
+            provider=provider,
+            status=400,
+            start_time=start_time,
+            model=model,
+            error_code="translation_failed",
+        )
+        return _json_error(400, f"failed to translate chat request: {exc}", code="translation_failed")
+
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
+
+    async def _post_once(active_cred: UpstreamCredential):
+        """Issue one Responses POST; return (status, raw_body, request_id)."""
+        upstream_url = f"{active_cred.base_url.rstrip('/')}/responses"
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                upstream_url,
+                json=responses_payload,
+                headers=headers_for_credential(active_cred),
+                allow_redirects=False,
+            ) as upstream_resp:
+                raw = await upstream_resp.read()
+                return (
+                    upstream_resp.status,
+                    raw,
+                    _request_id_from_headers(upstream_resp.headers),
+                    upstream_resp.headers.get("content-type", ""),
+                    _filter_response_headers(upstream_resp.headers),
+                )
+
+    active_cred = credential
+    try:
+        status, raw, request_id, content_type, resp_headers = await _post_once(active_cred)
+
+        # One-shot rotation on auth/rate-limit failures so the documented
+        # /chat/completions consumer is protected just like the generic path.
+        if status in {401, 429}:
+            try:
+                retry_cred = adapter.get_retry_credential(
+                    failed_credential=active_cred,
+                    status_code=status,
+                )
+            except Exception as exc:
+                logger.warning("proxy: Codex chat-shim retry credential resolution failed: %s", exc)
+                retry_cred = None
+            if retry_cred is not None:
+                logger.info(
+                    "proxy: Codex chat shim got %s; retrying once with rotated credential",
+                    status,
+                )
+                active_cred = retry_cred
+                status, raw, request_id, content_type, resp_headers = await _post_once(active_cred)
+
+        if status >= 400:
+            _log_proxy_event(
+                method=request.method,
+                path="/chat/completions",
+                provider=provider,
+                status=status,
+                start_time=start_time,
+                model=model,
+                upstream_request_id=request_id,
+                error_code="upstream_error",
+            )
+            return web.Response(
+                status=status,
+                body=raw,
+                headers=resp_headers,
+            )
+        try:
+            stripped = raw.lstrip()
+            if (
+                "text/event-stream" in content_type.lower()
+                or stripped.startswith(b"event:")
+                or stripped.startswith(b"data:")
+            ):
+                upstream_json = responses_stream_to_payload(raw)
+            else:
+                upstream_json = json.loads(raw.decode("utf-8") if raw else "{}")
+            if not isinstance(upstream_json, dict):
+                raise ValueError("response JSON must be an object")
+        except Exception as exc:
+            _log_proxy_event(
+                method=request.method,
+                path="/chat/completions",
+                provider=provider,
+                status=502,
+                start_time=start_time,
+                model=model,
+                upstream_request_id=request_id,
+                error_code="upstream_invalid_response",
+            )
+            return _json_error(502, f"invalid Codex response: {exc}", code="upstream_invalid_response")
+    except aiohttp.ClientError as exc:
+        logger.warning("proxy: Codex upstream connection failed: %s", exc)
+        _log_proxy_event(
+            method=request.method,
+            path="/chat/completions",
+            provider=provider,
+            status=502,
+            start_time=start_time,
+            model=model,
+            error_code="upstream_unreachable",
+        )
+        return _json_error(502, f"upstream connection failed: {exc}", code="upstream_unreachable")
+    except asyncio.TimeoutError:
+        _log_proxy_event(
+            method=request.method,
+            path="/chat/completions",
+            provider=provider,
+            status=504,
+            start_time=start_time,
+            model=model,
+            error_code="upstream_timeout",
+        )
+        return _json_error(504, "upstream request timed out", code="upstream_timeout")
+
+    chat_payload = responses_payload_to_chat_completion(
+        upstream_json,
+        model=str(incoming.get("model") or responses_payload.get("model") or ""),
+    )
+    _log_proxy_event(
+        method=request.method,
+        path="/chat/completions",
+        provider=provider,
+        status=200,
+        start_time=start_time,
+        model=model,
+        usage=_usage_from_payload(chat_payload),
+        upstream_request_id=request_id,
+    )
+    return web.json_response(chat_payload)
+
+
 def create_app(adapter: UpstreamAdapter) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter."""
     if not AIOHTTP_AVAILABLE:
@@ -108,12 +395,21 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         )
 
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
+        start_time = time.monotonic()
         # Extract the path *after* /v1
         rel_path = request.match_info.get("tail", "")
         rel_path = "/" + rel_path.lstrip("/")
 
         if rel_path not in adapter.allowed_paths:
             allowed = ", ".join(sorted(adapter.allowed_paths))
+            _log_proxy_event(
+                method=request.method,
+                path=rel_path,
+                provider=adapter.name,
+                status=404,
+                start_time=start_time,
+                error_code="path_not_allowed",
+            )
             return _json_error(
                 404,
                 f"Path /v1{rel_path} is not forwarded by this proxy. "
@@ -125,6 +421,14 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             cred = adapter.get_credential()
         except Exception as exc:
             logger.warning("proxy: credential resolution failed: %s", exc)
+            _log_proxy_event(
+                method=request.method,
+                path=rel_path,
+                provider=adapter.name,
+                status=401,
+                start_time=start_time,
+                error_code="upstream_auth_failed",
+            )
             return _json_error(401, str(exc), code="upstream_auth_failed")
 
         # Forward body verbatim. Read into memory once — request bodies for
@@ -135,14 +439,34 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
+        def _headers_for_credential(active_cred: UpstreamCredential) -> dict:
+            fwd_headers = _filter_request_headers(request.headers)
+            extra_headers = getattr(active_cred, "headers", None)
+            if isinstance(extra_headers, dict):
+                for key, value in extra_headers.items():
+                    if key.lower() != "authorization":
+                        fwd_headers[key] = value
+            fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            return fwd_headers
+
+        if adapter.name == "openai-codex" and rel_path == "/chat/completions":
+            return await _handle_codex_chat_completion(
+                request=request,
+                adapter=adapter,
+                credential=cred,
+                headers_for_credential=_headers_for_credential,
+                body=body,
+                provider=adapter.name,
+                start_time=start_time,
+            )
+
         async def _send_upstream(active_cred: UpstreamCredential):
             upstream_url = f"{active_cred.base_url.rstrip('/')}{rel_path}"
             # Preserve query string verbatim.
             if request.query_string:
                 upstream_url = f"{upstream_url}?{request.query_string}"
 
-            fwd_headers = _filter_request_headers(request.headers)
-            fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            fwd_headers = _headers_for_credential(active_cred)
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s (body=%d bytes)",
@@ -171,9 +495,27 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             try:
                 return await _send_upstream(active_cred)
             except RuntimeError as exc:
+                _log_proxy_event(
+                    method=request.method,
+                    path=rel_path,
+                    provider=adapter.name,
+                    status=500,
+                    start_time=start_time,
+                    model=_safe_model_from_body(body),
+                    error_code="proxy_session_init_failed",
+                )
                 return _json_error(500, str(exc)), None
             except aiohttp.ClientError as exc:
                 logger.warning("proxy: upstream connection failed: %s", exc)
+                _log_proxy_event(
+                    method=request.method,
+                    path=rel_path,
+                    provider=adapter.name,
+                    status=502,
+                    start_time=start_time,
+                    model=_safe_model_from_body(body),
+                    error_code="upstream_unreachable",
+                )
                 return (
                     _json_error(
                         502,
@@ -183,6 +525,15 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     None,
                 )
             except asyncio.TimeoutError:
+                _log_proxy_event(
+                    method=request.method,
+                    path=rel_path,
+                    provider=adapter.name,
+                    status=504,
+                    start_time=start_time,
+                    model=_safe_model_from_body(body),
+                    error_code="upstream_timeout",
+                )
                 return (
                     _json_error(
                         504,
@@ -222,17 +573,40 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         )
         await resp.prepare(request)
 
+        interrupted = False
         try:
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
                     await resp.write(chunk)
         except (aiohttp.ClientError, asyncio.CancelledError) as exc:
+            interrupted = True
             logger.warning("proxy: streaming interrupted: %s", exc)
+            _log_proxy_event(
+                method=request.method,
+                path=rel_path,
+                provider=adapter.name,
+                status=upstream_resp.status,
+                start_time=start_time,
+                model=_safe_model_from_body(body),
+                upstream_request_id=_request_id_from_headers(upstream_resp.headers),
+                error_code="streaming_interrupted",
+            )
         finally:
             upstream_resp.release()
             await session.close()
 
         await resp.write_eof()
+        if not interrupted:
+            _log_proxy_event(
+                method=request.method,
+                path=rel_path,
+                provider=adapter.name,
+                status=upstream_resp.status,
+                start_time=start_time,
+                model=_safe_model_from_body(body),
+                upstream_request_id=_request_id_from_headers(upstream_resp.headers),
+                error_code="upstream_error" if upstream_resp.status >= 400 else None,
+            )
         return resp
 
     # /health doesn't go through the upstream

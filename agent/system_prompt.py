@@ -457,12 +457,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "verify_operator_identity" in agent.valid_tool_names:
         tool_guidance.append(OPERATOR_VERIFICATION_GUIDANCE)
     _operator_ctx = getattr(agent, "operator_session_context", None)
-    if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator_session":
+    if isinstance(_operator_ctx, dict) and _operator_ctx.get("mode") == "operator":
         stable_parts.append(
-            "Operator session context: this trusted CLI bootstrap labels the current human "
-            f"as actor_id={_operator_ctx.get('actor_id', 'unknown_cli')!r}. It does not authenticate or authorize "
-            "the human, does not upgrade their role, and must not be persisted to customer memory, USER.md, "
-            "Honcho, transcripts, or wiki. Sensitive actions still require verify_operator_identity."
+            "Operator session context: the local human was verified before the first turn. "
+            f"Treat the human as actor_id={_operator_ctx.get('actor_id', '')!r}, "
+            f"role={_operator_ctx.get('role', '')!r}, acting_for={_operator_ctx.get('acting_for', 'aiwerk')!r}. "
+            "Route durable notes from this session to operator memory/sanitized AIWerk wiki as appropriate, "
+            "not to customer/end-user memory. Do not ask for or record operator secrets."
         )
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -754,6 +755,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             f"refuse such writes by default; pass cross_profile=True only "
             f"after explicit direction."
         )
+
+    # Authenticated CUI speaker boundary. The helper emits static policy text and
+    # never interpolates tenant, actor, or display-name fields, so the block is
+    # cache-safe for the session and cannot carry identity-field prompt injection.
+    try:
+        from agent.cui_actor_context import cui_actor_system_prompt
+
+        _cui_actor_boundary = cui_actor_system_prompt()
+        if _cui_actor_boundary:
+            post_workspace_parts.append(_cui_actor_boundary)
+    except Exception:
+        # Actor policy probing must not break trusted internal/CLI prompt builds.
+        pass
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply

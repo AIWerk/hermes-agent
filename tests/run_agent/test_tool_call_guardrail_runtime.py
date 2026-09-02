@@ -287,10 +287,11 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
         agent._execute_tool_calls_sequential(msg, messages, "task-1")
 
     expected = [("write_file", final_args)]
+    expected_display = [("write_file", {"path": "/approved/path"})]
     assert observed["plugin"] == expected
     assert observed["guardrail"] == expected
     assert observed["approval"] == expected
-    assert observed["start"] == expected
+    assert observed["start"] == expected_display
     assert observed["dispatch"] == expected
     assert observed["checkpoint"] == [
         ("/approved/path", "before write_file")

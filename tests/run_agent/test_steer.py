@@ -26,6 +26,8 @@ def _bare_agent() -> AIAgent:
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
     agent._model_request_active = threading.Event()
+    agent._response_commit_pending = threading.Event()
+    agent._steer_admission_open = True
     agent._executing_tools = False
     agent._execution_thread_id = None
     agent._interrupt_thread_signal_pending = False
@@ -48,6 +50,62 @@ class TestSteerAcceptance:
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
+
+    def test_rejects_after_turn_commit_closes_admission(self):
+        agent = _bare_agent()
+        agent._steer_admission_open = False
+
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+    def test_text_commit_atomically_closes_and_drains_redirect_and_steer(self):
+        agent = _bare_agent()
+        agent._response_commit_pending.set()
+        agent._pending_redirect = "redirect correction"
+        agent._pending_steer = "steer correction"
+
+        correction = agent._take_text_commit_correction_and_close_admission()
+
+        assert correction == (
+            "redirect correction\n\n"
+            "[Additional user correction]\n"
+            "steer correction"
+        )
+        assert agent._response_commit_pending.is_set() is False
+        assert agent._steer_admission_open is False
+        assert agent._pending_redirect is None
+        assert agent._pending_steer is None
+        assert agent.steer("later turn") is False
+
+    def test_outer_turn_cleanup_clears_stale_fence_and_pending_corrections(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        agent._response_commit_pending.set()
+        agent._pending_redirect = "stale redirect"
+        agent._pending_steer = "stale steer"
+
+        agent._close_turn_correction_admission()
+
+        assert agent._model_request_active.is_set() is False
+        assert agent._response_commit_pending.is_set() is False
+        assert agent._steer_admission_open is False
+        assert agent._pending_redirect is None
+        assert agent._pending_steer is None
+        assert agent.redirect("next turn") is False
+        assert agent.steer("next turn") is False
+
+    def test_outer_turn_cleanup_can_preserve_exception_correction(self):
+        agent = _bare_agent()
+        agent._model_request_active.set()
+        agent._response_commit_pending.set()
+        agent._pending_steer = "accepted correction"
+
+        agent._close_turn_correction_admission(preserve_pending=True)
+
+        assert agent._model_request_active.is_set() is False
+        assert agent._response_commit_pending.is_set() is False
+        assert agent._steer_admission_open is False
+        assert agent._pending_steer == "accepted correction"
 
 
 
@@ -114,7 +172,7 @@ class TestActiveTurnRedirect:
         assert seen == ["visible provider thinking"]
         assert not getattr(agent, "_current_streamed_reasoning_text", "")
 
-    def test_response_completion_before_redirect_lock_rejects_correction(self):
+    def test_response_completion_before_redirect_lock_accepts_until_commit_fence(self):
         agent = _bare_agent()
         agent._model_request_active.set()
         started = threading.Event()
@@ -129,11 +187,20 @@ class TestActiveTurnRedirect:
             worker.start()
             assert started.wait(timeout=1)
             # Mirrors conversation_loop clearing the request-active marker
-            # under this same lock before redirect can commit its slot.
+            # and opening the response-commit window under the same lock.
             agent._model_request_active.clear()
+            agent._response_commit_pending.set()
         worker.join(timeout=1)
 
-        assert outcome["accepted"] is False
+        assert outcome["accepted"] is True
+        assert agent._pending_redirect == "late correction"
+
+    def test_redirect_rejects_after_response_commit_fence_closes(self):
+        agent = _bare_agent()
+        agent._model_request_active.clear()
+        agent._response_commit_pending.clear()
+
+        assert agent.redirect("new turn now") is False
         assert agent._pending_redirect is None
 
     def test_hard_stop_wins_concurrent_redirect(self):

@@ -3,49 +3,64 @@ import time
 
 import pytest
 
-def test_build_operator_session_context_is_trusted_but_non_authorizing():
+def test_build_operator_session_context_is_verified_operator():
     from hermes_cli.operator_session import build_operator_session_context
+    from hermes_cli.operator_verification import OperatorVerificationResult
 
     now = int(time.time())
-    ctx = build_operator_session_context(
-        session_id="sid-1", interface="cli", now=now,
+    result = OperatorVerificationResult(
+        ok=True,
+        actor_id="attila",
+        role="operator",
+        verified_at=now,
+        expires_at=now + 900,
     )
+    ctx = build_operator_session_context(result)
 
     assert ctx == {
-        "mode": "operator_session",
-        "actor_id": "unknown_cli",
-        "role": "unknown",
+        "mode": "operator",
+        "actor_id": "attila",
+        "role": "operator",
         "acting_for": "aiwerk",
-        "memory_scope": "none",
-        "authorizing": False,
-        "interface": "cli",
-        "session_id": "sid-1",
-        "provenance": "trusted_cli_bootstrap",
-        "issued_at": now,
+        "memory_scope": "operator",
+        "verified_at": now,
         "expires_at": now + 900,
     }
     assert "secret" not in json.dumps(ctx).lower()
 
 
-def test_bootstrap_operator_session_sets_only_non_authorizing_context(monkeypatch):
+def test_bootstrap_operator_session_verifies_and_caches_identity(monkeypatch):
     from hermes_cli import operator_session
-    from hermes_cli.operator_verification import get_cached_operator_verification
+    from hermes_cli.operator_verification import OperatorVerificationResult
 
     now = int(time.time())
-    monkeypatch.setattr(operator_session.time, "time", lambda: now)
+    result = OperatorVerificationResult(
+        ok=True,
+        actor_id="attila",
+        role="operator",
+        verified_at=now,
+        expires_at=now + 900,
+    )
+    cached = []
+    monkeypatch.setattr(operator_session, "run_operator_verifier", lambda: result)
+    monkeypatch.setattr(
+        operator_session,
+        "cache_operator_verification",
+        lambda value, session_id=None: cached.append((value.actor_id, session_id)),
+    )
     monkeypatch.delenv("HERMES_OPERATOR_SESSION_CONTEXT", raising=False)
 
     ctx = operator_session.bootstrap_operator_session(session_id="sid-1", quiet=True)
 
-    assert ctx["actor_id"] == "unknown_cli"
-    assert ctx["authorizing"] is False
-    assert ctx["memory_scope"] == "none"
+    assert ctx["actor_id"] == "attila"
+    assert ctx["mode"] == "operator"
+    assert ctx["memory_scope"] == "operator"
     env_payload = json.loads(operator_session.os.environ["HERMES_OPERATOR_SESSION_CONTEXT"])
-    assert env_payload["role"] == "unknown"
+    assert env_payload["role"] == "operator"
     assert env_payload["bootstrap_pid"] == operator_session.os.getpid()
-    assert operator_session.load_operator_session_context_from_env() is None
+    assert operator_session.load_operator_session_context_from_env() == ctx
     assert operator_session.get_current_operator_session_context() == ctx
-    assert get_cached_operator_verification(session_id="sid-1") is None
+    assert cached == [("attila", "sid-1")]
 
 
 def test_operator_session_env_rejects_forged_or_expired_context(monkeypatch):
@@ -116,11 +131,25 @@ def test_current_operator_context_expires(monkeypatch):
     assert operator_session._CURRENT_OPERATOR_SESSION_CONTEXT is None
 
 
-def test_bootstrap_operator_session_requires_explicit_session_binding():
+def test_bootstrap_operator_session_allows_process_level_binding(monkeypatch):
     from hermes_cli import operator_session
+    from hermes_cli.operator_verification import OperatorVerificationResult
 
-    with pytest.raises(ValueError, match="session_id"):
-        operator_session.bootstrap_operator_session(quiet=True)
+    now = int(time.time())
+    monkeypatch.setattr(
+        operator_session,
+        "run_operator_verifier",
+        lambda: OperatorVerificationResult(
+            ok=True,
+            actor_id="attila",
+            role="operator",
+            verified_at=now,
+            expires_at=now + 900,
+        ),
+    )
+    monkeypatch.setattr(operator_session, "cache_operator_verification", lambda *a, **k: None)
+
+    assert operator_session.bootstrap_operator_session(quiet=True)["actor_id"] == "attila"
 
 
 def test_expired_process_cache_fallback_is_removed():

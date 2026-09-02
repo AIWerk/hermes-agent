@@ -637,6 +637,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    operator_session_context: Dict[str, Any] | None = None,
     requested_provider: str = None,
 ):
     """
@@ -709,6 +710,16 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    if operator_session_context is None:
+        try:
+            from hermes_cli.operator_session import get_current_operator_session_context
+
+            operator_session_context = get_current_operator_session_context()
+        except Exception:
+            operator_session_context = None
+    agent.operator_session_context = (
+        operator_session_context if isinstance(operator_session_context, dict) else None
+    )
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -924,6 +935,11 @@ def init_agent(
     agent._interrupt_thread_signal_pending = False
     agent._client_lock = threading.RLock()
     agent._model_request_active = threading.Event()
+    # Atomic provider-return → transcript-commit fence. Redirect remains
+    # admissible after the provider returns until the final text is committed.
+    agent._response_commit_pending = threading.Event()
+    # Fail closed outside a live logical turn; opened only after setup/lease gates.
+    agent._steer_admission_open = False
     agent._supports_active_turn_redirect = True
 
     # /steer mechanism — inject a user note into the next tool result
@@ -1911,6 +1927,7 @@ def init_agent(
                     memory_enabled=agent._memory_enabled,
                     user_profile_enabled=agent._user_profile_enabled,
                 )
+                agent._memory_store.operator_session_context = agent.operator_session_context
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init

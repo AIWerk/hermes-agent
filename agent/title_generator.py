@@ -17,6 +17,7 @@ user typed. That ordering is the industry-standard one — Codex CLI encodes the
 same ``custom > ai > fallback`` precedence in its session importer.
 """
 
+import inspect
 import json
 import logging
 import re
@@ -441,7 +442,15 @@ def generate_title(
         return None
 
 
-def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
+def _persist_session_title(
+    session_db,
+    session_id,
+    title,
+    *,
+    source,
+    turn_index: Optional[int] = None,
+    dedupe=True,
+):
     """Persist a title at *source* authority, recovering from name collisions.
 
     The write goes through ``set_auto_title`` (precedence check + write in one
@@ -465,7 +474,13 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
 
     def _set(candidate):
         if auto_fn is not None:
-            if not auto_fn(session_id, candidate, source=source):
+            if not _call_title_setter(
+                auto_fn,
+                session_id,
+                candidate,
+                source=source,
+                turn_index=turn_index,
+            ):
                 logger.debug(
                     "Skipping %s title: a higher-authority title already holds "
                     "session %s",
@@ -630,20 +645,22 @@ def _auto_title_session(
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
     )
-    source = "llm"
+    source = "auto_initial"
     if not title:
         return
 
     try:
-        persisted = _persist_session_title(session_db, session_id, title, source=source)
+        persisted = _persist_session_title(
+            session_db,
+            session_id,
+            title,
+            source=source,
+            turn_index=1,
+        )
         if persisted is None:
             return
         logger.debug("Auto-generated session title: %s", persisted)
-        if title_callback is not None:
-            try:
-                title_callback(persisted, source)
-            except Exception:
-                logger.debug("Auto-title callback failed", exc_info=True)
+        _notify_title_callback(title_callback, persisted, source)
     except Exception as e:
         logger.debug("Failed to set auto-generated title: %s", e)
 
@@ -757,3 +774,402 @@ def maybe_auto_title(
         name="auto-title",
     )
     thread.start()
+
+
+_RETITLE_PROMPT = (
+    "Generate a concise updated session title (3-8 words). Capture the overall "
+    "current topic, not just the first exchange. Return JSON only."
+)
+
+_FINAL_TITLE_PROMPT = (
+    "Generate the final concise session title (3-8 words) from this compact "
+    "session summary. Prefer a title broad enough to cover all major work. "
+    "Return JSON only."
+)
+
+_MANUAL_SOURCES = {"manual", "user"}
+
+_MID_RETITLE_MIN_USER_TURNS = 5
+
+_MID_RETITLE_TURN_INTERVAL = 5
+
+def _call_lifecycle_title_llm(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: float,
+    failure_callback: Optional[FailureCallback],
+    main_runtime: Optional[dict],
+) -> Optional[str]:
+    """Use the upstream structured-output path for lifecycle refinements."""
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=64,
+            temperature=0.3,
+            timeout=timeout,
+            main_runtime=main_runtime,
+            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+        )
+        content = response.choices[0].message.content or ""
+        return _clean_title(_extract_title_text(content))
+    except Exception as exc:
+        logger.warning("Title generation failed: %s", exc)
+        logger.debug("Title generation traceback", exc_info=True)
+        if failure_callback is not None:
+            try:
+                failure_callback("title generation", exc)
+            except Exception:
+                logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+def _title_words(title: str) -> set[str]:
+    return {
+        word
+        for word in re.findall(r"[\wÀ-ž]+", (title or "").lower())
+        if len(word) > 2
+    }
+
+def _materially_different(old_title: Optional[str], new_title: Optional[str]) -> bool:
+    if not new_title:
+        return False
+    if not old_title:
+        return True
+    old = re.sub(r"\W+", " ", old_title.lower()).strip()
+    new = re.sub(r"\W+", " ", new_title.lower()).strip()
+    if old == new or old in new or new in old:
+        return False
+    old_words = _title_words(old_title)
+    new_words = _title_words(new_title)
+    if not old_words or not new_words:
+        return True
+    overlap = len(old_words & new_words) / max(1, min(len(old_words), len(new_words)))
+    return overlap < 0.60
+
+def _format_recent_exchange(messages: list[dict[str, Any]], max_messages: int = 10) -> str:
+    lines = []
+    for message in (messages or [])[-max_messages:]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        text = redact_sensitive_text(re.sub(r"\s+", " ", _message_text(message)).strip())
+        if text:
+            lines.append(f"{role}: {text[:700]}")
+    return "\n".join(lines)
+
+def generate_retitle(
+    *,
+    current_title: Optional[str],
+    messages: list[dict[str, Any]],
+    events: Optional[list[dict[str, Any]]] = None,
+    scratchpad: Optional[dict[str, Any]] = None,
+    timeout: float = 30.0,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+) -> Optional[str]:
+    """Generate a mid-session title from recent transcript and durable notes."""
+    if not _auto_title_enabled():
+        return None
+    transcript = _format_recent_exchange(messages)
+    notes = redact_sensitive_text(format_notes_for_prompt(events, scratchpad) or "")
+    if not transcript and not notes:
+        return None
+    prompt = (
+        f"Current title: {redact_sensitive_text(current_title or '(none)')}\n\n"
+        f"Incremental notes:\n{notes[:4000]}\n\n"
+        f"Recent transcript:\n{transcript[-5000:]}"
+    )
+    return _call_lifecycle_title_llm(
+        system_prompt=_RETITLE_PROMPT,
+        user_prompt=prompt,
+        timeout=timeout,
+        failure_callback=failure_callback,
+        main_runtime=main_runtime,
+    )
+
+def generate_final_title(
+    *,
+    current_title: Optional[str],
+    summary: dict[str, Any],
+    timeout: float = 30.0,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+) -> Optional[str]:
+    """Generate a final title from a compact stored session summary."""
+    if not _auto_title_enabled():
+        return None
+    outline = summary.get("outline") or []
+    topics = summary.get("topics") or []
+    prompt = (
+        f"Current title: {redact_sensitive_text(current_title or '(none)')}\n"
+        f"Summary: {redact_sensitive_text(str(summary.get('short_summary') or ''))}\n"
+        f"Outline: {redact_sensitive_text('; '.join(map(str, outline)))}\n"
+        f"Topics: {redact_sensitive_text(', '.join(map(str, topics)))}"
+    )
+    return _call_lifecycle_title_llm(
+        system_prompt=_FINAL_TITLE_PROMPT,
+        user_prompt=prompt,
+        timeout=timeout,
+        failure_callback=failure_callback,
+        main_runtime=main_runtime,
+    )
+
+def _notify_title_callback(
+    callback: Optional[TitleCallback], title: str, source: str
+) -> None:
+    """Support upstream two-argument and legacy one-argument callbacks."""
+    if callback is None:
+        return
+    callback_source = "derived" if source == "derived" else "llm"
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        signature = None
+    try:
+        if signature is not None:
+            try:
+                signature.bind(title, callback_source)
+            except TypeError:
+                callback(title)
+            else:
+                callback(title, callback_source)
+        else:
+            callback(title, callback_source)
+    except Exception:
+        logger.debug("Auto-title callback failed", exc_info=True)
+
+def _call_title_setter(
+    setter,
+    session_id: str,
+    title: str,
+    *,
+    source: str,
+    turn_index: Optional[int],
+):
+    """Call current or legacy store signatures without retrying body errors."""
+    variants = [
+        {"source": source, "turn_index": turn_index},
+        {"source": source},
+        {},
+    ]
+    try:
+        signature = inspect.signature(setter)
+    except (TypeError, ValueError):
+        # Unknown signatures get one modern call only.  Never catch a TypeError
+        # from the function body and replay a potentially stateful write.
+        return setter(session_id, title, **variants[0])
+    for kwargs in variants:
+        try:
+            signature.bind(session_id, title, **kwargs)
+        except TypeError:
+            continue
+        return setter(session_id, title, **kwargs)
+    raise TypeError("title setter has no compatible signature")
+
+def _safe_set_title(
+    session_db,
+    session_id: str,
+    title: str,
+    *,
+    source: str,
+    turn_index: Optional[int] = None,
+    title_callback: Optional[TitleCallback] = None,
+) -> bool:
+    """Persist a lifecycle update through the store's atomic precedence path."""
+    auto_setter = getattr(session_db, "set_auto_title", None)
+
+    def _write(candidate: str) -> bool:
+        if callable(auto_setter):
+            return bool(
+                _call_title_setter(
+                    auto_setter,
+                    session_id,
+                    candidate,
+                    source=source,
+                    turn_index=turn_index,
+                )
+            )
+        return bool(
+            _call_title_setter(
+                session_db.set_session_title,
+                session_id,
+                candidate,
+                source=source,
+                turn_index=turn_index,
+            )
+        )
+
+    try:
+        ok = _write(title)
+    except ValueError:
+        try:
+            fallback = session_db.get_next_title_in_lineage(title)
+            ok = _write(fallback)
+            title = fallback
+        except Exception:
+            logger.debug("Failed to set generated session title", exc_info=True)
+            return False
+    except Exception:
+        logger.debug("Failed to set generated session title", exc_info=True)
+        return False
+    if ok:
+        _notify_title_callback(title_callback, title, source)
+    return bool(ok)
+
+def _title_meta(session_db, session_id: str) -> Optional[dict[str, Any]]:
+    getter = getattr(session_db, "get_session_title_metadata", None)
+    if callable(getter):
+        meta = getter(session_id)
+        if isinstance(meta, dict):
+            return meta
+    title = session_db.get_session_title(session_id)
+    return {"title": title, "title_source": None, "title_turn_index": None}
+
+def _is_manual(meta: dict[str, Any]) -> bool:
+    return (meta or {}).get("title_source") in _MANUAL_SOURCES
+
+def retitle_session(
+    session_db,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    *,
+    turn_index: Optional[int] = None,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    title_callback: Optional[TitleCallback] = None,
+) -> bool:
+    """Generate and atomically store a mid-session lifecycle title."""
+    if not session_db or not session_id:
+        return False
+    try:
+        meta = _title_meta(session_db, session_id) or {}
+        if _is_manual(meta) or meta.get("title_source") == "auto_final":
+            return False
+        current_title = meta.get("title")
+        events = session_db.get_session_events(session_id, limit=30)
+        scratchpad = session_db.get_session_scratchpad(session_id)
+    except Exception:
+        logger.debug("mid-session retitle metadata unavailable", exc_info=True)
+        return False
+
+    new_title = generate_retitle(
+        current_title=current_title,
+        messages=messages,
+        events=events,
+        scratchpad=scratchpad,
+        failure_callback=failure_callback,
+        main_runtime=main_runtime,
+    )
+    if not new_title or not _materially_different(current_title, new_title):
+        return False
+    return _safe_set_title(
+        session_db,
+        session_id,
+        new_title,
+        source="auto_mid",
+        turn_index=turn_index,
+        title_callback=title_callback,
+    )
+
+def maybe_retitle_session(
+    session_db,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    conversation_history: Optional[list[dict[str, Any]]] = None,
+    *,
+    turn_index: Optional[int] = None,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    title_callback: Optional[TitleCallback] = None,
+    synchronous: bool = False,
+) -> Optional[threading.Thread | bool]:
+    """Run the cheap manual/final/throttle gate before a mid-session LLM call."""
+    if not session_db or not session_id or not messages:
+        return False if synchronous else None
+    user_msg_count = sum(
+        1 for message in messages if _is_real_user_turn(message)
+    )
+    if user_msg_count < _MID_RETITLE_MIN_USER_TURNS:
+        return False if synchronous else None
+    try:
+        meta = _title_meta(session_db, session_id) or {}
+    except Exception:
+        return False if synchronous else None
+    if _is_manual(meta) or meta.get("title_source") == "auto_final":
+        return False if synchronous else None
+    last_turn = meta.get("title_turn_index")
+    try:
+        last_turn_int = int(last_turn) if last_turn is not None else 0
+    except (TypeError, ValueError):
+        last_turn_int = 0
+    current_turn = int(turn_index or user_msg_count)
+    if current_turn - last_turn_int < _MID_RETITLE_TURN_INTERVAL:
+        return False if synchronous else None
+
+    if synchronous:
+        return retitle_session(
+            session_db,
+            session_id,
+            messages,
+            turn_index=current_turn,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            title_callback=title_callback,
+        )
+
+    thread = threading.Thread(
+        target=retitle_session,
+        args=(session_db, session_id, list(messages)),
+        kwargs={
+            "turn_index": current_turn,
+            "failure_callback": failure_callback,
+            "main_runtime": main_runtime,
+            "title_callback": title_callback,
+        },
+        daemon=True,
+        name="mid-session-retitle",
+    )
+    thread.start()
+    return thread
+
+def finalize_session_title(
+    session_db,
+    session_id: str,
+    summary: dict[str, Any],
+    *,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    title_callback: Optional[TitleCallback] = None,
+) -> bool:
+    """Refine an automatic title from the final compact session summary."""
+    if not session_db or not session_id or not summary:
+        return False
+    try:
+        meta = _title_meta(session_db, session_id) or {}
+        if _is_manual(meta):
+            return False
+        current_title = meta.get("title")
+    except Exception:
+        return False
+    new_title = generate_final_title(
+        current_title=current_title,
+        summary=summary,
+        failure_callback=failure_callback,
+        main_runtime=main_runtime,
+    )
+    if not new_title or not _materially_different(current_title, new_title):
+        return False
+    return _safe_set_title(
+        session_db,
+        session_id,
+        new_title,
+        source="auto_final",
+        turn_index=None,
+        title_callback=title_callback,
+    )

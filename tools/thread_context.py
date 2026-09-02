@@ -52,6 +52,10 @@ def _callback_api():
         _get_operator_verification_callback,
         set_operator_verification_callback,
     )
+    from tools.skills_tool import (
+        _get_secret_capture_callback,
+        set_secret_capture_callback,
+    )
     return (
         _get_approval_callback,
         _get_sudo_password_callback,
@@ -59,6 +63,8 @@ def _callback_api():
         set_sudo_password_callback,
         _get_operator_verification_callback,
         set_operator_verification_callback,
+        _get_secret_capture_callback,
+        set_secret_capture_callback,
     )
 
 
@@ -77,48 +83,79 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     absent.
     """
     ctx = contextvars.copy_context()
-    parent_approval_cb = parent_sudo_cb = parent_operator_cb = None
+    parent_approval_cb = parent_sudo_cb = parent_operator_cb = parent_secret_cb = None
     setters = None
     try:
-        get_approval, get_sudo, set_approval, set_sudo, get_operator, set_operator = _callback_api()
+        callback_api = _callback_api()
+        if len(callback_api) == 6:
+            # Backward-compatible for embedders/test doubles implementing the
+            # pre-secret-capture callback tuple.
+            callback_api = (*callback_api, lambda: None, lambda _value: None)
+        (
+            get_approval,
+            get_sudo,
+            set_approval,
+            set_sudo,
+            get_operator,
+            set_operator,
+            get_secret,
+            set_secret,
+        ) = callback_api
         parent_approval_cb = get_approval()
         parent_sudo_cb = get_sudo()
         parent_operator_cb = get_operator()
-        setters = (set_approval, set_sudo, set_operator)
+        parent_secret_cb = get_secret()
+        setters = (set_approval, set_sudo, set_operator, set_secret)
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
 
     def _runner(*args, **kwargs):
         def _inner():
+            def _clear_callbacks() -> bool:
+                if setters is None:
+                    return True
+                cleared = True
+                for setter in setters:
+                    try:
+                        setter(None)
+                    except Exception:
+                        cleared = False
+                        logger.debug(
+                            "Failed to clear propagated approval/sudo callback",
+                            exc_info=True,
+                        )
+                return cleared
+
             if setters is not None:
-                set_approval, set_sudo, set_operator = setters
-                try:
-                    if parent_approval_cb is not None:
-                        set_approval(parent_approval_cb)
-                    if parent_sudo_cb is not None:
-                        set_sudo(parent_sudo_cb)
-                    if parent_operator_cb is not None:
-                        set_operator(parent_operator_cb)
-                except Exception:
-                    logger.debug(
-                        "Failed to install propagated approval/sudo callbacks; "
-                        "dangerous-command approval will fail closed",
-                        exc_info=True,
+                installed = True
+                for setter, callback in zip(
+                    setters,
+                    (
+                        parent_approval_cb,
+                        parent_sudo_cb,
+                        parent_operator_cb,
+                        parent_secret_cb,
+                    ),
+                    strict=True,
+                ):
+                    try:
+                        setter(callback)
+                    except Exception:
+                        installed = False
+                        logger.debug(
+                            "Failed to install propagated approval/sudo callback; "
+                            "rolling back before tool dispatch",
+                            exc_info=True,
+                        )
+                        break
+                if not installed and not _clear_callbacks():
+                    raise RuntimeError(
+                        "Could not establish a clean approval callback context"
                     )
             try:
                 return target(*args, **kwargs)
             finally:
-                if setters is not None:
-                    set_approval, set_sudo, set_operator = setters
-                    try:
-                        set_approval(None)
-                        set_sudo(None)
-                        set_operator(None)
-                    except Exception:
-                        logger.debug(
-                            "Failed to clear propagated approval/sudo callbacks",
-                            exc_info=True,
-                        )
+                _clear_callbacks()
 
         return ctx.run(_inner)
 

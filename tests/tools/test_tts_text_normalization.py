@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 
 from tools import tts_tool
-from tools.tts_tool import _normalize_text_for_tts, text_to_speech_tool
+from tools.tts_tool import (
+    _english_number_to_words,
+    _german_number_to_words,
+    _hungarian_number_to_words,
+    _normalize_text_for_tts,
+    text_to_speech_tool,
+)
 
 
 def test_normalize_text_for_tts_spells_hungarian_celsius_and_percent():
@@ -45,6 +51,29 @@ def test_normalize_text_for_tts_spells_german_negative_decimal():
     normalized = _normalize_text_for_tts(text, language="de-CH")
 
     assert normalized == "Draussen sind minus drei Komma fünf Grad Celsius."
+
+
+def test_locale_specific_number_words_distinguish_thousands_from_decimals():
+    assert _hungarian_number_to_words("1.000") == "ezer"
+    assert _hungarian_number_to_words("3,14") == "három egész egy négy"
+    assert _german_number_to_words("1.000") == "eintausend"
+    assert _german_number_to_words("3,14") == "drei Komma eins vier"
+    assert _english_number_to_words("1,000") == "one thousand"
+
+
+def test_locale_specific_number_words_support_multi_group_thousands():
+    assert _hungarian_number_to_words("1.000.000") == "egymillió"
+    assert _german_number_to_words("1.000.000") == "eine Million"
+    assert _english_number_to_words("1,000,000") == "one million"
+    assert _hungarian_number_to_words("1.000.000,5") == "egymillió egész öt"
+    assert _german_number_to_words("1.000.000,5") == "eine Million Komma fünf"
+    assert _english_number_to_words("1,000,000.5") == "one million point five"
+
+
+def test_normalize_text_for_tts_speaks_multi_group_thousands():
+    assert "eine Million" in _normalize_text_for_tts("Das kostet 1.000.000 CHF.", language="de")
+    assert "egymillió" in _normalize_text_for_tts("Ez 1.000.000 Ft.", language="hu")
+    assert "one million" in _normalize_text_for_tts("It costs 1,000,000 dollars.", language="en")
 
 
 def test_normalize_text_for_tts_spells_german_eur_and_huf_codes():

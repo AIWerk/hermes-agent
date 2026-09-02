@@ -9,10 +9,22 @@ Covers:
 """
 
 import subprocess
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli.main import cmd_update
+
+
+@contextmanager
+def _no_running_gateways():
+    """Keep config-prompt tests out of the live gateway restart path."""
+    with patch("hermes_cli.main._purge_stale_hermes_modules"), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ), patch(
+        "hermes_cli.gateway.find_profile_gateway_processes", return_value=[]
+    ):
+        yield
 
 
 def _make_run_side_effect(
@@ -75,7 +87,7 @@ class TestUpdateYesConfigMigration:
 
         args = SimpleNamespace(yes=True)
 
-        with patch("builtins.input") as mock_input:
+        with _no_running_gateways(), patch("builtins.input") as mock_input:
             cmd_update(args)
             # Never prompted the user.
             mock_input.assert_not_called()
@@ -126,7 +138,9 @@ class TestUpdateYesConfigMigration:
         # "Non-interactive session" branch instead of prompting.
         import sys as _sys
 
-        with patch("builtins.input", return_value="n") as mock_input, patch.object(
+        with _no_running_gateways(), patch(
+            "builtins.input", return_value="n"
+        ) as mock_input, patch.object(
             _sys.stdin, "isatty", return_value=True
         ), patch.object(_sys.stdout, "isatty", return_value=True):
             cmd_update(args)
@@ -177,7 +191,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
 
         import sys as _sys
 
-        with patch(
+        with _no_running_gateways(), patch(
             "builtins.input",
             side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
         ), patch.object(_sys.stdin, "isatty", return_value=True), patch.object(

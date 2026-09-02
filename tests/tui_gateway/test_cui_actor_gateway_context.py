@@ -66,6 +66,28 @@ def test_dispatch_resets_actor_context_after_handler_error(monkeypatch):
     assert server.current_cui_actor_context() == {}
 
 
+def test_dispatch_explicit_invalid_actor_keeps_database_scoped(monkeypatch):
+    raw_db = object()
+    seen = {}
+    monkeypatch.setattr(server, "_db", raw_db)
+
+    def inspect(_request):
+        db = server._get_db()
+        seen["is_raw"] = db is raw_db
+        seen["actor"] = getattr(db, "_actor", None)
+        return {"id": "x", "result": True}
+
+    monkeypatch.setattr(server, "handle_request", inspect)
+    response = server.dispatch(
+        {"jsonrpc": "2.0", "id": "x", "method": "ping", "params": {}},
+        actor_context={"tenant_id": "tenant-a", "actor_id": "actor-a", "role": "unknown"},
+    )
+
+    assert response == {"id": "x", "result": True}
+    assert seen == {"is_raw": False, "actor": {"_restricted": "1"}}
+    assert server.current_cui_actor_context() == {}
+
+
 def test_concurrent_dispatches_do_not_bleed_actor_context(monkeypatch):
     barrier = threading.Barrier(2)
     seen = {}
@@ -112,6 +134,29 @@ def test_deferred_record_captures_allowlisted_dispatch_actor():
 
     assert record["cui_actor_context"] == TRUSTED_ACTOR
     assert server.current_cui_actor_context() == {}
+
+
+def test_deferred_record_preserves_trusted_no_actor_authority():
+    token = server.bind_cui_actor_context(None)
+    try:
+        record = server._deferred_session_record(
+            "trusted-session",
+            cols=80,
+            cwd="/tmp",
+            history=[],
+            lease=None,
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert record["cui_actor_context"] == {}
+    assert not record["cui_actor_context"]
+    rebound = server.bind_cui_actor_context(record["cui_actor_context"])
+    try:
+        assert server.current_cui_actor_context() == {}
+        assert not server.current_cui_actor_context()
+    finally:
+        server.reset_cui_actor_context(rebound)
 
 
 def test_session_actor_runner_rebinds_and_resets_on_success_and_error():
@@ -605,7 +650,7 @@ def test_optional_live_inheritance_confines_completion_create_and_oneshot(monkey
             (TRUSTED_ACTOR, "owned"),
             (TRUSTED_ACTOR, "foreign"),
             (TRUSTED_ACTOR, "missing"),
-            ({}, "foreign"),
+            (None, "foreign"),
         ):
             response = _request_as(
                 actor,
@@ -685,7 +730,7 @@ def test_config_set_confines_all_session_consuming_branches_before_mutation(monk
         assert owned["tool_progress_mode"] == "off"
 
         trusted_response = _request_as(
-            {},
+            None,
             {
                 "id": "trusted-model",
                 "method": "config.set",
@@ -810,7 +855,7 @@ def test_profile_resume_reauthorizes_resolved_continuation_tip_before_side_effec
 
     effects.clear()
     raw.tip = "foreign-tip"
-    trusted = _request_as({}, request)
+    trusted = _request_as(None, request)
     assert trusted["result"]["resumed"] == "foreign-tip"
     assert ("safety", "foreign-tip") in effects
     assert ("publish", "foreign-tip") in effects

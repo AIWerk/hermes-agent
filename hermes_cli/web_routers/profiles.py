@@ -27,7 +27,7 @@ from collections import OrderedDict
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
-from fastapi import APIRouter, HTTPException, Query  # noqa: F401
+from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -75,6 +75,7 @@ _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
 _hub_action_name = late("_hub_action_name")
 _open_session_db_at_path = late("_open_session_db_at_path")
+_cui_actor_context_from_request = late("_cui_actor_context_from_request")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
@@ -218,6 +219,7 @@ def _sidebar_singleflight_cache(func):
 
 @sessions_router.get("/api/profiles/sessions")
 def get_profiles_sessions(
+    request: Request,
     # ``le=500`` caps the per-request page size (idea from #39200) — this
     # endpoint fans the query out across EVERY profile's state.db, so an
     # unbounded limit multiplies the damage. 500 (not 100) because real
@@ -247,6 +249,7 @@ def get_profiles_sessions(
     Rows omit ``system_prompt``/``model_config`` unless ``full=1`` — same
     list projection as ``/api/sessions``.
     """
+    actor = late("_cui_actor_context_from_request")(request)
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
     if order not in ("created", "recent"):
@@ -278,9 +281,10 @@ def get_profiles_sessions(
     source_filter = source or None
     source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
     exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
-    # Over-fetch per profile so the merged+sorted window is correct for the
-    # requested page. Capped so a huge profile can't blow up the response.
-    per_profile = min(max(limit + offset, limit), 500)
+    # Fetch enough from every profile for a correct merged page. Request
+    # validation bounds `limit`; `offset` must not be silently capped because
+    # deep pages would otherwise be empty.
+    per_profile = max(limit + offset, limit)
 
     merged: List[Dict[str, Any]] = []
     total = 0
@@ -306,20 +310,33 @@ def get_profiles_sessions(
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
-            rows = db.list_sessions_rich(
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-                limit=per_profile,
-                offset=0,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-                # Same SQL-level blob skip as /api/sessions (see above).
-                compact_rows=not full,
-                include_pinned=True,
-            )
+            rich_query = {
+                "source": source_filter,
+                "sources": source_list or None,
+                "exclude_sources": exclude_list or None,
+                "min_message_count": min_message_count,
+                "include_archived": include_archived,
+                "archived_only": archived_only,
+                "order_by_last_active": order == "recent",
+                "compact_rows": False if actor else not full,
+                "include_pinned": True,
+            }
+            if actor:
+                # Authorization needs model_config/CUI ownership metadata and
+                # must inspect every row before count/window projection.
+                rows = late("_list_sessions_rich_all")(db, **rich_query)
+            else:
+                rows = db.list_sessions_rich(
+                    **rich_query,
+                    limit=per_profile,
+                    offset=0,
+                )
+            if actor:
+                rows = [
+                    row
+                    for row in rows
+                    if late("_session_visible_to_cui_actor")(row, actor)
+                ]
             profile_total = db.session_count(
                 source=source_filter,
                 sources=source_list or None,
@@ -329,6 +346,8 @@ def get_profiles_sessions(
                 archived_only=archived_only,
                 exclude_children=True,
             )
+            if actor:
+                profile_total = len(rows)
             total += profile_total
             profile_totals[name] = profile_total
             for s in rows:
@@ -357,6 +376,8 @@ def get_profiles_sessions(
         window.extend(s for s in merged[offset + limit:] if s.get("pinned") and id(s) not in seen)
     if not full:
         _strip_session_list_rows(window)
+    if actor:
+        window = late("_project_session_list_rows_public")(window)
     return {
         "sessions": window,
         "total": total,
@@ -370,6 +391,7 @@ def get_profiles_sessions(
 @sessions_router.get("/api/profiles/sessions/sidebar")
 @_sidebar_singleflight_cache
 def get_profiles_sessions_sidebar(
+    request: Request,
     recents_profile: str = "all",
     recents_limit: int = 20,
     recents_exclude: str = None,
@@ -399,6 +421,7 @@ def get_profiles_sessions_sidebar(
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
     desktop's per-slice calls.
     """
+    actor = late("_cui_actor_context_from_request")(request)
     from hermes_cli import profiles as profiles_mod
 
     try:
@@ -422,6 +445,7 @@ def get_profiles_sessions_sidebar(
     recents_rows: List[Dict[str, Any]] = []
     cron_rows: List[Dict[str, Any]] = []
     messaging_rows: List[Dict[str, Any]] = []
+
     recents_truncated: Dict[str, bool] = {}
     profile_totals: Dict[str, Dict[str, float]] = {}
     errors: List[Dict[str, str]] = []
@@ -441,20 +465,23 @@ def get_profiles_sessions_sidebar(
             s["pinned"] = bool(s.get("pinned"))
         return rows
 
-    def _slice(db, *, source=None, exclude=None, cap):
+    def _slice(db, *, source=None, exclude=None, cap, exhaustive=False):
+        query = {
+            "source": source,
+            "exclude_sources": exclude or None,
+            "min_message_count": 1,
+            "include_archived": False,
+            "archived_only": False,
+            "order_by_last_active": True,
+            "compact_rows": False if actor else True,
+            "include_pinned": True,
+        }
+        if actor or exhaustive:
+            return late("_list_sessions_rich_all")(db, **query)
         return db.list_sessions_rich(
-            source=source,
-            exclude_sources=exclude or None,
+            **query,
             limit=cap,
             offset=0,
-            min_message_count=1,
-            include_archived=False,
-            archived_only=False,
-            order_by_last_active=True,
-            compact_rows=True,
-            # A pinned conversation must reach the sidebar even when it has
-            # aged past the window — otherwise its Pinned row renders empty.
-            include_pinned=True,
         )
 
     for name, home in targets:
@@ -472,6 +499,7 @@ def get_profiles_sessions_sidebar(
             cron_cap,
             messaging_cap,
             tuple(messaging_exclude_list),
+            bool(actor),
         )
         slices = _sidebar_profile_cache_get(profile_cache_key)
         if slices is None:
@@ -496,6 +524,7 @@ def get_profiles_sessions_sidebar(
                         db,
                         exclude=messaging_exclude_list,
                         cap=messaging_cap,
+                        exhaustive=True,
                     ),
                 }
                 _sidebar_profile_cache_put(profile_cache_key, slices)
@@ -507,6 +536,18 @@ def get_profiles_sessions_sidebar(
                 db.close()
 
         profile_rows = slices["recents"]
+        profile_cron_rows = slices["cron"]
+        profile_messaging_rows = slices["messaging"]
+        if actor:
+            visible = late("_session_visible_to_cui_actor")
+            profile_rows = [row for row in profile_rows if visible(row, actor)]
+            profile_cron_rows = [
+                row for row in profile_cron_rows if visible(row, actor)
+            ]
+            profile_messaging_rows = [
+                row for row in profile_messaging_rows if visible(row, actor)
+            ]
+
         # A full window means more rows remain on disk. That is all the
         # sidebar's "load more" needs, and unlike an exact COUNT(*) per
         # profile per refresh it costs nothing beyond the rows already
@@ -516,10 +557,16 @@ def get_profiles_sessions_sidebar(
         recents_truncated[name] = unpinned_count >= recents_cap
         recents_rows.extend(_tag(profile_rows, name))
         profile_totals[name] = slices["usage"]
-        cron_rows.extend(_tag(slices["cron"], name))
-        messaging_rows.extend(_tag(slices["messaging"], name))
+        cron_rows.extend(_tag(profile_cron_rows, name))
+        messaging_rows.extend(_tag(profile_messaging_rows, name))
 
     def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
+        if actor:
+            rows = [
+                row
+                for row in rows
+                if late("_session_visible_to_cui_actor")(row, actor)
+            ]
         rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)
         # Pinned rows survive the cap. The per-profile queries deliberately
         # back-fill them past the LIMIT, so truncating the merged window on
@@ -529,17 +576,22 @@ def get_profiles_sessions_sidebar(
             seen = {id(s) for s in win}
             win.extend(s for s in rows[cap:] if s.get("pinned") and id(s) not in seen)
         _strip_session_list_rows(win)
+        if actor:
+            win = late("_project_session_list_rows_public")(win)
         return win
 
+    recents_window = _window(recents_rows, recents_cap)
+    cron_window = _window(cron_rows, cron_cap)
+    messaging_window = _window(messaging_rows, messaging_cap)
     return {
         "recents": {
-            "sessions": _window(recents_rows, recents_cap),
+            "sessions": recents_window,
             "profiles_truncated": recents_truncated,
-            "profiles_usage": profile_totals,
+            "profiles_usage": {} if actor else profile_totals,
         },
-        "cron": {"sessions": _window(cron_rows, cron_cap)},
+        "cron": {"sessions": cron_window},
         "messaging": {
-            "sessions": _window(messaging_rows, messaging_cap),
+            "sessions": messaging_window,
             "total": len(messaging_rows),
         },
         "errors": errors,
@@ -618,7 +670,9 @@ def _merge_profile_tree(
 
 
 @sessions_router.get("/api/profiles/projects/tree")
-def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000):
+def get_profiles_projects_tree(
+    request: Request, preview_limit: int = 3, session_limit: int = 2000
+):
     """Project tree for every profile at once, for the all-profiles sidebar.
 
     ``projects.tree`` over JSON-RPC answers for the backend's own profile, so
@@ -638,6 +692,9 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     (policy reconciliation), which this read-only fan-out should not do to a
     profile the user is not driving.
     """
+    if _cui_actor_context_from_request(request):
+        return {"projects": [], "scoped_session_ids": [], "errors": []}
+
     from hermes_cli import profiles as profiles_mod
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tui_gateway import server as gateway_server
@@ -1010,25 +1067,7 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
     except Exception as e:
         _log.exception("PATCH /api/profiles/%s failed", name)
         raise HTTPException(status_code=500, detail=str(e))
-    # For the default profile the rename lands as a presentation-only
-    # display_name; the canonical id ("default") is unchanged. Always
-    # return the canonical id so callers keying on `name` stay correct.
-    try:
-        is_default = profiles_mod.normalize_profile_name(name) == "default"
-    except ValueError:
-        is_default = False
-    if is_default:
-        return {
-            "ok": True,
-            "name": "default",
-            "display_name": body.new_name.strip(),
-            "path": str(path),
-        }
-    return {
-        "ok": True,
-        "name": profiles_mod.normalize_profile_name(body.new_name),
-        "path": str(path),
-    }
+    return {"ok": True, "name": body.new_name, "path": str(path)}
 
 
 @router.delete("/api/profiles/{name}")

@@ -483,6 +483,11 @@ def test_auxiliary_stream_unwraps_completed_response(relay_turn):
 
 
 
+def test_call_llm_owns_relay_context_decorator():
+    assert hasattr(auxiliary_client.call_llm, "__wrapped__")
+    assert not hasattr(auxiliary_client._sync_progress_create_for, "__wrapped__")
+
+
 def test_call_llm_stream_unwraps_completed_response(relay_turn, monkeypatch):
     """Outermost seam: ``call_llm(stream=True)`` — decorated with
     ``@_relay_auxiliary_call`` in production, so the Relay context is always

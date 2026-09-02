@@ -1393,17 +1393,22 @@ def test_run_prompt_submit_joins_ticker_without_timeout(monkeypatch):
 
 
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("agent.redact")
+    import importlib
+
+    redact_module = importlib.import_module("agent.redact")
 
     def fail_redaction(*_args, **_kwargs):
         raise RuntimeError("redaction unavailable")
 
-    setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
-
-    assert server._redact_tui_verbose_text("api_key=secret") == ""
-    assert server._tool_args_text({"api_key": "secret"}) == ""
-    assert server._tool_result_text("token=secret") == ""
+    original_redactor = redact_module.redact_sensitive_text
+    redact_module.redact_sensitive_text = fail_redaction
+    try:
+        assert server._redact_tui_verbose_text("api_key=secret") == ""
+        assert server._tool_args_text({"api_key": "secret"}) == ""
+        assert server._tool_result_text("token=secret") == ""
+    finally:
+        redact_module.redact_sensitive_text = original_redactor
+    assert server._redact_tui_verbose_text("ordinary preview") == "ordinary preview"
 
 
 def test_tui_verbose_tool_details_are_capped_before_emit(monkeypatch):
@@ -1432,17 +1437,13 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
 
 
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
-    redact_module = types.ModuleType("agent.redact")
-
-    def fail_redaction(*_args, **_kwargs):
-        raise RuntimeError("redaction unavailable")
-
-    setattr(redact_module, "redact_sensitive_text", fail_redaction)
-    monkeypatch.setitem(sys.modules, "agent.redact", redact_module)
-
     events: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(server, "_tool_args_text", lambda _args: "")
+    monkeypatch.setattr(server, "_tool_result_text", lambda _result: "")
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server,
+        "_emit",
+        lambda event_type, sid, payload: events.append((event_type, sid, payload)),
     )
     monkeypatch.setitem(
         server._sessions,
@@ -1450,8 +1451,16 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
         {"tool_progress_mode": "verbose", "tool_started_at": {}},
     )
 
-    server._on_tool_start("redaction-test", "tool-1", "terminal", {"command": "pwd"})
-    server._on_tool_complete("redaction-test", "tool-1", "terminal", {"command": "pwd"}, "done")
+    server._on_tool_start(
+        "redaction-test", "tool-1", "terminal", {"command": "pwd"}
+    )
+    server._on_tool_complete(
+        "redaction-test",
+        "tool-1",
+        "terminal",
+        {"command": "pwd"},
+        "done",
+    )
 
     assert events[0][0] == "tool.start"
     assert events[1][0] == "tool.complete"
@@ -7906,6 +7915,44 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_config_get_yolo_reports_session_and_global_state(monkeypatch):
+    from tools.approval import clear_session, enable_session_yolo
+
+    server._sessions["sid"] = _session()
+    try:
+        enable_session_yolo("session-key")
+        response = server.handle_request(
+            {"id": "1", "method": "config.get", "params": {"session_id": "sid", "key": "yolo"}}
+        )
+        assert response["result"]["value"] == "on"
+
+        clear_session("session-key")
+        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        response = server.handle_request(
+            {"id": "2", "method": "config.get", "params": {"key": "yolo"}}
+        )
+        assert response["result"]["value"] == "on"
+    finally:
+        clear_session("session-key")
+        server._sessions.clear()
+
+
+def test_config_get_yolo_preserves_error_envelope(monkeypatch):
+    monkeypatch.setattr(
+        "tools.approval.is_session_yolo_enabled",
+        lambda _key: (_ for _ in ()).throw(RuntimeError("lookup failed")),
+    )
+    server._sessions["sid"] = _session()
+    try:
+        response = server.handle_request(
+            {"id": "1", "method": "config.get", "params": {"session_id": "sid", "key": "yolo"}}
+        )
+        assert "error" in response
+        assert "lookup failed" in response["error"]["message"]
+    finally:
+        server._sessions.clear()
+
+
 def test_config_set_yolo_toggles_session_scope():
     from tools.approval import clear_session, is_session_yolo_enabled
 
@@ -10552,6 +10599,83 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         assert stored.read_text(encoding="utf-8") == "a,b\n"
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_commands_catalog_filters_admin_and_unmarked_skills_for_customer_actor(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent.skill_commands.scan_skill_commands",
+        lambda: {
+            "/customer": {
+                "name": "customer",
+                "description": "Customer skill",
+                "visibility": "customer",
+            },
+            "/operator-skill": {
+                "name": "operator-skill",
+                "description": "Admin skill",
+                "visibility": "admin",
+            },
+            "/unmarked": {
+                "name": "unmarked",
+                "description": "Internal skill",
+                "visibility": "internal",
+            },
+        },
+    )
+    token = server.bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "customer-1", "role": "customer"}
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "commands.catalog", "params": {}}
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    advertised = {name for name, _description in resp["result"]["pairs"]}
+    assert "/customer" in advertised
+    assert "/operator-skill" not in advertised
+    assert "/unmarked" not in advertised
+    assert set(resp["result"]["skills"]) == {"/customer"}
+    assert resp["result"]["skill_count"] == 1
+
+
+def test_command_dispatch_denies_hidden_skill_before_loading_for_customer_actor(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent.skill_commands.scan_skill_commands",
+        lambda: {
+            "/operator-skill": {
+                "name": "operator-skill",
+                "description": "Admin skill",
+                "visibility": "admin",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.build_skill_invocation_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("hidden skill body was loaded")
+        ),
+    )
+    token = server.bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "customer-1", "role": "customer"}
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {"name": "operator-skill", "arg": "", "session_id": ""},
+            }
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert resp["error"]["code"] == 4031
 
 
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
@@ -15159,6 +15283,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -15731,11 +15859,21 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
-            return [
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            offset=0,
+            order_by_last_active=False,
+            compact_rows=False,
+            include_hidden=False,
+        ):
+            rows = [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
             ]
+            return rows[offset : offset + limit]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
 
@@ -21055,3 +21193,111 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_prompt_submit_materializes_uploaded_attachment_context(monkeypatch, tmp_path):
+    started: list[str] = []
+    upload_root = tmp_path / "dashboard_uploads"
+    source = upload_root / "shared-sid" / "batch" / "doc.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("Uploaded document body", encoding="utf-8")
+
+    server._sessions["shared-sid"] = _session()
+    monkeypatch.setattr(server, "_DASHBOARD_UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda session, text: started.append(text)
+    )
+    monkeypatch.setattr(
+        server.threading,
+        "Thread",
+        lambda *a, **k: types.SimpleNamespace(daemon=False, start=lambda: None),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "attachment-submit",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "shared-sid",
+                    "text": "Use the upload",
+                    "attachments": [
+                        {
+                            "name": "doc.md",
+                            "path": str(source),
+                            "type": "text/markdown",
+                            "extracted_text": "Uploaded document body",
+                            "extraction": "text",
+                        }
+                    ],
+                },
+            }
+        )
+        assert response["result"]["status"] == "streaming"
+        assert len(started) == 1
+        assert "Use the upload" in started[0]
+        assert "[Attached file: doc.md" in started[0]
+        assert "Uploaded document body" in started[0]
+    finally:
+        server._sessions.pop("shared-sid", None)
+
+
+
+def test_prompt_submit_materializes_shared_uri_into_attachment_context(
+    monkeypatch, tmp_path
+):
+    started: list[str] = []
+    upload_root = tmp_path / "dashboard_uploads"
+    source = upload_root / "shared-sid" / "shared" / "doc.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("Shared document body", encoding="utf-8")
+
+    server._sessions["shared-sid"] = _session()
+    monkeypatch.setattr(server, "_DASHBOARD_UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(
+        server,
+        "_shared_uri_prompt_attachments",
+        lambda text, sid: [
+            {
+                "name": "doc.md",
+                "path": str(source),
+                "type": "text/markdown",
+                "extracted_text": "Shared document body",
+                "extraction": "text",
+            }
+        ]
+        if "shared://Folder/doc.md" in str(text)
+        else [],
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda session, text: started.append(text)
+    )
+    monkeypatch.setattr(
+        server.threading,
+        "Thread",
+        lambda *a, **k: types.SimpleNamespace(daemon=False, start=lambda: None),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "shared-sid",
+                    "text": "Use shared://Folder/doc.md",
+                },
+            }
+        )
+        assert resp["result"]["status"] == "streaming"
+        assert len(started) == 1
+        assert "Use shared://Folder/doc.md" in started[0]
+        assert "[Attached file: doc.md" in started[0]
+        assert f"Path: {source}" in started[0]
+        assert "Shared document body" in started[0]
+    finally:
+        server._sessions.pop("shared-sid", None)

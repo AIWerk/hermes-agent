@@ -4,7 +4,8 @@ No React, no JavaScript dependency. Listed providers come from the
 registry; clicking a provider sends a GET to
 ``/auth/login?provider=<name>``.
 
-Visual styling mirrors the Nous Research design system (the
+Visual styling mirrors the AIWerk customer assistant surface while retaining the
+Nous Research design-system foundations (the
 ``@nous-research/ui`` package the React dashboard uses): the same
 ``Collapse`` / ``Rules Compressed`` typeface, amber-on-dark colour
 tokens (``#170d02`` / ``#ffac02`` / ``#fff``), uppercase + wide-tracking
@@ -34,11 +35,11 @@ from hermes_cli.dashboard_auth import list_session_providers
 # are doubled (``{{`` / ``}}``).
 _LOGIN_HTML_TEMPLATE = """\
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in — Hermes Agent</title>
+<title>Anmelden — AIWerk</title>
 <style>
   /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
   @font-face {{
@@ -301,16 +302,16 @@ _LOGIN_HTML_TEMPLATE = """\
 </head>
 <body>
 <main>
-  <div class="brand">Nous<span class="dot"></span>Research</div>
+  <div class="brand">AIWerk<span class="dot"></span>Assistant</div>
   <div class="card">
-    <h1>Sign in</h1>
-    <p class="subtitle">Choose a sign-in method to continue to the Hermes Agent dashboard.</p>
+    <h1>Anmelden</h1>
+    <p class="subtitle">Melde dich an, um mit deinem AIWerk Assistenten weiterzuarbeiten.</p>
     <div class="provider-list">
 {provider_buttons}
     </div>
   </div>
   <footer>
-    <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
+    <span class="sep"></span>Geschützter Kundenbereich<span class="sep"></span>
   </footer>
 </main>
 {password_script}
@@ -320,11 +321,11 @@ _LOGIN_HTML_TEMPLATE = """\
 
 _EMPTY_HTML = """\
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign-in unavailable — Hermes Agent</title>
+<title>Anmeldung nicht verfügbar — AIWerk</title>
 <style>
   @font-face {
     font-family: 'Collapse';
@@ -389,14 +390,10 @@ _EMPTY_HTML = """\
 </head>
 <body>
 <main>
-<h1>Sign-in unavailable</h1>
-<p>This dashboard is bound to a non-loopback host but no authentication
-providers are available.</p>
-<p>Configure the bundled username/password provider or an OAuth provider.
-See the <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard#authentication-gated-mode">dashboard
-authentication documentation</a> for setup instructions.</p>
-<p>For auth-free local use, bind to <code>127.0.0.1</code> and connect through
-an SSH tunnel or Tailscale.</p>
+<h1>Anmeldung nicht verfügbar</h1>
+<!-- Sign-in unavailable: configure a username/password provider or OAuth provider. -->
+<p>Dieser AIWerk Kundenbereich ist geschützt, aber es ist kein Authentifizierungsanbieter konfiguriert.</p>
+<p>Bitte AIWerk Support kontaktieren. Der Zugriff bleibt bis zur Korrektur geschlossen.</p>
 </main>
 </body>
 </html>
@@ -439,13 +436,13 @@ _PASSWORD_FORM_SCRIPT = """\
           });
         }
         var msg = resp.status === 429
-          ? 'Too many attempts. Please wait and try again.'
-          : (resp.status === 401 ? 'Invalid username or password.'
-                                 : 'Sign-in failed. Please try again.');
+          ? 'Zu viele Versuche. Bitte kurz warten.'
+          : (resp.status === 401 ? 'Benutzername oder Passwort stimmt nicht.'
+                                 : 'Anmeldung fehlgeschlagen. Bitte erneut versuchen.');
         if (err) { err.textContent = msg; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       }).catch(function () {
-        if (err) { err.textContent = 'Network error. Please try again.'; err.hidden = false; }
+        if (err) { err.textContent = 'Netzwerkfehler. Bitte erneut versuchen.'; err.hidden = false; }
         if (btn) { btn.disabled = false; }
       });
     });
@@ -491,7 +488,7 @@ def render_login_html(*, next_path: str = "") -> str:
             buttons.append(
                 f'      <a class="provider-btn" '
                 f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
-                f'Sign in with {html.escape(p.display_name)}</a>'
+                f'Mit {html.escape(p.display_name)} anmelden</a>'
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
     return _LOGIN_HTML_TEMPLATE.format(

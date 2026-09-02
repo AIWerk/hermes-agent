@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from hermes_cli import web_server
 
@@ -110,7 +111,8 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
     _FakeSessionDB.requested_fields = None
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
 
-    response = asyncio.run(web_server.search_sessions(q="20260603", limit=2))
+    request = SimpleNamespace(state=SimpleNamespace(session=None))
+    response = asyncio.run(web_server.search_sessions(request, q="20260603", limit=2))
 
     assert _FakeSessionDB.requested_fields is not None
     assert "context" not in _FakeSessionDB.requested_fields

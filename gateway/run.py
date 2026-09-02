@@ -5445,6 +5445,11 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if self._runner._should_suppress_text_streaming_for_voice_reply(
+            ctx.source,
+            ctx.event_message_type,
+        ):
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -22271,6 +22276,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.handle_message(event)
 
+    def _should_suppress_text_streaming_for_voice_reply(
+        self,
+        source: SessionSource,
+        message_type: Optional[MessageType],
+    ) -> bool:
+        """True when this turn should produce a voice reply without a text stream."""
+        if message_type != MessageType.VOICE:
+            return False
+        chat_id = getattr(source, "chat_id", "") or ""
+        platform = getattr(source, "platform", None)
+        if platform is None:
+            return False
+        voice_mode = getattr(self, "_voice_mode", {}).get(self._voice_key(platform, chat_id), "off")
+        return voice_mode == "voice_only"
+
+
     def _should_send_voice_reply(
         self,
         event: MessageEvent,
@@ -26370,7 +26391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, str | None], dict[str, Any]] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -26378,16 +26399,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys, memoized by honcho.json content."""
         try:
+            import hashlib
+
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                content_digest = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                content_digest = None
+            memo_key = (str(path), content_digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -27868,6 +27891,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -27973,6 +27997,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if self._should_suppress_text_streaming_for_voice_reply(source, message_type):
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -28360,6 +28386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                message_type=message_type,
             )
 
         from run_agent import AIAgent
@@ -28641,6 +28668,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
+            event_message_type=message_type,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,

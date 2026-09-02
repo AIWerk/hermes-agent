@@ -15,6 +15,11 @@ from acp.schema import (
     ToolKind,
 )
 
+from agent.tool_argument_projection import (
+    project_tool_args_for_display,
+    sanitize_tool_display_text,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1013,7 @@ def _build_tool_complete_content(
     snapshot: Any = None,
 ) -> List[Any]:
     """Build structured ACP completion content, falling back to plain text."""
-    display_result = result or ""
+    display_result = sanitize_tool_display_text(result or "")
     if len(display_result) > 5000:
         display_result = display_result[:4900] + f"\n... ({len(result)} chars total, truncated)"
 
@@ -1023,13 +1028,19 @@ def _build_tool_complete_content(
                 snapshot=snapshot,
             )
             if isinstance(diff_text, str) and diff_text.strip():
-                diff_content = _parse_unified_diff_content(diff_text)
+                diff_content = _parse_unified_diff_content(
+                    sanitize_tool_display_text(diff_text)
+                )
                 if diff_content:
                     return diff_content
         except Exception:
             pass
 
-    polished_content = _build_polished_completion_content(tool_name, result, function_args)
+    polished_content = _build_polished_completion_content(
+        tool_name,
+        display_result,
+        function_args,
+    )
     if polished_content:
         return polished_content
 
@@ -1060,7 +1071,10 @@ def build_tool_start(
     """
     try:
         return _build_tool_start(
-            tool_call_id, tool_name, arguments, edit_diff=edit_diff
+            tool_call_id,
+            tool_name,
+            project_tool_args_for_display(tool_name, arguments),
+            edit_diff=edit_diff,
         )
     except Exception as exc:  # noqa: BLE001 — a tool-call render must never abort the turn
         logger.debug("ACP tool-start render failed for %r: %s", tool_name, exc)
@@ -1087,9 +1101,13 @@ def _build_tool_start(
         if edit_diff is not None:
             content = [
                 acp.tool_diff_content(
-                    path=edit_diff.path,
-                    old_text=edit_diff.old_text,
-                    new_text=edit_diff.new_text,
+                    path=sanitize_tool_display_text(edit_diff.path),
+                    old_text=(
+                        sanitize_tool_display_text(edit_diff.old_text)
+                        if edit_diff.old_text is not None
+                        else None
+                    ),
+                    new_text=sanitize_tool_display_text(edit_diff.new_text),
                 )
             ]
         else:
@@ -1104,9 +1122,13 @@ def _build_tool_start(
         if edit_diff is not None:
             content = [
                 acp.tool_diff_content(
-                    path=edit_diff.path,
-                    old_text=edit_diff.old_text,
-                    new_text=edit_diff.new_text,
+                    path=sanitize_tool_display_text(edit_diff.path),
+                    old_text=(
+                        sanitize_tool_display_text(edit_diff.old_text)
+                        if edit_diff.old_text is not None
+                        else None
+                    ),
+                    new_text=sanitize_tool_display_text(edit_diff.new_text),
                 )
             ]
         else:
@@ -1311,15 +1333,17 @@ def build_tool_complete(
     snapshot: Any = None,
 ) -> ToolCallProgress:
     """Create a ToolCallUpdate (progress) event for a completed tool call."""
+    safe_args = project_tool_args_for_display(tool_name, function_args)
+    safe_result = sanitize_tool_display_text(result or "") if result is not None else None
     kind = get_tool_kind(tool_name)
     if tool_name == "web_extract":
-        error_text = _format_web_extract_result(result)
+        error_text = _format_web_extract_result(safe_result)
         content = [_text(error_text)] if error_text else None
     else:
         content = _build_tool_complete_content(
             tool_name,
-            result,
-            function_args=function_args,
+            safe_result,
+            function_args=safe_args,
             snapshot=snapshot,
         )
     return acp.update_tool_call(
@@ -1327,7 +1351,11 @@ def build_tool_complete(
         kind=kind,
         status="failed" if _tool_result_failed(result, tool_name) else "completed",
         content=content,
-        raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
+        raw_output=(
+            None
+            if tool_name in _POLISHED_TOOLS or _is_structured_json_result(safe_result)
+            else safe_result
+        ),
     )
 
 

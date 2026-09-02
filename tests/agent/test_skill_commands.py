@@ -50,6 +50,67 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     return external_category
 
 
+def test_scan_skill_commands_preserves_customer_visibility_metadata(tmp_path):
+    _make_skill(tmp_path, "customer-visible", "visibility: customer\n")
+    _make_skill(tmp_path, "legacy-public", "slash_visibility: public\n")
+    _make_skill(
+        tmp_path,
+        "nested-customer-visible",
+        "metadata:\n  aiwerk:\n    visibility: customer\n",
+    )
+    _make_skill(
+        tmp_path,
+        "legacy-hermes-user",
+        "metadata:\n  hermes:\n    cui_visibility: user\n",
+    )
+    _make_skill(tmp_path, "unmarked")
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        result = scan_skill_commands()
+
+    assert result["/customer-visible"]["visibility"] == "customer"
+    assert result["/legacy-public"]["visibility"] == "customer"
+    assert result["/nested-customer-visible"]["visibility"] == "customer"
+    assert result["/legacy-hermes-user"]["visibility"] == "customer"
+    assert result["/unmarked"]["visibility"] == "internal"
+
+
+def test_legacy_customer_visibility_alias_reaches_catalog_and_dispatch(
+    monkeypatch, tmp_path
+):
+    from tui_gateway import server
+
+    _make_skill(tmp_path, "legacy-public", "slash_visibility: public\n")
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", tmp_path)
+    monkeypatch.setattr(
+        "agent.skill_commands.build_skill_invocation_message",
+        lambda *_args, **_kwargs: "legacy skill loaded",
+    )
+    token = server.bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "customer-1", "role": "customer"}
+    )
+    try:
+        catalog = server.handle_request(
+            {"id": "1", "method": "commands.catalog", "params": {}}
+        )
+        dispatched = server.handle_request(
+            {
+                "id": "2",
+                "method": "command.dispatch",
+                "params": {"name": "legacy-public", "arg": "", "session_id": ""},
+            }
+        )
+    finally:
+        server.reset_cui_actor_context(token)
+
+    assert catalog is not None
+    assert dispatched is not None
+    advertised = {name for name, _description in catalog["result"]["pairs"]}
+    assert "/legacy-public" in advertised
+    assert dispatched["result"]["type"] == "skill"
+    assert dispatched["result"]["message"] == "legacy skill loaded"
+
+
 class TestScanSkillCommands:
 
 
@@ -662,6 +723,31 @@ class TestBuildSkillInvocationMessage:
         assert msg is not None
         assert "local cli" in msg.lower()
 
+    def test_preserves_remaining_remote_setup_warning(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.delenv("TENOR_API_KEY", raising=False)
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            None,
+            raising=False,
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "test-skill",
+                frontmatter_extra=(
+                    "required_environment_variables:\n"
+                    "  - name: TENOR_API_KEY\n"
+                    "    prompt: Tenor API key\n"
+                ),
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/test-skill", "do stuff")
+
+        assert msg is not None
+        assert "remote environment" in msg.lower()
 
     def test_supporting_file_hint_uses_file_path_argument(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

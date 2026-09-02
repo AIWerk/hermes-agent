@@ -290,14 +290,95 @@ def test_callback_operator_verifier_fails_closed_without_callback(monkeypatch, t
     assert result.reason == "callback_not_available"
 
 
-def test_cli_agent_thread_wires_operator_verifier_callback():
-    import inspect
+def test_cli_agent_worker_executes_callback_operator_verifier_with_registered_masked_callback():
+    import threading
     import cli
+    from hermes_cli.operator_verification import get_operator_verification_callback
 
-    impl_src = inspect.getsource(cli.HermesCLI._chat_impl)
-    wrapper_src = inspect.getsource(cli.HermesCLI.chat)
-    assert "set_operator_verification_callback(self._operator_verification_callback)" in impl_src
-    assert "set_operator_verification_callback(None)" in wrapper_src
+    helper = getattr(cli, "_install_cli_agent_thread_callbacks", None)
+    assert helper is not None
+
+    masked = lambda: "masked-secret"
+    owner = type("Owner", (), {})()
+    owner._sudo_password_callback = lambda: "sudo"
+    owner._approval_callback = lambda *_args: "once"
+    owner._secret_capture_callback = lambda *_args: "secret"
+    owner._operator_verification_callback = masked
+    seen = []
+
+    def worker():
+        helper(owner)
+        seen.append(get_operator_verification_callback())
+        cli._clear_cli_agent_thread_callbacks()
+        seen.append(get_operator_verification_callback())
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert seen == [masked, None]
+
+
+def test_concurrent_foreground_and_background_operator_verification_subjects_keep_distinct_session_ids(
+    monkeypatch,
+):
+    import threading
+    import cli
+    from hermes_cli import operator_verification as ov
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "hostile-global-session")
+    monkeypatch.setattr(
+        ov,
+        "load_operator_verification_config",
+        lambda: ov.OperatorVerificationConfig(
+            enabled=True,
+            verifier_type="callback",
+            interface="cli",
+        ),
+    )
+    monkeypatch.setattr(ov, "_cui_actor_context_data", lambda: {})
+    monkeypatch.setattr(ov, "_load_operator_store", lambda: {"actor_id": "operator"})
+
+    owner = type("Owner", (), {})()
+    owner._sudo_password_callback = lambda: "sudo"
+    owner._approval_callback = lambda *_args: "once"
+    owner._secret_capture_callback = lambda *_args: "secret"
+    owner._operator_verification_callback = lambda: "masked-secret"
+    barrier = threading.Barrier(2)
+    seen = {}
+
+    def worker(label, session_id):
+        import inspect
+
+        if "session_id" in inspect.signature(
+            cli._install_cli_agent_thread_callbacks
+        ).parameters:
+            scope = cli._install_cli_agent_thread_callbacks(
+                owner, session_id=session_id
+            )
+        else:
+            scope = cli._install_cli_agent_thread_callbacks(owner)
+        try:
+            barrier.wait(timeout=5)
+            seen[label] = ov.current_operator_verification_subject(
+                "operator", session_id=session_id
+            )
+        finally:
+            cli._clear_cli_agent_thread_callbacks(scope)
+
+    threads = [
+        threading.Thread(target=worker, args=("foreground", "session-foreground")),
+        threading.Thread(target=worker, args=("background", "session-background")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert seen["foreground"]["session_id"] == "session-foreground"
+    assert seen["background"]["session_id"] == "session-background"
 
 
 def test_thread_context_propagates_and_clears_operator_callback(monkeypatch):

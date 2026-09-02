@@ -278,6 +278,27 @@ def _annotate_rebuild_status(db, payload: Dict[str, Any]) -> None:
     }
 
 
+def _annotate_search_provenance(db, payload: Dict[str, Any]) -> None:
+    """Expose degraded canonical-scan provenance and the operator action."""
+    try:
+        health = db.fts_health_state()
+    except Exception:
+        return
+    repair_required = bool(health.get("repair_required"))
+    payload["search_provenance"] = {
+        "engine": "canonical_like" if repair_required else "fts",
+        "degraded": repair_required,
+        "repair_required": repair_required,
+    }
+    if repair_required:
+        payload["operator_alert"] = {
+            "severity": "error",
+            "message": "Session search index repair is required.",
+            "repair_command": health.get("repair_command")
+            or "hermes sessions repair-search",
+        }
+
+
 def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Stable-sort FTS rows so interactive sessions rank above automation.
 
@@ -800,6 +821,7 @@ def _discover(
             "message": "No matching sessions found.",
         }
         _annotate_rebuild_status(db, _empty_payload)
+        _annotate_search_provenance(db, _empty_payload)
         return json.dumps(_empty_payload, ensure_ascii=False)
 
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
@@ -930,6 +952,7 @@ def _discover(
         "sessions_searched": len(seen_sessions),
     }
     _annotate_rebuild_status(db, _final_payload)
+    _annotate_search_provenance(db, _final_payload)
     return json.dumps(_final_payload, ensure_ascii=False)
 
 

@@ -1,5 +1,6 @@
 """Tests for agent/skill_utils.py."""
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -18,6 +19,9 @@ from agent.skill_utils import (
     resolve_skill_config_values,
     skill_matches_platform,
     skill_matches_platform_list,
+    skill_visibility_from_frontmatter,
+    skill_visibility_scope_for_current_actor,
+    skill_visible_for_current_actor,
 )
 
 
@@ -29,6 +33,59 @@ from agent.skill_utils import (
 
 
 
+
+@pytest.mark.parametrize(
+    ("frontmatter", "expected"),
+    [
+        ({"visibility": "customer"}, "customer"),
+        ({"cui_visibility": "user"}, "customer"),
+        ({"slash_visibility": "public"}, "customer"),
+        ({"visibility": "all"}, "customer"),
+        ({"metadata": {"aiwerk": {"cui_visibility": "customer"}}}, "customer"),
+        ({"metadata": {"hermes": {"slash_visibility": "user"}}}, "customer"),
+        ({"visibility": "operator"}, "admin"),
+        ({"metadata": {"hermes": {"visibility": "internal"}}}, "internal"),
+        ({"visibility": "unknown"}, "internal"),
+    ],
+)
+def test_skill_visibility_preserves_historical_metadata_vocabulary(
+    frontmatter, expected
+):
+    assert skill_visibility_from_frontmatter(frontmatter) == expected
+
+
+@pytest.mark.parametrize(
+    "role", ["admin", "owner", "operator", "tenant_admin", "aiwerk_admin"]
+)
+def test_skill_catalog_keeps_historical_full_catalog_roles(role):
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    token = bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": f"{role}-1", "role": role}
+    )
+    try:
+        assert skill_visible_for_current_actor("internal") is True
+        assert skill_visibility_scope_for_current_actor() == "admin"
+    finally:
+        reset_cui_actor_context(token)
+
+
+def test_skill_catalog_customer_and_incomplete_actor_fail_closed():
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    for actor, expected_scope in (
+        (
+            {"tenant_id": "tenant-1", "actor_id": "customer-1", "role": "customer"},
+            "customer",
+        ),
+        ({"actor_id": "incomplete", "role": "owner"}, "restricted"),
+    ):
+        token = bind_cui_actor_context(actor)
+        try:
+            assert skill_visible_for_current_actor("internal") is False
+            assert skill_visibility_scope_for_current_actor() == expected_scope
+        finally:
+            reset_cui_actor_context(token)
 
 
 def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
@@ -72,6 +129,38 @@ skills:
         {"key": "wiki.path", "description": "Wiki path"}
     ])["wiki.path"].endswith("/wiki")
     assert parse_count == 1
+
+
+def test_skill_config_cache_detects_same_mtime_same_size_content_change(
+    tmp_path, monkeypatch
+):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "skills:\n  disabled:\n    - skill-a\n",
+        encoding="utf-8",
+    )
+    original_stat = config_path.stat()
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+    assert get_disabled_skill_names() == {"skill-a"}
+
+    config_path.write_text(
+        "skills:\n  disabled:\n    - skill-b\n",
+        encoding="utf-8",
+    )
+    os.utime(
+        config_path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+
+    assert config_path.stat().st_size == original_stat.st_size
+    assert config_path.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert get_disabled_skill_names() == {"skill-b"}
 
 
 class TestParseConfigStringList:

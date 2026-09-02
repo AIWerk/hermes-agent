@@ -1,6 +1,31 @@
 from types import SimpleNamespace
 
 from agent.agent_init import _merge_custom_provider_extra_body
+from providers import get_provider_profile
+
+
+def test_custom_profile_omits_ollama_reasoning_fields_for_remote_endpoint():
+    profile = get_provider_profile("custom")
+    assert profile is not None
+    extra_body, top_level = profile.build_api_kwargs_extras(
+        base_url="https://api.mistral.ai/v1",
+        reasoning_config={"enabled": False, "effort": "none"},
+    )
+
+    assert "think" not in extra_body
+    assert "reasoning_effort" not in top_level
+
+
+def test_custom_profile_keeps_ollama_reasoning_fields_for_local_endpoint():
+    profile = get_provider_profile("custom")
+    assert profile is not None
+    extra_body, top_level = profile.build_api_kwargs_extras(
+        base_url="http://127.0.0.1:11434/v1",
+        reasoning_config={"enabled": False, "effort": "none"},
+    )
+
+    assert extra_body["think"] is False
+    assert top_level["reasoning_effort"] == "none"
 
 
 

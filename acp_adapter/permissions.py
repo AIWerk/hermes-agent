@@ -13,6 +13,11 @@ from acp.schema import (
     PermissionOption,
 )
 
+from agent.tool_argument_projection import (
+    project_tool_args_for_display,
+    sanitize_tool_display_text,
+)
+
 logger = logging.getLogger(__name__)
 
 # Maps ACP permission option ids to Hermes approval result strings.
@@ -89,15 +94,26 @@ def _build_permission_tool_call(command: str, description: str):
     import acp as _acp
 
     tool_call_id = f"perm-check-{next(_PERMISSION_REQUEST_IDS)}"
-    title = f"{description}: {command}" if description else command
-    content_text = f"{description}\n$ {command}" if description else f"$ {command}"
+    safe_command = project_tool_args_for_display(
+        "terminal",
+        {"command": command},
+    ).get("command", "")
+    safe_description = sanitize_tool_display_text(description)
+    title = (
+        f"{safe_description}: {safe_command}" if safe_description else safe_command
+    )
+    content_text = (
+        f"{safe_description}\n$ {safe_command}"
+        if safe_description
+        else f"$ {safe_command}"
+    )
     return _acp.update_tool_call(
         tool_call_id,
         title=title,
         kind="execute",
         status="pending",
         content=[_acp.tool_content(_acp.text_block(content_text))],
-        raw_input={"command": command, "description": description},
+        raw_input={"command": safe_command, "description": safe_description},
     )
 
 

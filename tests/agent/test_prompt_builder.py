@@ -389,6 +389,47 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    def test_actor_visibility_is_applied_to_snapshot_and_memory_cache(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "general"
+        for name, visibility in (
+            ("customer-skill", "customer"),
+            ("admin-skill", "admin"),
+            ("internal-skill", "internal"),
+        ):
+            skill_dir = skills_dir / name
+            skill_dir.mkdir(parents=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {name}\nvisibility: {visibility}\n---\n"
+            )
+
+        admin_token = bind_cui_actor_context(
+            {"tenant_id": "tenant-1", "actor_id": "admin-1", "role": "admin"}
+        )
+        try:
+            admin_prompt = build_skills_system_prompt()
+        finally:
+            reset_cui_actor_context(admin_token)
+
+        customer_token = bind_cui_actor_context(
+            {"tenant_id": "tenant-1", "actor_id": "customer-1", "role": "customer"}
+        )
+        try:
+            customer_prompt = build_skills_system_prompt()
+        finally:
+            reset_cui_actor_context(customer_token)
+
+        assert "customer-skill" in admin_prompt
+        assert "admin-skill" in admin_prompt
+        assert "internal-skill" in admin_prompt
+        assert "customer-skill" in customer_prompt
+        assert "admin-skill" not in customer_prompt
+        assert "internal-skill" not in customer_prompt
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"

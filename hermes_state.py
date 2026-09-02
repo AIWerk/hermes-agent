@@ -78,6 +78,11 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
+    FTS_REPAIR_FAILURE_COUNT_KEY,
+    FTS_REPAIR_FIRST_ERROR_AT_KEY,
+    FTS_REPAIR_LAST_ERROR_AT_KEY,
+    FTS_REPAIR_LAST_ERROR_KEY,
+    FTS_REPAIR_META_KEYS,
     FTS_SQL,
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
@@ -3785,6 +3790,11 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_high_water": None,
         "fts_rebuild_progress": None,
         "fts_rebuild_deferral": None,
+        "fts_repair_required": None,
+        "fts_failure_count": None,
+        "fts_first_error_at": None,
+        "fts_last_error_at": None,
+        "fts_last_error": None,
     }
 
     # WAL sidecar size needs no connection at all.
@@ -3866,6 +3876,15 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
             except Exception:
                 return None
 
+        def _meta_text(key: str) -> Optional[str]:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                return str(row[0]) if row and row[0] is not None else None
+            except Exception:
+                return None
+
         stats["fts_storage_version"] = _meta_int("fts_storage_version")
         high_water = _meta_int("fts_rebuild_high_water")
         progress = _meta_int("fts_rebuild_progress")
@@ -3875,6 +3894,11 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
             stats["fts_rebuild_pending"] = False
         else:
             stats["fts_rebuild_pending"] = (progress or 0) < high_water
+        stats["fts_repair_required"] = _meta_text(FTS_STALE_KEY) is not None
+        stats["fts_failure_count"] = _meta_int(FTS_REPAIR_FAILURE_COUNT_KEY)
+        stats["fts_first_error_at"] = _meta_text(FTS_REPAIR_FIRST_ERROR_AT_KEY)
+        stats["fts_last_error_at"] = _meta_text(FTS_REPAIR_LAST_ERROR_AT_KEY)
+        stats["fts_last_error"] = _meta_text(FTS_REPAIR_LAST_ERROR_KEY)
         try:
             row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ? LIMIT 1",
@@ -5273,22 +5297,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         if not self._is_fts_write_corruption_error(exc):
             return False
-        # Set the one-shot flag before the foreign-holder check: even when
-        # the rebuild is skipped, the fail-open path that follows persists
-        # the FTS_STALE_KEY marker so the next process startup will retry
-        # via _recover_stale_fts (which has its own holder guard). Setting
-        # the flag here also avoids re-running the expensive psutil scan on
-        # every subsequent corrupted write through this instance.
         self._fts_runtime_rebuild_attempted = True
-        foreign_holders = self._foreign_state_db_holders()
-        if foreign_holders:
-            logger.warning(
-                "Skipping automatic state.db FTS rebuild while foreign "
-                "processes hold the database or WAL sidecars (%s); detaching "
-                "FTS sync so canonical writes can continue.",
-                foreign_holders,
-            )
-            return False
         logger.warning(
             "state.db write failed with an FTS-corruption error (%s) — "
             "attempting one-shot in-place FTS rebuild; canonical message "
@@ -5335,6 +5344,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                         (FTS_STALE_KEY,),
                     )
+                    now = repr(time.time())
+                    prior = {
+                        row[0]: row[1]
+                        for row in self._conn.execute(
+                            "SELECT key, value FROM state_meta "
+                            f"WHERE key IN ({','.join('?' for _ in FTS_REPAIR_META_KEYS)})",
+                            FTS_REPAIR_META_KEYS,
+                        ).fetchall()
+                    }
+                    first_error_at = prior.get(FTS_REPAIR_FIRST_ERROR_AT_KEY) or now
+                    try:
+                        failure_count = int(
+                            prior.get(FTS_REPAIR_FAILURE_COUNT_KEY) or "0"
+                        ) + 1
+                    except (TypeError, ValueError):
+                        failure_count = 1
+                    repair_meta = {
+                        FTS_REPAIR_FIRST_ERROR_AT_KEY: first_error_at,
+                        FTS_REPAIR_LAST_ERROR_AT_KEY: now,
+                        FTS_REPAIR_FAILURE_COUNT_KEY: str(failure_count),
+                        FTS_REPAIR_LAST_ERROR_KEY: str(exc)[:1000],
+                    }
+                    self._conn.executemany(
+                        "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        repair_meta.items(),
+                    )
                     cjk_triggers_present = self._conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
                         f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
@@ -5366,8 +5402,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         logger.error(
             "state.db FTS indexes remain corrupt (%s); disabled FTS sync and "
-            "retrying the canonical write. Search temporarily uses LIKE until "
-            "a later SessionDB open rebuilds the indexes.",
+            "retrying the canonical write. Search uses a degraded canonical "
+            "LIKE scan until an operator runs 'hermes sessions repair-search' "
+            "offline.",
             exc,
         )
         return True
@@ -9153,11 +9190,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     TITLE_SOURCE_DERIVED = "derived"
     TITLE_SOURCE_LLM = "llm"
     TITLE_SOURCE_USER = "user"
+    TITLE_SOURCE_MANUAL = "manual"
+    TITLE_SOURCE_AUTO_INITIAL = "auto_initial"
+    TITLE_SOURCE_AUTO_MID = "auto_mid"
+    TITLE_SOURCE_AUTO_FINAL = "auto_final"
     _TITLE_SOURCE_RANK = {
         TITLE_SOURCE_DERIVED: 0,
         TITLE_SOURCE_LLM: 1,
-        TITLE_SOURCE_USER: 2,
+        TITLE_SOURCE_AUTO_INITIAL: 1,
+        TITLE_SOURCE_AUTO_MID: 2,
+        TITLE_SOURCE_AUTO_FINAL: 3,
+        TITLE_SOURCE_USER: 4,
+        TITLE_SOURCE_MANUAL: 4,
     }
+    _MANUAL_TITLE_SOURCES = frozenset({TITLE_SOURCE_USER, TITLE_SOURCE_MANUAL})
+    _AUTOMATIC_TITLE_SOURCES = frozenset(
+        {
+            TITLE_SOURCE_DERIVED,
+            TITLE_SOURCE_LLM,
+            TITLE_SOURCE_AUTO_INITIAL,
+            TITLE_SOURCE_AUTO_MID,
+            TITLE_SOURCE_AUTO_FINAL,
+        }
+    )
 
     @classmethod
     def _title_rank(cls, source: Optional[str]) -> int:
@@ -9170,8 +9225,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         legacy rows, which is the conservative direction.
         """
         if source is None:
-            return cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_USER]
-        return cls._TITLE_SOURCE_RANK.get(str(source), 0)
+            return cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_MANUAL]
+        return cls._TITLE_SOURCE_RANK.get(
+            str(source), cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_MANUAL]
+        )
 
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
@@ -9264,6 +9321,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         title: str,
         *,
         source: str,
+        turn_index: Optional[int] = None,
+        force: bool = False,
     ) -> bool:
         """Write a title, enforcing provenance precedence.
 
@@ -9280,8 +9339,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cannot be clobbered by the late arrival.
         """
         title = self.sanitize_title(title)
-        is_user = source == self.TITLE_SOURCE_USER
-        new_rank = self._title_rank(source) if not is_user else None
+        source = str(source or self.TITLE_SOURCE_MANUAL)
+        if source not in self._TITLE_SOURCE_RANK:
+            raise ValueError(f"invalid title source: {source!r}")
+        is_manual = source in self._MANUAL_TITLE_SOURCES
+        new_rank = self._title_rank(source) if not is_manual else None
+        now = time.time()
 
         def _do(conn):
             current = conn.execute(
@@ -9290,7 +9353,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if current is None:
                 return 0
-            if not is_user and current["title"] is not None:
+            if not force and not is_manual and current["title"] is not None:
                 if self._title_rank(current["title_source"]) >= new_rank:
                     return 0
 
@@ -9318,7 +9381,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         conn, ancestor_id=conflict_id, descendant_id=session_id
                     ):
                         conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
+                            "UPDATE sessions SET title = NULL, title_source = NULL, "
+                            "title_updated_at = NULL, title_turn_index = NULL WHERE id = ?",
                             (conflict_id,),
                         )
                     else:
@@ -9329,11 +9393,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # NULL-safe in SQLite), so a concurrent write between the SELECT
             # and here loses instead of being silently overwritten.
             cursor = conn.execute(
-                "UPDATE sessions SET title = ?, title_source = ? "
+                "UPDATE sessions SET title = ?, title_source = ?, "
+                "title_updated_at = ?, title_turn_index = ? "
                 "WHERE id = ? AND title IS ? AND title_source IS ?",
                 (
                     title,
                     source if title else None,
+                    now if title else None,
+                    turn_index if title else None,
                     session_id,
                     current["title"],
                     current["title_source"],
@@ -9344,40 +9411,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title on the user's behalf.
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        source: str = TITLE_SOURCE_MANUAL,
+        turn_index: Optional[int] = None,
+    ) -> bool:
+        """Set or update a title with explicit lifecycle provenance.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
 
-        This records ``user`` provenance, so auto-titling will never replace
-        the result. Automatic callers must use :meth:`set_auto_title`.
+        The default records ``manual`` provenance, so automatic title stages
+        can never replace an explicit rename.  Lifecycle callers may pass an
+        automatic source and turn index directly.
         """
         return self._set_session_title(
-            session_id, title, source=self.TITLE_SOURCE_USER
+            session_id,
+            title,
+            source=source,
+            turn_index=turn_index,
+            force=True,
         )
 
-    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+    def set_auto_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        source: str,
+        turn_index: Optional[int] = None,
+    ) -> bool:
         """Set an automatically generated title, honoring provenance precedence.
 
         Returns True when the title was written, False when a higher-authority
         title already holds the row (nothing is modified in that case).
         """
-        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+        if source not in self._AUTOMATIC_TITLE_SOURCES:
             raise ValueError(f"invalid automatic title source: {source!r}")
-        return self._set_session_title(session_id, title, source=source)
+        return self._set_session_title(
+            session_id,
+            title,
+            source=source,
+            turn_index=turn_index,
+            force=False,
+        )
 
-    def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
-        """Back-compat shim: set an LLM title only if nothing better exists.
+    def set_auto_title_if_empty(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        source: str = TITLE_SOURCE_AUTO_INITIAL,
+        turn_index: Optional[int] = None,
+    ) -> bool:
+        """Set an initial automatic title unless equal/higher authority exists.
 
         Retained because older callers (and third-party plugins) reference it
-        by name. New code should call :meth:`set_auto_title` with an explicit
-        source.
+        by name.  The upstream instant ``derived`` title is lower authority, so
+        an ``auto_initial`` model title may still upgrade it atomically.
         """
         return self.set_auto_title(
-            session_id, title, source=self.TITLE_SOURCE_LLM
+            session_id,
+            title,
+            source=source,
+            turn_index=turn_index,
         )
 
     def get_session_title(self, session_id: str) -> Optional[str]:
@@ -9402,24 +9504,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return row["title_source"]
 
     def get_session_title_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Compatibility view for AIWerk title-lifecycle consumers."""
+        """Compatibility view for older AIWerk title-lifecycle consumers.
+
+        The approved pin lifecycle no longer mutates the legacy update-time/turn
+        fields, but retaining this read API avoids breaking third-party callers.
+        """
         with self._lock:
             row = self._conn.execute(
-                "SELECT title, title_source FROM sessions WHERE id = ?",
+                """
+                SELECT title, title_source, title_updated_at, title_turn_index
+                FROM sessions WHERE id = ?
+                """,
                 (session_id,),
             ).fetchone()
-        if not row:
-            return None
-        source = row["title_source"]
-        return {
-            "title": row["title"],
-            # Legacy AIWerk callers named upstream's user-authoritative source
-            # "manual"; preserve that compatibility view without changing the
-            # canonical storage provenance.
-            "title_source": "manual" if source == "user" else source,
-            "title_updated_at": None,
-            "title_turn_index": None,
-        }
+        return dict(row) if row else None
 
     def set_session_title_source(self, session_id: str, source: str) -> bool:
         """Overwrite a title's provenance without touching the title text.
@@ -9875,6 +9973,66 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _SESSION_COMPACT_EXCLUDED = frozenset(
         {"system_prompt", "system_prompt_hash", "git_metadata_generation"}
     )
+    _SESSION_COLUMN_VISIBILITY = {
+        "id": "public",
+        "source": "public",
+        "user_id": "internal",
+        "session_key": "internal",
+        "chat_id": "internal",
+        "chat_type": "internal",
+        "thread_id": "internal",
+        "display_name": "public",
+        "origin_json": "internal",
+        "expiry_finalized": "internal",
+        "model": "public",
+        "model_config": "internal",
+        "system_prompt": "secret",
+        "system_prompt_hash": "internal",
+        "parent_session_id": "public",
+        "started_at": "public",
+        "ended_at": "public",
+        "end_reason": "public",
+        "message_count": "public",
+        "tool_call_count": "public",
+        "input_tokens": "public",
+        "output_tokens": "public",
+        "cache_read_tokens": "public",
+        "cache_write_tokens": "public",
+        "reasoning_tokens": "public",
+        "cwd": "public",
+        "git_branch": "public",
+        "git_repo_root": "internal",
+        "git_metadata_generation": "internal",
+        "billing_provider": "public",
+        "billing_base_url": "internal",
+        "billing_mode": "public",
+        "estimated_cost_usd": "public",
+        "actual_cost_usd": "public",
+        "cost_status": "public",
+        "cost_source": "public",
+        "pricing_version": "public",
+        "title": "public",
+        "title_source": "public",
+        "title_updated_at": "public",
+        "title_turn_index": "public",
+        "last_activity_at": "public",
+        "last_activity_description": "public",
+        "last_activity_provenance": "public",
+        "api_call_count": "public",
+        "handoff_state": "internal",
+        "handoff_platform": "internal",
+        "handoff_error": "internal",
+        "compression_failure_cooldown_until": "internal",
+        "compression_failure_error": "internal",
+        "compression_fallback_streak": "internal",
+        "compression_ineffective_count": "internal",
+        "profile_name": "public",
+        "rewind_count": "public",
+        "archived": "public",
+        "pinned": "public",
+        "hidden": "public",
+        "last_read_at": "public",
+    }
     _session_compact_cols_sql: Optional[str] = None
 
     def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
@@ -14719,6 +14877,420 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+    def fts_health_state(self) -> Dict[str, Any]:
+        """Return the durable operator-facing FTS repair state."""
+        self._refresh_fts_stale_state()
+        values: Dict[str, str] = {}
+        try:
+            with self._read_ctx() as conn:
+                values = {
+                    row[0]: row[1]
+                    for row in conn.execute(
+                        "SELECT key, value FROM state_meta "
+                        f"WHERE key IN ({','.join('?' for _ in FTS_REPAIR_META_KEYS)})",
+                        FTS_REPAIR_META_KEYS,
+                    ).fetchall()
+                }
+        except sqlite3.Error:
+            pass
+
+        def _number(key: str, cast, default=None):
+            try:
+                return cast(values[key])
+            except (KeyError, TypeError, ValueError):
+                return default
+
+        repair_required = bool(self._fts_stale)
+        return {
+            "repair_required": repair_required,
+            "severity": "error" if repair_required else "ok",
+            "first_error_at": _number(FTS_REPAIR_FIRST_ERROR_AT_KEY, float),
+            "last_error_at": _number(FTS_REPAIR_LAST_ERROR_AT_KEY, float),
+            "failure_count": _number(FTS_REPAIR_FAILURE_COUNT_KEY, int, 0),
+            "last_error": values.get(FTS_REPAIR_LAST_ERROR_KEY),
+            "repair_command": (
+                "hermes sessions repair-search" if repair_required else None
+            ),
+        }
+
+    def _repair_stale_cjk_fts_offline(self) -> bool:
+        """Rebuild a detached CJK index inside the active repair transaction."""
+        stale = self._conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (FTS_CJK_STALE_KEY,),
+        ).fetchone()
+        if not stale:
+            return False
+        if not self._fts_cjk_loaded:
+            raise sqlite3.DatabaseError(
+                "CJK repair is required but cjk_unicode61 is unavailable"
+            )
+        cursor = self._conn.cursor()
+        for trigger in _FTS_CJK_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        cursor.execute("DROP TABLE IF EXISTS messages_fts_cjk")
+        cursor.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
+        self._execute_script_in_current_transaction(cursor, FTS_CJK_TABLE_SQL)
+        cursor.execute(
+            "INSERT INTO messages_fts_cjk(messages_fts_cjk) VALUES('rebuild')"
+        )
+        self._execute_script_in_current_transaction(cursor, FTS_CJK_TRIGGER_SQL)
+        cursor.execute(
+            "DELETE FROM state_meta WHERE key IN (?, ?, ?)",
+            (
+                FTS_CJK_STALE_KEY,
+                "fts_cjk_rebuild_high_water",
+                "fts_cjk_rebuild_progress",
+            ),
+        )
+        self._fts_cjk_available = True
+        return True
+
+    @staticmethod
+    def _fts_schema_uses_external_content(schema_sql: str) -> bool:
+        """Parse the FTS5 argument list and identify a non-empty content option."""
+        tokens: List[Tuple[str, int]] = []
+        quote: Optional[str] = None
+        i = 0
+        while i < len(schema_sql):
+            char = schema_sql[i]
+            if quote:
+                if char == quote:
+                    if i + 1 < len(schema_sql) and schema_sql[i + 1] == quote:
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if schema_sql.startswith("--", i):
+                newline = schema_sql.find("\n", i + 2)
+                i = len(schema_sql) if newline < 0 else newline + 1
+                continue
+            if schema_sql.startswith("/*", i):
+                end = schema_sql.find("*/", i + 2)
+                if end < 0:
+                    raise sqlite3.DatabaseError("unterminated FTS5 schema comment")
+                i = end + 2
+                continue
+            if char in "'\"`":
+                quote = char
+                i += 1
+                continue
+            if char == "[":
+                quote = "]"
+                i += 1
+                continue
+            if char.isalpha() or char == "_":
+                end = i + 1
+                while end < len(schema_sql) and (
+                    schema_sql[end].isalnum() or schema_sql[end] == "_"
+                ):
+                    end += 1
+                tokens.append((schema_sql[i:end].lower(), end))
+                i = end
+                continue
+            if char == "(":
+                tokens.append((char, i + 1))
+            i += 1
+
+        start = None
+        for index in range(len(tokens) - 2):
+            if [token for token, _ in tokens[index : index + 3]] == [
+                "using",
+                "fts5",
+                "(",
+            ]:
+                start = tokens[index + 2][1]
+                break
+        if start is None:
+            raise sqlite3.DatabaseError("not a recognizable FTS5 schema")
+
+        arguments: List[str] = []
+        current: List[str] = []
+        depth = 0
+        quote = None
+        i = start
+        while i < len(schema_sql):
+            char = schema_sql[i]
+            if quote:
+                current.append(char)
+                if char == quote:
+                    if i + 1 < len(schema_sql) and schema_sql[i + 1] == quote:
+                        current.append(schema_sql[i + 1])
+                        i += 1
+                    else:
+                        quote = None
+                i += 1
+                continue
+            if schema_sql.startswith("--", i):
+                newline = schema_sql.find("\n", i + 2)
+                i = len(schema_sql) if newline < 0 else newline + 1
+                current.append(" ")
+                continue
+            if schema_sql.startswith("/*", i):
+                end = schema_sql.find("*/", i + 2)
+                if end < 0:
+                    raise sqlite3.DatabaseError("unterminated FTS5 schema comment")
+                i = end + 2
+                current.append(" ")
+                continue
+            if char in "'\"`":
+                quote = char
+                current.append(char)
+            elif char == "[":
+                quote = "]"
+                current.append(char)
+            elif char == "(":
+                depth += 1
+                current.append(char)
+            elif char == ")":
+                if depth == 0:
+                    arguments.append("".join(current).strip())
+                    break
+                depth -= 1
+                current.append(char)
+            elif char == "," and depth == 0:
+                arguments.append("".join(current).strip())
+                current = []
+            else:
+                current.append(char)
+            i += 1
+        else:
+            raise sqlite3.DatabaseError("unterminated FTS5 argument list")
+
+        if any(not argument for argument in arguments):
+            raise sqlite3.DatabaseError("empty FTS5 argument")
+
+        tail_index = i + 1
+        semicolon_seen = False
+        while tail_index < len(schema_sql):
+            char = schema_sql[tail_index]
+            if char.isspace():
+                tail_index += 1
+                continue
+            if schema_sql.startswith("--", tail_index):
+                newline = schema_sql.find("\n", tail_index + 2)
+                tail_index = len(schema_sql) if newline < 0 else newline + 1
+                continue
+            if schema_sql.startswith("/*", tail_index):
+                end = schema_sql.find("*/", tail_index + 2)
+                if end < 0:
+                    raise sqlite3.DatabaseError("unterminated FTS5 schema comment")
+                tail_index = end + 2
+                continue
+            if char == ";" and not semicolon_seen:
+                semicolon_seen = True
+                tail_index += 1
+                continue
+            raise sqlite3.DatabaseError("unexpected trailing FTS5 schema token")
+
+        for argument in arguments:
+            option = re.match(
+                r"^\s*(?:content|[\"`\[]content[\"`\]])\s*=\s*(.*?)\s*$",
+                argument,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if not option:
+                continue
+            value = option.group(1).strip()
+            if not value:
+                raise sqlite3.DatabaseError("empty unquoted FTS5 content option")
+            if len(value) >= 2 and (
+                (value[0] == value[-1] and value[0] in "'\"`")
+                or (value[0] == "[" and value[-1] == "]")
+            ):
+                value = value[1:-1].replace(value[-1] * 2, value[-1])
+            return value != ""
+        return False
+
+    def _verify_fts_repair(self) -> Tuple[bool, str]:
+        """Verify canonical SQLite and each present FTS index after rebuilding."""
+        try:
+            integrity_rows = self._conn.execute("PRAGMA integrity_check").fetchall()
+            if [tuple(row) for row in integrity_rows] != [("ok",)]:
+                return False, f"integrity_check returned {integrity_rows!r}"
+            checked = 0
+            for table in self._FTS_TABLES:
+                if not self._fts_table_exists(table):
+                    continue
+                schema_row = self._conn.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                schema_sql = schema_row[0] if schema_row else None
+                if not schema_sql:
+                    raise sqlite3.DatabaseError(
+                        f"cannot determine FTS content shape for {table}"
+                    )
+                external_content = self._fts_schema_uses_external_content(
+                    str(schema_sql)
+                )
+                if external_content:
+                    # rank=1 additionally compares an external-content FTS
+                    # index against its canonical table/view, not only its
+                    # internal b-tree structure.
+                    self._conn.execute(
+                        f"INSERT INTO {table}({table}, rank) "
+                        "VALUES('integrity-check', 1)"
+                    )
+                else:
+                    self._conn.execute(
+                        f"INSERT INTO {table}({table}) VALUES('integrity-check')"
+                    )
+                checked += 1
+            if checked == 0:
+                return False, "no FTS indexes were available to verify"
+            return True, "ok"
+        except sqlite3.DatabaseError as exc:
+            return False, str(exc)
+
+    def _restore_writer_after_offline_repair(self) -> Optional[str]:
+        """Release EXCLUSIVE mode and best-effort restore the ordinary writer."""
+        old_conn, self._conn = self._conn, None
+        self._close_connection_quietly(old_conn)
+        new_conn = None
+        try:
+            new_conn = _connect_tracked_db(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            new_conn.row_factory = sqlite3.Row
+            self._conn = new_conn
+            self._wal_active = (
+                apply_wal_with_fallback(new_conn, db_label="state.db") == "wal"
+            )
+            apply_database_pragmas(new_conn, db_label="state.db")
+            new_conn.execute("PRAGMA foreign_keys=ON")
+            self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
+            self._init_schema()
+            return None
+        except BaseException as exc:
+            if self._conn is new_conn:
+                self._conn = None
+            self._close_connection_quietly(new_conn)
+            self._wal_active = False
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_loaded = False
+            self._fts_cjk_available = False
+            if not isinstance(exc, Exception):
+                raise
+            logger.error(
+                "Verified offline FTS repair completed, but writer connection "
+                "restoration failed: %s",
+                exc,
+            )
+            return f"{type(exc).__name__}: {exc}"
+
+    def repair_fts_offline(self) -> Dict[str, Any]:
+        """Explicitly rebuild, verify, then clear durable repair-required state.
+
+        The caller must stop every other database opener. A /proc holder scan
+        is only an early diagnostic; correctness comes from holding SQLite's
+        EXCLUSIVE locking mode continuously across rebuild,
+        verification, marker deletion, and commit.
+        """
+        self._refresh_fts_stale_state()
+        if not self._fts_stale:
+            return {"repaired": False, "verified": True, "reason": "not-required"}
+        holders = count_db_holders(self.db_path)
+        if holders != 1:
+            return {
+                "repaired": False,
+                "verified": False,
+                "reason": f"offline-holder-check-failed:{holders}",
+            }
+        self._stop_token_writer()
+        with self._lock:
+            # Drain this instance's idle read connections before changing
+            # journal mode. Marking the pool closed is appropriate for this
+            # offline, terminal operation; later reads fall back to _conn.
+            with self._read_conns_lock:
+                self._read_conns_closed = True
+            while True:
+                try:
+                    read_conn = self._read_pool.get_nowait()
+                except queue.Empty:
+                    break
+                self._close_read_conn(read_conn)
+
+            stage = "acquire-exclusive-lock"
+            restore_error = None
+            try:
+                mode = self._conn.execute(
+                    "PRAGMA locking_mode=EXCLUSIVE"
+                ).fetchone()
+                if not mode or str(mode[0]).lower() != "exclusive":
+                    raise sqlite3.OperationalError(
+                        f"could not enter EXCLUSIVE locking mode: {mode!r}"
+                    )
+                legacy = self._db_has_legacy_inline_fts(self._conn.cursor())
+                stage = "rebuild-indexes"
+                rebuilt = self._recover_stale_fts(
+                    self._conn.cursor(), legacy=legacy
+                )
+                if not rebuilt:
+                    return {
+                        "repaired": False,
+                        "verified": False,
+                        "reason": "rebuild-failed",
+                    }
+                stage = "rebuild-cjk-index"
+                cjk_rebuilt = self._repair_stale_cjk_fts_offline()
+                stage = "verify-indexes"
+                verified, detail = self._verify_fts_repair()
+                if not verified:
+                    raise sqlite3.DatabaseError(detail)
+                stage = "clear-repair-marker"
+                self._conn.execute(
+                    "DELETE FROM state_meta "
+                    f"WHERE key IN ({','.join('?' for _ in (FTS_STALE_KEY, *FTS_REPAIR_META_KEYS))})",
+                    (FTS_STALE_KEY, *FTS_REPAIR_META_KEYS),
+                )
+                self._conn.commit()
+            except BaseException as exc:
+                self._conn.rollback()
+                try:
+                    self._conn.execute("BEGIN EXCLUSIVE")
+                    self._drop_all_fts_triggers(self._conn.cursor())
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                self._fts_stale = True
+                self._fts_enabled = False
+                self._trigram_available = False
+                self._fts_cjk_available = False
+                return {
+                    "repaired": False,
+                    "verified": False,
+                    "reason": f"{stage}: {exc}",
+                }
+            finally:
+                try:
+                    self._conn.execute("PRAGMA locking_mode=NORMAL")
+                except sqlite3.Error:
+                    logger.debug("Could not restore NORMAL locking mode", exc_info=True)
+                # In WAL mode SQLite retains an EXCLUSIVE-mode lock until the
+                # connection closes, even after PRAGMA reports NORMAL. Reopen
+                # the writer before returning so ordinary readers are not
+                # stranded after either a successful or failed repair.
+                restore_error = self._restore_writer_after_offline_repair()
+        self._fts_stale = False
+        self._fts_enabled = restore_error is None
+        report = {
+            "repaired": True,
+            "verified": True,
+            "indexes_rebuilt": rebuilt,
+            "cjk_rebuilt": cjk_rebuilt,
+            "connection_restored": restore_error is None,
+        }
+        if restore_error is not None:
+            report["connection_restore_error"] = restore_error
+        return report
 
 
 class AsyncSessionDB:

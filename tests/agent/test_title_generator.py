@@ -199,10 +199,10 @@ class TestAutoTitleSession:
                 title_callback=lambda title, source: seen.append((title, source)),
             )
         db.set_auto_title.assert_called_once_with(
-            "sess-1", "Readable Session", source="llm"
+            "sess-1", "Readable Session", source="auto_initial", turn_index=1
         )
-        # The stage reaches the consumer, so one that spends a rate-limited
-        # remote call per title can take this and skip the derived one.
+        # Lifecycle provenance remains internal; remote consumers keep the
+        # stable two-stage callback vocabulary.
         assert seen == [("Readable Session", "llm")]
 
     def test_upgrades_a_derived_title_but_not_an_llm_one(self, tmp_path):

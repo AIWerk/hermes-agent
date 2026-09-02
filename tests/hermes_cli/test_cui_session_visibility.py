@@ -108,3 +108,39 @@ def test_authenticated_request_context_fails_closed_when_identity_incomplete():
     )
     assert web_server._cui_actor_context_from_request(complete) == ACTOR_A
     assert web_server._cui_actor_context_from_request(incomplete)["_restricted"] == "1"
+
+
+def test_persisted_session_iterator_pages_past_foreign_rows_without_leaking_metadata():
+    from tui_gateway import server
+
+    rows = [
+        {**_row(f"foreign-{index}", ACTOR_B), "title": "foreign"}
+        for index in range(server._PERSISTED_SESSION_SCAN_PAGE_SIZE + 1)
+    ]
+    rows.append(
+        {
+            **_row("own", ACTOR_A),
+            "title": "Own session",
+            "preview": "hello",
+            "started_at": 7,
+            "message_count": 2,
+        }
+    )
+
+    class DB:
+        def list_sessions_rich(self, *, limit, offset=0, **_kwargs):
+            return rows[offset : offset + limit]
+
+    visible = list(server._iter_visible_persisted_session_rows(DB(), ACTOR_A))
+
+    assert visible == [
+        {
+            "id": "own",
+            "source": "tui",
+            "title": "Own session",
+            "preview": "hello",
+            "started_at": 7,
+            "message_count": 2,
+        }
+    ]
+    assert "model_config" not in visible[0]

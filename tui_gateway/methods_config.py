@@ -286,6 +286,20 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"value": "fast" if tier == "priority" else "normal"})
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
+    if key == "yolo":
+        try:
+            session = _sessions.get(params.get("session_id", ""))
+            if session is not None:
+                from tools.approval import is_session_yolo_enabled
+
+                enabled = is_session_yolo_enabled(session["session_key"])
+            else:
+                enabled = str(os.environ.get("HERMES_YOLO_MODE", "")).strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            return _ok(rid, {"value": "on" if enabled else "off"})
+        except Exception as e:
+            return _err(rid, 5001, str(e))
     if key in {"approval_mode", "approvals.mode"}:
         try:
             return _ok(rid, {"value": _load_approval_mode()})

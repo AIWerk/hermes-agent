@@ -1782,12 +1782,16 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
     ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key, **_elevenlabs_environment_kwargs(el_config))
-    audio_generator = client.text_to_speech.convert(
+    convert_kwargs = dict(
         text=text,
         voice_id=voice_id,
         model_id=model_id,
         output_format=output_format,
     )
+    language = el_config.get("language_code") or el_config.get("language")
+    if isinstance(language, str) and language.strip():
+        convert_kwargs["language_code"] = language.strip()
+    audio_generator = client.text_to_speech.convert(**convert_kwargs)
 
     # audio_generator yields chunks -- write them all
     with open(output_path, "wb") as f:
@@ -3497,111 +3501,338 @@ def _text_to_speech_single(
 # Conservative Hungarian/German spoken-form normalization
 # ===========================================================================
 _HU_SMALL_NUMBERS = {
-    0: "nulla", 1: "egy", 2: "kettő", 3: "három", 4: "négy",
-    5: "öt", 6: "hat", 7: "hét", 8: "nyolc", 9: "kilenc",
-    10: "tíz", 11: "tizenegy", 12: "tizenkettő", 13: "tizenhárom",
-    14: "tizennégy", 15: "tizenöt", 16: "tizenhat", 17: "tizenhét",
-    18: "tizennyolc", 19: "tizenkilenc", 20: "húsz", 30: "harminc",
-    40: "negyven", 50: "ötven", 60: "hatvan", 70: "hetven",
-    80: "nyolcvan", 90: "kilencven",
+    0: "nulla",
+    1: "egy",
+    2: "kettő",
+    3: "három",
+    4: "négy",
+    5: "öt",
+    6: "hat",
+    7: "hét",
+    8: "nyolc",
+    9: "kilenc",
+    10: "tíz",
+    11: "tizenegy",
+    12: "tizenkettő",
+    13: "tizenhárom",
+    14: "tizennégy",
+    15: "tizenöt",
+    16: "tizenhat",
+    17: "tizenhét",
+    18: "tizennyolc",
+    19: "tizenkilenc",
+    20: "húsz",
+    30: "harminc",
+    40: "negyven",
+    50: "ötven",
+    60: "hatvan",
+    70: "hetven",
+    80: "nyolcvan",
+    90: "kilencven",
 }
+
 _DE_SMALL_NUMBERS = {
-    0: "null", 1: "eins", 2: "zwei", 3: "drei", 4: "vier",
-    5: "fünf", 6: "sechs", 7: "sieben", 8: "acht", 9: "neun",
-    10: "zehn", 11: "elf", 12: "zwölf", 13: "dreizehn",
-    14: "vierzehn", 15: "fünfzehn", 16: "sechzehn", 17: "siebzehn",
-    18: "achtzehn", 19: "neunzehn", 20: "zwanzig", 30: "dreißig",
-    40: "vierzig", 50: "fünfzig", 60: "sechzig", 70: "siebzig",
-    80: "achtzig", 90: "neunzig",
+    0: "null",
+    1: "eins",
+    2: "zwei",
+    3: "drei",
+    4: "vier",
+    5: "fünf",
+    6: "sechs",
+    7: "sieben",
+    8: "acht",
+    9: "neun",
+    10: "zehn",
+    11: "elf",
+    12: "zwölf",
+    13: "dreizehn",
+    14: "vierzehn",
+    15: "fünfzehn",
+    16: "sechzehn",
+    17: "siebzehn",
+    18: "achtzehn",
+    19: "neunzehn",
+    20: "zwanzig",
+    30: "dreißig",
+    40: "vierzig",
+    50: "fünfzig",
+    60: "sechzig",
+    70: "siebzig",
+    80: "achtzig",
+    90: "neunzig",
 }
 
 
 def _hungarian_int_to_words(value: int) -> str:
+    """Return a compact Hungarian word form for integers used in TTS."""
+    if value < 0:
+        return "mínusz " + _hungarian_int_to_words(abs(value))
     if value in _HU_SMALL_NUMBERS:
         return _HU_SMALL_NUMBERS[value]
     if value < 100:
-        tens, ones = divmod(value, 10)
-        prefix = "huszon" if tens == 2 else _HU_SMALL_NUMBERS[tens * 10]
-        return prefix + _HU_SMALL_NUMBERS[ones]
+        tens = value // 10 * 10
+        ones = value % 10
+        if tens == 20:
+            return "huszon" + _HU_SMALL_NUMBERS[ones]
+        return _HU_SMALL_NUMBERS[tens] + _HU_SMALL_NUMBERS[ones]
     if value < 1000:
-        hundreds, rest = divmod(value, 100)
+        hundreds = value // 100
+        rest = value % 100
         prefix = "száz" if hundreds == 1 else _hungarian_int_to_words(hundreds) + "száz"
-        return prefix if not rest else prefix + _hungarian_int_to_words(rest)
+        return prefix if rest == 0 else prefix + _hungarian_int_to_words(rest)
     if value < 1_000_000:
-        thousands, rest = divmod(value, 1000)
+        thousands = value // 1000
+        rest = value % 1000
         prefix = "ezer" if thousands == 1 else _hungarian_int_to_words(thousands) + "ezer"
-        return prefix if not rest else prefix + "-" + _hungarian_int_to_words(rest)
+        return prefix if rest == 0 else prefix + "-" + _hungarian_int_to_words(rest)
+    if value < 1_000_000_000:
+        millions = value // 1_000_000
+        rest = value % 1_000_000
+        prefix = "egymillió" if millions == 1 else _hungarian_int_to_words(millions) + "millió"
+        return prefix if rest == 0 else prefix + "-" + _hungarian_int_to_words(rest)
+    if value < 1_000_000_000_000:
+        billions = value // 1_000_000_000
+        rest = value % 1_000_000_000
+        prefix = "egymilliárd" if billions == 1 else _hungarian_int_to_words(billions) + "milliárd"
+        return prefix if rest == 0 else prefix + "-" + _hungarian_int_to_words(rest)
     return str(value)
+
+
+def _split_decimal_de_hu(value: str) -> Tuple[str, Optional[str]]:
+    """Split a de/hu-locale numeric string into (integer, fractional) parts.
+
+    In German and Hungarian the comma is the decimal separator and the dot
+    is the thousands separator (e.g. ``1.000`` = one thousand, ``3,14`` =
+    three point one four).  We therefore strip dots that group digits and
+    treat only the comma as the decimal point.  Returns ``(left, None)``
+    when the value has no comma — i.e. it's an integer (any dots are
+    thousands grouping and removed).
+    """
+    # Drop thousands-grouping dots that sit between digits.  Bounded,
+    # ReDoS-safe (single char class on each side, no nested quantifiers).
+    grouped = re.sub(r"(?<=\d)\.(?=\d)", "", value)
+    if "," in grouped:
+        left, right = grouped.split(",", 1)
+        return left, right
+    return grouped, None
+
+
+def _hungarian_number_to_words(raw: str) -> str:
+    sign = ""
+    value = raw.strip()
+    if value.startswith("-"):
+        sign = "mínusz "
+        value = value[1:]
+    value = value.replace(" ", "")
+    left, right = _split_decimal_de_hu(value)
+    if right is not None:
+        left_words = _hungarian_int_to_words(int(left or "0"))
+        right_words = " ".join(_hungarian_int_to_words(int(ch)) for ch in right if ch.isdigit())
+        return f"{sign}{left_words} egész {right_words}".strip()
+    return sign + _hungarian_int_to_words(int(left or "0"))
 
 
 def _german_int_to_words(value: int) -> str:
+    """Return a compact German word form for integers used in TTS."""
+    if value < 0:
+        return "minus " + _german_int_to_words(abs(value))
     if value in _DE_SMALL_NUMBERS:
         return _DE_SMALL_NUMBERS[value]
     if value < 100:
-        tens, ones = divmod(value, 10)
+        tens = value // 10 * 10
+        ones = value % 10
         ones_word = "ein" if ones == 1 else _DE_SMALL_NUMBERS[ones]
-        return ones_word + "und" + _DE_SMALL_NUMBERS[tens * 10]
+        return ones_word + "und" + _DE_SMALL_NUMBERS[tens]
     if value < 1000:
-        hundreds, rest = divmod(value, 100)
+        hundreds = value // 100
+        rest = value % 100
         prefix = "einhundert" if hundreds == 1 else _german_int_to_words(hundreds) + "hundert"
-        return prefix if not rest else prefix + _german_int_to_words(rest)
+        return prefix if rest == 0 else prefix + _german_int_to_words(rest)
     if value < 1_000_000:
-        thousands, rest = divmod(value, 1000)
+        thousands = value // 1000
+        rest = value % 1000
         prefix = "eintausend" if thousands == 1 else _german_int_to_words(thousands) + "tausend"
-        return prefix if not rest else prefix + _german_int_to_words(rest)
+        return prefix if rest == 0 else prefix + _german_int_to_words(rest)
+    if value < 1_000_000_000:
+        millions = value // 1_000_000
+        rest = value % 1_000_000
+        prefix = "eine Million" if millions == 1 else _german_int_to_words(millions) + " Millionen"
+        return prefix if rest == 0 else prefix + " " + _german_int_to_words(rest)
+    if value < 1_000_000_000_000:
+        billions = value // 1_000_000_000
+        rest = value % 1_000_000_000
+        prefix = "eine Milliarde" if billions == 1 else _german_int_to_words(billions) + " Milliarden"
+        return prefix if rest == 0 else prefix + " " + _german_int_to_words(rest)
     return str(value)
 
 
-def _number_to_words(raw: str, *, language: str) -> str:
+def _german_number_to_words(raw: str) -> str:
+    sign = ""
     value = raw.strip()
-    negative = value.startswith("-")
-    if negative:
+    if value.startswith("-"):
+        sign = "minus "
         value = value[1:]
-    converter = _hungarian_int_to_words if language == "hu" else _german_int_to_words
-    sign = ("mínusz " if language == "hu" else "minus ") if negative else ""
-    if "," in value or "." in value:
-        left, right = re.split(r"[,.]", value, maxsplit=1)
-        separator = " egész " if language == "hu" else " Komma "
-        decimals = " ".join(converter(int(digit)) for digit in right if digit.isdigit())
-        return sign + converter(int(left or "0")) + separator + decimals
-    return sign + converter(int(value))
+    value = value.replace(" ", "")
+    left, right = _split_decimal_de_hu(value)
+    if right is not None:
+        left_words = _german_int_to_words(int(left or "0"))
+        right_words = " ".join(_german_int_to_words(int(ch)) for ch in right if ch.isdigit())
+        return f"{sign}{left_words} Komma {right_words}".strip()
+    return sign + _german_int_to_words(int(left or "0"))
 
 
-_TTS_NUMERIC_TOKEN_RE = re.compile(r"(?<![\w/])-?\d+(?:[,.]\d+)?(?![\w/])")
+_EN_SMALL_NUMBERS = {
+    0: "zero",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+    13: "thirteen",
+    14: "fourteen",
+    15: "fifteen",
+    16: "sixteen",
+    17: "seventeen",
+    18: "eighteen",
+    19: "nineteen",
+    20: "twenty",
+    30: "thirty",
+    40: "forty",
+    50: "fifty",
+    60: "sixty",
+    70: "seventy",
+    80: "eighty",
+    90: "ninety",
+}
+
+
+def _english_int_to_words(value: int) -> str:
+    """Return a compact English word form for integers used in TTS."""
+    if value < 0:
+        return "minus " + _english_int_to_words(abs(value))
+    if value in _EN_SMALL_NUMBERS:
+        return _EN_SMALL_NUMBERS[value]
+    if value < 100:
+        tens = value // 10 * 10
+        ones = value % 10
+        return _EN_SMALL_NUMBERS[tens] + "-" + _EN_SMALL_NUMBERS[ones]
+    if value < 1000:
+        hundreds = value // 100
+        rest = value % 100
+        prefix = _EN_SMALL_NUMBERS[hundreds] + " hundred"
+        return prefix if rest == 0 else prefix + " " + _english_int_to_words(rest)
+    for scale, name in ((1_000_000_000, "billion"), (1_000_000, "million"), (1000, "thousand")):
+        if value >= scale:
+            count = value // scale
+            rest = value % scale
+            prefix = _english_int_to_words(count) + " " + name
+            return prefix if rest == 0 else prefix + " " + _english_int_to_words(rest)
+    return str(value)
+
+
+def _split_decimal_en(value: str) -> Tuple[str, Optional[str]]:
+    """Split an en-locale numeric string into (integer, fractional) parts.
+
+    In English the comma is the thousands separator and the dot is the decimal
+    point — the mirror image of de/hu.  Comma groups are stripped and only the
+    dot is treated as the decimal separator.  Returns ``(left, None)`` for
+    integers (values with no dot).
+    """
+    grouped = re.sub(r"(?<=\d),(?=\d)", "", value)
+    if "." in grouped:
+        left, right = grouped.split(".", 1)
+        return left, right
+    return grouped, None
+
+
+def _english_number_to_words(raw: str) -> str:
+    sign = ""
+    value = raw.strip()
+    if value.startswith("-"):
+        sign = "minus "
+        value = value[1:]
+    value = value.replace(" ", "")
+    left, right = _split_decimal_en(value)
+    if right is not None:
+        left_words = _english_int_to_words(int(left or "0"))
+        right_words = " ".join(_english_int_to_words(int(ch)) for ch in right if ch.isdigit())
+        return f"{sign}{left_words} point {right_words}".strip()
+    return sign + _english_int_to_words(int(left or "0"))
+
+
+# Match numbers with optional multi-group thousands separators followed by an
+# optional decimal part. The grouped alternative (``\d{1,3}(?:[.,]\d{3})+...``)
+# captures whole values like ``1.000.000`` / ``1,000,000`` / ``12.345.678`` so
+# they read as one number instead of being split at each separator. The plain
+# alternative keeps the single-group / decimal cases (``1.000`` / ``3,14``)
+# unchanged. Locale interpretation of ``.`` vs ``,`` happens per-language in the
+# *_number_to_words helpers.
+_TTS_NUMERIC_TOKEN_RE = re.compile(
+    r"(?<![\w/])-?(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+(?:[,.]\d+)?)(?![\w/])"
+)
 
 
 def _normalize_text_for_tts(text: str, language: Optional[str] = None) -> str:
-    """Expand common spoken forms for Hungarian and German only."""
+    """Normalize symbols and numerals into more speakable text before TTS.
+
+    The implementation is deliberately conservative and covers the languages we
+    use for customer-facing voice replies first: Hungarian and German.
+    """
     if not text:
         return text
+
     lang = (language or "").strip().lower()
-    if not (lang.startswith("hu") or lang.startswith("de")):
-        return text
-    base_lang = "hu" if lang.startswith("hu") else "de"
-    if base_lang == "hu":
-        replacements = (
-            (r"\s*°\s*C\b|\s*℃", " Celsius fok"),
-            (r"\s*%", " százalék"),
-            (r"\s*€|\s*\bEUR\b", " euró"),
-            (r"\s*\bCHF\b", " svájci frank"),
-            (r"\s*\b(?:HUF|Ft)\b", " forint"),
-        )
-    else:
-        replacements = (
-            (r"\s*°\s*C\b|\s*℃", " Grad Celsius"),
+    normalized = text
+    if lang.startswith("de"):
+        replacements = [
+            (r"\s*°\s*C\b", " Grad Celsius"),
+            (r"\s*℃", " Grad Celsius"),
             (r"\s*%", " Prozent"),
             (r"\s*€|\s*\bEUR\b", " Euro"),
             (r"\s*\bCHF\b", " Schweizer Franken"),
             (r"\s*\bHUF\b", " Ungarische Forint"),
-        )
-    normalized = text
+        ]
+    elif lang.startswith("hu"):
+        replacements = [
+            (r"\s*°\s*C\b", " Celsius fok"),
+            (r"\s*℃", " Celsius fok"),
+            (r"\s*%", " százalék"),
+            (r"\s*€|\s*\bEUR\b", " euró"),
+            (r"\s*\bCHF\b", " svájci frank"),
+            (r"\s*\b(?:HUF|Ft)\b", " forint"),
+        ]
+    elif lang.startswith("en"):
+        replacements = []
+    else:
+        return text
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
-    normalized = _TTS_NUMERIC_TOKEN_RE.sub(
-        lambda match: _number_to_words(match.group(0), language=base_lang),
-        normalized,
-    )
-    return re.sub(r"\s{2,}", " ", normalized).strip()
+
+    if lang.startswith("hu"):
+        normalized = _TTS_NUMERIC_TOKEN_RE.sub(
+            lambda match: _hungarian_number_to_words(match.group(0)),
+            normalized,
+        )
+    elif lang.startswith("de"):
+        normalized = _TTS_NUMERIC_TOKEN_RE.sub(
+            lambda match: _german_number_to_words(match.group(0)),
+            normalized,
+        )
+    elif lang.startswith("en"):
+        normalized = _TTS_NUMERIC_TOKEN_RE.sub(
+            lambda match: _english_number_to_words(match.group(0)),
+            normalized,
+        )
+
+    normalized = re.sub(r"\s{2,}", " ", normalized)
+    return normalized.strip()
 
 
 def _resolve_tts_language(tts_config: Optional[Dict[str, Any]], provider: str) -> Optional[str]:

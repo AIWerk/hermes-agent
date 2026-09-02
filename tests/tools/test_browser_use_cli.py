@@ -780,7 +780,8 @@ class TestStepLabels:
         assert build_tool_preview("browser_exec", {"code": self._CODE}) == (
             "Searching Amazon for paper towels"
         )
-        assert "new_tab" in build_tool_preview("browser_exec", {"code": "new_tab('x')"})
+        # Raw executable code remains hidden when no explicit safe label exists.
+        assert build_tool_preview("browser_exec", {"code": "new_tab('x')"}) is None
 
     def test_progress_line_shows_label(self):
         from agent.display import get_cute_tool_message

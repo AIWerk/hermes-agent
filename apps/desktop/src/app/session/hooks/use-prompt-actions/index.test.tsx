@@ -18,6 +18,7 @@ import {
   $currentCwd,
   $currentUsage,
   $messages,
+  $selectedStoredSessionId,
   $sessions,
   $terminalBackend,
   $turnStartedAt,
@@ -5523,5 +5524,58 @@ describe('usePromptActions editMessage stale-target recovery (#82462)', () => {
     expect(
       (submitCalls[0]?.[1] as { truncate_before_user_ordinal?: unknown } | undefined)?.truncate_before_user_ordinal
     ).toBeUndefined()
+  })
+})
+
+// Recovered cross-session auto-reset isolation regression.
+describe('background auto-reset isolation', () => {
+  it('a background auto-reset rotates only its target state and never steals foreground selection', async () => {
+    $busy.set(false)
+    $selectedStoredSessionId.set('stored-foreground')
+
+    const selectedRef = { current: 'stored-foreground' }
+    const updates: { sessionId: string; storedSessionId: null | string | undefined }[] = []
+
+    const requestGateway = vi.fn(async (method: string) =>
+      (method === 'prompt.submit'
+        ? {
+            auto_reset: true,
+            previous_session_key: 'stored-background-old',
+            session_key: 'stored-background-new',
+            stored_session_id: 'stored-background-new',
+            status: 'streaming'
+          }
+        : {}) as never
+    )
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="rt-foreground"
+        getRuntimeIdForStoredSession={storedId =>
+          storedId === 'stored-background-old' ? 'rt-background' : null
+        }
+        onReady={h => (handle = h)}
+        onUpdateState={(sessionId, storedSessionId) => updates.push({ sessionId, storedSessionId })}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedRef}
+        storedSessionId="stored-foreground"
+      />
+    )
+
+    expect(
+      await handle!.submitText('queued for background session', {
+        fromQueue: true,
+        sessionId: 'rt-background',
+        storedSessionId: 'stored-background-old'
+      })
+    ).toBe(true)
+    expect($selectedStoredSessionId.get()).toBe('stored-foreground')
+    expect(selectedRef.current).toBe('stored-foreground')
+    expect(updates.at(-1)).toEqual({
+      sessionId: 'rt-background',
+      storedSessionId: 'stored-background-new'
+    })
   })
 })

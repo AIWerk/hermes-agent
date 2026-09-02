@@ -19,6 +19,13 @@ describe("Markdown streaming progress", () => {
       expect(html.match(/#+/g)).toEqual([marker.trim()]);
     },
   );
+
+  it("renders an incomplete multiline heading marker without hanging", () => {
+    const html = render("Antwort\n\n### ", true);
+
+    expect(html).toContain("Antwort");
+    expect(html).toContain("###");
+  });
 });
 
 describe("Markdown heading hierarchy", () => {

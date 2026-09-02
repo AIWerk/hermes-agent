@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { isAssistantDashboardMode } from "./dashboard-flags";
+import { getHermesUserDisplayName, isAssistantDashboardMode } from "./dashboard-flags";
 
 
 describe("assistant dashboard mode", () => {
@@ -20,5 +20,13 @@ describe("assistant dashboard mode", () => {
 
     (globalThis as { window?: unknown }).window = { __HERMES_DASHBOARD_MODE__: "spoofed" };
     expect(isAssistantDashboardMode()).toBe(false);
+  });
+
+  it("returns only a trimmed injected user display name", () => {
+    (globalThis as { window?: unknown }).window = { __HERMES_USER_DISPLAY_NAME__: "  Kata  " };
+    expect(getHermesUserDisplayName()).toBe("Kata");
+
+    (globalThis as { window?: unknown }).window = { __HERMES_USER_DISPLAY_NAME__: "   " };
+    expect(getHermesUserDisplayName()).toBeNull();
   });
 });

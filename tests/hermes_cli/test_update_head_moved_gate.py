@@ -105,6 +105,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
     # Gateway restart path (called after a successful update).
     monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a: None)
+    # Keep module patches alive across the simulated update. A real update
+    # purges stale modules; this unit test must not replace its gateway fakes
+    # with the live machine's module objects.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda *a, **k: None)
     # Keep the (now surfaced — #78574) gateway auto-restart phase away from
     # this machine's real gateways: discovery returns nothing, systemd is
     # unsupported, so the phase is a clean no-op for both snapshots.

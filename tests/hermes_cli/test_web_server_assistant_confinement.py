@@ -121,10 +121,35 @@ def test_assistant_ws_gate_rejects_extra_or_privileged_contract(
     ) is not None
 
 
+def test_request_actor_context_rejects_unknown_authenticated_role(web_server) -> None:
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            session=SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="unexpected",
+                display_name="Configured Customer",
+                user_id="user-a",
+                provider="test",
+            )
+        )
+    )
+
+    actor = web_server._cui_actor_context_from_request(request)
+    assert actor == {"_restricted": "1"}
+    assert web_server._session_visible_to_cui_actor({}, actor) is False
+
+
 def test_assistant_ws_gate_requires_complete_server_identity(web_server) -> None:
     request = {"method": "session.create", "params": {"source": "web", "close_on_disconnect": True}}
 
-    for identity in (None, {}, {"role": "user"}, {"role": "user", "actor_id": "a"}):
+    for identity in (
+        None,
+        {},
+        {"role": "user"},
+        {"role": "user", "actor_id": "a"},
+        {"role": "unexpected", "actor_id": "a", "tenant_id": "t"},
+    ):
         assert web_server._assistant_ws_request_gate(request, identity) is not None
 
 

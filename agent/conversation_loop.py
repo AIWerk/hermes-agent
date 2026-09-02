@@ -468,6 +468,76 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _record_incremental_session_notes(
+    agent,
+    messages: List[Dict],
+    conversation_history: Optional[List[Dict]] = None,
+    final_response: Optional[str] = None,
+) -> None:
+    """Best-effort deterministic note capture after a persisted turn."""
+    if not getattr(agent, "_session_db", None) or not getattr(
+        agent, "session_id", None
+    ):
+        return
+    try:
+        from agent.session_notes import record_session_event
+
+        start_idx = len(conversation_history) if conversation_history else 0
+        turn_messages = messages[start_idx:]
+        turn_index = getattr(agent, "_user_turn_count", None) or 0
+        for msg in turn_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            text = content if isinstance(content, str) else str(content or "")
+            tool_name = msg.get("tool_name") or msg.get("name") or "tool"
+            record_session_event(
+                agent._session_db,
+                agent.session_id,
+                "tool_result",
+                {"summary": text[:500], "tool_name": tool_name},
+                turn_index=turn_index,
+            )
+        tool_turns = sum(
+            1
+            for msg in turn_messages
+            if isinstance(msg, dict)
+            and (msg.get("role") == "tool" or msg.get("tool_calls"))
+        )
+        if tool_turns and final_response:
+            record_session_event(
+                agent._session_db,
+                agent.session_id,
+                "turn_note",
+                {
+                    "summary": str(final_response)[:500],
+                    "current_goal": "Aktuelle Nutzeraufgabe fortsetzen",
+                    "tool_turns": tool_turns,
+                },
+                turn_index=turn_index,
+            )
+        if final_response:
+            try:
+                from agent.title_generator import maybe_retitle_session
+
+                maybe_retitle_session(
+                    agent._session_db,
+                    agent.session_id,
+                    messages,
+                    conversation_history,
+                    turn_index=turn_index,
+                    failure_callback=getattr(agent, "_emit_auxiliary_failure", None),
+                    main_runtime={
+                        "provider": getattr(agent, "provider", None),
+                        "model": getattr(agent, "model", None),
+                    },
+                )
+            except Exception:
+                logger.debug("mid-session retitle scheduling failed", exc_info=True)
+    except Exception:
+        logger.debug("incremental session note capture failed", exc_info=True)
+
+
 def _is_copilot_provider(agent: Any) -> bool:
     """Delegate to ``AIAgent._is_copilot_provider`` (single owner of the check).
 
@@ -2014,16 +2084,28 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    def _consume_redirect_for_retry(*, include_pending_steer: bool = False) -> bool:
+        nonlocal original_user_message, final_response
+        if include_pending_steer:
+            text = agent._take_text_commit_correction_and_close_admission()
+        else:
+            text = agent._take_pending_redirect_and_close_response_window()
+        if not text:
+            return False
+        _apply_active_turn_redirect(agent, messages, text)
+        if isinstance(original_user_message, str):
+            original_user_message = (
+                f"{original_user_message}\n\n"
+                f"User correction during the turn: {text}"
+            )
+        agent._persist_session(messages, conversation_history)
+        final_response = None
+        if include_pending_steer:
+            agent._open_turn_correction_admission()
+        return True
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-        _redirect_text = agent._drain_pending_redirect()
-        if _redirect_text:
-            _apply_active_turn_redirect(agent, messages, _redirect_text)
-            if isinstance(original_user_message, str):
-                original_user_message = (
-                    f"{original_user_message}\n\n"
-                    f"User correction during the turn: {_redirect_text}"
-                )
-            agent._persist_session(messages, conversation_history)
+        _consume_redirect_for_retry()
 
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
@@ -2918,6 +3000,8 @@ def run_conversation(
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": (
@@ -3217,6 +3301,7 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                _response_returned = False
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -3234,18 +3319,31 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                    _response_returned = True
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:
                                 _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
+                            response_commit_pending = getattr(
+                                agent, "_response_commit_pending", None
                             )
+                            if _response_returned and response_commit_pending is not None:
+                                response_commit_pending.set()
+                            _redirect_crossed_response = bool(agent._pending_redirect)
+                            if _redirect_crossed_response and response_commit_pending is not None:
+                                response_commit_pending.clear()
                     else:
                         if _model_request_active is not None:
                             _model_request_active.clear()
+                        response_commit_pending = getattr(
+                            agent, "_response_commit_pending", None
+                        )
+                        if _response_returned and response_commit_pending is not None:
+                            response_commit_pending.set()
                         _redirect_crossed_response = agent._has_pending_redirect()
+                        if _redirect_crossed_response and response_commit_pending is not None:
+                            response_commit_pending.clear()
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -3479,6 +3577,8 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
@@ -3514,6 +3614,9 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
+                            if _consume_redirect_for_retry(include_pending_steer=True):
+                                _retry.restart_with_redirected_messages = True
+                                break
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
                             return {
@@ -3682,6 +3785,8 @@ def run_conversation(
                         f"{_CONTENT_POLICY_RECOVERY_HINT}"
                     )
 
+                    if _consume_redirect_for_retry(include_pending_steer=True):
+                        continue
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     return _content_policy_blocked_result(
@@ -3775,6 +3880,8 @@ def run_conversation(
                             "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
@@ -3829,6 +3936,8 @@ def run_conversation(
                             "→ Or resend your message (your conversation "
                             "history is preserved)"
                         )
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
@@ -3996,6 +4105,8 @@ def run_conversation(
                                     "finish_reason": "length",
                                 })
                             agent._session_messages = messages
+                            if _consume_redirect_for_retry(include_pending_steer=True):
+                                continue
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
@@ -4067,6 +4178,8 @@ def run_conversation(
                             # errors) can leave a tool-result tail; this path
                             # never reaches finalize_turn (#48879 class).
                             close_interrupted_tool_sequence(messages, _final_response)
+                            if _consume_redirect_for_retry(include_pending_steer=True):
+                                continue
                             agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _final_response,
@@ -4082,6 +4195,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
                         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
 
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
@@ -4097,6 +4212,8 @@ def run_conversation(
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": "First response truncated due to output length limit",
@@ -5272,6 +5389,8 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
+                    if _consume_redirect_for_retry(include_pending_steer=True):
+                        continue
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
                     return {
@@ -5337,6 +5456,8 @@ def run_conversation(
                         f"{agent.log_prefix}Context overflow ({classified.reason.value}) with "
                         f"auto-compaction disabled — not compressing."
                     )
+                    if _consume_redirect_for_retry(include_pending_steer=True):
+                        continue
                     agent._persist_session(messages, conversation_history)
                     _final_response = (
                         "Context overflow and auto-compaction is disabled "
@@ -5659,6 +5780,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -5691,6 +5814,8 @@ def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
@@ -5731,6 +5856,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
                         return {
@@ -5809,6 +5936,8 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
+                            if _consume_redirect_for_retry(include_pending_steer=True):
+                                continue
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                             return {
@@ -5837,6 +5966,8 @@ def run_conversation(
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
+                                if _consume_redirect_for_retry(include_pending_steer=True):
+                                    continue
                                 agent._persist_session(messages, conversation_history)
                                 return _compression_deferred_result(
                                     agent, messages, api_call_count
@@ -5885,6 +6016,8 @@ def run_conversation(
                             f"{agent.log_prefix}Output-cap error not routed into compression "
                             f"(max_tokens over provider cap): {error_msg[:200]}"
                         )
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = (
                             "max_tokens exceeds the provider's output cap for this model. "
@@ -5963,6 +6096,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -5997,6 +6132,8 @@ def run_conversation(
                         # attempt and end the turn softly so the gateway does
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
@@ -6026,6 +6163,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                         logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
                         return {
@@ -6299,6 +6438,8 @@ def run_conversation(
                     # Persisting the failed user message would make the
                     # session even larger, causing the same failure on the
                     # next attempt. (#1630)
+                    if _consume_redirect_for_retry(include_pending_steer=True):
+                        continue
                     if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
@@ -6545,6 +6686,8 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    if _consume_redirect_for_retry(include_pending_steer=True):
+                        continue
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -6636,6 +6779,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
                         return {
@@ -6871,6 +7016,8 @@ def run_conversation(
                     agent._incomplete_scratchpad_retries = 0
                     
                     rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
+                    if _consume_redirect_for_retry(include_pending_steer=True):
+                        continue
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     
@@ -7015,6 +7162,8 @@ def run_conversation(
                     continue
 
                 agent._codex_incomplete_retries = 0
+                if _consume_redirect_for_retry(include_pending_steer=True):
+                    continue
                 agent._persist_session(messages, conversation_history)
                 return {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
@@ -7104,6 +7253,8 @@ def run_conversation(
                         # interrupt aborts (#48879 / #52592) so the next user
                         # turn is not tool→user for strict providers.
                         close_interrupted_tool_sequence(messages, _final_response)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
@@ -7188,6 +7339,8 @@ def run_conversation(
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
+                        if _consume_redirect_for_retry(include_pending_steer=True):
+                            continue
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
@@ -7911,6 +8064,8 @@ def run_conversation(
                                     f"(retry {agent._empty_content_retries}/{_empty_retry_budget})."
                                 )
                                 close_interrupted_tool_sequence(messages, _interrupt_text)
+                                if _consume_redirect_for_retry(include_pending_steer=True):
+                                    continue
                                 agent._persist_session(messages, conversation_history)
                                 agent.clear_interrupt()
                                 return {
@@ -8141,9 +8296,11 @@ def run_conversation(
                         if isinstance(_frag, dict):
                             _frag.pop("_length_continuation_fragment", None)
                             _frag.pop("_length_continuation_nudge", None)
-                
+
+                if _consume_redirect_for_retry(include_pending_steer=True):
+                    continue
                 final_response = agent._strip_think_blocks(final_response).strip()
-                
+
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
@@ -8193,6 +8350,7 @@ def run_conversation(
                     })
                     agent._session_messages = messages
                     final_response = None
+                    agent._open_turn_correction_admission()
                     continue
 
                 # Reached finalization without the dropped-tool-call mismatch —
