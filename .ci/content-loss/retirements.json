@@ -1,4 +1,45 @@
 {
-  "approvals": [],
+  "approvals": [
+    {
+      "id": "R2-CONTROL-BASELINE-PR97",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "db5f44bdf2cdfe6406b757f2ec2f3512c6992312",
+      "allowed_target_state": "blob:fce91773628be47bd4969ccce3814b77fa8e7764",
+      "valid_for_pr": 97,
+      "not_before": "2026-09-02T13:00:00Z",
+      "expires_at": "2026-09-09T13:00:00Z",
+      "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension in a separate control-plane transition."
+    },
+    {
+      "id": "R2-CONTROL-GUARD-PR97",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "expected_old_blob": "77566d69af8fa99f63f60c3405d95b78ee12eac8",
+      "allowed_target_state": "blob:e8926a2858cad6215018725c18262d99b646138a",
+      "valid_for_pr": 97,
+      "not_before": "2026-09-02T13:00:00Z",
+      "expires_at": "2026-09-09T13:00:00Z",
+      "reason": "Authorize the exact protected-marker enforcement implementation as an isolated control-plane transition."
+    },
+    {
+      "id": "R2-CONTROL-GUARD-TESTS-PR97",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "expected_old_blob": "65590ce824705414d95e94c35a7dfc5d4ab44e3f",
+      "allowed_target_state": "blob:afe5965b174577737a6f92ce201e2b2aabe02120",
+      "valid_for_pr": 97,
+      "not_before": "2026-09-02T13:00:00Z",
+      "expires_at": "2026-09-09T13:00:00Z",
+      "reason": "Authorize the exact protected-marker regression coverage alongside its isolated guard transition."
+    },
+    {
+      "id": "R2-CONTROL-BASELINE-PR98",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "db5f44bdf2cdfe6406b757f2ec2f3512c6992312",
+      "allowed_target_state": "blob:fce91773628be47bd4969ccce3814b77fa8e7764",
+      "valid_for_pr": 98,
+      "not_before": "2026-09-02T13:00:00Z",
+      "expires_at": "2026-09-09T13:00:00Z",
+      "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension after the guard schema transition."
+    }
+  ],
   "schema_version": 1
 }
