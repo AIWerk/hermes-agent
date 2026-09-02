@@ -160,6 +160,7 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",

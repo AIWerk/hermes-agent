@@ -67,6 +67,31 @@ def _dropped_tool_call_response(content: str):
 
 
 class TestDroppedToolCallRecovery:
+    def test_internal_retry_reopens_steer_admission(self, loop_agent):
+        """A recovery continuation is still the active logical user turn."""
+        from tests.run_agent.test_run_agent import _mock_response
+
+        responses = iter([
+            _dropped_tool_call_response("Let me verify."),
+            _mock_response(content="Verified.", finish_reason="stop"),
+        ])
+        loop_agent.client.chat.completions.create.side_effect = list(responses)
+        original_open = loop_agent._open_turn_correction_admission
+        with (
+            patch.object(
+                loop_agent,
+                "_open_turn_correction_admission",
+                wraps=original_open,
+            ) as reopen,
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("review the PR")
+
+        assert result["completed"] is True
+        assert reopen.call_count >= 2
+
     def test_dropped_tool_call_reprompts_instead_of_exiting(self, loop_agent):
         """finish_reason=tool_calls with an empty tool_calls array must
         re-prompt the model to emit the call rather than exiting the loop

@@ -461,6 +461,19 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "",
         ))
 
+    if stats.get("fts_repair_required"):
+        failures = stats.get("fts_failure_count")
+        count_text = f" after {failures} failure(s)" if failures is not None else ""
+        last_error = stats.get("fts_last_error")
+        detail = "run 'hermes sessions repair-search' offline with the gateway stopped"
+        if last_error:
+            detail += f"; last error: {last_error}"
+        lines.append((
+            "error",
+            f"state.db search index is repair-required{count_text}",
+            f"({detail})",
+        ))
+
     deferral = stats.get("fts_rebuild_deferral")
     if isinstance(deferral, dict):
         attempts = deferral.get("attempts")
@@ -2091,20 +2104,14 @@ def run_doctor(args):
     except Exception:
         running_in_container = False
 
-    if running_in_container:
-        # Inside our container the Docker terminal backend is not
-        # configured by default (Docker-in-Docker isn't set up); the
-        # local backend is the intended one. Skip the noisy "docker
-        # not found" warning. If the user has explicitly chosen
-        # TERMINAL_ENV=docker inside the container they likely mounted
-        # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
-            check_info(
-                "Running inside a container — using local terminal backend "
-                "(docker-in-docker is not configured by default)"
-            )
-            # Skip to next section; Docker isn't relevant here.
-            terminal_env = "local"
+    if running_in_container and terminal_env == "local":
+        # A plain container runtime uses the local backend internally. Explicit
+        # remote/sandbox backends (SSH, Daytona, Vercel, etc.) remain explicit
+        # and must still receive their backend-specific diagnostics.
+        check_info(
+            "Running inside a container — using local terminal backend "
+            "(docker-in-docker is not configured by default)"
+        )
     if terminal_env == "docker":
         if _safe_which("docker"):
             # Check if docker daemon is running

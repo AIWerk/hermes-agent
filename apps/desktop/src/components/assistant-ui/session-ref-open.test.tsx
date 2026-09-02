@@ -7,10 +7,16 @@ import { $previewTabs, closeRightRail } from '@/store/preview'
 import { DirectiveContent } from './directive-text'
 import { MarkdownTextContent } from './markdown-text'
 
+const ensureGatewayProfile = vi.fn(async (_profile?: string) => {})
 const openSession = vi.fn()
 
 vi.mock('@/app/open-session', () => ({
   openSession: (...args: unknown[]) => openSession(...args)
+}))
+
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  ensureGatewayProfile: (profile?: string) => ensureGatewayProfile(profile)
 }))
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -18,6 +24,8 @@ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDeskt
 afterEach(() => {
   cleanup()
   closeRightRail()
+  ensureGatewayProfile.mockReset()
+  ensureGatewayProfile.mockResolvedValue(undefined)
   openSession.mockClear()
   delete desktopWindow.hermesDesktop
   __resetSessionLinkTitleCache()
@@ -28,9 +36,17 @@ afterEach(() => {
 // it names via the shared door (focus if on screen, else a stacked tab).
 describe('session refs open the session', () => {
   it('opens the session from an agent-written link', async () => {
+    let finishProfileSwitch!: () => void
+
+    ensureGatewayProfile.mockImplementationOnce(() => new Promise<void>(resolve => (finishProfileSwitch = resolve)))
     render(<MarkdownTextContent isRunning={false} text="Picked up in @session:work/20260101_abc123 last night." />)
 
     fireEvent.click(await screen.findByTitle('work/20260101_abc123'))
+
+    await vi.waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith('work'))
+    expect(openSession).not.toHaveBeenCalled()
+
+    finishProfileSwitch()
 
     await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
   })
@@ -42,6 +58,23 @@ describe('session refs open the session', () => {
 
     expect(chip.tagName).toBe('BUTTON')
     fireEvent.click(chip)
+
+    await vi.waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith('work'))
+    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
+  })
+
+  it('waits for an in-flight profile switch before opening a profileless ref', async () => {
+    let finishProfileSwitch!: () => void
+
+    ensureGatewayProfile.mockImplementationOnce(() => new Promise<void>(resolve => (finishProfileSwitch = resolve)))
+    render(<MarkdownTextContent isRunning={false} text="Continue @session:20260101_abc123 here." />)
+
+    fireEvent.click(await screen.findByTitle('20260101_abc123'))
+
+    await vi.waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith(undefined))
+    expect(openSession).not.toHaveBeenCalled()
+
+    finishProfileSwitch()
 
     await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
   })

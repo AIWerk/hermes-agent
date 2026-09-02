@@ -48,10 +48,15 @@ _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
+_cui_actor_context_from_request = late("_cui_actor_context_from_request")
+_list_sessions_rich_all = late("_list_sessions_rich_all")
+_session_visible_to_cui_actor = late("_session_visible_to_cui_actor")
+_project_session_list_rows_public = late("_project_session_list_rows_public")
 
 
 @list_router.get("/api/sessions")
 def get_sessions(
+    request: Request,
     # ``le=100`` caps the page size (idea from #39200): an unbounded limit
     # lets one request drag every session row (plus correlated-subquery
     # preview work) out of SQLite in a single hit.
@@ -112,33 +117,44 @@ def get_sessions(
             # section (source=cron) into two independent lists.
             source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
             exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-                cwd_prefix=(cwd_prefix or None),
-                limit=limit,
-                offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-                # SQL-level projection: when the caller didn't ask for full
-                # rows, skip the system_prompt blob inside SQLite too (pairs
-                # with the API-level _strip_session_list_rows below).
-                compact_rows=not full,
-                include_pinned=True,
-            )
-            total = db.session_count(
-                source=source or None,
-                sources=source_list or None,
-                cwd_prefix=(cwd_prefix or None),
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
+            actor = _cui_actor_context_from_request(request)
+            list_kwargs = {
+                "source": source or None,
+                "sources": source_list or None,
+                "exclude_sources": exclude_list or None,
+                "cwd_prefix": (cwd_prefix or None),
+                "min_message_count": min_message_count,
+                "include_archived": include_archived,
+                "archived_only": archived_only,
+                "order_by_last_active": order == "recent",
+                "include_pinned": True,
+            }
+            total = 0
+            if actor:
+                all_rows = _list_sessions_rich_all(db, **list_kwargs)
+                visible_rows = [
+                    row for row in all_rows if _session_visible_to_cui_actor(row, actor)
+                ]
+                total = len(visible_rows)
+                sessions = visible_rows[offset : offset + limit]
+            else:
+                sessions = db.list_sessions_rich(
+                    **list_kwargs,
+                    limit=limit,
+                    offset=offset,
+                    compact_rows=not full,
+                )
+            if not actor:
+                total = db.session_count(
+                    source=source or None,
+                    sources=source_list or None,
+                    cwd_prefix=(cwd_prefix or None),
+                    exclude_sources=exclude_list or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    exclude_children=True,
+                )
             now = time.time()
             # Same ownership contract as get_session_detail: rows are stamped
             # with the serving profile even when the request wasn't explicitly
@@ -154,7 +170,9 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
-            if not full:
+            if actor:
+                sessions = _project_session_list_rows_public(sessions)
+            elif not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
@@ -168,6 +186,7 @@ def get_sessions(
 
 @search_router.get("/api/sessions/search")
 async def search_sessions(
+    request: Request,
     q: str = "",
     limit: int = 20,
     profile: Optional[str] = None,
@@ -185,6 +204,7 @@ async def search_sessions(
     Branches also use ``parent_session_id``, but they are real alternate
     conversations; don't collapse branch-specific hits back into the parent.
     """
+    actor = late("_cui_actor_context_from_request")(request)
     if not q or not q.strip():
         return {"results": []}
     try:
@@ -277,6 +297,13 @@ async def search_sessions(
                 if not raw_sid:
                     return
                 root = compression_root(raw_sid)
+                if actor:
+                    raw_session = db.get_session(raw_sid)
+                    if not late("_session_visible_to_cui_actor")(raw_session, actor):
+                        return
+                    visible_session = db.get_session(lineage_tip(root)) or db.get_session(root)
+                    if not late("_session_visible_to_cui_actor")(visible_session, actor):
+                        return
                 if root in seen or len(seen) >= safe_limit:
                     return
                 payload = dict(payload)
@@ -312,33 +339,60 @@ async def search_sessions(
                     )
                 else:
                     payload["id"] = sid
+                if actor:
+                    public_row = (
+                        late("_project_session_list_rows_public")([row])[0]
+                        if row
+                        else {"id": sid}
+                    )
+                    payload = late("_sanitize_public_message_value")(
+                        {
+                            **public_row,
+                            "id": public_row.get("id") or sid,
+                            "session_id": sid,
+                            "snippet": payload.get("snippet", ""),
+                            "role": payload.get("role"),
+                        }
+                    )
                 seen[root] = payload
 
             # Direct ID matches first: users often paste a session id from CLI,
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(
-                q,
-                limit=safe_limit,
-                include_archived=True,
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-            ):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
+            id_fetch_limit = max(safe_limit * 5, 50)
+            while len(seen) < safe_limit:
+                id_matches = db.search_sessions_by_id(
+                    q,
+                    limit=id_fetch_limit,
+                    include_archived=True,
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
                 )
+                for row in id_matches:
+                    if len(seen) >= safe_limit:
+                        break
+                    sid = row.get("id")
+                    preview = (row.get("preview") or "").strip()
+                    snippet = preview or f"Session ID: {sid}"
+                    add_lineage_result(
+                        sid,
+                        {
+                            "snippet": snippet,
+                            "role": None,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "session_started": row.get("started_at"),
+                        },
+                    )
+                if (
+                    not actor
+                    or len(id_matches) < id_fetch_limit
+                    or len(seen) >= safe_limit
+                ):
+                    break
+                id_fetch_limit *= 2
 
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
@@ -354,34 +408,41 @@ async def search_sessions(
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
             fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(
-                query=prefix_query,
-                source_filter=include_sources,
-                exclude_sources=exclude_list or None,
-                limit=fetch_limit,
-                fields=(
-                    "session_id",
-                    "role",
-                    "snippet",
-                    "source",
-                    "model",
-                    "session_started",
-                ),
-            )
-
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
+            while len(seen) < safe_limit:
+                matches = db.search_messages(
+                    query=prefix_query,
+                    source_filter=include_sources,
+                    exclude_sources=exclude_list or None,
+                    limit=fetch_limit,
+                    fields=(
+                        "session_id",
+                        "role",
+                        "snippet",
+                        "source",
+                        "model",
+                        "session_started",
+                    ),
                 )
+
+                for m in matches:
+                    if len(seen) >= safe_limit:
+                        break
+                    add_lineage_result(
+                        m["session_id"],
+                        {
+                            "snippet": m.get("snippet", ""),
+                            "role": m.get("role"),
+                            "source": m.get("source"),
+                            "model": m.get("model"),
+                            "session_started": m.get("session_started"),
+                        },
+                    )
+                if not actor or len(matches) < fetch_limit or len(seen) >= safe_limit:
+                    break
+                # Authorization happens after the global FTS query. Expand until
+                # an authorized page is full or the match set is exhausted so
+                # higher-ranked cross-owner rows cannot starve valid results.
+                fetch_limit *= 2
             return {"results": list(seen.values())}
         finally:
             db.close()
@@ -393,7 +454,7 @@ async def search_sessions(
 
 
 @manage_router.post("/api/sessions/bulk-delete")
-async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
+async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions, request: Request):
     """Delete every session in ``body.ids`` in a single DB transaction.
 
     Backs the dashboard's bulk-select-and-delete flow on the sessions
@@ -434,9 +495,16 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
+    actor = late("_cui_actor_context_from_request")(request)
+
     def _delete() -> int:
         db = _open_session_db_for_profile(body.profile, read_only=False)
         try:
+            if actor:
+                for session_id in body.ids:
+                    late("_enforce_cui_session_visible")(
+                        db.get_session(session_id), actor, session_id=session_id
+                    )
             return db.delete_sessions(body.ids)
         finally:
             db.close()
@@ -453,6 +521,8 @@ async def import_sessions_endpoint(request: Request):
     restores a whole Hermes backup archive, while this endpoint is scoped to
     session rows/messages and is safe to use from the Sessions page.
     """
+    if late("_cui_actor_context_from_request")(request):
+        raise HTTPException(status_code=403, detail="session import is operator-only")
     try:
         raw_body = await _read_session_import_body(request)
         body = SessionImport.model_validate_json(raw_body)
@@ -472,13 +542,15 @@ async def import_sessions_endpoint(request: Request):
 
 
 @manage_router.get("/api/sessions/empty/count")
-async def count_empty_sessions_endpoint(profile: Optional[str] = None):
+async def count_empty_sessions_endpoint(request: Request, profile: Optional[str] = None):
     """Return the number of empty, ended, non-archived sessions.
 
     Drives the dashboard's "Delete empty (N)" button — when N is 0 the
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
+    if late("_cui_actor_context_from_request")(request):
+        raise HTTPException(status_code=403, detail="empty-session statistics are operator-only")
     def _count() -> int:
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
@@ -490,7 +562,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @manage_router.delete("/api/sessions/empty")
-async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
+async def delete_empty_sessions_endpoint(request: Request, profile: Optional[str] = None):
     """Delete every empty (``message_count == 0``), ended,
     non-archived session in a single transaction.
 
@@ -509,6 +581,8 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     prune-on-startup pass. Matching that pre-existing trade-off keeps
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
+    if late("_cui_actor_context_from_request")(request):
+        raise HTTPException(status_code=403, detail="bulk empty-session deletion is operator-only")
     def _delete() -> int:
         db = _open_session_db_for_profile(profile, read_only=False)
         try:
@@ -521,12 +595,14 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
 
 
 @manage_router.get("/api/sessions/stats")
-async def get_session_stats(profile: Optional[str] = None):
+async def get_session_stats(request: Request, profile: Optional[str] = None):
     """Session-store statistics for the Sessions page (mirrors `hermes sessions stats`).
 
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
+    if late("_cui_actor_context_from_request")(request):
+        raise HTTPException(status_code=403, detail="session-store statistics are operator-only")
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         total = db.session_count(include_archived=True)
@@ -553,13 +629,15 @@ async def get_session_stats(profile: Optional[str] = None):
 
 
 @manage_router.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str, profile: Optional[str] = None):
+async def get_session_detail(session_id: str, request: Request, profile: Optional[str] = None):
+    actor = late("_cui_actor_context_from_request")(request)
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         sid = db.resolve_session_id(session_id)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        late("_enforce_cui_session_visible")(session, actor)
         # Always stamp the owning profile — the serving profile is known even
         # when the request carries no ``?profile=`` (it's this process's own
         # profile). Stamping only on explicit ``?profile=`` left rows for the
@@ -570,6 +648,8 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
             _cron_profile_home(profile)[0] if profile else _cron_default_profile()
         )
         session["is_default_profile"] = session["profile"] == "default"
+        if actor:
+            session = late("_project_session_list_rows_public")([session])[0]
         return session
     finally:
         db.close()
@@ -578,12 +658,19 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
 async def get_session_latest_descendant(
     session_id: str,
+    request: Request,
     profile: Optional[str] = None,
 ):
+    actor = late("_cui_actor_context_from_request")(request)
     def _lookup():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
-            return _session_latest_descendant(session_id, db)
+            sid = db.resolve_session_id(session_id)
+            late("_enforce_cui_session_visible")(db.get_session(sid) if sid else None, actor)
+            latest, path = _session_latest_descendant(session_id, db)
+            if latest:
+                late("_enforce_cui_session_visible")(db.get_session(latest), actor)
+            return latest, path
         finally:
             db.close()
 
@@ -601,6 +688,7 @@ async def get_session_latest_descendant(
 @manage_router.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(
     session_id: str,
+    request: Request,
     profile: Optional[str] = None,
     limit: Optional[int] = Query(None, ge=0),
     offset: int = Query(0, ge=0),
@@ -613,13 +701,17 @@ async def get_session_messages(
             detail="order must be one of: oldest, latest",
         )
 
+    actor = late("_cui_actor_context_from_request")(request)
+
     def _read():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return None
+            late("_enforce_cui_session_visible")(db.get_session(sid), actor)
             sid = db.resolve_resume_session_id(sid)
+            late("_enforce_cui_session_visible")(db.get_session(sid), actor)
             # Always page this endpoint. An omitted limit used to load an
             # entire transcript, which can be hundreds of thousands of rows
             # for a runaway session and exhaust the dashboard process. Keep
@@ -656,26 +748,27 @@ async def get_session_messages(
             if not projected.get("display_kind"):
                 projected["display_kind"] = "hidden"
         else:
-            # Keep the physical content for inspection/export compatibility;
-            # Desktop consumes this display-only projection. A legacy hidden
-            # wrapper must not hide a successfully recovered live ask.
             projected["display_content"] = display_view.get("content")
             projected.pop("display_kind", None)
         projected_messages.append(projected)
+    messages = projected_messages
+    if actor:
+        messages = late("_project_cui_message_rows_public")(messages)
     return {
         "session_id": sid,
-        "messages": projected_messages,
+        "messages": messages,
         "pagination": {
             "limit": _limit,
             "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
-            "returned": len(projected_messages),
+            "returned": len(messages),
         },
     }
 
 
 @manage_router.delete("/api/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def delete_session_endpoint(session_id: str, request: Request, profile: Optional[str] = None):
+    actor = late("_cui_actor_context_from_request")(request)
     # ``profile`` deletes a session belonging to another (local) profile by
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
@@ -694,6 +787,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
+            late("_enforce_cui_session_visible")(db.get_session(sid), actor)
             db.delete_session(sid)
             return {"ok": True}
         finally:
@@ -703,7 +797,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
 
 
 @manage_router.patch("/api/sessions/{session_id}")
-async def rename_session_endpoint(session_id: str, body: SessionRename):
+async def rename_session_endpoint(session_id: str, body: SessionRename, request: Request):
     """Update a session: rename, archive, pin, and/or mark read/unread.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
@@ -718,6 +812,9 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
+        late("_enforce_cui_session_visible")(
+            db.get_session(sid), late("_cui_actor_context_from_request")(request)
+        )
         if (
             body.title is None
             and body.archived is None
@@ -753,13 +850,20 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
 
 
 @manage_router.get("/api/sessions/{session_id}/export")
-async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def export_session_endpoint(session_id: str, request: Request, profile: Optional[str] = None):
     """Stream a single session (metadata + messages) as JSON."""
+    actor = late("_cui_actor_context_from_request")(request)
     def _prepare_export():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             sid = db.resolve_session_id(session_id)
-            return (sid, db.get_session(sid)) if sid else None
+            if not sid:
+                return None
+            session = db.get_session(sid)
+            late("_enforce_cui_session_visible")(session, actor)
+            if actor:
+                session = late("_project_session_list_rows_public")([session])[0]
+            return sid, session
         finally:
             db.close()
 
@@ -789,6 +893,8 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
                     limit=500,
                     after_id=last_id if last_id is not None else 0,
                 )
+                if actor:
+                    messages = late("_project_cui_message_rows_public")(messages)
                 for message in messages:
                     if not first:
                         yield ","
@@ -815,6 +921,8 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 
 
 @manage_router.post("/api/sessions/prune")
-async def prune_sessions_endpoint(body: SessionPrune):
+async def prune_sessions_endpoint(body: SessionPrune, request: Request):
     """Delete ended sessions matching filters without blocking the event loop."""
+    if late("_cui_actor_context_from_request")(request):
+        raise HTTPException(status_code=403, detail="Bulk session pruning is operator-only")
     return await asyncio.to_thread(_prune_sessions, body)

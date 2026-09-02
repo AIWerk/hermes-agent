@@ -372,48 +372,6 @@ class TestRuntimeFtsRebuild:
         assert any(">>>" in (r.get("snippet") or "") for r in results)
 
 
-    def test_second_corruption_fails_open_and_rebuilds_on_reopen(
-        self, db, tmp_path
-    ):
-        if not db._fts_enabled:
-            pytest.skip("FTS5 unavailable in this build")
-        db_path = tmp_path / "state.db"
-        db.create_session("s1", source="test")
-        db.append_message("s1", "user", "seed")
-        _corrupt_fts(db_path)
-        db.append_message("s1", "user", "first heal")  # consumes the one shot
-        assert db._fts_runtime_rebuild_attempted is True
-
-        # A second corruption must not strand the canonical transcript. The
-        # derived indexes are detached and marked stale instead of looping.
-        _corrupt_fts(db_path)
-        db.append_message("s1", "user", "second corruption")
-        assert _message_contents(db_path) == [
-            "seed",
-            "first heal",
-            "second corruption",
-        ]
-        assert db._fts_stale is True
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
-
-        # Search remains available from canonical rows while FTS is stale.
-        results = db.search_messages("second corruption")
-        assert results
-        assert any("second corruption" in row["snippet"] for row in results)
-
-        # A later open atomically rebuilds all canonical rows before triggers
-        # return, then clears the durable breadcrumb.
-        db.close()
-        reopened = SessionDB(db_path=db_path)
-        try:
-            assert reopened._fts_stale is False
-            assert _meta_value(db_path, FTS_STALE_KEY) is None
-            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
-            results = reopened.search_messages("second corruption")
-            assert results
-        finally:
-            reopened.close()
 
     def test_failed_in_place_rebuild_fails_open(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
@@ -433,29 +391,6 @@ class TestRuntimeFtsRebuild:
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
-    def test_foreign_holder_skips_runtime_rebuild_and_fails_open(
-        self, db, tmp_path, monkeypatch
-    ):
-        if not db._fts_enabled:
-            pytest.skip("FTS5 unavailable in this build")
-        db_path = tmp_path / "state.db"
-        db.create_session("s1", source="test")
-        db.append_message("s1", "user", "seed")
-        _corrupt_fts(db_path)
-
-        monkeypatch.setattr(
-            db,
-            "_foreign_state_db_holders",
-            lambda: [(4242, str(db_path) + "-wal")],
-            raising=False,
-        )
-
-        db.append_message("s1", "user", "canonical survives foreign holder")
-
-        assert _message_contents(db_path)[-1] == "canonical survives foreign holder"
-        assert db._fts_stale is True
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
 
     def test_stale_search_preserves_not_semantics(self, db, tmp_path, monkeypatch):
         if not db._fts_enabled:
@@ -572,58 +507,6 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
-    def test_repeated_deferrals_reap_inactive_orphan_then_rebuild(
-        self, db, tmp_path, monkeypatch
-    ):
-        if not db._fts_enabled:
-            pytest.skip("FTS5 unavailable in this build")
-        db_path = tmp_path / "state.db"
-        db.create_session("s1", source="test")
-        db.append_message("s1", "user", "seed")
-        _corrupt_fts(db_path)
-        monkeypatch.setattr(
-            db,
-            "rebuild_fts",
-            lambda: (_ for _ in ()).throw(sqlite3.DatabaseError("still corrupt")),
-        )
-        db.append_message("s1", "user", "before restart")
-        db.close()
-
-        raw = sqlite3.connect(str(db_path))
-        raw.execute(
-            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (
-                FTS_REBUILD_DEFERRAL_KEY,
-                json.dumps({"first_seen": 1.0, "last_seen": 30.0, "attempts": 2}),
-            ),
-        )
-        raw.commit()
-        raw.close()
-
-        holder_scans = iter(([(4242, str(db_path) + "-wal")], []))
-        reaped = []
-        monkeypatch.setattr(
-            SessionDB,
-            "_foreign_state_db_holders",
-            lambda self: next(holder_scans),
-        )
-        monkeypatch.setattr(
-            SessionDB,
-            "_reap_inactive_orphan_desktop_holders",
-            lambda self, holders, *, min_age_seconds: reaped.extend(holders) or [4242],
-        )
-        monkeypatch.setattr(hermes_state_schema.time, "time", lambda: 120.0)
-
-        reopened = SessionDB(db_path=db_path)
-        try:
-            assert reaped == [(4242, str(db_path) + "-wal")]
-            assert reopened._fts_stale is False
-            assert _meta_value(db_path, FTS_STALE_KEY) is None
-            assert _meta_value(db_path, FTS_REBUILD_DEFERRAL_KEY) is None
-            assert reopened.search_messages("before restart")
-        finally:
-            reopened.close()
 
     def test_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-state.db"
@@ -658,8 +541,65 @@ class TestRuntimeFtsRebuild:
 
         recovered = SessionDB(db_path=db_path)
         try:
+            assert recovered._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+            assert recovered.search_messages("canonical survives")
+
+            report = recovered.repair_fts_offline()
+            assert report["repaired"] is True
+            assert report["verified"] is True
             assert recovered._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None
             assert recovered.search_messages("canonical survives")
         finally:
             recovered.close()
+
+    def test_second_corruption_requires_verified_offline_repair(
+        self, db, tmp_path
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db_path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+        db.append_message("s1", "user", "first heal")  # consumes the one shot
+        assert db._fts_runtime_rebuild_attempted is True
+
+        # A second corruption must not strand the canonical transcript. The
+        # derived indexes are detached and marked stale instead of looping.
+        _corrupt_fts(db_path)
+        db.append_message("s1", "user", "second corruption")
+        assert _message_contents(db_path) == [
+            "seed",
+            "first heal",
+            "second corruption",
+        ]
+        assert db._fts_stale is True
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()
+
+        # Search remains available from canonical rows while FTS is stale.
+        results = db.search_messages("second corruption")
+        assert results
+        assert any("second corruption" in row["snippet"] for row in results)
+
+        # Reopening alone must preserve repair-required and detached triggers.
+        # Only an explicit verified offline repair may clear the breadcrumb.
+        db.close()
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+            assert _base_fts_triggers(db_path) == set()
+            results = reopened.search_messages("second corruption")
+            assert results
+
+            report = reopened.repair_fts_offline()
+            assert report["repaired"] is True
+            assert report["verified"] is True
+            assert reopened._fts_stale is False
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+        finally:
+            reopened.close()

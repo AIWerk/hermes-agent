@@ -11,6 +11,8 @@ declare global {
     __HERMES_DASHBOARD_MODE__?: "admin" | "assistant";
     /** Hidden customer locale injected by tenant/profile configuration. */
     __AIWERK_CUI_LOCALE__?: string;
+    /** Sanitized first-name style label for authenticated customer greeting. */
+    __HERMES_USER_DISPLAY_NAME__?: string | null;
     /** Sanitized customer-facing agent label injected for browser-title branding. */
     __HERMES_AGENT_DISPLAY_NAME__?: string | null;
   }
@@ -31,6 +33,14 @@ export function isDashboardEmbeddedChatEnabled(): boolean {
 
 export function isAssistantDashboardMode(): boolean {
   return typeof window !== "undefined" && window.__HERMES_DASHBOARD_MODE__ === "assistant";
+}
+
+export function getHermesUserDisplayName(): string | null {
+  if (typeof window === "undefined") return null;
+  const value = window.__HERMES_USER_DISPLAY_NAME__;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 export function getHermesAgentDisplayName(): string | null {

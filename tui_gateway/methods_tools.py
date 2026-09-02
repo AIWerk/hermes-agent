@@ -339,7 +339,11 @@ def _(rid, params: dict) -> dict:
             # loaded once per catalog build.
             usage, origin_of = _skill_usage_lookup()
 
+            from agent.skill_utils import skill_visible_for_current_actor
+
             for k, info in sorted(scan_skill_commands().items()):
+                if not skill_visible_for_current_actor(info.get("visibility")):
+                    continue
                 d = str(info.get("description", "Skill"))
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 name = str(info.get("name") or k.lstrip("/"))
@@ -550,6 +554,10 @@ def _(rid, params: dict) -> dict:
         cmds = scan_skill_commands()
         key = f"/{name}"
         if key in cmds:
+            from agent.skill_utils import skill_visible_for_current_actor
+
+            if not skill_visible_for_current_actor(cmds[key].get("visibility")):
+                return _err(rid, 4031, "skill is not available to the current actor")
             msg = build_skill_invocation_message(
                 key, arg, task_id=session.get("session_key", "") if session else ""
             )

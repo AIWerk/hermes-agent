@@ -3201,6 +3201,22 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    # AIWerk design intent (Attila, 2026-09-02): the customer VPS is reached
+    # over SSH by the operator only. Verify the human ONCE at CLI start, then
+    # trust the session as operator (mode="operator", memory_scope="operator",
+    # session bound to the verified actor_id). Do NOT replace this with
+    # per-action prompts - that is what the upstream "operator_session"
+    # bootstrap does, and it makes the CLI unusable for the operator.
+    # Authority comes from the password gate; the env var only carries the
+    # verified result to child processes. See spec v2.21 section 5.11.
+    operator_session_context = None
+    if getattr(args, "operator", False):
+        from hermes_cli.operator_session import bootstrap_operator_session
+
+        operator_session_context = bootstrap_operator_session(
+            quiet=getattr(args, "quiet", False)
+        )
+
     _pin_kanban_board_env()
     _confirm_startup_expensive_model_override(args)
 
@@ -3271,6 +3287,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "operator_session_context": operator_session_context,
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -12245,6 +12262,10 @@ def _try_fast_chat_launch() -> bool:
     _prepare_agent_startup(args)
 
     if getattr(args, "oneshot", None):
+        if getattr(args, "operator", False):
+            from hermes_cli.operator_session import bootstrap_operator_session
+
+            bootstrap_operator_session(quiet=True)
         _confirm_startup_expensive_model_override(args)
         _run_and_exit_oneshot(
             args.oneshot,
@@ -12303,6 +12324,10 @@ def _try_termux_fast_cli_launch() -> bool:
 
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
+        if getattr(args, "operator", False):
+            from hermes_cli.operator_session import bootstrap_operator_session
+
+            bootstrap_operator_session(quiet=True)
         _confirm_startup_expensive_model_override(args)
         _run_and_exit_oneshot(
             args.oneshot,
@@ -13857,6 +13882,16 @@ def main():
         help="Skip the disk-space confirmation prompt",
     )
 
+    sessions_subparsers.add_parser(
+        "repair-search",
+        help="Offline verified repair for a degraded full-text search index",
+        description=(
+            "Rebuild and verify the full-text search indexes while every other "
+            "Hermes process is stopped. The durable repair-required marker is "
+            "cleared only after verification succeeds."
+        ),
+    )
+
     sessions_repair = sessions_subparsers.add_parser(
         "repair",
         help="Repair a malformed state.db schema so hidden sessions reappear",
@@ -14236,6 +14271,10 @@ def main():
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
     if getattr(args, "oneshot", None):
+        if getattr(args, "operator", False):
+            from hermes_cli.operator_session import bootstrap_operator_session
+
+            bootstrap_operator_session(quiet=True)
         _confirm_startup_expensive_model_override(args)
         _run_and_exit_oneshot(
             args.oneshot,

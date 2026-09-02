@@ -1190,6 +1190,16 @@ def memory_tool(
     """
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+
+    from agent.cui_actor_context import (
+        cui_admin_memory_block_result,
+        memory_write_blocked_for_cui_admin,
+    )
+
+    actor_guard_args = {"action": action, "operations": operations}
+    if memory_write_blocked_for_cui_admin("memory", actor_guard_args):
+        return cui_admin_memory_block_result("memory")
+
     if action in {"add", "replace", "remove"} and getattr(store, "operator_session_context", None):
         return tool_error(
             "Operator sessions cannot write to built-in prompt-injected user/memory stores.",
@@ -1333,6 +1343,18 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     Returns the store's result dict.
     """
     action = payload.get("action")
+    from agent.cui_actor_context import (
+        cui_admin_memory_block_result,
+        memory_write_blocked_for_cui_admin,
+    )
+
+    actor_guard_args = {
+        "action": action,
+        "operations": payload.get("operations"),
+    }
+    if memory_write_blocked_for_cui_admin("memory", actor_guard_args):
+        return json.loads(cui_admin_memory_block_result("memory"))
+
     if action in {"add", "replace", "remove", "batch"} and getattr(store, "operator_session_context", None):
         return {
             "success": False,

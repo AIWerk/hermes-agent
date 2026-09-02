@@ -1559,6 +1559,9 @@ def test_subagent_agent_boundary_closes_its_own_scope(
         _parent_session_id="parent",
         _session_db=None,
         _conversation_root_id=lambda: "parent",
+        _open_turn_correction_admission=lambda: None,
+        _take_text_commit_correction_and_close_admission=lambda: None,
+        _close_turn_correction_admission=lambda **_kwargs: None,
     )
 
     if terminal == "return":

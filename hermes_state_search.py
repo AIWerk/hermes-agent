@@ -1446,6 +1446,17 @@ class SessionSearchMixin:
                 include_inactive=include_inactive,
                 fields=fields,
             )
+            path = self._describe_search_path(query)
+            degraded = path == "like_scan_fts_stale"
+            provenance = {
+                "engine": "canonical_like" if degraded else path,
+                "degraded": degraded,
+                "repair_required": degraded,
+            }
+            # ``fields`` is a strict projection contract.
+            if fields is None:
+                for row in rows:
+                    row["search_provenance"] = dict(provenance)
             return rows
         finally:
             try:

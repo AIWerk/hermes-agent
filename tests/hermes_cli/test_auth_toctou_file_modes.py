@@ -69,6 +69,44 @@ def test_save_auth_store_writes_0o600_with_0o700_parent(tmp_path, monkeypatch):
     assert data["providers"]["openai-codex"]["tokens"]["access_token"] == "secret-x"
 
 
+def test_save_auth_store_restores_existing_owner_after_atomic_replace(
+    tmp_path, monkeypatch
+):
+    """A privileged auth refresh must not steal auth.json from its owner."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from hermes_cli import auth as auth_mod
+
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(json.dumps({"version": 1, "providers": {}}))
+    sentinel_owner = (12345, 23456)
+    restored: list[tuple[str, tuple[int, int]]] = []
+
+    monkeypatch.setattr(auth_mod, "_preserve_file_owner", lambda path: sentinel_owner)
+    monkeypatch.setattr(
+        auth_mod,
+        "_restore_file_owner",
+        lambda path, owner: restored.append((str(path), owner)),
+    )
+
+    auth_mod._save_auth_store(
+        {
+            "version": auth_mod.AUTH_STORE_VERSION,
+            "providers": {
+                "openai-codex": {"tokens": {"access_token": "secret-y"}}
+            },
+        }
+    )
+
+    assert restored == [(str(auth_path), sentinel_owner)]
+    assert (
+        json.loads(auth_path.read_text())["providers"]["openai-codex"]["tokens"][
+            "access_token"
+        ]
+        == "secret-y"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _save_qwen_cli_tokens  (Qwen CLI OAuth tokens)
 # ---------------------------------------------------------------------------

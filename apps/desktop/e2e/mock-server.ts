@@ -22,6 +22,10 @@ import nodePath from 'node:path'
 
 /** A canned assistant reply used for every chat completion request. */
 export const MOCK_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
+export function generatedTitle(text: string): string {
+  return text.replace(/[\s.?!:;,-]+$/g, '')
+}
+export const MOCK_TITLE = generatedTitle(MOCK_REPLY)
 
 export interface MockServerOptions {
   /** Pause the matching stream after its first token for session-switch E2E coverage. */
@@ -973,6 +977,8 @@ export const SIDEBAR_CROSS_TEXTS = {
   interimText: SIDEBAR_CROSS_SCRIPT[0].text,
   /** The final answer text. */
   finalText: SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text,
+  /** Canonical generated session title. */
+  titleText: generatedTitle(SIDEBAR_CROSS_SCRIPT[SIDEBAR_CROSS_SCRIPT.length - 1].text),
   /**
    * The default (unheld) background process command. Tests that pass a
    * `backgroundReleasePath` get a sentinel-waiting command instead — see

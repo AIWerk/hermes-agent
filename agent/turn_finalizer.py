@@ -143,6 +143,23 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    # Atomically close redirect/steer admission before assembling the durable
+    # terminal result. Preserve an accepted non-text late correction.
+    _atomic_take = getattr(
+        agent, "_take_text_commit_correction_and_close_admission", None
+    )
+    if callable(_atomic_take):
+        _leftover_correction = _atomic_take()
+    else:
+        _legacy_close = getattr(agent, "_close_turn_correction_admission", None)
+        _leftover_correction = (
+            agent._drain_pending_steer()
+            if callable(getattr(agent, "_drain_pending_steer", None))
+            else None
+        )
+        if callable(_legacy_close):
+            _legacy_close()
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -456,6 +473,14 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        try:
+            agent._record_incremental_session_notes(
+                messages, conversation_history, final_response
+            )
+        except Exception as exc:
+            logger.debug(
+                "incremental session note capture failed: %s", exc, exc_info=True
+            )
         if completed and not interrupted and not failed and final_response:
             try:
                 from agent.turn_context import maybe_title_session_after_success
@@ -768,7 +793,7 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    _leftover_steer = _leftover_correction
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

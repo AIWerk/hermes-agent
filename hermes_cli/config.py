@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 from hermes_cli.cli_output import line_input
 import json
 import logging
@@ -247,11 +248,11 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+_LOAD_CONFIG_CACHE: Dict[str, Any] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
-_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_RAW_CONFIG_CACHE: Dict[str, Any] = {}
 # Serializes all config read/write paths. libyaml's C extension is not
 # thread-safe for concurrent safe_load() on the same file, and multiple
 # tool threads (approval.py, browser_tool.py, setup flows) hit
@@ -260,6 +261,15 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+
+
+def _read_config_snapshot(path: Path) -> Tuple[Tuple[int, int, bytes], bytes]:
+    """Read bytes once and return the signature bound to that exact snapshot."""
+    st = path.stat()
+    raw = path.read_bytes()
+    digest = hashlib.blake2b(raw, digest_size=16).digest()
+    return (st.st_mtime_ns, st.st_size, digest), raw
+
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -3246,33 +3256,31 @@ def read_raw_config() -> Dict[str, Any]:
     single value and don't want the overhead of ``load_config()``'s deep-merge
     + migration pipeline.
 
-    Cached on the config file's (mtime_ns, size) — same strategy as
+    Cached on the config file's (mtime_ns, size, content digest) — same strategy as
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
-            st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
+            cache_key, raw = _read_config_snapshot(config_path)
         except (FileNotFoundError, OSError):
             return {}
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2])
+        if cached is not None and cached[:3] == cache_key:
+            return copy.deepcopy(cached[3])
 
         try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+            data = fast_safe_load(raw.decode("utf-8")) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return {}
 
         if not isinstance(data, dict):
             data = {}
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
+        _RAW_CONFIG_CACHE[path_key] = (*cache_key, copy.deepcopy(data))
         return data
 
 
@@ -3337,25 +3345,24 @@ def read_raw_config_readonly() -> Dict[str, Any]:
     checks like the shared-metrics gate, which runs 2-3x per agent turn and
     was paying a full config deepcopy each time.
 
-    Same (mtime_ns, size) freshness key as ``read_raw_config()`` — an edited
-    config.yaml is picked up on the next call.
+    Same exact-snapshot ``(mtime_ns, size, digest)`` freshness key as
+    ``read_raw_config()`` — an edited config.yaml is picked up even when a
+    writer preserves both timestamp and byte length.
     """
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
-            st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
+            cache_key, raw = _read_config_snapshot(config_path)
         except (FileNotFoundError, OSError):
             return {}
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return cached[2]
+        if cached is not None and cached[:3] == cache_key:
+            return cached[3]
 
         try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+            data = fast_safe_load(raw.decode("utf-8")) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return {}
@@ -3366,7 +3373,7 @@ def read_raw_config_readonly() -> Dict[str, Any]:
         # caller must see the exact dict later cache hits return, so a test
         # asserting ``ro1 is ro2`` holds from the very first call.
         cached_copy = copy.deepcopy(data)
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
+        _RAW_CONFIG_CACHE[path_key] = (*cache_key, cached_copy)
         return cached_copy
 
 
@@ -3743,55 +3750,46 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         path_key = str(config_path)
 
         try:
-            st = config_path.stat()
-            user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+            user_sig, user_raw = _read_config_snapshot(config_path)
         except FileNotFoundError:
             user_sig = None
+            user_raw = None
 
-        # Managed scope: fold the managed config file's (mtime, size) into the
-        # cache signature so editing /etc/hermes/config.yaml invalidates the
-        # cached merged result. (0, 0) means "no managed config file".
+        # Fingerprint and parse the exact same managed-file byte snapshot.
         from hermes_cli import managed_scope
 
-        managed_dir = managed_scope.get_managed_dir()
-        managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
-        try:
-            mst = managed_cfg_path.stat() if managed_cfg_path else None
-            managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
-        except OSError:
-            managed_sig = (0, 0)
+        managed_config, managed_sig = managed_scope.load_managed_config_with_signature()
 
-        # Combined cache signature: user file + managed file. None only when the
-        # user config is absent AND no managed file exists (nothing to cache on).
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
-                user_sig[0],
-                user_sig[1],
-                managed_sig[0],
-                managed_sig[1],
+            cache_sig = (
+                user_sig[0], user_sig[1], user_sig[2],
+                managed_sig[0], managed_sig[1], managed_sig[2],
             )
-        elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+        elif managed_sig != (0, 0, b""):
+            cache_sig = (
+                0, 0, b"",
+                managed_sig[0], managed_sig[1], managed_sig[2],
+            )
         else:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if cached is not None and cache_sig is not None and cached[:6] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[7] if len(cached) > 7 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return copy.deepcopy(cached[6]) if want_deepcopy else cached[6]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
         if user_sig is not None:
+            assert user_raw is not None
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                user_config = fast_safe_load(user_raw.decode("utf-8")) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -3836,8 +3834,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         # signature and triggers a normal reload.
                         _empty_env: Dict[str, Optional[str]] = {}
                         _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig[0], cache_sig[1],
-                            cache_sig[2], cache_sig[3],
+                            *cache_sig,
                             lkg_copy, _empty_env,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
@@ -3849,7 +3846,6 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with

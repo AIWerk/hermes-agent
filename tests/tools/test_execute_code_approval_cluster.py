@@ -83,6 +83,122 @@ def test_helper_clears_callbacks_on_teardown():
         TT.set_approval_callback(None)
 
 
+def test_thread_context_clears_stale_worker_callbacks_before_target_when_parent_has_none(
+    monkeypatch,
+):
+    from tools import thread_context as TC
+
+    state = {"approval": None, "sudo": None, "operator": None}
+
+    def callback_api():
+        return (
+            lambda: None,
+            lambda: None,
+            lambda value: state.__setitem__("approval", value),
+            lambda value: state.__setitem__("sudo", value),
+            lambda: None,
+            lambda value: state.__setitem__("operator", value),
+        )
+
+    monkeypatch.setattr(TC, "_callback_api", callback_api)
+    wrapped = TC.propagate_context_to_thread(
+        lambda: (state["approval"], state["sudo"], state["operator"])
+    )
+    state.update(
+        approval=object(),
+        sudo=object(),
+        operator=object(),
+    )
+
+    assert wrapped() == (None, None, None)
+    assert state == {"approval": None, "sudo": None, "operator": None}
+
+
+def test_helper_revokes_partial_install_before_target(monkeypatch):
+    from tools import thread_context as TC
+
+    approval_cb = object()
+    sudo_cb = object()
+    operator_cb = object()
+    state = {"approval": None, "sudo": None, "operator": None}
+
+    def set_approval(value):
+        state["approval"] = value
+
+    def set_sudo(value):
+        if value is sudo_cb:
+            raise RuntimeError("sudo install failed")
+        state["sudo"] = value
+
+    def set_operator(value):
+        state["operator"] = value
+
+    monkeypatch.setattr(
+        TC,
+        "_callback_api",
+        lambda: (
+            lambda: approval_cb,
+            lambda: sudo_cb,
+            set_approval,
+            set_sudo,
+            lambda: operator_cb,
+            set_operator,
+        ),
+    )
+    seen = []
+
+    TC.propagate_context_to_thread(
+        lambda: seen.append(tuple(state.values()))
+    )()
+
+    assert seen == [(None, None, None)]
+
+
+def test_helper_attempts_every_clear_when_one_setter_raises(monkeypatch):
+    from tools import thread_context as TC
+
+    approval_cb = object()
+    sudo_cb = object()
+    operator_cb = object()
+    state = {"approval": None, "sudo": None, "operator": None}
+    clear_calls = []
+
+    def set_approval(value):
+        if value is None:
+            clear_calls.append("approval")
+            raise RuntimeError("approval clear failed")
+        state["approval"] = value
+
+    def set_sudo(value):
+        if value is None:
+            clear_calls.append("sudo")
+        state["sudo"] = value
+
+    def set_operator(value):
+        if value is None:
+            clear_calls.append("operator")
+        state["operator"] = value
+
+    monkeypatch.setattr(
+        TC,
+        "_callback_api",
+        lambda: (
+            lambda: approval_cb,
+            lambda: sudo_cb,
+            set_approval,
+            set_sudo,
+            lambda: operator_cb,
+            set_operator,
+        ),
+    )
+
+    TC.propagate_context_to_thread(lambda: None)()
+
+    assert clear_calls == ["approval", "sudo", "operator"]
+    assert state["sudo"] is None
+    assert state["operator"] is None
+
+
 def test_both_rpc_threads_use_propagation_helper():
     """Source guard: both execute_code RPC threads must wrap their target with
     propagate_context_to_thread, or the gateway approval bypass (#33057)
@@ -499,3 +615,53 @@ def test_env_scrub_no_log_when_nothing_dropped(caplog):
             is_windows=False,
         )
     assert "dropped" not in "\n".join(r.getMessage() for r in caplog.records)
+
+def test_helper_propagates_secret_capture_callback():
+    """The skills secret-capture callback (thread-local in tools.skills_tool)
+    must be propagated into the worker thread, so a future parallelized
+    skill-install can still prompt for secrets instead of silently falling
+    through to setup_skipped."""
+    from tools import skills_tool as ST
+
+    sentinel = object()
+    ST.set_secret_capture_callback(sentinel)
+    try:
+        seen: dict = {}
+
+        def worker():
+            seen["secret_cb"] = ST._get_secret_capture_callback()
+
+        t = threading.Thread(target=propagate_context_to_thread(worker))
+        t.start()
+        t.join(timeout=5)
+
+        assert seen["secret_cb"] is sentinel
+    finally:
+        ST.set_secret_capture_callback(None)
+
+
+def test_helper_clears_secret_capture_callback_on_teardown():
+    """A recycled worker thread must not retain the propagated secret-capture
+    callback after the wrapped target finishes."""
+    from tools import skills_tool as ST
+
+    sentinel = object()
+    ST.set_secret_capture_callback(sentinel)
+    try:
+        seen: dict = {}
+
+        def first():
+            seen["during"] = ST._get_secret_capture_callback()
+
+        def second():  # NOT wrapped — runs on the same recycled worker thread
+            seen["after"] = ST._get_secret_capture_callback()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(propagate_context_to_thread(first)).result(timeout=5)
+            ex.submit(second).result(timeout=5)
+
+        assert seen["during"] is sentinel  # installed for the wrapped target
+        assert seen["after"] is None       # cleared on teardown
+    finally:
+        ST.set_secret_capture_callback(None)
+

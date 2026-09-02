@@ -169,7 +169,7 @@ describe('BillingSettings', () => {
       target: { value: '7.50' }
     })
 
-    expect(screen.getByText(`Threshold: minimum is ${formatMoney(10)}.`)).toBeTruthy()
+    expect(screen.getByText(/Threshold: minimum is \$\s?10\./)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -593,7 +593,7 @@ describe('BillingSettings', () => {
       ok: true
     })
 
-    await waitFor(() => expect(screen.getByText(`${formatMoney(25)} added. Balance is refreshing.`)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/\$\s?25 added\. Balance is refreshing\./)).toBeTruthy())
   })
 
   it('renders logged-out as a connect card without normal account rows', async () => {

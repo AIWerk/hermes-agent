@@ -421,6 +421,13 @@ def _build_skill_message(
     return message
 
 
+def _skill_command_visibility(frontmatter: Any) -> str:
+    """Return canonical visibility metadata for a scanned slash skill."""
+    from agent.skill_utils import skill_visibility_from_frontmatter
+
+    return skill_visibility_from_frontmatter(frontmatter)
+
+
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
 
@@ -528,6 +535,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
+                        "visibility": _skill_command_visibility(frontmatter),
                     }
                 except Exception:
                     continue

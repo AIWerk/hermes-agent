@@ -19,6 +19,11 @@ from itertools import count
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.tool_argument_projection import (
+    project_tool_args_for_display,
+    sanitize_tool_display_text,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +36,21 @@ class EditProposal:
     old_text: str | None
     new_text: str
     arguments: dict[str, Any]
+
+
+def project_edit_proposal_for_display(proposal: EditProposal) -> EditProposal:
+    """Return a credential-redacted copy without mutating internal authority."""
+    return EditProposal(
+        tool_name=proposal.tool_name,
+        path=sanitize_tool_display_text(proposal.path),
+        old_text=(
+            sanitize_tool_display_text(proposal.old_text)
+            if proposal.old_text is not None
+            else None
+        ),
+        new_text=sanitize_tool_display_text(proposal.new_text),
+        arguments=project_tool_args_for_display(proposal.tool_name, proposal.arguments),
+    )
 
 
 EditApprovalRequester = Callable[[EditProposal], bool]
@@ -267,19 +287,20 @@ def build_acp_edit_tool_call(proposal: EditProposal):
     import acp
 
     tool_call_id = f"edit-approval-{next(_PERMISSION_REQUEST_IDS)}"
+    display = project_edit_proposal_for_display(proposal)
     return acp.update_tool_call(
         tool_call_id,
-        title=f"Approve edit: {proposal.path}",
+        title=f"Approve edit: {display.path}",
         kind="edit",
         status="pending",
         content=[
             acp.tool_diff_content(
-                path=proposal.path,
-                old_text=proposal.old_text,
-                new_text=proposal.new_text,
+                path=display.path,
+                old_text=display.old_text,
+                new_text=display.new_text,
             )
         ],
-        raw_input={"tool": proposal.tool_name, "arguments": proposal.arguments},
+        raw_input={"tool": display.tool_name, "arguments": display.arguments},
     )
 
 

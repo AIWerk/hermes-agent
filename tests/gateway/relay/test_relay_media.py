@@ -15,11 +15,15 @@ Covers:
 
 from __future__ import annotations
 
+import io
+import socket
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 import pytest
 
+import gateway.relay.media as relay_media
 from gateway.config import PlatformConfig
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
@@ -165,6 +169,392 @@ async def test_inbound_without_client_keeps_public_drops_rehost():
 
 
 # ── RelayMediaClient unit surface ────────────────────────────────────────
+
+
+def test_media_base_url_derivation():
+    assert media_base_url("wss://conn.example/relay") == "https://conn.example"
+    assert media_base_url("ws://localhost:8080/relay") == "http://localhost:8080"
+    assert media_base_url("https://conn.example") == "https://conn.example"
+
+
+def test_client_enabled_requires_full_credentials():
+    assert RelayMediaClient("https://c.example", "gw1", "sec").enabled is True
+    assert RelayMediaClient("https://c.example", None, "sec").enabled is False
+    assert RelayMediaClient("https://c.example", "gw1", None).enabled is False
+    assert RelayMediaClient("", "gw1", "sec").enabled is False
+
+
+def test_client_recognizes_only_exact_origin_rehost_urls():
+    c = RelayMediaClient("https://c.example", "gw1", "sec")
+    assert c.is_relay_media_url("https://c.example/relay/media/abc") is True
+    assert c.is_relay_media_url("https://c.example.evil/relay/media/abc") is False
+    assert c.is_relay_media_url("https://evil.example/relay/media/abc") is False
+    assert c.is_relay_media_url("https://c.example/not-relay/media/abc") is False
+    assert c.is_relay_media_url("https://c.example/relay/media/../admin") is False
+    assert c.is_relay_media_url("https://c.example/relay/media/a%2Fb") is False
+    assert c.is_relay_media_url("https://cdn.discordapp.com/a/b.png") is False
+
+
+class _DownloadResponse:
+    def __init__(self, body: bytes = b"image", status: int = 200, **headers: str) -> None:
+        self._body = io.BytesIO(body)
+        self.status = status
+        self.headers = headers or {"Content-Type": "image/png"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body.read(size)
+
+
+class _RecordingOpener:
+    def __init__(self, outcomes) -> None:
+        self.outcomes = list(outcomes)
+        self.requests: list[urllib.request.Request] = []
+
+    def open(self, request, data=None, timeout=None):
+        self.requests.append(request)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _public_dns(monkeypatch, address: str = "93.184.216.34") -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+        ],
+    )
+
+
+def _redirect(_source: str, target: str) -> _DownloadResponse:
+    return _DownloadResponse(b"", status=302, **{"Location": target})
+
+
+@pytest.mark.asyncio
+async def test_attacker_relay_path_on_other_origin_receives_no_bearer(monkeypatch):
+    _public_dns(monkeypatch)
+    opener = _RecordingOpener([_DownloadResponse()])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    result = await client.download("https://attacker.example/relay/media/steal")
+
+    assert result is not None
+    Path(result).unlink()
+    assert opener.requests[0].get_header("Authorization") is None
+
+
+@pytest.mark.asyncio
+async def test_exact_configured_relay_origin_receives_bearer(monkeypatch):
+    _public_dns(monkeypatch)
+    opener = _RecordingOpener([_DownloadResponse()])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    result = await client.download("https://connector.example/relay/media/abc")
+
+    assert result is not None
+    Path(result).unlink()
+    assert opener.requests[0].get_header("Authorization", "").startswith("Bearer ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/media.png",
+        "http://10.1.2.3/media.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://168.63.129.16/metadata/instance",
+        "http://0.0.0.0/media.png",
+        "http://224.0.0.1/media.png",
+        "http://240.0.0.1/media.png",
+        "http://[::1]/media.png",
+        "http://[::]/media.png",
+        "http://[fc00::1]/media.png",
+        "http://[fe80::1]/media.png",
+        "http://[ff02::1]/media.png",
+        "http://[2001:db8::1]/media.png",
+        "file:///etc/passwd",
+        "data:text/plain,secret",
+    ],
+)
+async def test_public_download_rejects_unsafe_destinations_and_schemes(monkeypatch, url):
+    opener = _RecordingOpener([_DownloadResponse()])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    assert await client.download(url) is None
+    assert opener.requests == []
+
+
+@pytest.mark.asyncio
+async def test_public_download_pins_validated_address_across_dns_rebinding(monkeypatch):
+    public_ip = "93.184.216.34"
+    private_ip = "127.0.0.1"
+    dns_calls = 0
+    connected: list[str] = []
+    sent = bytearray()
+
+    def rebinding_dns(host, port, type=0):
+        nonlocal dns_calls
+        dns_calls += 1
+        address = public_ip if dns_calls == 1 else private_ip
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    class PinnedSocket:
+        def __init__(self, *_args, **_kwargs):
+            self._peer = None
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, address):
+            self._peer = address
+            connected.append(str(address[0]))
+
+        def getpeername(self):
+            return self._peer
+
+        def sendall(self, data):
+            sent.extend(data)
+
+        def makefile(self, *_args, **_kwargs):
+            return io.BytesIO(
+                b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"
+                b"Content-Length: 5\r\n\r\nimage"
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_dns)
+    monkeypatch.setattr(socket, "socket", PinnedSocket)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    result = await client.download("http://rebind.example/image.png")
+
+    assert result is not None
+    Path(result).unlink()
+    assert connected == [public_ip]
+    assert dns_calls == 1
+    assert b"Host: rebind.example\r\n" in sent
+
+
+def test_pinned_connection_falls_back_from_ipv4_to_validated_ipv6(monkeypatch):
+    attempts: list[tuple[int, str]] = []
+
+    class FamilySocket:
+        def __init__(self, family, *_args):
+            self.family = family
+            self._peer = None
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, address):
+            attempts.append((self.family, address[0]))
+            if self.family == socket.AF_INET:
+                raise OSError("IPv4 unavailable")
+            self._peer = address
+
+        def getpeername(self):
+            return self._peer
+
+        def close(self):
+            pass
+
+    addresses = (
+        (socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 80)),
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, ("2606:4700:4700::1111", 80, 0, 0)),
+    )
+    monkeypatch.setattr(socket, "socket", FamilySocket)
+    connection = relay_media._PinnedHTTPConnection(
+        "public.example", 80, addresses, timeout=1.0
+    )
+
+    connection.connect()
+
+    assert attempts == [
+        (socket.AF_INET, "93.184.216.34"),
+        (socket.AF_INET6, "2606:4700:4700::1111"),
+    ]
+    assert connection.sock is not None
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pinned_download_rejects_mismatched_connected_peer(monkeypatch):
+    _public_dns(monkeypatch)
+
+    class WrongPeerSocket:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _address):
+            pass
+
+        def getpeername(self):
+            return ("127.0.0.1", 80)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(socket, "socket", WrongPeerSocket)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    assert await client.download("http://public.example/image.png") is None
+
+
+@pytest.mark.asyncio
+async def test_https_pinning_keeps_original_hostname_for_tls_sni(monkeypatch):
+    _public_dns(monkeypatch)
+    server_names: list[str] = []
+
+    class FakeSocket:
+        def __init__(self, *_args, **_kwargs):
+            self._peer = None
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, address):
+            self._peer = address
+
+        def getpeername(self):
+            return self._peer
+
+        def sendall(self, _data):
+            pass
+
+        def makefile(self, *_args, **_kwargs):
+            return io.BytesIO(
+                b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"
+                b"Content-Length: 5\r\n\r\nimage"
+            )
+
+        def close(self):
+            pass
+
+    class FakeTLSContext:
+        check_hostname = True
+        verify_mode = 2
+
+        def wrap_socket(self, sock, *, server_hostname):
+            server_names.append(server_hostname)
+            return sock
+
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    monkeypatch.setattr(relay_media.ssl, "create_default_context", FakeTLSContext)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    result = await client.download("https://public.example/image.png")
+
+    assert result is not None
+    Path(result).unlink()
+    assert server_names == ["public.example"]
+
+
+@pytest.mark.asyncio
+async def test_public_download_rejects_if_any_dns_answer_is_private(monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, type=0: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", port)),
+        ],
+    )
+    opener = _RecordingOpener([_DownloadResponse()])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    assert await client.download("https://mixed.example/image.png") is None
+    assert opener.requests == []
+
+
+@pytest.mark.asyncio
+async def test_public_download_fails_closed_on_dns_failure(monkeypatch):
+    def fail_dns(host, port, type=0):
+        raise socket.gaierror("not found")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail_dns)
+    opener = _RecordingOpener([_DownloadResponse()])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    assert await client.download("https://missing.example/image.png") is None
+    assert opener.requests == []
+
+
+@pytest.mark.asyncio
+async def test_safe_public_download_is_allowed(monkeypatch):
+    _public_dns(monkeypatch)
+    opener = _RecordingOpener([_DownloadResponse()])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    result = await client.download("https://public.example/image.png")
+
+    assert result is not None
+    Path(result).unlink()
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_redirect_to_private_destination_is_rejected(monkeypatch):
+    _public_dns(monkeypatch)
+    source = "https://public.example/image.png"
+    opener = _RecordingOpener([_redirect(source, "http://127.0.0.1/secret")])
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    assert await client.download(source) is None
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_redirect_drops_connector_bearer(monkeypatch):
+    _public_dns(monkeypatch)
+    source = "https://connector.example/relay/media/abc"
+    target = "https://public.example/image.png"
+    opener = _RecordingOpener(
+        [_redirect(source, target), _DownloadResponse()]
+    )
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    result = await client.download(source)
+
+    assert result is not None
+    Path(result).unlink()
+    assert opener.requests[0].get_header("Authorization", "").startswith("Bearer ")
+    assert opener.requests[1].get_header("Authorization") is None
+
+
+@pytest.mark.asyncio
+async def test_redirect_chain_is_bounded(monkeypatch):
+    _public_dns(monkeypatch)
+    urls = [f"https://public.example/{index}" for index in range(5)]
+    opener = _RecordingOpener(
+        [_redirect(urls[index], urls[index + 1]) for index in range(4)]
+    )
+    monkeypatch.setattr(relay_media, "_open_pinned_response", opener.open)
+    client = RelayMediaClient("https://connector.example", "gw1", "sec")
+
+    assert await client.download(urls[0]) is None
+    assert len(opener.requests) == 4
 
 
 @pytest.mark.asyncio

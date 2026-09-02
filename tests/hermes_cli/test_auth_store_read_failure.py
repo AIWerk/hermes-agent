@@ -59,6 +59,29 @@ def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch,
     )
 
 
+def test_permission_error_preserves_auth_and_os_error_contracts(
+    store_file, monkeypatch
+):
+    from pathlib import Path
+
+    before = store_file.read_bytes()
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        _fail_read(PermissionError(errno.EACCES, "Permission denied")),
+    )
+
+    with pytest.raises(auth.AuthStoreReadError) as caught:
+        auth._load_auth_store(store_file)
+
+    assert isinstance(caught.value, auth.AuthError)
+    assert isinstance(caught.value, OSError)
+    assert "ownership/permissions" in str(caught.value)
+    assert "refusing to treat this as logged out" in str(caught.value)
+    assert store_file.read_bytes() == before
+    assert not store_file.with_suffix(".json.corrupt").exists()
+
+
 def test_unparseable_json_still_degrades_and_preserves_a_copy(store_file):
     store_file.write_text("{ not json", encoding="utf-8")
 

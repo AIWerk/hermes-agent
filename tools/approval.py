@@ -8,15 +8,18 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextlib
 import contextvars
 import fnmatch
 import functools
 import hashlib
+import ipaddress
 import logging
 import os
 import re
 import shlex
+import socket
 import sys
 import tempfile
 import threading
@@ -24,7 +27,9 @@ import time
 import unicodedata
 import uuid
 from typing import Optional
+from urllib.parse import urlparse
 from hermes_cli.config import cfg_get
+from hermes_cli.dashboard_auth.identity import RUNTIME_MUTATION_ADMIN_ROLE_ALIASES
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -36,22 +41,213 @@ logger = logging.getLogger(__name__)
 # instantly bypass all approval checks — a prompt-injection escalation path.
 _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 
-# Freeze the server-derived context at import, just like YOLO. Reading these
-# keys per call would let prompt-driven code manufacture authority mid-session.
-_MANAGED_AUTONOMY_CONTEXT_FROZEN = (
-    is_truthy_value(os.getenv("HERMES_CUI_MANAGED_AUTONOMY", "")),
-    os.getenv("HERMES_CUI_MANAGED_ACTOR_ID", "").strip(),
-    os.getenv("HERMES_CUI_MANAGED_ACTOR_ROLE", "").strip().lower(),
-)
-_MANAGED_AUTONOMY_ROLES = frozenset({"admin", "operator"})
+# Managed autonomy is authorized per logical CUI flow from the canonical,
+# server-authenticated actor context. Process environment is not authority.
 _MANAGED_AUTONOMY_LOW_RISK_PATTERN_KEYS = frozenset(
     {"script execution via -e/-c flag"}
 )
 
 
+def _cui_actor_context() -> dict:
+    """Return the canonical flow-bound CUI actor context."""
+    from agent.cui_actor_context import current_cui_actor_context
+
+    return dict(current_cui_actor_context())
+
+
+def _is_cui_managed_autonomy_enabled() -> bool:
+    """Require both launch authorization and a complete operator actor."""
+    if not env_var_enabled("AIWERK_CUI_MANAGED_AUTONOMY"):
+        return False
+    actor = _cui_actor_context()
+    tenant_id = str(actor.get("tenant_id") or "").strip()
+    actor_id = str(actor.get("actor_id") or actor.get("user_id") or "").strip()
+    role = str(actor.get("role") or "").strip().lower()
+    return bool(
+        tenant_id
+        and actor_id
+        and role in RUNTIME_MUTATION_ADMIN_ROLE_ALIASES
+    )
+
+
 def _managed_autonomy_authorized() -> bool:
-    enabled, actor_id, actor_role = _MANAGED_AUTONOMY_CONTEXT_FROZEN
-    return bool(enabled and actor_id and actor_role in _MANAGED_AUTONOMY_ROLES)
+    """Current flow-bound authority used by in-process gateway turns."""
+    from agent.cui_actor_context import current_bound_cui_actor_context
+
+    actor = current_bound_cui_actor_context()
+    tenant_id = str(actor.get("tenant_id") or "").strip()
+    actor_id = str(actor.get("actor_id") or "").strip()
+    role = str(actor.get("role") or "").strip().lower()
+    return bool(
+        tenant_id
+        and actor_id
+        and role in RUNTIME_MUTATION_ADMIN_ROLE_ALIASES
+    )
+
+
+_IP_LITERAL_SHAPE_RE = re.compile(r"^[0-9a-fx:.]+$", re.IGNORECASE)
+
+
+def _is_global_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
+def _is_public_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        pass
+    if _IP_LITERAL_SHAPE_RE.match(host):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    addresses = {info[4][0] for info in infos}
+    return bool(addresses) and all(_is_global_ip(str(addr)) for addr in addresses)
+
+
+def _is_safe_curl_read(command: str) -> bool:
+    if re.search(r"[;|<>`$]", command):
+        return False
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        return False
+    if not parts or parts[0] != "curl":
+        return False
+    safe_long_flags = {
+        "--silent", "--show-error", "--fail", "--fail-with-body",
+        "--head", "--compressed",
+    }
+    safe_numeric_options = {
+        "--max-time", "--connect-timeout", "--retry", "--retry-delay",
+    }
+    urls: list[str] = []
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part.startswith(("http://", "https://")):
+            urls.append(part)
+            index += 1
+            continue
+        if part in safe_long_flags:
+            index += 1
+            continue
+        if part in safe_numeric_options:
+            if index + 1 >= len(parts):
+                return False
+            try:
+                if float(parts[index + 1]) < 0:
+                    return False
+            except ValueError:
+                return False
+            index += 2
+            continue
+        if any(part.startswith(option + "=") for option in safe_numeric_options):
+            try:
+                if float(part.split("=", 1)[1]) < 0:
+                    return False
+            except ValueError:
+                return False
+            index += 1
+            continue
+        if part.startswith("-") and not part.startswith("--"):
+            # Only side-effect-free, argument-less short flags. Combined forms
+            # such as -sS and -fsSI are accepted; every other short flag fails.
+            if part == "-" or any(flag not in "sSfI" for flag in part[1:]):
+                return False
+            index += 1
+            continue
+        return False
+    return bool(urls) and all(_is_public_http_url(url) for url in urls)
+
+
+def _literal_terminal_calls_are_safe(tree: ast.AST) -> bool:
+    def terminal_call_is_safe(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            return False
+        if node.func.id != "terminal" or node.keywords:
+            return False
+        return bool(
+            node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and _is_safe_curl_read(node.args[0].value)
+        )
+
+    saw_terminal = False
+    saw_import = False
+    for statement in getattr(tree, "body", []):
+        if isinstance(statement, ast.ImportFrom):
+            if (
+                saw_import
+                or statement.module != "hermes_tools"
+                or len(statement.names) != 1
+                or statement.names[0].name != "terminal"
+                or statement.names[0].asname is not None
+            ):
+                return False
+            saw_import = True
+            continue
+        if isinstance(statement, ast.Assign):
+            if (
+                len(statement.targets) != 1
+                or not isinstance(statement.targets[0], ast.Name)
+                or statement.targets[0].id in {"terminal", "print"}
+                or not terminal_call_is_safe(statement.value)
+            ):
+                return False
+            saw_terminal = True
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            if terminal_call_is_safe(call):
+                saw_terminal = True
+                continue
+            if (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "print"
+                and not call.keywords
+                and all(isinstance(arg, (ast.Name, ast.Constant)) for arg in call.args)
+            ):
+                continue
+        return False
+    return saw_import and saw_terminal
+
+
+def _is_low_risk_cui_execute_code(code: str) -> bool:
+    lower = code.lower()
+    forbidden = [
+        r"\bsubprocess\b", r"\bos\.system\b", r"\bpopen\b", r"\bctypes\b",
+        r"\bshutil\b", r"\.write_text\b", r"\.write_bytes\b", r"\.unlink\b",
+        r"\brmtree\b", r"\bremove\b", r"\brmdir\b", r"\bmkdir\b",
+        r"\bwrite_file\b", r"\bpatch\b", r"\bdelete\b", r"\bemail\b",
+        r"\bpost\b", r"\bput\b", r"\bupload\b", r"\burlretrieve\b",
+        r"\burlcleanup\b", r"\bopen\s*\([^\)]*['\"](?:w|a|x|r\+)",
+    ]
+    if any(re.search(pattern, lower) for pattern in forbidden):
+        return False
+    urls = re.findall(r"https?://[^\s'\"`)>]+", code)
+    if not urls or not all(
+        _is_public_http_url(url.rstrip("),.;")) for url in urls
+    ):
+        return False
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return _literal_terminal_calls_are_safe(tree)
 
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
@@ -5295,6 +5491,14 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    if _is_cui_managed_autonomy_enabled() and _is_low_risk_cui_execute_code(code):
+        return {
+            "approved": True,
+            "message": None,
+            "policy_scoped_autonomy": True,
+            "low_risk_cui_read": True,
+        }
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()

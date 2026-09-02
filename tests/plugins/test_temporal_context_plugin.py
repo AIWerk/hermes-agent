@@ -10,6 +10,7 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.temporal_context import (
     build_temporal_context,
     pre_llm_call,
+    transform_llm_output,
 )
 
 
@@ -109,7 +110,7 @@ def test_register_uses_per_turn_hook_not_cached_system_prompt_section():
     register(context)
 
     assert manager._hooks["pre_llm_call"] == [pre_llm_call]
-    assert "transform_llm_output" not in manager._hooks
+    assert manager._hooks["transform_llm_output"] == [transform_llm_output]
     assert manager._system_prompt_sections == {}
 
 
@@ -119,11 +120,34 @@ def test_manifest_declares_current_hooks():
 
     assert manifest["name"] == "temporal_context"
     assert manifest["kind"] == "standalone"
-    assert manifest["provides_hooks"] == ["pre_llm_call"]
+    assert manifest["provides_hooks"] == ["pre_llm_call", "transform_llm_output"]
 
 
-def test_temporal_plugin_has_no_output_transform_or_regex_surface():
-    import plugins.temporal_context as temporal
+def _output_guard_config(enabled=True):
+    return {
+        "output_guard": {
+            "enabled": enabled,
+            "replacements": [
+                {"pattern": r"\bma délelőtt\b", "replacement": "korábban", "regex": True},
+                {"pattern": r"\bmára ennyi\b", "replacement": "itt megállok", "regex": True},
+            ],
+        }
+    }
 
-    assert not hasattr(temporal, "transform_llm_output")
-    assert not hasattr(temporal, "_regex_flags")
+
+def test_transform_llm_output_is_noop_unless_enabled():
+    text = "ma délelőtt csináltuk, mára ennyi"
+    assert transform_llm_output(text, config={}) == text
+    assert transform_llm_output(text, config=_output_guard_config(False)) == text
+
+
+def test_transform_llm_output_applies_configured_replacements():
+    assert transform_llm_output(
+        response_text="ma délelőtt csináltuk, mára ennyi",
+        config=_output_guard_config(),
+    ) == "korábban csináltuk, itt megállok"
+
+
+def test_transform_llm_output_preserves_explicit_timestamp():
+    text = "ma délelőtt 2026-05-21 10:15 CEST csináltuk, mára ennyi"
+    assert transform_llm_output(response_text=text, config=_output_guard_config()) == text

@@ -96,10 +96,37 @@ class TestToolProgressCallback:
 
 
 # ---------------------------------------------------------------------------
-# Thinking callback
+# Thinking/message callbacks
 # ---------------------------------------------------------------------------
 
 
+class TestFreeTextCallbacks:
+    def test_live_thought_and_message_redact_credentials(self, mock_conn, event_loop_fixture):
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        with (
+            patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts,
+            patch("acp_adapter.events.acp.update_agent_thought_text") as thought,
+            patch("acp_adapter.events.acp.update_agent_message_text") as message,
+        ):
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+            thought.return_value = MagicMock()
+            message.return_value = MagicMock()
+            thinking_cb = make_thinking_cb(
+                mock_conn, "session-1", event_loop_fixture
+            )
+            thinking_cb("Authorization: Bear")
+            thinking_cb(f"er {secret}")
+            thinking_cb.flush()
+            cb = make_message_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("Authorization: Bear")
+            cb(f"er {secret}")
+            cb.flush()
+
+        assert secret not in thought.call_args.args[0]
+        emitted = "".join(call.args[0] for call in message.call_args_list)
+        assert secret not in emitted
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +174,7 @@ class TestStepCallback:
             cb(1, [{"name": "terminal", "result": '{"output": "hello"}'}])
 
         mock_btc.assert_called_once_with(
-            "tc-xyz789", "terminal", result='{"output": "hello"}', function_args=None, snapshot=None
+            "tc-xyz789", "terminal", result='{"output": "hello"}', function_args={}, snapshot=None
         )
 
 
@@ -201,6 +228,19 @@ class TestStepCallback:
         ]
         assert [entry.status for entry in plan.entries] == ["completed", "in_progress", "completed"]
         assert [entry.priority for entry in plan.entries] == ["medium", "medium", "medium"]
+
+    def test_todo_native_plan_redacts_credential_bearing_content(self):
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        result = (
+            '{"todos":[{"id":"safe","content":"Authorization: Bearer '
+            + secret
+            + '","status":"pending"}]}'
+        )
+
+        plan = _build_plan_update_from_todo_result(result)
+
+        assert isinstance(plan, AgentPlanUpdate)
+        assert secret not in plan.entries[0].content
 
 
 

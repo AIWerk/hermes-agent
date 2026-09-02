@@ -27,6 +27,8 @@ def _invoke_callback(
     smart_denied=False,
     timeout=60.0,
     use_prompt_path=False,
+    command="rm -rf /",
+    description="dangerous command",
 ):
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     request_permission = AsyncMock(name="request_permission")
@@ -44,8 +46,8 @@ def _invoke_callback(
         cb = make_approval_callback(request_permission, loop, session_id="s1", timeout=timeout)
         if use_prompt_path:
             result = prompt_dangerous_approval(
-                "rm -rf /",
-                "dangerous command",
+                command,
+                description,
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
@@ -53,8 +55,8 @@ def _invoke_callback(
             )
         else:
             result = cb(
-                "rm -rf /",
-                "dangerous command",
+                command,
+                description,
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
@@ -98,6 +100,22 @@ class TestApprovalBridge:
             "deny",
             "deny_always",
         ]
+
+    def test_permission_card_redacts_secrets_from_all_derived_fields(self):
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        command = f"curl -H 'Authorization: Bearer {secret}' https://example.test"
+        description = f"Authorization: Bearer {secret}"
+
+        _, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            command=command,
+            description=description,
+        )
+
+        tool_call = kwargs["tool_call"]
+        assert secret not in repr(tool_call)
+        assert command.endswith("https://example.test")
+        assert description == f"Authorization: Bearer {secret}"
 
     def test_session_less_gate_offers_only_once_and_deny(self):
         """allow_session=False collapses the editor menu to once/deny.

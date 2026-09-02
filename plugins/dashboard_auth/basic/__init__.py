@@ -220,12 +220,37 @@ class BasicAuthProvider(DashboardAuthProvider):
     ) -> None:
         if len(secret) < 16:
             raise ValueError("secret must be at least 16 bytes")
+        static_fallback_users: dict[str, dict[str, str]] = {}
         if users:
             static_users: dict[str, dict[str, str]] = {}
             for configured_username, record in users.items():
                 if not configured_username or not isinstance(record, dict):
                     raise ValueError("each user must have a username and record")
                 static_users[configured_username] = self._copy_valid_record(record)
+            if username and password_hash:
+                if username in static_users:
+                    logger.warning(
+                        "dashboard-auth-basic: top-level username %r also appears "
+                        "in the users table; keeping the explicit users entry and "
+                        "ignoring the top-level credential.",
+                        username,
+                    )
+                else:
+                    logger.warning(
+                        "dashboard-auth-basic: both a users table and a top-level "
+                        "username/password were configured; merging the top-level "
+                        "credential %r as an admin user.",
+                        username,
+                    )
+                    fallback_record = {
+                        "password_hash": password_hash,
+                        "display_name": username,
+                        "actor_id": username,
+                        "role": "admin",
+                        "tenant_id": "",
+                    }
+                    static_users[username] = fallback_record
+                    static_fallback_users[username] = fallback_record
         else:
             if not username:
                 raise ValueError("username must be non-empty")
@@ -243,6 +268,7 @@ class BasicAuthProvider(DashboardAuthProvider):
         # Legacy env/single-user authority is process-static. Copy every
         # caller-owned record so later mutations cannot change authority.
         self._static_users = static_users
+        self._static_fallback_users = static_fallback_users
         self._authority_resolver = authority_resolver
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
@@ -270,13 +296,13 @@ class BasicAuthProvider(DashboardAuthProvider):
         # Constant-time-ish: always run a scrypt verify (against the real
         # hash if the username exists, else a dummy hash) so an unknown
         # username and a wrong password take comparable time.
-        record = self._resolve_record(username)
+        record, authority_source = self._resolve_record_with_source(username)
         username_ok = record is not None
         target_hash = (record or {}).get("password_hash", _DUMMY_HASH)
         password_ok = _verify_password(password, target_hash)
         if not (username_ok and password_ok):
             raise InvalidCredentialsError("invalid username or password")
-        return self._mint_session(username, record or {})
+        return self._mint_session(username, record or {}, authority_source or "")
 
     # ---- session lifecycle -------------------------------------------------
 
@@ -289,7 +315,14 @@ class BasicAuthProvider(DashboardAuthProvider):
         ):
             return None
         user_id = str(payload.get("sub", ""))
-        record = self._resolve_record(user_id)
+        authority_source = payload.get("authority_source")
+        if authority_source is None and self._static_fallback_users:
+            return None
+        if authority_source not in (None, "live", "static", "fallback"):
+            return None
+        record, _ = self._resolve_record_with_source(
+            user_id, required_source=authority_source
+        )
         if not record or not record.get("password_hash"):
             return None
         return self._session_from_record(
@@ -307,10 +340,17 @@ class BasicAuthProvider(DashboardAuthProvider):
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
         user_id = str(payload.get("sub", ""))
-        record = self._resolve_record(user_id)
+        authority_source = payload.get("authority_source")
+        if authority_source is None and self._static_fallback_users:
+            raise RefreshExpiredError("session authority source is missing")
+        if authority_source not in (None, "live", "static", "fallback"):
+            raise RefreshExpiredError("session authority source is invalid")
+        record, resolved_source = self._resolve_record_with_source(
+            user_id, required_source=authority_source
+        )
         if not record or not record.get("password_hash"):
             raise RefreshExpiredError("session membership no longer exists")
-        return self._mint_session(user_id, record)
+        return self._mint_session(user_id, record, resolved_source or "")
 
     def revoke_session(self, *, refresh_token: str) -> None:
         # Stateless tokens — nothing to revoke server-side. The session
@@ -337,8 +377,10 @@ class BasicAuthProvider(DashboardAuthProvider):
         copied["role"] = role.strip().lower()
         return copied
 
-    def _resolve_record(self, username: str) -> Optional[dict[str, str]]:
-        """Resolve and copy one record from exactly one authority snapshot."""
+    def _resolve_record_with_source(
+        self, username: str, *, required_source: object = None
+    ) -> tuple[Optional[dict[str, str]], Optional[str]]:
+        """Resolve one record and bind it to its current authority source."""
         try:
             snapshot = (
                 self._authority_resolver()
@@ -346,26 +388,56 @@ class BasicAuthProvider(DashboardAuthProvider):
                 else self._static_users
             )
             if not isinstance(snapshot, dict):
-                return None
-            record = snapshot.get(username)
+                return None, None
+            live_source = "live" if self._authority_resolver is not None else "static"
+            live_record = snapshot.get(username)
+            if required_source in ("live", "static"):
+                if required_source != live_source:
+                    return None, None
+                record = live_record
+                resolved_source = live_source
+            elif required_source == "fallback":
+                if live_record is not None:
+                    return None, None
+                record = self._static_fallback_users.get(username)
+                resolved_source = "fallback"
+            else:
+                record = live_record
+                resolved_source = live_source
+                if record is None:
+                    record = self._static_fallback_users.get(username)
+                    resolved_source = "fallback"
             if not isinstance(record, dict):
-                return None
-            return self._copy_valid_record(record)
+                return None, None
+            return self._copy_valid_record(record), resolved_source
         except Exception as exc:  # noqa: BLE001 - authority errors fail closed
             logger.warning(
                 "dashboard-auth-basic: current authority resolution failed: %s",
                 exc,
             )
-            return None
+            return None, None
 
-    def _mint_session(self, user_id: str, record: dict[str, str]) -> Session:
+    def _mint_session(
+        self, user_id: str, record: dict[str, str], authority_source: str
+    ) -> Session:
         now = int(time.time())
         exp = now + self._ttl
         access_token = _sign(
-            {"sub": user_id, "kind": "access", "exp": exp}, self._secret
+            {
+                "sub": user_id,
+                "kind": "access",
+                "exp": exp,
+                "authority_source": authority_source,
+            },
+            self._secret,
         )
         refresh_token = _sign(
-            {"sub": user_id, "kind": "refresh", "exp": now + _REFRESH_TTL_SECONDS},
+            {
+                "sub": user_id,
+                "kind": "refresh",
+                "exp": now + _REFRESH_TTL_SECONDS,
+                "authority_source": authority_source,
+            },
             self._secret,
         )
         return self._session_from_record(
@@ -559,7 +631,9 @@ def register(ctx) -> None:
             "dashboard-auth-basic: hashed env-supplied password in-memory "
             "(overrides any config password_hash)."
         )
-    elif not password_hash:
+    elif password_hash:
+        pass
+    elif plaintext:
         # config-only plaintext password.
         password_hash = hash_password(plaintext)
         logger.info(
@@ -567,6 +641,18 @@ def register(ctx) -> None:
             "For production, precompute dashboard.basic_auth.password_hash "
             "and remove the plaintext password from config."
         )
+    elif users:
+        # A users table remains usable on its own. Never manufacture a
+        # top-level administrator credential from an absent password.
+        if username:
+            logger.warning(
+                "dashboard-auth-basic: top-level username %r is configured "
+                "without a password or password_hash; ignoring that incomplete "
+                "credential and registering only the users table.",
+                username,
+            )
+        username = ""
+        password_hash = ""
 
     secret = _resolve_secret(section)
 

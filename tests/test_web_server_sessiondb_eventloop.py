@@ -2,6 +2,7 @@ import ast
 import asyncio
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 from hermes_cli import web_server
 from hermes_cli.web_routers import sessions as web_sessions
@@ -111,7 +112,8 @@ def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
 
     result = asyncio.run(
         web_server.bulk_delete_sessions_endpoint(
-            web_server.BulkDeleteSessions(ids=["one", "two"])
+            web_server.BulkDeleteSessions(ids=["one", "two"]),
+            SimpleNamespace(state=SimpleNamespace(session=None)),
         )
     )
 

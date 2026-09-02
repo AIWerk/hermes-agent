@@ -110,6 +110,7 @@ def test_idle_exactly_at_threshold():
 import os
 import socket as _socket
 import threading
+import uuid
 
 
 from gateway.scale_to_zero import (  # noqa: E402 - grouped with their section
@@ -124,7 +125,8 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    del tmp_path  # pytest's isolated root can exceed AF_UNIX's 108-byte limit
+    sock_path = f"/tmp/hf-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
@@ -144,6 +146,7 @@ def _fake_flaps(tmp_path, status_line, capture):
                 f"HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode()
             )
         server.close()
+        os.unlink(sock_path)
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()

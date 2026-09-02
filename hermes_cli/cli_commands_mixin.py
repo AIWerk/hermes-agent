@@ -31,12 +31,15 @@ from hermes_constants import display_hermes_home, is_termux as _is_termux_enviro
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
+    call_local_browser_launcher,
     discover_local_cdp_url,
     find_free_debug_port,
     is_browser_debug_ready,
     launch_chrome_debug,
+    load_local_browser_launcher_config,
     local_port_in_use,
     manual_chrome_debug_command,
+    wait_for_browser_debug_ready,
 )
 
 
@@ -2369,7 +2372,7 @@ class CLICommandsMixin:
         When it completes, prints the result to the CLI without modifying
         the active session's conversation history.
         """
-        from cli import AIAgent, ChatConsole, _accent_hex, _cprint, _maybe_remap_for_light_mode, _render_final_assistant_content, set_approval_callback, set_secret_capture_callback, set_sudo_password_callback
+        from cli import AIAgent, ChatConsole, _accent_hex, _clear_cli_agent_thread_callbacks, _cprint, _install_cli_agent_thread_callbacks, _maybe_remap_for_light_mode, _render_final_assistant_content
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
             _cprint("  Usage: /background <prompt>")
@@ -2394,12 +2397,9 @@ class CLICommandsMixin:
         turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
-            set_sudo_password_callback(self._sudo_password_callback)
-            set_approval_callback(self._approval_callback)
-            try:
-                set_secret_capture_callback(self._secret_capture_callback)
-            except Exception:
-                pass
+            _cli_thread_scope = _install_cli_agent_thread_callbacks(
+                self, session_id=task_id
+            )
             try:
                 bg_agent = AIAgent(
                     model=turn_route["model"],
@@ -2501,9 +2501,7 @@ class CLICommandsMixin:
                 _cprint(f"  ❌ Background task #{task_num} failed: {e}")
             finally:
                 try:
-                    set_sudo_password_callback(None)
-                    set_approval_callback(None)
-                    set_secret_capture_callback(None)
+                    _clear_cli_agent_thread_callbacks(_cli_thread_scope)
                 except Exception:
                     pass
                 self._background_tasks.pop(task_id, None)
@@ -2566,6 +2564,91 @@ class CLICommandsMixin:
 
         _DEFAULT_CDP = DEFAULT_BROWSER_CDP_URL
         current = os.environ.get("BROWSER_CDP_URL", "").strip()
+        launcher_cfg = load_local_browser_launcher_config()
+
+        def _print_launcher_hint() -> None:
+            print("     Local launcher is configured but not reachable.")
+            print("     On the user desktop, start it with:")
+            print("       systemctl --user start rocky-browser-launcher.service")
+
+        def _connect_to_cdp(cdp_url: str, launched_by_local_launcher: bool = False) -> None:
+            os.environ["BROWSER_CDP_URL"] = cdp_url
+            try:
+                from tools.browser_tool import _ensure_cdp_supervisor  # type: ignore[import-not-found]
+                _ensure_cdp_supervisor("default")
+            except Exception:
+                pass
+            print()
+            print("🌐 Browser connected to live Chromium-family browser via CDP")
+            print(f"   Endpoint: {cdp_url}")
+            if launched_by_local_launcher:
+                print("   Source: configured local browser launcher")
+            print()
+
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(
+                    "[System note: The user invoked /browser connect and connected your browser tools to "
+                    "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
+                    "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
+                    "control that CDP browser. This is typically a Hermes-managed isolated debug "
+                    "profile, not the user's main everyday browser. It is still user-visible and may contain "
+                    "pages, logged-in sessions, or cookies in that debug profile, so continue to follow the "
+                    "normal approval flow for navigational or destructive browser actions (navigating away, "
+                    "closing tabs, submitting forms) just as you would on any live browser.]"
+                )
+
+        if sub in {"launch", "open-local", "open", "up"}:
+            print()
+            if launcher_cfg.validation_error:
+                print(f"Browser local launcher config error: {launcher_cfg.validation_error}")
+                print()
+                return
+            if not launcher_cfg.enabled:
+                print("Browser local launcher is not configured.")
+                print("Configure browser.local_launcher.launcher_url, for example http://127.0.0.1:18765")
+                print()
+                return
+            ok, detail = call_local_browser_launcher(launcher_cfg, "open", timeout=15.0)
+            if not ok:
+                print(f"   ⚠ Could not open local browser: {detail}")
+                _print_launcher_hint()
+                print()
+                return
+            print("   ✓ Local browser launcher accepted /open")
+            if wait_for_browser_debug_ready(launcher_cfg.cdp_url, launcher_cfg.cdp_poll_timeout_s):
+                _connect_to_cdp(launcher_cfg.cdp_url, launched_by_local_launcher=True)
+            else:
+                print(f"   ⚠ Launcher responded, but CDP is not ready at {launcher_cfg.cdp_url}")
+                print("     Check the SSH reverse tunnel and rocky-browser logs on the user desktop.")
+                print()
+            return
+
+        if sub in {"close-local", "close", "down"}:
+            print()
+            if launcher_cfg.validation_error:
+                print(f"Browser local launcher config error: {launcher_cfg.validation_error}")
+                print()
+                return
+            if not launcher_cfg.enabled:
+                print("Browser local launcher is not configured.")
+                print()
+                return
+            ok, detail = call_local_browser_launcher(launcher_cfg, "down", timeout=15.0)
+            if not ok:
+                print(f"   ⚠ Could not close local browser: {detail}")
+                _print_launcher_hint()
+                print()
+                return
+            os.environ.pop("BROWSER_CDP_URL", None)
+            try:
+                from tools.browser_tool import cleanup_all_browsers, _stop_cdp_supervisor
+                _stop_cdp_supervisor("default")
+                cleanup_all_browsers()
+            except Exception:
+                pass
+            print("🌐 Local browser closed and CDP disconnected")
+            print()
+            return
 
         if sub == "use" or sub.startswith("use "):
             # /browser use [off] — toggle Browser Use mode (browser.backend),
@@ -2663,6 +2746,25 @@ class CLICommandsMixin:
             else:
                 _already_open = is_browser_debug_ready(cdp_url, timeout=1.0)
 
+            launched_by_local_launcher = False
+            if not _already_open and launcher_cfg.enabled and len(connect_parts) <= 2:
+                print("   Chromium-family browser is not reachable — asking configured local launcher to open it...")
+                ok, detail = call_local_browser_launcher(launcher_cfg, "open", timeout=15.0)
+                if ok and wait_for_browser_debug_ready(
+                    launcher_cfg.cdp_url, launcher_cfg.cdp_poll_timeout_s
+                ):
+                    cdp_url = launcher_cfg.cdp_url
+                    _already_open = True
+                    launched_by_local_launcher = True
+                    print(f"   ✓ Local browser launcher opened CDP at {cdp_url}")
+                elif ok:
+                    print(f"   ⚠ Launcher responded, but CDP is not ready at {launcher_cfg.cdp_url}")
+                else:
+                    print(f"   ⚠ Local browser launcher failed: {detail}")
+                    _print_launcher_hint()
+                    if _is_default:
+                        print("   Falling back to the normal local Chromium launch path...")
+
             if _already_open:
                 print(f"   ✓ Chromium-family browser is already listening at {cdp_url}")
             elif _is_default:
@@ -2714,33 +2816,10 @@ class CLICommandsMixin:
                 print()
                 return
 
-            os.environ["BROWSER_CDP_URL"] = cdp_url
-            # Eagerly start the CDP supervisor so pending_dialogs + frame_tree
-            # show up in the next browser_snapshot.  No-op if already started.
-            try:
-                from tools.browser_tool import _ensure_cdp_supervisor  # type: ignore[import-not-found]
-                _ensure_cdp_supervisor("default")
-            except Exception:
-                pass
-            print()
-            print("🌐 Browser connected to live Chromium-family browser via CDP")
-            print(f"   Endpoint: {cdp_url}")
-            print()
-
-            # Inject context message so the model knows this slash command
-            # intentionally makes the dev/debug CDP browser available for use.
-            if hasattr(self, '_pending_input'):
-                self._pending_input.put(
-                    "[System note: The user invoked /browser connect and connected your browser tools to "
-                    "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
-                    "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
-                    "control that CDP browser. The command itself is a signal that using browser tools for "
-                    "their current browser-related request is expected; do not wait for separate permission "
-                    "just because CDP is connected. This is typically a Hermes-managed isolated debug "
-                    "profile, not the user's main everyday browser. It is still user-visible and may contain "
-                    "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
-                    "closing tabs, or navigating away unless the user's task calls for it.]"
-                )
+            _connect_to_cdp(
+                cdp_url,
+                launched_by_local_launcher=launched_by_local_launcher,
+            )
 
         elif sub == "disconnect":
             if current:
@@ -3379,6 +3458,71 @@ class CLICommandsMixin:
         print("  Note: banner colors will update on next session start.")
         if self._apply_tui_skin_style():
             print("  Prompt + TUI colors updated.")
+
+    @staticmethod
+    def _language_default_skin(language: str) -> str:
+        return "default" if language == "en" else f"default-{language}"
+
+    def _handle_language_command(self, cmd: str):
+        """Handle /language [code] and apply its matching built-in skin."""
+        from cli import _ACCENT, save_config_value
+
+        try:
+            from agent.i18n import (
+                SUPPORTED_LANGUAGES,
+                _normalize_lang,
+                get_language,
+                reset_language_cache,
+            )
+            from hermes_cli.config import load_config
+            from hermes_cli.skin_engine import (
+                get_active_skin_name,
+                list_skins,
+                set_active_skin,
+            )
+        except ImportError as exc:
+            print(f"Language configuration not available: {exc}")
+            return
+
+        parts = cmd.strip().split(maxsplit=1)
+        cfg = load_config() or {}
+        current_skin = (cfg.get("display") or {}).get("skin") or get_active_skin_name()
+        if len(parts) < 2 or not parts[1].strip():
+            print(f"\n  Current language: {get_language()}")
+            print(f"  Current skin: {current_skin}")
+            print(f"  Supported languages: {', '.join(SUPPORTED_LANGUAGES)}")
+            print("\n  Usage: /language <code>")
+            return
+
+        requested = parts[1].strip().split()[0].lower()
+        language = _normalize_lang(requested)
+        english_aliases = {"en", "english", "en-us", "en-gb"}
+        if language == "en" and requested not in english_aliases:
+            print(f"  Unknown language: {requested}")
+            print(f"  Supported: {', '.join(SUPPORTED_LANGUAGES)}")
+            return
+
+        desired_skin = self._language_default_skin(language)
+        skin_available = desired_skin in {item["name"] for item in list_skins()}
+        language_saved = save_config_value("display.language", language)
+        if language_saved:
+            os.environ["HERMES_LANGUAGE"] = language
+            reset_language_cache()
+
+        skin_saved = False
+        if skin_available:
+            set_active_skin(desired_skin)
+            _ACCENT.reset()
+            skin_saved = save_config_value("display.skin", desired_skin)
+            self._apply_tui_skin_style()
+
+        suffix = "saved" if language_saved else "not saved"
+        print(f"  Language set to: {language} ({suffix})")
+        if skin_available:
+            print(f"  Skin set to: {desired_skin} ({'saved' if skin_saved else 'not saved'})")
+        else:
+            print(f"  No matching skin found for {language}: {desired_skin}")
+            print("  Language was changed; skin stayed unchanged.")
 
     def _compose_in_editor(self, initial_text: str = "") -> str:
         """Open ``$VISUAL``/``$EDITOR`` on a temp markdown file and return the

@@ -104,6 +104,36 @@ def _slow_execute(delay: float = 0.25):
     return _execute
 
 
+def test_admin_actor_memory_write_is_blocked_before_execution(monkeypatch):
+    import agent.tool_executor as te
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    agent = _make_agent(monkeypatch)
+    agent._tool_guardrails = MagicMock(
+        before_call=lambda name, args: MagicMock(allows_execution=True)
+    )
+    executed = []
+    token = bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "admin-1", "role": "operator"}
+    )
+    try:
+        outcome = te._run_agent_tool_execution_middleware(
+            agent,
+            function_name="memory",
+            function_args={"action": "add", "target": "user", "content": "x"},
+            effective_task_id="task",
+            tool_call_id="tc-memory",
+            execute=lambda args: executed.append(args) or "mutated",
+            display_index=1,
+        )
+    finally:
+        reset_cui_actor_context(token)
+
+    assert executed == []
+    assert outcome.blocked is True
+    assert json.loads(outcome.result)["blocked_by"] == "cui_admin_actor_memory_guard"
+
+
 def test_heartbeat_touches_periodically_and_stops():
     """The heartbeat thread touches activity on cadence, then exits on stop."""
     import agent.tool_executor as te

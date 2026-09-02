@@ -972,6 +972,35 @@ def set_operator_verification_callback(*args, **kwargs):
     return _set(*args, **kwargs)
 
 
+def _install_cli_agent_thread_callbacks(owner, *, session_id: str | None = None):
+    """Install callbacks and bind the worker's durable session identity."""
+    from gateway.session_context import scoped_current_session_id
+
+    session_scope = scoped_current_session_id(session_id)
+    session_scope.__enter__()
+    try:
+        set_sudo_password_callback(owner._sudo_password_callback)
+        set_approval_callback(owner._approval_callback)
+        set_secret_capture_callback(owner._secret_capture_callback)
+        set_operator_verification_callback(owner._operator_verification_callback)
+    except Exception:
+        session_scope.__exit__(*sys.exc_info())
+        raise
+    return session_scope
+
+
+def _clear_cli_agent_thread_callbacks(session_scope=None) -> None:
+    """Clear worker-local callbacks and restore its prior session identity."""
+    try:
+        set_sudo_password_callback(None)
+        set_approval_callback(None)
+        set_secret_capture_callback(None)
+        set_operator_verification_callback(None)
+    finally:
+        if session_scope is not None:
+            session_scope.__exit__(None, None, None)
+
+
 def _cleanup_all_browsers(*args, **kwargs):
     from tools.browser_tool import _emergency_cleanup_all_sessions
 
@@ -9759,6 +9788,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     _FRESH_CONTEXT_BEGIN = "[Hermes /fresh carryover context]"
     _FRESH_CONTEXT_END = "[/Hermes /fresh carryover context]"
+    _FRESH_DEFAULT_MESSAGES = 20
+    _FRESH_MAX_MESSAGES = 100
 
     def _strip_fresh_carryover_context(self, text: str | None) -> str:
         text = text if isinstance(text, str) else ""
@@ -9774,9 +9805,47 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         base = self._strip_fresh_carryover_context(getattr(self.agent, "ephemeral_system_prompt", None))
         self.agent.ephemeral_system_prompt = "\n\n".join(p for p in (base, carryover) if p) or None
 
+    def _parse_fresh_message_count(self, cmd_original: str) -> int | None:
+        """Parse /fresh [message-count], printing usage for invalid input."""
+        parts = cmd_original.split()
+        if len(parts) == 1:
+            return self._FRESH_DEFAULT_MESSAGES
+        if len(parts) > 2:
+            _cprint("  Usage: /fresh [message-count]")
+            return None
+        try:
+            count = int(parts[1])
+        except ValueError:
+            _cprint("  Usage: /fresh [message-count]")
+            return None
+        if count < 1:
+            _cprint("  Message count must be at least 1.")
+            return None
+        return min(count, self._FRESH_MAX_MESSAGES)
+
+    @staticmethod
+    def _message_content_to_text(content) -> str:
+        """Render OpenAI-style message content into compact plain text."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            chunks = []
+            for item in content:
+                if isinstance(item, dict):
+                    if isinstance(item.get("text"), str):
+                        chunks.append(item["text"])
+                    elif item.get("type"):
+                        chunks.append(f"[{item.get('type')}]")
+                else:
+                    chunks.append(str(item))
+            return "\n".join(chunks)
+        return str(content)
+
     def _build_fresh_carryover_context(self, message_count: int) -> tuple[str | None, int]:
         visible = [m for m in (self.conversation_history or []) if m.get("role") in {"user", "assistant"}]
-        selected = visible[-max(1, min(message_count, 100)):]
+        selected = visible[-message_count:]
         if not selected:
             return None, 0
         lines = [
@@ -9786,8 +9855,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"Carried messages: {len(selected)}",
         ]
         for item in selected:
-            content = str(item.get("content") or "")
-            content = content.replace(self._FRESH_CONTEXT_BEGIN, "").replace(self._FRESH_CONTEXT_END, "")
+            content = self._message_content_to_text(item.get("content"))
+            content = content.replace(self._FRESH_CONTEXT_BEGIN, "").replace(
+                self._FRESH_CONTEXT_END, ""
+            )
             lines.append(f"{item.get('role')}: {content}")
         lines.append(self._FRESH_CONTEXT_END)
         from agent.redact import redact_sensitive_text
@@ -10086,6 +10157,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             else:
                 print("(^_^)v New session started!")
 
+    def _honcho_injection_preview_config(self, event: str) -> tuple[bool, bool]:
+        """Return (enabled, fail_quietly) for automatic Honcho reset preview."""
+        try:
+            honcho_cfg = (getattr(self, "config", None) or {}).get("honcho", {}) or {}
+            if honcho_cfg.get("enabled") is False:
+                return False, True
+            preview_cfg = honcho_cfg.get("injection_preview")
+            if preview_cfg is None:
+                preview_cfg = honcho_cfg.get("injectionPreview")
+            preview_cfg = preview_cfg if isinstance(preview_cfg, dict) else {}
+            key = "on_clear" if event == "clear" else "on_new_session"
+            camel_key = "onClear" if event == "clear" else "onNewSession"
+            enabled = preview_cfg.get(key, preview_cfg.get(camel_key, True))
+            fail_quietly = preview_cfg.get(
+                "fail_quietly", preview_cfg.get("failQuietly", True)
+            )
+            return bool(enabled), bool(fail_quietly)
+        except Exception:
+            return True, True
+
+    def _print_honcho_reset_injection_preview(
+        self, event: str = "new_session"
+    ) -> None:
+        enabled, fail_quietly = self._honcho_injection_preview_config(event)
+        if not enabled:
+            return
+        try:
+            from plugins.memory.honcho.cli import build_injection_preview_summary
+
+            summary = build_injection_preview_summary(fail_quietly=fail_quietly)
+        except Exception as exc:
+            if fail_quietly:
+                return
+            summary = f"Honcho injection preview unavailable: {exc}"
+        if not summary:
+            return
+        try:
+            self._console_print(summary)
+        except Exception:
+            print(summary)
 
     def _consume_pending_resume_selection(self, text: str) -> bool:
         """Resolve a bare numeric reply that follows a bare ``/resume`` prompt.
@@ -12167,6 +12278,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._console_print(f"[dim {_tip_color}]✦ Tip: {_tip}[/]")
                 except Exception:
                     pass
+            self._print_honcho_reset_injection_preview("clear")
         elif canonical == "history":
             self.show_history()
         elif canonical == "title":
@@ -12242,12 +12354,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.new_session(title=title)
+            self._print_honcho_reset_injection_preview("new_session")
         elif canonical == "fresh":
-            parts = cmd_original.split()
-            try:
-                message_count = int(parts[1]) if len(parts) > 1 else 20
-            except ValueError:
-                _cprint("  Usage: /fresh [message-count]")
+            message_count = self._parse_fresh_message_count(cmd_original)
+            if message_count is None:
                 return True
             fresh_context, carried = self._build_fresh_carryover_context(message_count)
             self.new_session(fresh_context=fresh_context)
@@ -12576,6 +12686,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_subgoal_command(cmd_original)
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
+        elif canonical == "language":
+            self._handle_language_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
         elif canonical == "wake":
@@ -16649,12 +16761,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # registration (run() line ~9046) is invisible here because
                 # _callback_tls is threading.local().  Matches the pattern used
                 # by acp_adapter/server.py for ACP sessions.
-                set_sudo_password_callback(self._sudo_password_callback)
-                set_approval_callback(self._approval_callback)
-                try:
-                    set_secret_capture_callback(self._secret_capture_callback)
-                except Exception:
-                    pass
+                _cli_thread_scope = _install_cli_agent_thread_callbacks(
+                    self, session_id=self.session_id or "default"
+                )
                 # Bind this turn's approval session key into the contextvar so
                 # ``tools.approval.is_current_session_yolo_enabled()`` resolves
                 # against the same key that ``/yolo`` toggles under (see
@@ -16748,10 +16857,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Clear thread-local callbacks so a reused thread doesn't
                     # hold stale references to a disposed CLI instance.
                     try:
-                        set_sudo_password_callback(None)
-                        set_approval_callback(None)
-                        set_secret_capture_callback(None)
-                        set_operator_verification_callback(None)
+                        _clear_cli_agent_thread_callbacks(_cli_thread_scope)
                     except Exception:
                         pass
                     # Release the per-turn approval session key. ``_session_yolo``

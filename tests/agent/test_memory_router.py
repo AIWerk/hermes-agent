@@ -175,6 +175,58 @@ def test_approval_replay_enforces_router_for_single_and_batch_aliases(store):
     assert store.user_entries == []
 
 
+def test_admin_actor_cannot_use_direct_or_staged_memory_write_sinks(store):
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    token = bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "admin-1", "role": "admin"}
+    )
+    try:
+        direct_single = _result(
+            memory_tool(
+                action="add",
+                target="user",
+                content="The user prefers concise replies.",
+                store=store,
+            )
+        )
+        staged_single = apply_memory_pending(
+            {
+                "action": "add",
+                "target": "user",
+                "content": "The user prefers concise replies.",
+            },
+            store,
+        )
+        direct_batch = _result(
+            memory_tool(
+                target="user",
+                operations=[
+                    {"action": "add", "content": "The user likes dark mode."}
+                ],
+                store=store,
+            )
+        )
+        staged_batch = apply_memory_pending(
+            {
+                "action": "batch",
+                "target": "user",
+                "operations": [
+                    {"action": "add", "content": "The user likes dark mode."}
+                ],
+            },
+            store,
+        )
+    finally:
+        reset_cui_actor_context(token)
+
+    assert all(
+        result["success"] is False
+        for result in (direct_single, staged_single, direct_batch, staged_batch)
+    )
+    assert store.user_entries == []
+
+
 def test_allowed_memory_mutations_preserve_add_replace_batch_and_replay_semantics(store):
     assert _result(memory_tool(
         action="add", target="user", content="The user prefers concise replies.", store=store
@@ -297,6 +349,57 @@ def test_honcho_turn_sync_withholds_secret_without_external_honcho(monkeypatch):
 
     assert secret not in repr(stored)
     assert ("user", "[message withheld: contained a credential]") in stored
+
+
+def test_honcho_profile_card_update_blocks_bound_admin_before_manager(monkeypatch):
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    provider, _calls = _ready_honcho_provider(monkeypatch)
+    manager = provider._manager
+    assert manager is not None
+    profile_calls = []
+
+    def _set_peer_card(*args, **kwargs):
+        profile_calls.append((args, kwargs))
+        return ["The user prefers concise replies."]
+
+    manager.set_peer_card = _set_peer_card
+    token = bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "admin-1", "role": "admin"}
+    )
+    try:
+        result = json.loads(
+            provider.handle_tool_call(
+                "honcho_profile",
+                {"card": ["The user prefers concise replies."], "peer": "user"},
+            )
+        )
+    finally:
+        reset_cui_actor_context(token)
+
+    assert "error" in result
+    assert profile_calls == []
+
+
+def test_honcho_conclusion_blocks_bound_admin_actor_before_manager(monkeypatch):
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    provider, calls = _ready_honcho_provider(monkeypatch)
+    token = bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "admin-1", "role": "admin"}
+    )
+    try:
+        result = json.loads(
+            provider.handle_tool_call(
+                "honcho_conclude",
+                {"conclusion": "The user prefers concise replies.", "peer": "user"},
+            )
+        )
+    finally:
+        reset_cui_actor_context(token)
+
+    assert "error" in result
+    assert calls == []
 
 
 def test_honcho_conclusion_rejects_secret_without_contacting_manager(monkeypatch):

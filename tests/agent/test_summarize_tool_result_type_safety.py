@@ -148,12 +148,12 @@ class TestDisplayPreviewTypeSafety:
     tool-progress callback and crashed on non-string process args."""
 
 
-    def test_process_preview_non_string_data(self):
+    def test_process_preview_redacts_non_string_data(self):
         from agent.display import build_tool_preview
         result = build_tool_preview(
             "process", {"action": "submit", "session_id": "abc", "data": 42}
         )
-        assert result == 'submit abc "42"'
+        assert result == "submit abc"
 
     def test_process_preview_none_action(self):
         from agent.display import build_tool_preview

@@ -15,6 +15,10 @@ from typing import Any, Callable, Deque, Dict
 
 import acp
 from acp.schema import AgentPlanUpdate, PlanEntry
+from agent.tool_argument_projection import (
+    project_tool_args_for_display,
+    sanitize_tool_display_text,
+)
 
 from .tools import (
     build_tool_complete,
@@ -72,7 +76,9 @@ def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
     for item in todos:
         if not isinstance(item, dict):
             continue
-        content = str(item.get("content") or item.get("id") or "").strip()
+        content = sanitize_tool_display_text(
+            str(item.get("content") or item.get("id") or "")
+        ).strip()
         if not content:
             continue
         raw_status = str(item.get("status") or "pending").strip()
@@ -166,17 +172,22 @@ def make_tool_progress_cb(
         edit_diff = None
         if name in {"write_file", "patch"} and edit_approval_policy_getter is not None:
             try:
-                from acp_adapter.edit_approval import build_edit_proposal, should_auto_approve_edit
+                from acp_adapter.edit_approval import (
+                    build_edit_proposal,
+                    project_edit_proposal_for_display,
+                    should_auto_approve_edit,
+                )
 
                 proposal = build_edit_proposal(name, args)
                 if proposal is not None:
                     policy, cwd = edit_approval_policy_getter()
                     if should_auto_approve_edit(proposal, policy, cwd):
-                        edit_diff = proposal
+                        edit_diff = project_edit_proposal_for_display(proposal)
             except Exception:
                 logger.debug("Failed to prepare auto-approved ACP edit diff for %s", name, exc_info=True)
 
-        update = build_tool_start(tc_id, name, args, edit_diff=edit_diff)
+        display_args = project_tool_args_for_display(name or "", args)
+        update = build_tool_start(tc_id, name, display_args, edit_diff=edit_diff)
         _send_update(conn, session_id, loop, update)
 
     return _tool_progress
@@ -193,12 +204,23 @@ def make_thinking_cb(
 ) -> Callable:
     """Create a ``thinking_callback`` for AIAgent."""
 
-    def _thinking(text: str) -> None:
-        if not text:
-            return
-        update = acp.update_agent_thought_text(text)
-        _send_update(conn, session_id, loop, update)
+    pending = ""
 
+    def _thinking(text: str) -> None:
+        nonlocal pending
+        if text:
+            pending += text
+
+    def _flush() -> None:
+        nonlocal pending
+        if pending:
+            update = acp.update_agent_thought_text(
+                sanitize_tool_display_text(pending)
+            )
+            _send_update(conn, session_id, loop, update)
+            pending = ""
+
+    _thinking.flush = _flush  # type: ignore[attr-defined]
     return _thinking
 
 
@@ -241,11 +263,13 @@ def make_step_cb(
                 if tool_name and queue:
                     tc_id = queue.popleft()
                     meta = tool_call_meta.pop(tc_id, {})
+                    full_args = function_args or meta.get("args") or {}
+                    display_args = project_tool_args_for_display(tool_name, full_args)
                     update = build_tool_complete(
                         tc_id,
                         tool_name,
                         result=str(result) if result is not None else None,
-                        function_args=function_args or meta.get("args"),
+                        function_args=display_args,
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)
@@ -270,10 +294,21 @@ def make_message_cb(
 ) -> Callable:
     """Create a callback that streams agent response text to the editor."""
 
-    def _message(text: str) -> None:
-        if not text:
-            return
-        update = acp.update_agent_message_text(text)
-        _send_update(conn, session_id, loop, update)
+    pending = ""
 
+    def _message(text: str) -> None:
+        nonlocal pending
+        if text:
+            pending += text
+
+    def _flush() -> None:
+        nonlocal pending
+        if pending:
+            update = acp.update_agent_message_text(
+                sanitize_tool_display_text(pending)
+            )
+            _send_update(conn, session_id, loop, update)
+            pending = ""
+
+    _message.flush = _flush  # type: ignore[attr-defined]
     return _message

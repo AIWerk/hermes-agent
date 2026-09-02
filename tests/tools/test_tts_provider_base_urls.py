@@ -36,6 +36,31 @@ def test_elevenlabs_no_base_url_uses_sdk_default_environment():
     assert tts._elevenlabs_environment_kwargs({"base_url": ""}) == {}
 
 
+def test_elevenlabs_forwards_nonempty_configured_language(tmp_path):
+    captured: dict = {}
+
+    class _FakeSpeech:
+        @staticmethod
+        def convert(**kwargs):
+            captured.update(kwargs)
+            return [b"audio"]
+
+    class _FakeElevenLabs:
+        def __init__(self, **_kwargs):
+            self.text_to_speech = _FakeSpeech()
+
+    out = tmp_path / "out.mp3"
+    with patch.object(tts, "_resolve_provider_key", return_value="key"), \
+         patch.object(tts, "_import_elevenlabs", return_value=_FakeElevenLabs):
+        tts._generate_elevenlabs(
+            "szia",
+            str(out),
+            {"elevenlabs": {"language_code": " hu "}},
+        )
+
+    assert captured["language_code"] == "hu"
+
+
 # ── Mistral: tts.mistral.base_url → SDK server_url ────────────────────────
 
 

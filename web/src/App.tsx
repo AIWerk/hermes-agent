@@ -374,8 +374,20 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
+export function dashboardDocumentTitle(): string {
+  if (!isAssistantDashboardMode()) return "Assistant Dashboard";
+  const agentName = getHermesAgentDisplayName();
+  return agentName ? `${agentName} AI Assistant` : "AI Assistant";
+}
+
 export function DashboardRoot() {
-  return isAssistantDashboardMode() ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
+  const isAssistantMode = isAssistantDashboardMode();
+
+  useEffect(() => {
+    document.title = dashboardDocumentTitle();
+  }, [isAssistantMode]);
+
+  return isAssistantMode ? <AiwerkAssistantPage /> : <AdminDashboardApp />;
 }
 
 export default DashboardRoot;
@@ -387,11 +399,6 @@ function AdminDashboardApp() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
-
-  useEffect(() => {
-    const agentName = getHermesAgentDisplayName();
-    document.title = agentName ? `${agentName} AI Assistant` : "AI Assistant";
-  }, []);
 
   const [collapsed, setCollapsed] = useState(() => {
     try {

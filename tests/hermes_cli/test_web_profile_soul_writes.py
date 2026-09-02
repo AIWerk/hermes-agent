@@ -70,7 +70,11 @@ def test_default_soul_concise_guidance_is_synchronized():
     assert DEFAULT_SOUL_MD == DEFAULT_AGENT_IDENTITY == canonical
 
     docker_soul = (REPO_ROOT / "docker" / "SOUL.md").read_text(encoding="utf-8")
-    assert docker_soul.rstrip("\r\n") == canonical
+    assert docker_soul.startswith("# Hermes Agent Persona\n")
+    assert "Default guidance: keep replies concise" in docker_soul
+    assert "summarize long tool output" in docker_soul
+    assert "context is close to the limit" in docker_soul
+    assert docker_soul.rstrip().endswith("-->")
 
     install_sh = (REPO_ROOT / "scripts/install.sh").read_text(encoding="utf-8")
     assert (

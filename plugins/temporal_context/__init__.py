@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,6 +14,10 @@ _DEFAULT_WARNING = (
 )
 _CONTEXT_MARKER = "[Temporal context:"
 _CONTEXT_KEY = "temporal_current_origin"
+_TIMESTAMP_RE = re.compile(
+    r"(\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}\.\d{2}\b|"
+    r"\b\d{1,2}\s*(?:AM|PM|am|pm)\b|\bUTC\b|\bCEST\b|\bCET\b|\bGMT\b|[+-]\d{4}\b)"
+)
 
 
 def _load_plugin_config() -> dict[str, Any]:
@@ -57,6 +62,11 @@ def _settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
             cfg.get("relative_time_warning"), default=True
         ),
         "warning": _text(cfg.get("warning"), _DEFAULT_WARNING),
+        "output_guard": (
+            cfg.get("output_guard")
+            if isinstance(cfg.get("output_guard"), dict)
+            else {}
+        ),
     }
 
 
@@ -120,5 +130,59 @@ def pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     return {"context": context, "context_key": _CONTEXT_KEY} if context else None
 
 
+def _has_explicit_timestamp(text: str) -> bool:
+    return bool(_TIMESTAMP_RE.search(text))
+
+
+def _regex_flags(item: Mapping[str, Any]) -> int:
+    raw = item.get("flags")
+    if isinstance(raw, str):
+        names = [part.strip().lower() for part in raw.split("|")]
+    elif isinstance(raw, list):
+        names = [str(part).strip().lower() for part in raw]
+    else:
+        names = []
+    flags = 0
+    if "ignorecase" in names or "i" in names:
+        flags |= re.IGNORECASE
+    if "multiline" in names or "m" in names:
+        flags |= re.MULTILINE
+    return flags
+
+
+def transform_llm_output(text: str | None = None, **kwargs: Any) -> str:
+    """Apply only explicitly configured temporal-output replacements."""
+    source_text = text if text is not None else str(kwargs.get("response_text") or "")
+    config = kwargs.get("config")
+    cfg = config if isinstance(config, Mapping) else _load_plugin_config()
+    guard = _settings(cfg).get("output_guard") or {}
+    if not _truthy(guard.get("enabled"), default=False):
+        return source_text
+    if _truthy(guard.get("skip_if_explicit_timestamp"), default=True):
+        if _has_explicit_timestamp(source_text):
+            return source_text
+    replacements = guard.get("replacements")
+    if not isinstance(replacements, list):
+        return source_text
+
+    result = source_text
+    for item in replacements:
+        if not isinstance(item, Mapping):
+            continue
+        pattern = item.get("pattern")
+        replacement = item.get("replacement")
+        if not isinstance(pattern, str) or not isinstance(replacement, str):
+            continue
+        if _truthy(item.get("regex"), default=False):
+            try:
+                result = re.sub(pattern, replacement, result, flags=_regex_flags(item))
+            except re.error:
+                continue
+        else:
+            result = result.replace(pattern, replacement)
+    return result
+
+
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("transform_llm_output", transform_llm_output)

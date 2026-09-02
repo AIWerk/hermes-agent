@@ -257,6 +257,34 @@ class TestFindAllSkills:
 # ---------------------------------------------------------------------------
 
 
+def test_customer_actor_cannot_list_or_view_internal_skill(tmp_path, monkeypatch):
+    import json
+    from agent.cui_actor_context import bind_cui_actor_context, reset_cui_actor_context
+
+    _make_skill(tmp_path, "customer-skill", "visibility: customer\n")
+    _make_skill(
+        tmp_path,
+        "internal-skill",
+        "visibility: internal\n",
+        body="INTERNAL-ONLY-BODY",
+    )
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", tmp_path)
+    skills_tool_module._SKILLS_CACHE.clear()
+
+    token = bind_cui_actor_context(
+        {"tenant_id": "tenant-1", "actor_id": "customer-1", "role": "customer"}
+    )
+    try:
+        listed = json.loads(skills_list())
+        viewed = json.loads(skill_view("internal-skill", preprocess=False))
+    finally:
+        reset_cui_actor_context(token)
+
+    assert [skill["name"] for skill in listed["skills"]] == ["customer-skill"]
+    assert viewed["success"] is False
+    assert "INTERNAL-ONLY-BODY" not in json.dumps(viewed)
+
+
 class TestSkillsList:
     def test_empty_creates_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"

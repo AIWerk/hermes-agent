@@ -223,6 +223,72 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
     assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] == str(real_home)
 
 
+def test_run_prompt_keeps_copilot_auth_home_in_container_auto_mode(
+    monkeypatch, tmp_path
+):
+    hermes_home = tmp_path / "hermes"
+    (hermes_home / "home").mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch(
+        "agent.copilot_acp_client.subprocess.run",
+        side_effect=FileNotFoundError,
+    ):
+        with _patch(
+            "agent.copilot_acp_client.subprocess.Popen",
+            side_effect=_fake_popen_capture(captured),
+        ):
+            with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+                client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["HOME"] == str(real_home)
+    assert captured["kwargs"]["env"]["TERMINAL_HOME_MODE"] == "real"
+
+
+@pytest.mark.parametrize("mode", ["profile", "auto"])
+def test_run_prompt_preserves_explicit_copilot_home_mode_override(
+    monkeypatch, tmp_path, mode
+):
+    hermes_home = tmp_path / "hermes"
+    profile_home = hermes_home / "home"
+    profile_home.mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.setenv("TERMINAL_HOME_MODE", mode)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch(
+        "agent.copilot_acp_client.subprocess.run",
+        side_effect=FileNotFoundError,
+    ):
+        with _patch(
+            "agent.copilot_acp_client.subprocess.Popen",
+            side_effect=_fake_popen_capture(captured),
+        ):
+            with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+                client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["HOME"] == str(profile_home)
+    assert captured["kwargs"]["env"]["TERMINAL_HOME_MODE"] == mode
+
+
 def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)

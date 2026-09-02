@@ -397,6 +397,9 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        # Direct executor tests model an active outer turn. The recovered
+        # correction-admission contract is fail-closed outside that lifecycle.
+        a._open_turn_correction_admission()
         return a
 
 

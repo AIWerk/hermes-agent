@@ -3,16 +3,24 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import ctypes
+import errno
 import hashlib
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import queue
+import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +67,244 @@ from tui_gateway.transport import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_cui_actor_env(actor_context: dict | None):
+    """Compatibility adapter over the canonical per-flow actor ContextVar."""
+    actor = {
+        str(key): str(value)
+        for key, value in (actor_context or {}).items()
+        if key
+        in {
+            "tenant_id",
+            "actor_id",
+            "role",
+            "display_name",
+            "user_id",
+            "provider",
+            "_restricted",
+        }
+        and value is not None
+    }
+    return bind_cui_actor_context(actor) if actor else None
+
+
+def _clear_cui_actor_env(token) -> None:
+    if token:
+        reset_cui_actor_context(token)
+
+
+def _display_tool_args(name: str, args: object) -> dict:
+    try:
+        from agent.tool_argument_projection import project_tool_args_for_display
+
+        return project_tool_args_for_display(name, args)
+    except Exception:
+        return {}
+
+
+def _cui_actor_role_from_params(_params: dict | None) -> str:
+    """Return only the server-bound actor role; RPC parameters are not authority."""
+    actor = current_cui_actor_context()
+    return str((actor or {}).get("role") or "").strip().lower()
+
+
+def _cui_actor_is_admin(params: dict | None) -> bool:
+    from agent.cui_actor_context import is_aiwerk_admin_actor
+
+    _ = params
+    return is_aiwerk_admin_actor(current_cui_actor_context())
+
+
+def _skill_visibility(info: dict | None) -> str:
+    if not isinstance(info, dict):
+        return "internal"
+    for key in ("visibility", "cui_visibility", "slash_visibility"):
+        value = str(info.get(key) or "").strip().lower()
+        if value in {"customer", "user", "public", "all"}:
+            return "customer"
+        if value in {"admin", "internal"}:
+            return value
+    from agent.skill_utils import skill_visibility_from_frontmatter
+
+    return skill_visibility_from_frontmatter(info)
+
+
+def _skill_visible_for_actor(info: dict | None, _params: dict | None) -> bool:
+    from agent.skill_utils import skill_visible_for_current_actor
+
+    return skill_visible_for_current_actor(_skill_visibility(info))
+
+
+def _load_dashboard_user_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+
+        return load_config() or {}
+    except Exception:
+        return {}
+
+
+def _dashboard_user_for_cui_actor(actor: dict[str, str]) -> dict:
+    users = (
+        (_load_dashboard_user_config() or {})
+        .get("dashboard", {})
+        .get("basic_auth", {})
+        .get("users", [])
+    )
+    actor_id = str(actor.get("actor_id") or "").strip()
+    user_id = str(actor.get("user_id") or "").strip()
+    for user in users if isinstance(users, list) else []:
+        if not isinstance(user, dict):
+            continue
+        if actor_id and str(user.get("actor_id") or "").strip() == actor_id:
+            return user
+        configured_user_id = str(
+            user.get("user_id") or user.get("username") or ""
+        ).strip()
+        if user_id and configured_user_id == user_id:
+            return user
+    return {}
+
+
+def _configured_gateway_user_ids(user: dict, source: str) -> set[str]:
+    candidates = []
+    direct = user.get(f"{source}_user_ids") or user.get(f"{source}_user_id")
+    if direct is not None:
+        candidates.append(direct)
+    channel_map = user.get("channel_user_ids") or user.get("gateway_user_ids") or {}
+    if isinstance(channel_map, dict) and channel_map.get(source) is not None:
+        candidates.append(channel_map[source])
+    result: set[str] = set()
+    for value in candidates:
+        if isinstance(value, str):
+            result.update(
+                item.strip()
+                for item in value.replace(",", " ").split()
+                if item.strip()
+            )
+        elif isinstance(value, (list, tuple, set)):
+            result.update(str(item).strip() for item in value if str(item).strip())
+    return result
+
+
+def _row_gateway_subject_id(row: dict, source: str) -> str:
+    if source == "telegram":
+        return str(row.get("user_id") or row.get("chat_id") or "").strip()
+    return str(
+        row.get("user_id") or row.get("sender_id") or row.get("chat_id") or ""
+    ).strip()
+
+
+def _cui_actor_owns_gateway_row(row: dict | None, actor: dict[str, str]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    source = str(row.get("source") or "").strip().lower()
+    subject_id = _row_gateway_subject_id(row, source) if source else ""
+    if not subject_id:
+        return False
+    user = _dashboard_user_for_cui_actor(actor)
+    return subject_id in _configured_gateway_user_ids(user, source)
+
+
+_OUTBOUND_ENCODED_SEPARATOR_TARGETS = (
+    "%2f",
+    "%5c",
+    "%252f",
+    "%255c",
+)
+_OUTBOUND_SAFE_URI_SCHEMES = ("http://", "https://", "shared://")
+
+
+def _outbound_encoded_prefix_suffix(text: str) -> str:
+    percent = text.rfind("%")
+    if percent < 0:
+        return ""
+    suffix = text[percent:]
+    lowered = suffix.lower()
+    if any(target.startswith(lowered) for target in _OUTBOUND_ENCODED_SEPARATOR_TARGETS):
+        return suffix
+    return ""
+
+
+def _outbound_has_partial_safe_uri_scheme(text: str) -> bool:
+    lowered = text.lower()
+    for scheme in _OUTBOUND_SAFE_URI_SCHEMES:
+        for length in range(1, len(scheme) + 1):
+            if lowered.endswith(scheme[:length]):
+                start = len(text) - length
+                if start == 0 or not (
+                    text[start - 1].isalnum() or text[start - 1] == "_"
+                ):
+                    return True
+    return False
+
+
+def _outbound_fragment_has_path_risk(text: str) -> bool:
+    cursor = 0
+    fragments: list[str] = []
+    for match in _OUTBOUND_SAFE_URI_RE.finditer(text):
+        fragments.append(text[cursor : match.start()])
+        cursor = match.end()
+    fragments.append(text[cursor:])
+    risk_re = re.compile(
+        r"(?i)(?<![\w:/])(?:"
+        r"(?:MEDIA:|file://)?/(?:$|[A-Za-z_.~])"
+        r"|\\(?:$|\\|[A-Za-z_.~])"
+        r"|[A-Za-z]:[\\/]"
+        r"|%(?:25)*(?:2f|5c)"
+        r")"
+    )
+    return any(
+        risk_re.search(fragment) or _outbound_encoded_prefix_suffix(fragment)
+        for fragment in fragments
+    )
+
+
+def _project_outbound_stream_fragment(
+    state: tuple[str, bool], incoming: str
+) -> tuple[str, tuple[str, bool]]:
+    buffer, in_safe_uri = state
+    if in_safe_uri:
+        candidate = f"{buffer}{incoming}"
+        delimiter = re.search(r"[\s<>'\"]", candidate)
+        if delimiter is None:
+            return "", (candidate, True)
+        boundary = delimiter.start()
+        from agent.tool_argument_projection import sanitize_tool_display_text
+
+        preserved = sanitize_tool_display_text(candidate[:boundary])
+        projected, next_state = _project_outbound_stream_fragment(
+            ("", False), candidate[boundary:]
+        )
+        return f"{preserved}{projected}", next_state
+
+    candidate = f"{buffer}{incoming}"
+    projected = ""
+    while "\n" in candidate:
+        line, candidate = candidate.split("\n", 1)
+        projected += _sanitize_outbound_text_references(f"{line}\n")
+    safe_uri_matches = list(_OUTBOUND_SAFE_URI_RE.finditer(candidate))
+    if safe_uri_matches and safe_uri_matches[-1].end() == len(candidate):
+        match = safe_uri_matches[-1]
+        projected += _sanitize_outbound_text_references(candidate[: match.start()])
+        return projected, (match.group(0), True)
+    if _outbound_has_partial_safe_uri_scheme(candidate):
+        return projected, (candidate, False)
+    if len(candidate) > 65536:
+        carry = _outbound_encoded_prefix_suffix(candidate)
+        head = candidate[: -len(carry)] if carry else candidate
+        return f"{projected}{_sanitize_outbound_text_references(head)}", (
+            carry,
+            False,
+        )
+    if candidate and _outbound_fragment_has_path_risk(candidate):
+        return projected, (candidate, False)
+    return f"{projected}{_sanitize_outbound_text_references(candidate)}", (
+        "",
+        False,
+    )
+
 
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
@@ -1800,7 +2046,7 @@ def _row_visible_to_cui_actor(row: dict | None, actor: dict | None) -> bool:
         return False
     metadata = _row_cui_metadata(row)
     if not metadata:
-        return role in _CUI_ADMIN_ROLES
+        return role in _CUI_ADMIN_ROLES or _cui_actor_owns_gateway_row(row, actor)
     if metadata.get("tenant_id") != tenant_id:
         return False
     if role not in _CUI_ADMIN_ROLES:
@@ -1821,6 +2067,70 @@ def _row_visible_to_cui_actor(row: dict | None, actor: dict | None) -> bool:
 def _visible_persisted_session_row(db, session_id: str, actor: dict | None):
     row = db.get_session(session_id)
     return row if _row_visible_to_cui_actor(row, actor) else None
+
+
+_PERSISTED_SESSION_SCAN_PAGE_SIZE = 200
+_PUBLIC_SESSION_LIST_FIELDS = frozenset(
+    {
+        "id", "title", "preview", "started_at", "message_count", "source",
+        "display_name", "last_active", "summary", "topics", "archived", "hidden",
+    }
+)
+
+
+def _iter_visible_persisted_session_rows(
+    db,
+    actor: dict | None,
+    *,
+    deny_sources: frozenset[str] = frozenset(),
+    include_hidden: bool = False,
+):
+    """Yield actor-authorized compact rows without recency-window starvation."""
+    visibility_map = getattr(type(db), "_SESSION_COLUMN_VISIBILITY", {})
+    public_columns = {
+        name
+        for name, visibility in visibility_map.items()
+        if visibility == "public"
+    }
+    public_columns |= _PUBLIC_SESSION_LIST_FIELDS
+    db_offset = 0
+    while True:
+        scan_kwargs = {
+            "source": None,
+            "limit": _PERSISTED_SESSION_SCAN_PAGE_SIZE,
+            "offset": db_offset,
+            "order_by_last_active": True,
+            "compact_rows": True,
+            "compact_visibility": "internal",
+            "include_hidden": include_hidden,
+        }
+        try:
+            page = db.list_sessions_rich(**scan_kwargs)
+        except TypeError as exc:
+            unsupported = str(exc)
+            fallback_kwargs = dict(scan_kwargs)
+            changed = False
+            for key in ("compact_visibility", "include_hidden"):
+                if key in unsupported:
+                    fallback_kwargs.pop(key, None)
+                    changed = True
+            if not changed:
+                raise
+            page = db.list_sessions_rich(**fallback_kwargs)
+        if not page:
+            return
+        for row in page:
+            source = str(row.get("source") or "").strip().lower()
+            if source not in deny_sources and _row_visible_to_cui_actor(row, actor):
+                yield {
+                    key: value
+                    for key, value in row.items()
+                    if key in public_columns
+                }
+        page_count = len(page)
+        db_offset += page_count
+        if page_count < _PERSISTED_SESSION_SCAN_PAGE_SIZE:
+            return
 
 
 def _stamp_cui_actor_context(model_config: dict, actor_context: dict | None) -> None:
@@ -2201,7 +2511,70 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
+_OUTBOUND_DELTA_PROJECTION_LOCK = threading.Lock()
+_OUTBOUND_DELTA_PROJECTION_BUFFERS: dict[tuple[str, str], tuple[str, bool]] = {}
+_OUTBOUND_CUSTOMER_TEXT_FIELDS = {
+    "text", "error", "reasoning", "reasoning_content", "reasoning_details", "rendered"
+}
+
+
+def _sanitize_outbound_customer_value(value: Any) -> Any:
+    if isinstance(value, str):
+        from agent.tool_argument_projection import sanitize_tool_display_text
+
+        return sanitize_tool_display_text(_sanitize_outbound_text_references(value))
+    if isinstance(value, list):
+        return [_sanitize_outbound_customer_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_outbound_customer_value(item) for key, item in value.items()
+        }
+    return value
+
+
 def _emit(event: str, sid: str, payload: dict | None = None):
+    if event == "message.start":
+        with _OUTBOUND_DELTA_PROJECTION_LOCK:
+            for key in [
+                key for key in _OUTBOUND_DELTA_PROJECTION_BUFFERS if key[1] == sid
+            ]:
+                _OUTBOUND_DELTA_PROJECTION_BUFFERS.pop(key, None)
+    if event in {"message.delta", "reasoning.delta"} and isinstance(payload, dict):
+        incoming = str(payload.get("text") or "")
+        buffer_key = (event, sid)
+        with _OUTBOUND_DELTA_PROJECTION_LOCK:
+            buffered, _state = _OUTBOUND_DELTA_PROJECTION_BUFFERS.get(
+                buffer_key, ("", False)
+            )
+            _OUTBOUND_DELTA_PROJECTION_BUFFERS[buffer_key] = (
+                f"{buffered}{incoming}", False
+            )
+        return
+    if event == "message.complete":
+        with _OUTBOUND_DELTA_PROJECTION_LOCK:
+            for key in [
+                key for key in _OUTBOUND_DELTA_PROJECTION_BUFFERS if key[1] == sid
+            ]:
+                buffered, _state = _OUTBOUND_DELTA_PROJECTION_BUFFERS.pop(
+                    key, ("", False)
+                )
+                if buffered:
+                    write_json(
+                        _event_frame(
+                            key[0],
+                            sid,
+                            {"text": _sanitize_outbound_customer_value(buffered)},
+                        )
+                    )
+    if event in {
+        "message.delta", "message.interim", "message.complete", "reasoning.delta"
+    } and isinstance(payload, dict):
+        payload = dict(payload)
+        for field in _OUTBOUND_CUSTOMER_TEXT_FIELDS:
+            if field in payload:
+                payload[field] = _sanitize_outbound_customer_value(payload[field])
+    if isinstance(payload, dict):
+        payload = _sanitize_outbound_customer_value(payload)
     write_json(_event_frame(event, sid, payload))
 
 
@@ -3116,6 +3489,199 @@ def _live_record_visible_to_cui_actor(
 def _visible_live_session(session_id: str) -> dict | None:
     session = _sessions.get(session_id)
     return session if _live_record_visible_to_cui_actor(session) else None
+
+
+def _live_session_visible_to_cui_actor(
+    session: dict | None, actor: dict[str, str] | None
+) -> bool:
+    return _live_record_visible_to_cui_actor(session, actor)
+
+
+def _find_live_session(target: str) -> tuple[str, dict] | None:
+    needle = str(target or "").strip()
+    if not needle:
+        return None
+    try:
+        snapshot = list(_sessions.items())
+    except Exception:
+        return None
+    for sid, session in snapshot:
+        if session.get("_finalized"):
+            continue
+        key = str(session.get("session_key") or sid)
+        if needle in {sid, key}:
+            return sid, session
+    return None
+
+
+def _cui_session_reset_policy() -> dict:
+    raw = _load_cfg().get("session_reset")
+    policy = raw if isinstance(raw, dict) else {}
+    mode = str(policy.get("mode") or "both").strip().lower()
+    if mode not in {"daily", "idle", "both", "none"}:
+        mode = "both"
+    try:
+        at_hour = int(policy.get("at_hour", 4))
+    except (TypeError, ValueError):
+        at_hour = 4
+    try:
+        idle_minutes = int(policy.get("idle_minutes", 1440))
+    except (TypeError, ValueError):
+        idle_minutes = 1440
+    try:
+        bg_hours = int(policy.get("bg_process_max_age_hours", 24))
+    except (TypeError, ValueError):
+        bg_hours = 24
+    return {
+        "mode": mode,
+        "at_hour": max(0, min(23, at_hour)),
+        "idle_minutes": max(1, idle_minutes),
+        "bg_process_max_age_hours": max(0, bg_hours),
+    }
+
+
+def _cui_latest_session_activity(db, session_key: str, row: dict) -> float:
+    latest = float(row.get("started_at") or 0.0)
+    try:
+        for msg in db.get_messages(session_key) or []:
+            timestamp = msg.get("timestamp") if isinstance(msg, dict) else None
+            if timestamp is not None:
+                latest = max(latest, float(timestamp))
+    except Exception:
+        pass
+    return latest
+
+
+def _cui_session_reset_reason(db, session_key: str) -> str | None:
+    if not session_key:
+        return None
+    policy = _cui_session_reset_policy()
+    if policy["mode"] == "none":
+        return None
+    try:
+        row = db.get_session(session_key)
+    except Exception:
+        row = None
+    if not row or row.get("ended_at") is not None:
+        return None
+    try:
+        from tools.process_registry import process_registry
+
+        max_age_hours = policy["bg_process_max_age_hours"]
+        max_age = max_age_hours * 3600 if max_age_hours > 0 else None
+        if process_registry.has_active_for_session(
+            session_key, max_active_age=max_age
+        ):
+            return None
+    except Exception:
+        pass
+    last_active = _cui_latest_session_activity(db, session_key, row)
+    now = time.time()
+    if policy["mode"] in {"idle", "both"} and (
+        now > last_active + policy["idle_minutes"] * 60
+    ):
+        return "idle"
+    if policy["mode"] in {"daily", "both"}:
+        boundary = datetime.fromtimestamp(now).replace(
+            hour=policy["at_hour"], minute=0, second=0, microsecond=0
+        ).timestamp()
+        if datetime.fromtimestamp(now).hour < policy["at_hour"]:
+            boundary -= 24 * 60 * 60
+        if last_active < boundary:
+            return "daily"
+    return None
+
+
+def _rotate_cui_session_if_expired(sid: str, session: dict) -> dict | None:
+    if not session or session.get("running"):
+        return None
+    old_key = str(session.get("session_key") or "")
+    if not old_key:
+        return None
+    with _session_db(session) as db:
+        if db is None:
+            return None
+        reason = _cui_session_reset_reason(db, old_key)
+        if not reason:
+            return None
+        new_key = _new_session_key()
+        try:
+            db.end_session(old_key, "session_reset")
+        except Exception:
+            logger.debug("failed to mark expired CUI session ended", exc_info=True)
+
+    old_agent = session.get("agent")
+    old_worker = session.get("slash_worker")
+    old_stop = session.get("_notif_stop")
+    if old_stop is not None:
+        try:
+            old_stop.set()
+        except Exception:
+            pass
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        unregister_gateway_notify(old_key)
+    except Exception:
+        pass
+    try:
+        if old_worker:
+            old_worker.close()
+    except Exception:
+        pass
+    try:
+        if old_agent is not None and hasattr(old_agent, "close"):
+            old_agent.close()
+    except Exception:
+        pass
+
+    _notify_session_boundary("on_session_finalize", old_key)
+    _transfer_active_session_slot(sid, session, new_session_id=new_key)
+    now = time.time()
+    with session.get("history_lock") or contextlib.nullcontext():
+        session["agent"] = None
+        session["agent_error"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session.pop("agent_build_lock", None)
+        session.pop("resume_session_id", None)
+        session.pop("resume_runtime_overrides", None)
+        session.pop("display_history_prefix", None)
+        session["attached_images"] = []
+        session["edit_snapshots"] = {}
+        session["history"] = []
+        session["history_version"] = 0
+        session["image_counter"] = 0
+        session["inflight_turn"] = None
+        session["last_active"] = now
+        session["created_at"] = now
+        session["pending_title"] = None
+        session["parent_session_id"] = None
+        session["running"] = False
+        session["session_key"] = new_key
+        session["slash_worker"] = None
+        session["tool_started_at"] = {}
+        session["_notif_stop"] = None
+        session["auto_reset_from"] = old_key
+        session["auto_reset_reason"] = reason
+    _register_session_cwd(session)
+    session["_auto_reset_boundary_notified_for"] = new_key
+    _notify_session_boundary("on_session_reset", new_key)
+    _emit(
+        "session.info",
+        sid,
+        {
+            "session_id": new_key,
+            "auto_reset": True,
+            "auto_reset_from": old_key,
+            "auto_reset_reason": reason,
+            "cwd": _display_session_cwd(session),
+            "lazy": True,
+            "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+            "profile_name": _current_profile_name(),
+        },
+    )
+    return {"from": old_key, "to": new_key, "reason": reason}
 
 
 def _sess_nowait(params, rid):
@@ -7720,6 +8286,71 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     return info
 
 
+def _switch_live_session(
+    sid: str,
+    session: dict,
+    target_session_id: str,
+    history: list,
+    *,
+    reason: str,
+) -> dict:
+    """Move one live gateway record to another persisted session."""
+    old_key = session.get("session_key") or ""
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        if old_key:
+            unregister_gateway_notify(old_key)
+    except Exception:
+        pass
+    session["session_key"] = target_session_id
+    session["pending_title"] = None
+    info = _reset_session_agent(sid, session)
+    try:
+        from tools.approval import register_gateway_notify
+
+        register_gateway_notify(
+            target_session_id,
+            lambda data: _emit_approval_request(sid, data),
+        )
+    except Exception:
+        pass
+    with session["history_lock"]:
+        session["history"] = list(history or [])
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        session["running"] = False
+        _clear_inflight_turn(session)
+    agent = session.get("agent")
+    try:
+        if agent is not None and hasattr(agent, "_invalidate_system_prompt"):
+            agent._invalidate_system_prompt()
+    except Exception:
+        pass
+    _notify_session_boundary("on_session_reset", target_session_id)
+    _emit(
+        "session.switched",
+        sid,
+        {"session_id": target_session_id, "reason": reason, "info": info},
+    )
+    return info
+
+
+def _commit_gateway_session_boundary(session: dict, session_id: str) -> None:
+    agent = session.get("agent")
+    with session["history_lock"]:
+        history = list(session.get("history", []))
+    if agent is not None and history and hasattr(agent, "commit_memory_session"):
+        try:
+            agent.commit_memory_session(history)
+        except Exception:
+            pass
+    _notify_session_boundary("on_session_finalize", session_id)
+
+
+def _side_source() -> str:
+    return os.environ.get("HERMES_SESSION_SOURCE", "tui")
+
+
 def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     """Refresh a session's tool snapshot when MCP discovery lands late.
 
@@ -8229,6 +8860,715 @@ def _build_image_ref_message(user_text: str, image_paths: list[str]) -> str:
     return text or "What do you see in this image?"
 
 
+_DASHBOARD_UPLOAD_ROOT = (Path(_hermes_home) / "dashboard_uploads").resolve()
+_ATTACHMENT_CONTEXT_LIMIT = 60_000
+_IMAGE_ATTACHMENT_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+_AUDIO_ATTACHMENT_EXTENSIONS = frozenset({".mp3", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"})
+_VIDEO_ATTACHMENT_EXTENSIONS = frozenset({".mp4", ".mov", ".webm", ".mkv"})
+_TEXT_ATTACHMENT_EXTENSIONS = frozenset({".txt", ".md", ".csv", ".yaml", ".yml"})
+_ACTIVE_ATTACHMENT_EXTENSIONS = frozenset(
+    {
+        ".html", ".htm", ".xhtml", ".xht", ".xhtm", ".shtml",
+        ".svg", ".svgz", ".xml", ".xsl", ".xslt",
+        ".js", ".mjs", ".cjs", ".mhtml", ".mht", ".htc",
+    }
+)
+_OUTBOUND_ATTACHMENT_EXTENSIONS = (
+    _IMAGE_ATTACHMENT_EXTENSIONS
+    | frozenset(
+        {
+            ".pdf", ".docx", ".xlsx", ".xls", ".pptx", ".ppt", ".zip",
+            ".tar", ".gz", ".tgz", ".7z", ".rar", ".json",
+        }
+    )
+    | _TEXT_ATTACHMENT_EXTENSIONS
+    | _AUDIO_ATTACHMENT_EXTENSIONS
+    | _VIDEO_ATTACHMENT_EXTENSIONS
+    | _ACTIVE_ATTACHMENT_EXTENSIONS
+)
+_OUTBOUND_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+_OUTBOUND_ATTACHMENT_RE = re.compile(
+    r"(?<![\w:/])(?:MEDIA:|file://)?(/(?:(?!\s+(?:and|or|und|oder)\s+)[^\n)\]>'\"])+?\.(?:png|jpe?g|gif|webp|pdf|txt|md|csv|json|ya?ml|docx|xlsx?|pptx?|zip|tar|gz|tgz|7z|rar|mp3|m4a|wav|webm|ogg|aac|flac|mp4|mov|mkv|html?|xhtml?|shtml|svgz?|xml|xslt?|mjs|cjs|js|mhtml?|htc))(?=$|[\s)\]>'\";,])",
+    re.IGNORECASE,
+)
+_OUTBOUND_SAFE_URI_RE = re.compile(
+    r"\b(?:https?://|shared://)[^\s<>'\"]+", re.IGNORECASE
+)
+_OUTBOUND_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w:/])((?:(?:MEDIA:|file://)?/(?!/)[^\n)\]>'\";,]+?)"
+    r"|(?:(?:MEDIA:)?[A-Za-z]:[\\/][^\n)\]>'\";,]+?)"
+    r"|(?:\\\\[^\n)\]>'\";,]+?|//[^/\s]+/[^\n)\]>'\";,]+?))"
+    r"(?=$|\s+(?:and|or|und|oder)\s+|[\n)\]>'\";,])",
+    re.IGNORECASE,
+)
+_OUTBOUND_ENCODED_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w%])((?:%(?:25)*(?:2f|5c)){1,2}[^\s)\]>'\";,]+)", re.IGNORECASE
+)
+_SHARED_OUTBOUND_FOLDER_NAME = "Agent-Downloads"
+
+
+def _attachment_preview_kind(path: Path, media_type: str) -> str:
+    ext = path.suffix.lower()
+    if ext in _ACTIVE_ATTACHMENT_EXTENSIONS or ext == ".json":
+        return "file"
+    if media_type.startswith("image/") and ext in _IMAGE_ATTACHMENT_EXTENSIONS:
+        return "image"
+    if media_type == "application/pdf" or ext == ".pdf":
+        return "pdf"
+    if media_type.startswith("audio/") or ext in _AUDIO_ATTACHMENT_EXTENSIONS:
+        return "audio"
+    if media_type.startswith("video/") or ext in _VIDEO_ATTACHMENT_EXTENSIONS:
+        return "video"
+    if media_type.startswith("text/") or ext in _TEXT_ATTACHMENT_EXTENSIONS:
+        return "text"
+    return "file"
+
+
+def _outbound_source_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    try:
+        roots.append(_DASHBOARD_UPLOAD_ROOT)
+    except Exception:
+        pass
+    try:
+        roots.append(Path(tempfile.gettempdir()).resolve())
+    except Exception:
+        pass
+    return tuple(roots)
+
+
+_OUTBOUND_FORBIDDEN_DIR_NAMES: frozenset[str] = frozenset(
+    {".ssh", ".aws", ".gnupg", ".config", ".hermes", ".secrets", ".azure", ".gcloud"}
+)
+
+
+def _outbound_source_allowed(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    try:
+        hermes_home = _hermes_home.resolve()
+        if resolved == hermes_home or hermes_home in resolved.parents:
+            return False
+    except Exception:
+        pass
+    if any(part in _OUTBOUND_FORBIDDEN_DIR_NAMES for part in resolved.parts):
+        return False
+    for root in _outbound_source_roots():
+        try:
+            if resolved == root or root in resolved.parents:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _materialize_outbound_artifact(path: Path) -> Path | None:
+    if not _outbound_source_allowed(path):
+        return None
+    try:
+        path_stat = path.stat()
+        if path_stat.st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+            return None
+        digest = hashlib.sha256(
+            f"{path}\0{path_stat.st_mtime_ns}\0{path_stat.st_size}".encode(
+                "utf-8", errors="surrogatepass"
+            )
+        ).hexdigest()[:16]
+        target_dir = _DASHBOARD_UPLOAD_ROOT / "outbound_artifacts" / digest
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / path.name
+        if not target.exists() or target.stat().st_size != path_stat.st_size:
+            shutil.copy2(path, target)
+            try:
+                target.chmod(0o600)
+            except Exception:
+                pass
+        return target.resolve()
+    except Exception:
+        return None
+
+
+def _resolve_outbound_shared_folder_root() -> Path | None:
+    try:
+        from hermes_cli import web_server
+
+        root = web_server._resolve_shared_folder_root(_load_cfg())
+        return root.resolve() if root else None
+    except Exception:
+        return None
+
+
+def _shared_folder_relative_path(root: Path, path: Path) -> str | None:
+    try:
+        base = root.resolve()
+        target = path.resolve()
+        if target != base and base not in target.parents:
+            return None
+        parts = target.relative_to(base).parts
+        if not parts or any(
+            part in {".", ".."} or part.startswith(".") for part in parts
+        ):
+            return None
+        return "/".join(parts)
+    except Exception:
+        return None
+
+
+def _file_sha256_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _shared_candidate_matches(path: Path, *, size: int, digest: str) -> bool:
+    try:
+        return (
+            not path.is_symlink()
+            and path.is_file()
+            and path.stat().st_size == size
+            and _file_sha256_digest(path) == digest
+        )
+    except Exception:
+        return False
+
+
+def _copy_outbound_source_to_snapshot(source: Path, snapshot: Path) -> int | None:
+    def reject() -> None:
+        snapshot.unlink(missing_ok=True)
+
+    if sys.platform != "linux" or not _outbound_source_allowed(source):
+        reject()
+        return None
+    source_absolute = Path(os.path.abspath(source))
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    for root in _outbound_source_roots():
+        try:
+            root_resolved = root.expanduser().resolve()
+            relative = source_absolute.relative_to(root_resolved)
+            if not relative.parts or any(
+                part in {".", ".."} or part in _OUTBOUND_FORBIDDEN_DIR_NAMES
+                for part in relative.parts
+            ):
+                continue
+            directory_fd = os.open(root_resolved, directory_flags)
+            try:
+                for part in relative.parts[:-1]:
+                    next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+                    os.close(directory_fd)
+                    directory_fd = next_fd
+                source_fd = os.open(
+                    relative.parts[-1], file_flags, dir_fd=directory_fd
+                )
+            finally:
+                os.close(directory_fd)
+            try:
+                before = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_size > _OUTBOUND_ATTACHMENT_MAX_BYTES
+                ):
+                    reject()
+                    return None
+                copied = 0
+                with (
+                    os.fdopen(source_fd, "rb", closefd=False) as input_handle,
+                    snapshot.open("wb") as output_handle,
+                ):
+                    while chunk := input_handle.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+                            reject()
+                            return None
+                        output_handle.write(chunk)
+                    output_handle.flush()
+                    os.fsync(output_handle.fileno())
+                after = os.fstat(source_fd)
+                stable_before = (
+                    before.st_dev, before.st_ino, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns,
+                )
+                stable_after = (
+                    after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns,
+                )
+                if stable_before != stable_after or copied != before.st_size:
+                    reject()
+                    return None
+                snapshot.chmod(0o600)
+                return copied
+            finally:
+                os.close(source_fd)
+        except Exception:
+            continue
+    reject()
+    return None
+
+
+def _rename_snapshot_noreplace(snapshot: Path, target: Path) -> bool:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOTSUP, "atomic outbound publication requires Linux")
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(-100, os.fsencode(snapshot), -100, os.fsencode(target), 1)
+    if result == 0:
+        return True
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        return False
+    raise OSError(error_number, os.strerror(error_number), target)
+
+
+def _materialize_outbound_shared_artifact(
+    path: Path,
+) -> tuple[Path | None, str | None, int | None]:
+    root = _resolve_outbound_shared_folder_root()
+    try:
+        source = Path(os.path.abspath(path))
+        if not _outbound_source_allowed(source):
+            return None, None, None
+        stem = source.stem or "file"
+        suffix = source.suffix
+        if not root:
+            try:
+                from hermes_cli import web_server
+
+                with tempfile.TemporaryDirectory(
+                    prefix="hermes-outbound-shared-"
+                ) as temp_dir:
+                    snapshot = Path(temp_dir) / source.name
+                    snapshot_size = _copy_outbound_source_to_snapshot(source, snapshot)
+                    if snapshot_size is None:
+                        return None, None, None
+                    digest = _file_sha256_digest(snapshot)
+                    rel = f"{_SHARED_OUTBOUND_FOLDER_NAME}/{stem}-{digest}{suffix}"
+                    uploaded_rel = web_server._upload_shared_file_to_cloud(
+                        web_server.load_config(), snapshot, rel
+                    )
+                    return (
+                        (None, uploaded_rel, snapshot_size)
+                        if uploaded_rel
+                        else (None, None, None)
+                    )
+            except Exception:
+                return None, None, None
+        rel_existing = _shared_folder_relative_path(root, source)
+        source_is_agent_download = bool(
+            rel_existing
+            and rel_existing.split("/", 1)[0] == _SHARED_OUTBOUND_FOLDER_NAME
+        )
+        target_dir = (root / _SHARED_OUTBOUND_FOLDER_NAME).resolve()
+        root_resolved = root.resolve()
+        if target_dir != root_resolved and root_resolved not in target_dir.parents:
+            return None, None, None
+        target_dir.mkdir(parents=True, exist_ok=True)
+        temp_target = target_dir / f".{source.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            snapshot_size = _copy_outbound_source_to_snapshot(source, temp_target)
+            if snapshot_size is None:
+                return None, None, None
+            digest = _file_sha256_digest(temp_target)
+            hashed_candidates = (
+                target_dir / f"{stem}-{digest[:12]}{suffix}",
+                target_dir / f"{stem}-{digest}{suffix}",
+            )
+            candidates = (
+                hashed_candidates
+                if source_is_agent_download
+                else (target_dir / source.name, *hashed_candidates)
+            )
+            target: Path | None = None
+            for candidate in candidates:
+                if _shared_candidate_matches(
+                    candidate, size=snapshot_size, digest=digest
+                ):
+                    target = candidate
+                    break
+                if _rename_snapshot_noreplace(temp_target, candidate):
+                    target = candidate
+                    break
+                if _shared_candidate_matches(
+                    candidate, size=snapshot_size, digest=digest
+                ):
+                    target = candidate
+                    break
+            while target is None:
+                candidate = target_dir / f"{stem}-{digest}-{uuid.uuid4().hex}{suffix}"
+                if _rename_snapshot_noreplace(temp_target, candidate):
+                    target = candidate
+            rel = _shared_folder_relative_path(root, target)
+            return target.resolve(), rel, snapshot_size
+        finally:
+            temp_target.unlink(missing_ok=True)
+    except Exception:
+        return None, None, None
+
+
+def _session_upload_component(session_id: Any) -> str:
+    """Mirror the upload endpoint's session-directory normalization."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(session_id or "")).strip(".-_")
+    return (safe or "session")[:80]
+
+
+def _attachment_path_allowed(path: Path, session_id: Any = None) -> bool:
+    """Confine uploaded paths to the upload root and, when given, one session."""
+    try:
+        resolved = path.resolve()
+        if session_id is not None and str(session_id).strip():
+            session_root = (
+                _DASHBOARD_UPLOAD_ROOT / _session_upload_component(session_id)
+            ).resolve()
+            return resolved == session_root or session_root in resolved.parents
+        return (
+            resolved == _DASHBOARD_UPLOAD_ROOT
+            or _DASHBOARD_UPLOAD_ROOT in resolved.parents
+        )
+    except Exception:
+        return False
+
+
+_INBOUND_SHARED_URI_RE = re.compile(
+    r"\bshared://[^\s)\]>'\"]+", re.IGNORECASE
+)
+_INBOUND_IMAGE_HINT_RE = re.compile(
+    r"vision_analyze\s+using\s+image_url:\s+([^\]\n]+)", re.IGNORECASE
+)
+
+
+def _shared_uri_relative_path(uri: str) -> str | None:
+    raw = str(uri or "").strip().rstrip(".,;")
+    if not raw.lower().startswith("shared://"):
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    rel = "/".join(
+        part for part in (parsed.netloc, parsed.path.lstrip("/")) if part
+    )
+    rel = urllib.parse.unquote(rel).replace("\\", "/")
+    parts = [part for part in rel.split("/") if part]
+    if not parts or any(
+        part in {".", ".."} or part.startswith(".") for part in parts
+    ):
+        return None
+    return "/".join(parts)
+
+
+def _shared_uri_prompt_attachments(
+    text: Any, session_id: Any
+) -> list[dict[str, Any]]:
+    """Materialize Customer UI shared references as confined attachments."""
+    if not isinstance(text, str) or "shared://" not in text.lower():
+        return []
+    try:
+        from hermes_cli import web_server
+
+        config = web_server.load_config()
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _INBOUND_SHARED_URI_RE.finditer(text):
+        rel = _shared_uri_relative_path(match.group(0))
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        item = {
+            "name": Path(rel).name,
+            "reference_uri": f"shared://{urllib.parse.quote(rel, safe='/')}",
+            "open_url": (
+                "/api/assistant/shared-folder/open?path="
+                f"{urllib.parse.quote(rel, safe='')}"
+            ),
+        }
+        try:
+            out.append(
+                web_server._create_shared_file_attachment(
+                    config, item, str(session_id or "session")
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _inbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
+    """Recover confined Customer UI image previews from persisted history."""
+    if not isinstance(text, str) or not text:
+        return []
+    attachments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _INBOUND_IMAGE_HINT_RE.finditer(text):
+        try:
+            path = Path(match.group(1).strip()).expanduser().resolve()
+        except Exception:
+            continue
+        if (
+            str(path) in seen
+            or not _attachment_path_allowed(path)
+            or not path.is_file()
+            or path.suffix.lower() not in _IMAGE_ATTACHMENT_EXTENSIONS
+        ):
+            continue
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if not media_type.startswith("image/"):
+            continue
+        seen.add(str(path))
+        try:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        open_url = (
+            "/api/assistant/artifacts/open?path="
+            f"{urllib.parse.quote(str(path), safe='')}"
+        )
+        attachments.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "type": media_type,
+                "size": size,
+                "is_image": True,
+                "open_url": open_url,
+                "preview_url": open_url,
+                "safe_renderable": True,
+            }
+        )
+    return attachments
+
+
+def _attachment_text_block(name: str, path: Path, text: str, note: str = "") -> str:
+    header = f"[Attached file: {name}\nPath: {path}"
+    if note:
+        header += f"\nNote: {note}"
+    if text.strip():
+        clipped = text[:_ATTACHMENT_CONTEXT_LIMIT]
+        if len(text) > _ATTACHMENT_CONTEXT_LIMIT:
+            clipped += "\n[Attachment text truncated]"
+        return f"{header}\nContent:\n{clipped}\n]"
+    return (
+        f"{header}\nContent was not extracted automatically. "
+        "The file is available at the path above.]"
+    )
+
+
+def _process_prompt_attachments(
+    attachments: Any, session_id: Any = None
+) -> tuple[list[str], str]:
+    """Validate Customer UI uploads and build model-visible attachment context."""
+    if not isinstance(attachments, list):
+        return [], ""
+    image_paths: list[str] = []
+    file_blocks: list[str] = []
+    for item in attachments[:10]:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        if (
+            not _attachment_path_allowed(path, session_id)
+            or not path.exists()
+            or not path.is_file()
+        ):
+            continue
+        name = str(item.get("name") or path.name)
+        mime = str(item.get("type") or "")
+        if (
+            mime.startswith("image/")
+            or path.suffix.lower() in _IMAGE_ATTACHMENT_EXTENSIONS
+        ):
+            image_paths.append(str(path))
+            continue
+        text = str(item.get("extracted_text") or "")
+        note = str(item.get("extraction") or "")
+        if not text and path.suffix.lower() in {
+            ".txt",
+            ".md",
+            ".csv",
+            ".json",
+            ".yaml",
+            ".yml",
+        }:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")[
+                    :_ATTACHMENT_CONTEXT_LIMIT
+                ]
+                note = note or "text"
+            except Exception:
+                note = note or "text-read-failed"
+        file_blocks.append(_attachment_text_block(name, path, text, note))
+    return image_paths, "\n\n".join(file_blocks)
+
+
+def _outbound_local_path_filename(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    for prefix in ("MEDIA:", "file://"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized.rstrip().rsplit("/", 1)[-1] or "file"
+
+
+def _decode_outbound_path_reference(value: str) -> str:
+    decoded = value
+    for _ in range(3):
+        expanded = urllib.parse.unquote(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    return decoded
+
+
+def _sanitize_outbound_text_references(text: str) -> str:
+    def sanitize_unprotected(fragment: str) -> str:
+        fragment = _OUTBOUND_ATTACHMENT_RE.sub(
+            lambda match: _outbound_local_path_filename(match.group(0)), fragment
+        )
+        fragment = _OUTBOUND_LOCAL_PATH_RE.sub(
+            lambda match: _outbound_local_path_filename(match.group(1)), fragment
+        )
+        return _OUTBOUND_ENCODED_LOCAL_PATH_RE.sub(
+            lambda match: _outbound_local_path_filename(
+                _decode_outbound_path_reference(match.group(1))
+            ),
+            fragment,
+        )
+
+    pieces: list[str] = []
+    cursor = 0
+    for match in _OUTBOUND_SAFE_URI_RE.finditer(text):
+        pieces.append(sanitize_unprotected(text[cursor : match.start()]))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(sanitize_unprotected(text[cursor:]))
+    from agent.tool_argument_projection import sanitize_tool_display_text
+
+    return sanitize_tool_display_text("".join(pieces))
+
+
+def _outbound_image_attachment_payloads(text: Any) -> list[dict[str, Any]]:
+    return _outbound_attachment_payloads_and_text(text)[0]
+
+
+def _outbound_attachment_payloads_and_text(
+    text: Any, *, append_shared_links: bool = False
+) -> tuple[list[dict[str, Any]], str]:
+    if not isinstance(text, str) or not text:
+        return [], "" if text is None else str(text)
+    attachments: list[dict[str, Any]] = []
+    appended_links: list[str] = []
+    delivery_errors: list[str] = []
+    safe_uri_spans = [match.span() for match in _OUTBOUND_SAFE_URI_RE.finditer(text)]
+    seen: set[str] = set()
+    for match in _OUTBOUND_ATTACHMENT_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in safe_uri_spans):
+            continue
+        raw_path = match.group(1)
+        try:
+            source_path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            continue
+        if (
+            str(source_path) in seen
+            or not source_path.is_file()
+            or source_path.suffix.lower() not in _OUTBOUND_ATTACHMENT_EXTENSIONS
+        ):
+            continue
+        seen.add(str(source_path))
+        if not _outbound_source_allowed(source_path):
+            continue
+        try:
+            source_size = source_path.stat().st_size
+        except Exception:
+            continue
+        if source_size > _OUTBOUND_ATTACHMENT_MAX_BYTES:
+            continue
+        media_type = (
+            mimetypes.guess_type(source_path.name)[0] or "application/octet-stream"
+        )
+        preview_kind = _attachment_preview_kind(source_path, media_type)
+        is_image = preview_kind == "image"
+        safe_renderable = preview_kind in {"image", "pdf", "text", "audio", "video"}
+        _shared_path, shared_rel_path, shared_size = (
+            _materialize_outbound_shared_artifact(source_path)
+        )
+        if not shared_rel_path:
+            delivery_errors.append(
+                f"Die Datei {source_path.name} konnte nicht unter "
+                "Agent-Downloads bereitgestellt werden."
+            )
+            continue
+        payload_path = f"shared://{urllib.parse.quote(shared_rel_path, safe='/')}"
+        shared_open_url = (
+            "/api/assistant/shared-folder/open?path="
+            f"{urllib.parse.quote(shared_rel_path, safe='')}"
+        )
+        open_url = shared_open_url
+        download_url = shared_open_url
+        public_link: dict[str, str] | None = None
+        if append_shared_links:
+            try:
+                from hermes_cli import web_server
+
+                public_link = web_server._create_shared_file_public_link(
+                    web_server.load_config(),
+                    shared_rel_path,
+                    name=source_path.stem or source_path.name,
+                )
+            except Exception:
+                public_link = None
+            if public_link:
+                open_url = public_link.get("url") or shared_open_url
+                download_url = public_link.get("download_url") or open_url
+            if shared_open_url not in text:
+                line = f"{source_path.name}: {shared_open_url}"
+                if public_link:
+                    line = (
+                        f"{source_path.name}: {shared_open_url}\n"
+                        f"  Web-Link: {public_link.get('url')}\n"
+                        f"  Download: {public_link.get('download_url')}"
+                    )
+                appended_links.append(line)
+        preview_url = open_url if safe_renderable else None
+        payload = {
+            "name": source_path.name,
+            "kind": "file",
+            "path": payload_path,
+            "type": media_type,
+            "size": shared_size if shared_size is not None else source_size,
+            "is_image": is_image,
+            "open_url": open_url,
+            "download_url": download_url,
+            "preview_url": preview_url,
+            "preview_kind": preview_kind,
+            "safe_renderable": safe_renderable,
+            "shared_folder_path": shared_rel_path,
+        }
+        if public_link:
+            payload["public_url"] = public_link.get("url")
+            payload["public_download_url"] = public_link.get("download_url")
+        attachments.append(payload)
+    text = _sanitize_outbound_text_references(text)
+    if append_shared_links and appended_links:
+        suffix = "\n".join(f"- {line}" for line in appended_links)
+        text = (
+            f"{text.rstrip()}\n\nIm Shared-Ordner unter Agent-Downloads abgelegt:\n"
+            f"{suffix}"
+        )
+    if delivery_errors:
+        text = f"{text.rstrip()}\n\n" + "\n".join(delivery_errors)
+    return attachments, text
+
+
 def _build_persist_message_with_image_refs(user_text: str, image_paths: list[str]) -> str:
     """Build the clean, UI-recognizable version of the user's message for
     persisting to session history. Uses ``@image:<path>`` directives — the
@@ -8584,6 +9924,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("_row_id") is not None:
             msg["row_id"] = m["_row_id"]
         if role == "user":
+            attachments = _inbound_image_attachment_payloads(content_text)
+            if attachments:
+                msg["attachments"] = attachments
             invocation = _skill_scaffold_projection(content_text)
             if invocation:
                 # Show the invocation, never the expanded skill body. The raw
@@ -8592,9 +9935,15 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 msg["text"] = invocation
                 msg["display_kind"] = "skill_invocation"
         if role == "assistant":
+            attachments, sanitized_text = _outbound_attachment_payloads_and_text(
+                content_text
+            )
+            msg["text"] = sanitized_text
+            if attachments:
+                msg["attachments"] = attachments
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
-                    msg[key] = m.get(key)
+                    msg[key] = _sanitize_outbound_customer_value(m.get(key))
         # Forward display-only timeline metadata so the TUI can render
         # model switches and delegation completions as events instead of
         # opaque user messages, and hide compaction handoffs entirely.
@@ -8602,7 +9951,12 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if display_kind:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
-            msg["display_metadata"] = m["display_metadata"]
+            msg["display_metadata"] = _sanitize_outbound_customer_value(
+                m["display_metadata"]
+            )
+        from agent.tool_argument_projection import sanitize_tool_display_text
+
+        msg["text"] = sanitize_tool_display_text(msg.get("text", ""))
         messages.append(msg)
 
     return messages
@@ -9282,9 +10636,13 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not isinstance(turn, dict):
         return None
     user = str(turn.get("user") or "").strip()
-    assistant = str(turn.get("assistant") or "")
+    assistant = _sanitize_outbound_text_references(
+        str(turn.get("assistant") or "")
+    )
     streaming = bool(turn.get("streaming"))
-    error = str(turn.get("error") or "").strip()
+    error = _sanitize_outbound_text_references(
+        str(turn.get("error") or "").strip()
+    )
     if not user and not assistant and not streaming and not error:
         return None
     snapshot = {
@@ -9355,10 +10713,16 @@ def _emit_terminal_turn_error(
     with session["history_lock"]:
         _fail_inflight_turn(session, error, error_surface=error_surface)
         turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
+        message = _sanitize_outbound_text_references(
+            str(turn.get("error") or "turn failed")
+        )
         partial = str(turn.get("assistant") or "")
         cols = int(session.get("cols", 80))
-    text = partial or f"Error: {message}"
+    text = (
+        _sanitize_outbound_text_references(partial)
+        if partial
+        else f"Error: {message}"
+    )
     payload = {
         "text": text,
         "usage": _get_usage(agent) if agent is not None else {},

@@ -118,6 +118,114 @@ class TestProvider:
         assert r.user_id == "admin"
         assert p.verify_session(access_token=r.access_token) is not None
 
+    def test_current_authority_demotion_applies_on_verify(self, basic):
+        password_hash = basic.hash_password("pw")
+        authority = {
+            "alice": {
+                "password_hash": password_hash,
+                "role": "admin",
+                "tenant_id": "tenant-1",
+                "actor_id": "alice",
+                "display_name": "Alice",
+            }
+        }
+        provider = basic.BasicAuthProvider(
+            secret=secrets.token_bytes(32),
+            users=authority,
+            authority_resolver=lambda: authority,
+        )
+        session = provider.complete_password_login(username="alice", password="pw")
+        assert session.role == "admin"
+
+        authority["alice"] = {**authority["alice"], "role": "user"}
+        verified = provider.verify_session(access_token=session.access_token)
+
+        assert verified is not None
+        assert verified.role == "user"
+        assert verified.expires_at == session.expires_at
+
+    def test_current_authority_removal_revokes_verify_and_refresh(self, basic):
+        password_hash = basic.hash_password("pw")
+        authority = {
+            "alice": {
+                "password_hash": password_hash,
+                "role": "admin",
+                "tenant_id": "tenant-1",
+                "actor_id": "alice",
+                "display_name": "Alice",
+            }
+        }
+        provider = basic.BasicAuthProvider(
+            secret=secrets.token_bytes(32),
+            users=authority,
+            authority_resolver=lambda: authority,
+        )
+        session = provider.complete_password_login(username="alice", password="pw")
+
+        del authority["alice"]
+
+        assert provider.verify_session(access_token=session.access_token) is None
+        with pytest.raises(RefreshExpiredError):
+            provider.refresh_session(refresh_token=session.refresh_token)
+
+    def test_live_collision_removal_cannot_upgrade_token_to_fallback_admin(
+        self, basic
+    ):
+        fallback_hash = basic.hash_password("fallback-pw")
+        live_hash = basic.hash_password("live-pw")
+        authority = {
+            "alice": {
+                "password_hash": basic.hash_password("alice-pw"),
+                "role": "user",
+                "actor_id": "alice",
+            }
+        }
+        provider = basic.BasicAuthProvider(
+            secret=secrets.token_bytes(32),
+            username="root",
+            password_hash=fallback_hash,
+            users=authority,
+            authority_resolver=lambda: authority,
+        )
+        authority["root"] = {
+            "password_hash": live_hash,
+            "role": "user",
+            "actor_id": "live-root",
+        }
+        session = provider.complete_password_login(username="root", password="live-pw")
+        assert session.role == "user"
+        assert session.actor_id == "live-root"
+
+        del authority["root"]
+
+        assert provider.verify_session(access_token=session.access_token) is None
+        with pytest.raises(RefreshExpiredError):
+            provider.refresh_session(refresh_token=session.refresh_token)
+
+    def test_malformed_current_role_fails_closed(self, basic):
+        password_hash = basic.hash_password("pw")
+        authority = {
+            "alice": {
+                "password_hash": password_hash,
+                "role": "admin",
+                "tenant_id": "tenant-1",
+                "actor_id": "alice",
+                "display_name": "Alice",
+            }
+        }
+        provider = basic.BasicAuthProvider(
+            secret=secrets.token_bytes(32),
+            users=authority,
+            authority_resolver=lambda: authority,
+        )
+        session = provider.complete_password_login(username="alice", password="pw")
+
+        authority["alice"] = {**authority["alice"], "role": "support"}
+
+        assert provider.verify_session(access_token=session.access_token) is None
+        with pytest.raises(RefreshExpiredError):
+            provider.refresh_session(refresh_token=session.refresh_token)
+
 
     def test_cross_secret_token_does_not_verify(self, basic):
         p1 = self._make(basic)
@@ -202,6 +310,108 @@ class TestRegister:
         # ... and the config password no longer does.
         with pytest.raises(InvalidCredentialsError):
             provider.complete_password_login(username="admin", password="config-pw")
+
+    def test_top_level_admin_merged_with_users_table(self, basic, monkeypatch, caplog):
+        user_hash = basic.hash_password("user-pw")
+        admin_hash = basic.hash_password("admin-pw")
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {
+                "username": "root",
+                "password_hash": admin_hash,
+                "users": [
+                    {
+                        "username": "alice",
+                        "password_hash": user_hash,
+                        "role": "user",
+                    },
+                ],
+            },
+        )
+        ctx = MagicMock()
+        with caplog.at_level("WARNING"):
+            basic.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+
+        assert provider.complete_password_login(
+            username="alice", password="user-pw"
+        ).role == "user"
+        admin_session = provider.complete_password_login(
+            username="root", password="admin-pw"
+        )
+        assert admin_session.user_id == "root"
+        assert admin_session.role == "admin"
+        verified = provider.verify_session(access_token=admin_session.access_token)
+        assert verified is not None
+        assert verified.user_id == "root"
+        assert verified.role == "admin"
+        refreshed = provider.refresh_session(refresh_token=admin_session.refresh_token)
+        assert refreshed.user_id == "root"
+        assert refreshed.role == "admin"
+        assert any("merging the top-level" in rec.message for rec in caplog.records)
+
+    def test_top_level_admin_collision_prefers_users_entry(
+        self, basic, monkeypatch, caplog
+    ):
+        users_hash = basic.hash_password("table-pw")
+        top_hash = basic.hash_password("top-pw")
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {
+                "username": "admin",
+                "password_hash": top_hash,
+                "users": [
+                    {
+                        "username": "admin",
+                        "password_hash": users_hash,
+                        "role": "admin",
+                    },
+                ],
+            },
+        )
+        ctx = MagicMock()
+        with caplog.at_level("WARNING"):
+            basic.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+
+        assert provider.complete_password_login(
+            username="admin", password="table-pw"
+        ).user_id == "admin"
+        with pytest.raises(InvalidCredentialsError):
+            provider.complete_password_login(username="admin", password="top-pw")
+        assert any("also appears" in rec.message for rec in caplog.records)
+
+    def test_mixed_config_does_not_create_empty_password_admin(
+        self, basic, monkeypatch, caplog
+    ):
+        user_hash = basic.hash_password("user-pw")
+        monkeypatch.setattr(
+            basic,
+            "_load_config_basic_auth_section",
+            lambda: {
+                "username": "root",
+                "users": [
+                    {
+                        "username": "alice",
+                        "password_hash": user_hash,
+                        "role": "user",
+                    },
+                ],
+            },
+        )
+        ctx = MagicMock()
+        with caplog.at_level("WARNING"):
+            basic.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args.args[0]
+
+        assert provider.complete_password_login(
+            username="alice", password="user-pw"
+        ).user_id == "alice"
+        with pytest.raises(InvalidCredentialsError):
+            provider.complete_password_login(username="root", password="")
+        assert any("without a password" in rec.message for rec in caplog.records)
 
     def test_explicit_secret_makes_sessions_portable(self, basic, monkeypatch):
         # Two providers built from the SAME explicit secret accept each

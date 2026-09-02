@@ -397,21 +397,11 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
     return value
 
 
-def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | None:
-    """Return a copy of tool args safe for logs/progress UI.
+def redact_tool_args_for_display(tool_name: str, args: Any) -> dict[str, Any]:
+    """Return the centralized fail-closed customer-facing argument projection."""
+    from agent.tool_argument_projection import project_tool_args_for_display
 
-    For ``browser_type`` the ``text`` argument is run through the same
-    secret-pattern redactor used for logs.  Recognizable credentials (API
-    keys, tokens) are masked before the value reaches tool progress
-    notifications; normal typed text is left intact for debuggability.
-    """
-    if not isinstance(args, dict):
-        return args
-    if tool_name == "browser_type" and isinstance(args.get("text"), str):
-        safe_args = dict(args)
-        safe_args["text"] = redact_sensitive_text(args["text"], force=True)
-        return safe_args
-    return args
+    return project_tool_args_for_display(tool_name, args)
 
 
 def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, list[str]]:
@@ -453,7 +443,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         max_len = _tool_preview_max_len
     if not args:
         return None
-    args = redact_tool_args_for_display(tool_name, args) or args
+    browser_label = _browser_exec_step_label(args) if tool_name == "browser_exec" else None
+    args = redact_tool_args_for_display(tool_name, args)
     primary_args = {
         "terminal": "command", "web_search": "query", "web_extract": "urls",
         "read_file": "path", "write_file": "path", "patch": "path",
@@ -469,9 +460,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
 
     # browser_exec: prefer the leading `# …` comment as a friendly step label
     if tool_name == "browser_exec":
-        label = _browser_exec_step_label(args)
-        if label is not None:
-            return _truncate_preview(label, max_len)
+        if browser_label is not None:
+            return _truncate_preview(browser_label, max_len)
         preview = _oneline(str(args.get("code", "") or ""))
         return _truncate_preview(preview, max_len) if preview else None
 
@@ -1392,7 +1382,8 @@ def _get_cute_tool_message(
     When *result* is provided the line is checked for failure indicators.
     Failed tool calls get a red prefix and an informational suffix.
     """
-    args = redact_tool_args_for_display(tool_name, args) or args
+    browser_label = _browser_exec_step_label(args) if tool_name == "browser_exec" else None
+    args = redact_tool_args_for_display(tool_name, args)
     dur = f"{duration:.1f}s"
     is_failure, failure_suffix = _detect_tool_failure(tool_name, result)
     skin_prefix = get_skin_tool_prefix()
@@ -1546,12 +1537,11 @@ def _get_cute_tool_message(
         first_line = code.strip().split("\n")[0] if code.strip() else ""
         return _wrap(f"┊ 🐍 exec      {_trunc(first_line, 35)}  {dur}")
     if tool_name == "browser_exec":
-        label = _browser_exec_step_label(args)
-        if label is not None:
+        if browser_label is not None:
             # Leading `# …` comment (the tool description asks for one):
             # surface it as the user-facing step label; the code itself stays
             # collapsed behind display.tool_preview_length.
-            return _wrap(f"┊ 🌐 browser   {label}  {dur}")
+            return _wrap(f"┊ 🌐 browser   {browser_label}  {dur}")
         code = " ".join(str(args.get("code", "") or "").split())
         return _wrap(f"┊ 🌐 browser   {_trunc(code, 35)}  {dur}")
     if tool_name == "delegate_task":

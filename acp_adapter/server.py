@@ -65,9 +65,7 @@ from acp.schema import (
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
-    make_message_cb,
     make_step_cb,
-    make_thinking_cb,
     make_tool_progress_cb,
 )
 from acp_adapter.permissions import make_approval_callback
@@ -79,6 +77,10 @@ from agent.context_compressor import (
     ContextCompressor,
 )
 from agent.interrupt_compat import request_hard_interrupt
+from agent.tool_argument_projection import (
+    project_tool_args_for_display,
+    sanitize_tool_display_text,
+)
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1104,7 +1106,11 @@ class HermesACPAgent(acp.Agent):
         )
         update = SessionInfoUpdate(
             session_update="session_info_update",
-            title=title if isinstance(title, str) and title.strip() else None,
+            title=(
+                sanitize_tool_display_text(title)
+                if isinstance(title, str) and title.strip()
+                else None
+            ),
             updated_at=updated_at,
             field_meta=meta,
         )
@@ -1444,7 +1450,9 @@ class HermesACPAgent(acp.Agent):
         field_meta: dict[str, Any] | None = None,
     ) -> UserMessageChunk | AgentMessageChunk | None:
         """Build an ACP history replay update for a user/assistant message."""
-        block = TextContentBlock(type="text", text=text)
+        block = TextContentBlock(
+            type="text", text=sanitize_tool_display_text(text)
+        )
         if role == "user":
             return UserMessageChunk(
                 session_update="user_message_chunk",
@@ -1462,7 +1470,7 @@ class HermesACPAgent(acp.Agent):
     @staticmethod
     def _history_thought_update(text: str) -> AgentThoughtChunk:
         """Build an ACP history replay update for an assistant thought."""
-        return acp.update_agent_thought_text(text)
+        return acp.update_agent_thought_text(sanitize_tool_display_text(text))
 
     @staticmethod
     def _history_tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -1560,7 +1568,13 @@ class HermesACPAgent(acp.Agent):
                             continue
                         tool_name, args = self._history_tool_call_name_args(tool_call)
                         active_tool_calls[tool_call_id] = (tool_name, args)
-                        if not await _send(build_tool_start(tool_call_id, tool_name, args)):
+                        if not await _send(
+                            build_tool_start(
+                                tool_call_id,
+                                tool_name,
+                                project_tool_args_for_display(tool_name, args),
+                            )
+                        ):
                             return
                 continue
 
@@ -1579,7 +1593,10 @@ class HermesACPAgent(acp.Agent):
                         tool_call_id,
                         tool_name,
                         result=result_text,
-                        function_args=function_args,
+                        function_args=project_tool_args_for_display(
+                            tool_name,
+                            function_args,
+                        ),
                     )
                 ):
                     return
@@ -1771,7 +1788,11 @@ class HermesACPAgent(acp.Agent):
                 SessionInfo(
                     session_id=s["session_id"],
                     cwd=s["cwd"],
-                    title=s.get("title"),
+                    title=(
+                        sanitize_tool_display_text(s["title"])
+                        if isinstance(s.get("title"), str)
+                        else s.get("title")
+                    ),
                     updated_at=updated_at,
                 )
             )
@@ -1795,6 +1816,7 @@ class HermesACPAgent(acp.Agent):
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
         state = self.session_manager.get_session(session_id)
+        queued_drain_turn = bool(kwargs.pop("_queued_drain", False))
         if state is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
@@ -1869,7 +1891,9 @@ class HermesACPAgent(acp.Agent):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
                 if self._conn:
-                    update = acp.update_agent_message_text(response_text)
+                    update = acp.update_agent_message_text(
+                        sanitize_tool_display_text(response_text)
+                    )
                     await self._conn.session_update(session_id, update)
                     await self._send_usage_update(state)
                 return PromptResponse(stop_reason="end_turn")
@@ -1880,7 +1904,7 @@ class HermesACPAgent(acp.Agent):
         redirected = False
         queued_depth: int | None = None
         with state.runtime_lock:
-            if state.is_running:
+            if state.is_running and not queued_drain_turn:
                 if (
                     text_only_prompt
                     and isinstance(user_content, str)
@@ -1937,6 +1961,9 @@ class HermesACPAgent(acp.Agent):
         edit_approval_requester = None
 
         streamed_message = False
+        message_fragments: list[str] = []
+        reasoning_fragments: list[str] = []
+        reasoning_cb: Any = None
 
         if conn:
             tool_progress_cb = make_tool_progress_cb(
@@ -1947,15 +1974,19 @@ class HermesACPAgent(acp.Agent):
                 tool_call_meta,
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
             )
-            reasoning_cb = make_thinking_cb(conn, session_id, loop)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
-            message_cb = make_message_cb(conn, session_id, loop)
+
+            def _reasoning_cb(text: str) -> None:
+                if text:
+                    reasoning_fragments.append(text)
+
+            reasoning_cb = _reasoning_cb
 
             def stream_delta_cb(text: str) -> None:
                 nonlocal streamed_message
                 if text:
                     streamed_message = True
-                message_cb(text)
+                    message_fragments.append(text)
 
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
             try:
@@ -2110,6 +2141,96 @@ class HermesACPAgent(acp.Agent):
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
 
+        async def _flush_buffered_customer_streams() -> None:
+            if conn and reasoning_fragments:
+                await conn.session_update(
+                    session_id,
+                    acp.update_agent_thought_text(
+                        sanitize_tool_display_text("".join(reasoning_fragments))
+                    ),
+                )
+                reasoning_fragments.clear()
+            if conn and message_fragments:
+                await conn.session_update(
+                    session_id,
+                    acp.update_agent_message_text(
+                        sanitize_tool_display_text("".join(message_fragments))
+                    ),
+                )
+                message_fragments.clear()
+
+        def _release_turn(*, schedule_queue: bool) -> None:
+            with state.runtime_lock:
+                has_queued = bool(state.queued_prompts)
+                reserve_for_drain = schedule_queue and has_queued
+                if not reserve_for_drain:
+                    state.is_running = False
+                    state.current_prompt_text = ""
+            if reserve_for_drain:
+                # Keep active ownership reserved until the scheduled drainer
+                # atomically transfers it to the oldest queued prompt.
+                loop.create_task(_drain_queued_prompts(owns_turn=True))
+
+        async def _drain_queued_prompts(*, owns_turn: bool) -> None:
+            with state.runtime_lock:
+                if not owns_turn and state.is_running:
+                    # The active/new turn owns the eventual drain.
+                    return
+                if not state.queued_prompts:
+                    if owns_turn:
+                        state.is_running = False
+                        state.current_prompt_text = ""
+                    return
+                next_prompt = state.queued_prompts.pop(0)
+                # Atomically transfer active-turn ownership to the FIFO item
+                # before any outbound await permits another prompt to race in.
+                state.is_running = True
+                state.current_prompt_text = next_prompt
+            try:
+                if conn:
+                    try:
+                        await conn.session_update(
+                            session_id,
+                            acp.update_user_message_text(
+                                sanitize_tool_display_text(next_prompt)
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not emit queued ACP prompt update for %s",
+                            session_id,
+                            exc_info=True,
+                        )
+                await self.prompt(
+                    prompt=[TextContentBlock(type="text", text=next_prompt)],
+                    session_id=session_id,
+                    _queued_drain=True,
+                )
+            except BaseException:
+                # Only pre-execution failures escape the nested queued turn;
+                # cancellation after its worker completes is suppressed there.
+                with state.runtime_lock:
+                    state.queued_prompts.insert(0, next_prompt)
+                    state.is_running = True
+                    state.current_prompt_text = next_prompt
+                loop.create_task(_drain_queued_prompts(owns_turn=True))
+                return
+
+        async def _finish_completed_queued_turn() -> None:
+            drain_task = loop.create_task(
+                _drain_queued_prompts(owns_turn=True)
+            )
+            task = asyncio.current_task()
+            while not drain_task.done():
+                if task is not None:
+                    while task.cancelling():
+                        task.uncancel()
+                try:
+                    await asyncio.shield(drain_task)
+                except asyncio.CancelledError:
+                    continue
+            await drain_task
+
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
             # can detect a compression-driven session rotation afterwards. The
@@ -2121,18 +2242,65 @@ class HermesACPAgent(acp.Agent):
             # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+            worker_future = loop.run_in_executor(_executor, ctx.run, _run_agent)
+            result = await asyncio.shield(worker_future)
+        except asyncio.CancelledError as cancellation:
+            # run_in_executor work is not cancelled with its awaiting task.
+            # Consume repeated cancellation requests and join the worker before
+            # the one terminal flush; otherwise later callback writes race past
+            # cleanup. The original cancellation is re-raised afterwards.
+            task = asyncio.current_task()
+            while not worker_future.done():
+                if task is not None:
+                    while task.cancelling():
+                        task.uncancel()
+                try:
+                    await asyncio.shield(worker_future)
+                except asyncio.CancelledError:
+                    continue
+            await _flush_buffered_customer_streams()
+            if queued_drain_turn:
+                await _finish_completed_queued_turn()
+                return PromptResponse(stop_reason="cancelled")
+            _release_turn(schedule_queue=True)
+            raise cancellation
         except Exception:
             logger.exception("Executor error for session %s", session_id)
-            with state.runtime_lock:
-                state.is_running = False
-                state.current_prompt_text = ""
+            await _flush_buffered_customer_streams()
+            if queued_drain_turn:
+                raise
+            _release_turn(schedule_queue=True)
             return PromptResponse(stop_reason="end_turn")
+        except BaseException:
+            # Process-level unwind must not strand already-produced customer
+            # output, session state, or accepted queued prompts.
+            await _flush_buffered_customer_streams()
+            _release_turn(schedule_queue=True)
+            raise
+
+        pending_steer = result.get("pending_steer")
+        if isinstance(pending_steer, str) and pending_steer.strip():
+            # A redirect accepted too late for the completed model turn is an
+            # acknowledged correction, not telemetry. Preserve it as the next
+            # FIFO turn ahead of later queued prompts.
+            with state.runtime_lock:
+                state.queued_prompts.insert(0, pending_steer)
+
+        # The provider turn is complete here. Flush before any post-turn await
+        # (persistence/provenance) can be cancelled by a disconnect.
+        await _flush_buffered_customer_streams()
 
         if result.get("messages"):
             state.history = result["messages"]
             # Persist updated history so sessions survive process restarts.
-            self.session_manager.save_session(session_id)
+            try:
+                self.session_manager.save_session(session_id)
+            except BaseException:
+                if queued_drain_turn:
+                    await _finish_completed_queued_turn()
+                    return PromptResponse(stop_reason="cancelled")
+                _release_turn(schedule_queue=True)
+                raise
 
         # Detect a compression-driven internal session rotation. If the agent's
         # DB head moved during the turn, emit a session_info_update carrying
@@ -2157,6 +2325,12 @@ class HermesACPAgent(acp.Agent):
                     session_id,
                     exc_info=True,
                 )
+            except BaseException:
+                if queued_drain_turn:
+                    await _finish_completed_queued_turn()
+                    return PromptResponse(stop_reason="cancelled")
+                _release_turn(schedule_queue=True)
+                raise
 
         final_response = result.get("final_response", "")
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
@@ -2178,30 +2352,21 @@ class HermesACPAgent(acp.Agent):
             # or when a plugin hook transformed the response after streaming
             # finished (e.g. transform_llm_output) — otherwise the appended /
             # rewritten text never reaches the client.
-            update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
-
-        # Mark this turn idle before draining queued work so recursive prompt()
-        # calls can acquire the session. Queued turns are intentionally run as
-        # normal follow-up user prompts, preserving role alternation and history.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
-
-        while True:
-            with state.runtime_lock:
-                if not state.queued_prompts:
-                    break
-                next_prompt = state.queued_prompts.pop(0)
-            if conn:
-                await conn.session_update(
-                    session_id,
-                    acp.update_user_message_text(next_prompt),
-                )
-            await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
-                session_id=session_id,
+            update = acp.update_agent_message_text(
+                sanitize_tool_display_text(final_response)
             )
+            try:
+                await conn.session_update(session_id, update)
+            except BaseException:
+                if queued_drain_turn:
+                    await _finish_completed_queued_turn()
+                    return PromptResponse(stop_reason="cancelled")
+                _release_turn(schedule_queue=True)
+                raise
+
+        # Atomically hand active-turn ownership to the next FIFO item, or mark
+        # the session idle when the queue is empty.
+        await _drain_queued_prompts(owns_turn=True)
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
@@ -2213,10 +2378,18 @@ class HermesACPAgent(acp.Agent):
                 cached_read_tokens=result.get("cache_read_tokens"),
             )
 
-        await self._send_usage_update(state)
+        try:
+            await self._send_usage_update(state)
+        except BaseException:
+            if queued_drain_turn:
+                return PromptResponse(stop_reason="cancelled", usage=usage)
+            # FIFO ownership was already handed off (or the session made idle)
+            # before this telemetry-only await; do not clear a newer turn.
+            raise
 
         stop_reason = "cancelled" if cancelled else "end_turn"
         return PromptResponse(stop_reason=stop_reason, usage=usage)
+
 
     # ---- Slash commands (headless) -------------------------------------------
 

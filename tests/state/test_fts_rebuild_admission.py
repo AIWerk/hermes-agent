@@ -182,11 +182,11 @@ class TestSchemaPathAdmission:
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
 
-    def test_stale_recovery_defers_then_succeeds_after_release(
+    def test_stale_recovery_defers_and_remains_fail_closed_after_release(
         self, tmp_path, fast_timeout
     ):
-        """_recover_stale_fts defers under contention and completes once the
-        authority is free (next open)."""
+        """A stale breadcrumb defers under contention and remains detached on
+        reopen; recovery requires the explicit offline repair path."""
         db_path = tmp_path / "state.db"
         d = SessionDB(db_path=db_path)
         if not d._fts_enabled:
@@ -218,9 +218,10 @@ class TestSchemaPathAdmission:
 
         d3 = SessionDB(db_path=db_path)
         try:
-            assert d3._fts_enabled is True
+            assert d3._fts_enabled is False
         finally:
             d3.close()
-        # Recovered: breadcrumb cleared, triggers restored.
-        assert _meta_value(db_path, FTS_STALE_KEY) is None
-        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+        # Reopen is not an implicit repair authority: breadcrumb remains and
+        # no live triggers are installed over a known index gap.
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()

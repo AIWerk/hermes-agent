@@ -406,6 +406,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     title_source TEXT,
+    title_updated_at REAL,
+    title_turn_index INTEGER,
     last_activity_at REAL,
     last_activity_description TEXT,
     last_activity_provenance TEXT,
@@ -792,6 +794,17 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 # have been written while those triggers were absent, so merely recreating
 # them would preserve an unknown index gap.
 FTS_STALE_KEY = "fts_stale"
+
+FTS_REPAIR_FIRST_ERROR_AT_KEY = "fts_repair_first_error_at"
+FTS_REPAIR_LAST_ERROR_AT_KEY = "fts_repair_last_error_at"
+FTS_REPAIR_FAILURE_COUNT_KEY = "fts_repair_failure_count"
+FTS_REPAIR_LAST_ERROR_KEY = "fts_repair_last_error"
+FTS_REPAIR_META_KEYS = (
+    FTS_REPAIR_FIRST_ERROR_AT_KEY,
+    FTS_REPAIR_LAST_ERROR_AT_KEY,
+    FTS_REPAIR_FAILURE_COUNT_KEY,
+    FTS_REPAIR_LAST_ERROR_KEY,
+)
 
 # Durable diagnostic for stale FTS recovery blocked across process restarts.
 FTS_REBUILD_DEFERRAL_KEY = "fts_rebuild_deferral"

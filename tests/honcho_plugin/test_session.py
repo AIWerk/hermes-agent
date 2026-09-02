@@ -1,5 +1,6 @@
 """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
 
+import threading
 import time
 
 from datetime import datetime
@@ -603,6 +604,15 @@ class TestBaseContextSummary:
     def test_format_includes_summary(self):
         """Session summary should appear first in the formatted context."""
         provider = HonchoMemoryProvider()
+        provider._config = SimpleNamespace(
+            raw={
+                "injection": {
+                    "includeSummary": True,
+                    "includeUserRepresentation": True,
+                }
+            },
+            host="",
+        )
         ctx = {
             "summary": "Testing Honcho tools and dialectic depth.",
             "representation": "Eri is a developer.",
@@ -635,7 +645,12 @@ class TestBaseContextSummary:
 
         provider = HonchoMemoryProvider()
         provider._manager = manager
-        provider._config = SimpleNamespace(timeout=0.01, context_tokens=0)
+        provider._config = SimpleNamespace(
+            timeout=0.01,
+            context_tokens=0,
+            raw={"injection": {"includeUserRepresentation": True}},
+            host="",
+        )
         provider._session_key = "test"
         provider._session_initialized = True
         provider._recall_mode = "context"
@@ -925,7 +940,12 @@ class TestSessionStartDialecticPrewarm:
         from unittest.mock import patch, MagicMock
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        defaults = dict(api_key="test-key", enabled=True, recall_mode="hybrid")
+        defaults = dict(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="hybrid",
+            raw={"injection": {"includeDialectic": True}},
+        )
         if cfg_extra:
             defaults.update(cfg_extra)
         cfg = HonchoClientConfig(**defaults)
@@ -1057,6 +1077,7 @@ class TestDialecticLifecycleSmoke:
             api_key="test-key", enabled=True, recall_mode="hybrid",
             dialectic_reasoning_level="low", reasoning_heuristic=True,
             reasoning_level_cap="high", dialectic_depth=1,
+            raw={"injection": {"includeDialectic": True}},
         )
         if cfg_extra:
             defaults.update(cfg_extra)
@@ -1315,3 +1336,285 @@ class TestGetSessionContextFallback:
         assert peer_id == "user-peer"
         assert target == "user-peer"
 
+
+class TestSessionSwitchRuntimeCache:
+    def test_late_prefetch_result_from_old_generation_is_dropped(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._session_generation = 1
+        import time
+
+        provider._manager = MagicMock()
+        provider._run_dialectic_depth = MagicMock(
+            side_effect=lambda query: (time.sleep(0.05), "stale old-session context")[1]
+        )
+        provider._session_key = "old-session"
+        provider._config = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            timeout=0.01,
+            raw={"injection": {"includeDialectic": True}},
+        )
+        provider._prefetch_thread_started_at = 0.0
+        provider._last_dialectic_turn = -999
+        provider._dialectic_cadence = 1
+        provider._turn_count = 1
+
+        provider.queue_prefetch("meaningful query")
+        prefetch_thread = provider._prefetch_thread
+        provider._reset_runtime_context_cache()
+        if prefetch_thread:
+            prefetch_thread.join(timeout=1.0)
+
+        assert provider._prefetch_result == ""
+
+
+class TestSessionSwitchRuntimeCacheRecovery:
+    """Session switches must not carry stale formatted injection context forward."""
+
+    def test_session_switch_flushes_and_clears_injection_cache(self):
+        from unittest.mock import patch
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="hybrid",
+            raw={"injection": {"includeDialectic": False}},
+        )
+        provider = HonchoMemoryProvider()
+        old_manager = MagicMock()
+        new_manager = MagicMock()
+        old_session = MagicMock()
+        new_session = MagicMock()
+        old_session.messages = []
+        new_session.messages = []
+        old_manager.get_or_create.return_value = old_session
+        new_manager.get_or_create.return_value = new_session
+
+        with patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg), \
+             patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
+             patch("plugins.memory.honcho.session.HonchoSessionManager", side_effect=[old_manager, new_manager]), \
+             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
+            provider.initialize(session_id="old-session")
+            _settle_prewarm(provider)
+            provider._base_context_cache = "## Session Summary\nstale\n\n## User Representation\nstale"
+            provider._prefetch_result = "stale dialectic"
+            provider._prefetch_result_fired_at = 1
+            provider._turn_count = 7
+
+            provider.on_session_switch("new-session", reset=True)
+
+        old_manager.flush_all.assert_called()
+        old_manager.shutdown.assert_called_once()
+        assert provider._manager is new_manager
+        assert provider._session_initialized is True
+        assert provider._session_key
+        assert provider._base_context_cache is None
+        assert provider._prefetch_result == ""
+        assert provider._prefetch_result_fired_at == -999
+        assert provider._turn_count == 0
+
+    def test_late_prefetch_result_from_old_generation_is_dropped(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._session_generation = 1
+        import time
+
+        provider._manager = MagicMock()
+        provider._run_dialectic_depth = MagicMock(
+            side_effect=lambda query: (time.sleep(0.05), "stale old-session context")[1]
+        )
+        provider._session_key = "old-session"
+        provider._config = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            timeout=0.01,
+            raw={"injection": {"includeDialectic": True}},
+        )
+        provider._prefetch_thread_started_at = 0.0
+        provider._last_dialectic_turn = -999
+        provider._dialectic_cadence = 1
+        provider._turn_count = 1
+
+        provider.queue_prefetch("meaningful query")
+        prefetch_thread = provider._prefetch_thread
+        provider._reset_runtime_context_cache()
+        if prefetch_thread:
+            prefetch_thread.join(timeout=1.0)
+
+        assert provider._prefetch_result == ""
+
+class TestSessionSwitchBackgroundWritesRecovery:
+    """Late durable-write workers must never cross a session generation."""
+
+    @staticmethod
+    def _provider_and_config():
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="tools",
+            init_on_session_start=True,
+        )
+        provider = HonchoMemoryProvider()
+        provider._config = cfg
+        provider._recall_mode = "tools"
+        provider._manager = MagicMock()
+        provider._session_key = "old-session"
+        provider._session_initialized = True
+        return provider, cfg
+
+    @staticmethod
+    def _deferred_thread_type(started, release):
+        real_thread = threading.Thread
+
+        class DeferredThread(real_thread):
+            """Start normally, but hold the worker body past a bounded join."""
+
+            def __init__(self, *, target, **kwargs):
+                def deferred_target():
+                    started.set()
+                    release.wait(timeout=2.0)
+                    target()
+
+                super().__init__(target=deferred_target, **kwargs)
+
+            def join(self, timeout=None):
+                if not release.is_set():
+                    return
+                return super().join(timeout=timeout)
+
+        return DeferredThread
+
+    @staticmethod
+    def _switch(provider, cfg, new_manager):
+        new_manager.get_or_create.return_value = MagicMock(messages=[])
+        with patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
+             patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=new_manager), \
+             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
+            provider.on_session_switch("new-session", reset=True)
+
+    def test_sync_worker_that_outlives_switch_is_discarded(self):
+        provider, cfg = self._provider_and_config()
+        old_manager = provider._manager
+        old_manager.get_or_create.return_value = MagicMock()
+        new_manager = MagicMock()
+        started = threading.Event()
+        release = threading.Event()
+        deferred_thread = self._deferred_thread_type(started, release)
+
+        with patch("plugins.memory.honcho.threading.Thread", deferred_thread):
+            provider.sync_turn("old user", "old assistant")
+        assert started.wait(timeout=1.0)
+
+        self._switch(provider, cfg, new_manager)
+        new_manager.get_or_create.reset_mock()
+        release.set()
+        provider._sync_thread.join(timeout=1.0)
+
+        old_manager.get_or_create.assert_not_called()
+        new_manager.get_or_create.assert_not_called()
+
+    def test_conclusion_worker_that_outlives_switch_is_discarded(self):
+        provider, cfg = self._provider_and_config()
+        old_manager = provider._manager
+        new_manager = MagicMock()
+        started = threading.Event()
+        release = threading.Event()
+        deferred_thread = self._deferred_thread_type(started, release)
+
+        with patch("plugins.memory.honcho.threading.Thread", deferred_thread):
+            provider.on_memory_write("add", "user", "User prefers concise answers")
+        assert started.wait(timeout=1.0)
+        write_threads = list(provider._write_threads)
+        assert len(write_threads) == 1
+
+        self._switch(provider, cfg, new_manager)
+        release.set()
+        write_threads[0].join(timeout=1.0)
+
+        old_manager.create_conclusion.assert_not_called()
+        new_manager.create_conclusion.assert_not_called()
+
+class TestSessionSwitchIdentityAndRaceRecovery:
+    """Gateway identity must survive a session switch; a stale init must not
+    mark the provider ready after a switch bumped the session generation."""
+
+    @staticmethod
+    def _patches(provider, cfg, mock_manager):
+        from unittest.mock import patch, MagicMock
+
+        return [
+            patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg),
+            patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()),
+            patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager),
+            patch("hermes_constants.get_hermes_home", return_value=MagicMock()),
+        ]
+
+    def test_identity_preserved_across_session_switch(self):
+        from contextlib import ExitStack
+        from unittest.mock import MagicMock
+        from plugins.memory.honcho import HonchoMemoryProvider
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="k", enabled=True, recall_mode="tools",
+            init_on_session_start=True, peer_name=None,
+        )
+        provider = HonchoMemoryProvider()
+        mock_manager = MagicMock()
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_manager.get_or_create.return_value = mock_session
+
+        from unittest.mock import patch
+        with ExitStack() as stack:
+            mgr_cls = stack.enter_context(
+                patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager)
+            )
+            stack.enter_context(patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg))
+            stack.enter_context(patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()))
+            stack.enter_context(patch("hermes_constants.get_hermes_home", return_value=MagicMock()))
+
+            provider.initialize(session_id="s1", user_id="8439114563", user_id_alt="alt-id")
+            assert mgr_cls.call_args.kwargs["runtime_user_peer_name"] == "8439114563"
+
+            # Real switch callers pass only sparse kwargs (no identity).
+            provider.on_session_switch("s2", reset=True, reason="new")
+            assert mgr_cls.call_args.kwargs["runtime_user_peer_name"] == "8439114563"
+            assert mgr_cls.call_args.kwargs["runtime_user_peer_name_alt"] == "alt-id"
+
+    def test_stale_init_does_not_mark_ready_after_generation_bump(self):
+        from unittest.mock import patch, MagicMock
+        from plugins.memory.honcho import HonchoMemoryProvider
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="k", enabled=True, recall_mode="tools",
+            init_on_session_start=False, peer_name=None,
+        )
+        provider = HonchoMemoryProvider()
+        provider._recall_mode = "tools"
+
+        mock_manager = MagicMock()
+        mock_session = MagicMock()
+        mock_session.messages = []
+
+        def _bump(_key):
+            # Simulate a session switch landing mid-init.
+            provider._session_generation += 1
+            return mock_session
+
+        mock_manager.get_or_create.side_effect = _bump
+
+        with patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
+             patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager), \
+             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
+            provider._do_session_init(cfg, "old-session", user_id="u1")
+
+        # A superseded init must not mark the provider ready.
+        assert provider._session_initialized is False

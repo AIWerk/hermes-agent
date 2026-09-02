@@ -313,7 +313,11 @@ def detect_audio_environment() -> dict:
     # (issue #21203).  Only block when no forwarding is configured.
     from hermes_constants import is_container
     if is_container():
-        if has_forwarded_audio:
+        if termux_capture:
+            notices.append(
+                "Container detection present, but Termux:API microphone capture is available"
+            )
+        elif has_forwarded_audio:
             notices.append("Running inside container (Docker/Podman/LXC) with host audio forwarding")
         else:
             warnings.append(

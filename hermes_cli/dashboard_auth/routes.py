@@ -47,10 +47,25 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.identity import (
+    greeting_identity_from_session,
+    is_complete_authenticated_identity,
+)
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _assistant_mode_request(request: Request) -> bool:
+    app = getattr(request, "app", None)
+    state = getattr(app, "state", None)
+    return getattr(state, "dashboard_mode", "admin") == "assistant"
+
+
+def _require_assistant_identity(request: Request, session: object) -> None:
+    if _assistant_mode_request(request) and not is_complete_authenticated_identity(session):
+        raise HTTPException(status_code=403, detail="Complete authenticated identity required")
 
 
 def _redirect_uri(request: Request) -> str:
@@ -916,6 +931,7 @@ async def api_auth_me(request: Request):
     sess = getattr(request.state, "session", None)
     if sess is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _require_assistant_identity(request, sess)
     tenant_id = getattr(sess, "tenant_id", "") or sess.org_id
     actor_id = getattr(sess, "actor_id", "") or sess.user_id
     role = getattr(sess, "role", "") or "user"
@@ -930,6 +946,7 @@ async def api_auth_me(request: Request):
             "tenant_id": tenant_id,
             "actor_id": actor_id,
             "role": role,
+            "greeting": greeting_identity_from_session(sess),
         },
         headers={"Cache-Control": "private, no-store"},
     )
@@ -957,6 +974,7 @@ async def api_auth_ws_ticket(request: Request):
     if sess is None:
         # Middleware should already have rejected, but check defensively.
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _require_assistant_identity(request, sess)
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.

@@ -189,6 +189,16 @@ def _is_remote_env_backend(backend: str) -> bool:
     except Exception:
         return False
 _secret_capture_callback = None
+_callback_tls = threading.local()
+
+
+def _get_secret_capture_callback():
+    callback = getattr(_callback_tls, "secret_capture", None)
+    if callback is not None:
+        return callback
+    # Compatibility for existing local callers/tests that still patch the old
+    # module slot directly. Production registration uses the thread-local setter.
+    return _secret_capture_callback
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -260,8 +270,8 @@ _INJECTION_PATTERNS: list = [
 
 
 def set_secret_capture_callback(callback) -> None:
-    global _secret_capture_callback
-    _secret_capture_callback = callback
+    """Register secret capture for only the current gateway turn thread."""
+    _callback_tls.secret_capture = callback
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -445,7 +455,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    secret_capture_callback = _get_secret_capture_callback()
+    if secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -463,7 +474,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
@@ -786,11 +797,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
+                from agent.skill_utils import skill_visibility_from_frontmatter
+
                 seen_names.add(name)
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "visibility": skill_visibility_from_frontmatter(frontmatter),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -846,9 +860,22 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                     continue
                 if _is_skill_disabled(plugin_skill["name"]):
                     continue
+                from agent.skill_utils import skill_visibility_from_frontmatter
+
+                plugin_skill["visibility"] = skill_visibility_from_frontmatter(frontmatter)
                 all_skills.append(plugin_skill)
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
+
+        from agent.skill_utils import skill_visible_for_current_actor
+
+        all_skills = [
+            skill
+            for skill in all_skills
+            if skill_visible_for_current_actor(skill.get("visibility"))
+        ]
+        for skill in all_skills:
+            skill.pop("visibility", None)
 
         if not all_skills:
             return json.dumps(
@@ -933,6 +960,19 @@ def _serve_plugin_skill(
         parsed_frontmatter, _ = _parse_frontmatter(content)
     except Exception:
         pass
+
+    from agent.skill_utils import (
+        skill_visibility_from_frontmatter,
+        skill_visible_for_current_actor,
+    )
+
+    if not skill_visible_for_current_actor(
+        skill_visibility_from_frontmatter(parsed_frontmatter)
+    ):
+        return json.dumps(
+            {"success": False, "error": "Skill is not available to the current actor."},
+            ensure_ascii=False,
+        )
 
     qualified_name = f"{namespace}:{bare}"
     if _is_skill_disabled(qualified_name):
@@ -1489,6 +1529,22 @@ def skill_view(
             parsed_frontmatter, _ = _parse_frontmatter(content)
         except Exception:
             parsed_frontmatter = {}
+
+        from agent.skill_utils import (
+            skill_visibility_from_frontmatter,
+            skill_visible_for_current_actor,
+        )
+
+        if not skill_visible_for_current_actor(
+            skill_visibility_from_frontmatter(parsed_frontmatter)
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Skill is not available to the current actor.",
+                },
+                ensure_ascii=False,
+            )
 
         if not skill_matches_platform(parsed_frontmatter):
             return json.dumps(

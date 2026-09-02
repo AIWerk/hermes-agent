@@ -89,7 +89,14 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import (
+    _preserve_file_owner,
+    _restore_file_owner,
+    atomic_replace,
+    atomic_yaml_write,
+    env_float,
+    is_truthy_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1003,6 +1010,10 @@ class AuthError(RuntimeError):
         self.relogin_required = relogin_required
 
 
+class AuthStoreReadError(AuthError, OSError):
+    """Unreadable auth store preserving both auth and OS-error contracts."""
+
+
 def is_rate_limited_auth_error(error: Exception) -> bool:
     """True when an :class:`AuthError` represents upstream rate-limiting / quota
     exhaustion rather than missing or invalid credentials.
@@ -1352,6 +1363,11 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
     try:
         raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
+    except PermissionError as exc:
+        raise AuthStoreReadError(
+            f"Auth store is unreadable: {auth_file} ({exc}). "
+            "Check file ownership/permissions; refusing to treat this as logged out."
+        ) from exc
     except OSError:
         # The file exists (checked above) but could not be READ: EMFILE under
         # fd exhaustion, EACCES, EIO, a stalled network mount. None of those
@@ -1431,6 +1447,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    original_owner = _preserve_file_owner(auth_file)
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
         # the TOCTOU window where default umask (often 0o644) briefly exposed
@@ -1446,6 +1463,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             handle.flush()
             os.fsync(handle.fileno())
         atomic_replace(tmp_path, auth_file)
+        _restore_file_owner(auth_file, original_owner)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:

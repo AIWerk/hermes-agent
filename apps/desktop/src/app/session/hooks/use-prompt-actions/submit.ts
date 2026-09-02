@@ -97,6 +97,15 @@ const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
   setMessages
 }
 
+interface PromptSubmitResult {
+  auto_reset?: boolean
+  auto_reset_reason?: string
+  previous_session_key?: string
+  session_key?: string
+  status?: string
+  stored_session_id?: string
+}
+
 /** The prompt submit pipeline, extracted from usePromptActions. */
 export function useSubmitPrompt(deps: SubmitPromptDeps) {
   const {
@@ -758,16 +767,22 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // other session-scoped RPC (attach, /compress, rewind, interrupt) goes
         // through the same helper so one policy covers the whole bug class.
         let submitErr: unknown = null
+        let submitResult: PromptSubmitResult | null = null
+        let effectiveSessionId = sessionId
 
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
-          await withSessionNotFoundResume(
+          const submit = await withSessionNotFoundResume<PromptSubmitResult>(
             sessionId,
             recoverStoredSessionId,
             liveId =>
               withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestGateway<PromptSubmitResult>(
+                  'prompt.submit',
+                  submitParams(liveId),
+                  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                )
               ),
             {
               requestGateway,
@@ -786,6 +801,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
+          submitResult = submit.result
+          effectiveSessionId = submit.sessionId
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
@@ -798,6 +815,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         if (submitErr !== null) {
           throw submitErr
+        }
+
+        const rotatedStoredSessionId = submitResult?.stored_session_id || submitResult?.session_key || null
+
+        if (submitResult?.auto_reset && rotatedStoredSessionId) {
+          updateSessionState(
+            effectiveSessionId,
+            state => ({ ...state, storedSessionId: rotatedStoredSessionId }),
+            rotatedStoredSessionId
+          )
         }
 
         if (usingComposerAttachments) {

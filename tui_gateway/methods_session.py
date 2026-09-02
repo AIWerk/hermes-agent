@@ -176,6 +176,7 @@ def _(rid, params: dict) -> dict:
             # that goes stale whenever a new platform is added or a user names
             # their own source.
             deny = frozenset({"kanban", "tool"})
+            cui_actor = current_cui_actor_context()
 
             # ``title``: EXACT-title registry lookup, not a listing. The core
             # UNIQUE title index means at most one session per db carries a
@@ -212,13 +213,18 @@ def _(rid, params: dict) -> dict:
                     not row
                     or row.get("archived")
                     or (row.get("source") or "").strip().lower() in deny
+                    or not _row_visible_to_cui_actor(row, cui_actor)
                 ):
                     return _ok(rid, {"sessions": []})
                 try:
                     tip = db.resolve_resume_session_id(row["id"]) or row["id"]
                 except Exception:
                     tip = row["id"]
-                tip_row = (db.get_session(tip) or row) if tip != row["id"] else row
+                tip_row = (
+                    _visible_persisted_session_row(db, tip, cui_actor) or row
+                    if tip != row["id"]
+                    else row
+                )
                 return _ok(
                     rid,
                     {
@@ -236,27 +242,28 @@ def _(rid, params: dict) -> dict:
                     },
                 )
 
-            limit = int(params.get("limit", 200) or 200)
-            # ``include_hidden``: surfaces that OWN hidden sessions (the Bots
-            # pane's per-profile browser, plugin session pickers) need to list
-            # them; the flag stays off for the resume picker and every other
-            # global caller so `hidden` keeps meaning "not in shared lists".
+            limit = max(0, int(params.get("limit", 200) or 200))
+            visible_offset = max(0, int(params.get("offset", 0) or 0))
             include_hidden = is_truthy_value(params.get("include_hidden", False))
-            # Over-fetch modestly so per-source filtering doesn't leave us
-            # short; the compression-tip projection in ``list_sessions_rich``
-            # can also merge rows.
-            fetch_limit = max(limit * 2, 200)
-            rows = [
-                s
-                for s in db.list_sessions_rich(
-                    source=None,
-                    limit=fetch_limit,
-                    order_by_last_active=True,
-                    compact_rows=True,
-                    include_hidden=include_hidden,
-                )
-                if (s.get("source") or "").strip().lower() not in deny
-            ][:limit]
+            rows = []
+            total = 0
+            for row in _iter_visible_persisted_session_rows(
+                db,
+                cui_actor,
+                deny_sources=deny,
+                include_hidden=include_hidden,
+            ):
+                if visible_offset <= total < visible_offset + limit:
+                    rows.append(row)
+                total += 1
+            try:
+                storage_health = db.fts_health_state()
+            except Exception:
+                storage_health = {
+                    "repair_required": False,
+                    "severity": "unknown",
+                    "repair_command": None,
+                }
             return _ok(
                 rid,
                 {
@@ -270,7 +277,9 @@ def _(rid, params: dict) -> dict:
                             "source": s.get("source") or "",
                         }
                         for s in rows
-                    ]
+                    ],
+                    "total": total,
+                    "storage_health": storage_health,
                 },
             )
         except Exception as e:
@@ -300,17 +309,10 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"session_id": None})
         try:
             deny = frozenset({"kanban", "tool"})
-            # Over-fetch by a generous bounded amount so heavy sub-agent
-            # users (lots of recent ``tool`` rows) don't get a false
-            # "no eligible session" answer.  ``session.list`` uses a
-            # similar over-fetch strategy.
-            rows = db.list_sessions_rich(
-                source=None, limit=200, order_by_last_active=True, compact_rows=True
-            )
-            for row in rows:
-                src = (row.get("source") or "").strip().lower()
-                if src in deny:
-                    continue
+            cui_actor = current_cui_actor_context()
+            for row in _iter_visible_persisted_session_rows(
+                db, cui_actor, deny_sources=deny
+            ):
                 return _ok(
                     rid,
                     {
@@ -3544,6 +3546,150 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"spawn_tree.load failed: {exc}")
 
     return _ok(rid, payload)
+
+
+@method("session.side.back")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = params.get("session_id", "")
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+    wait_err = _wait_agent(session, rid)
+    if wait_err:
+        return wait_err
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    source = _side_source()
+    current_session_id = session.get("session_key") or sid
+    try:
+        entry = db.pop_side_session(
+            source=source,
+            side_session_id=current_session_id,
+        )
+        if not entry:
+            return _ok(rid, {"mode": "main", "returned": False})
+        parent_session_id = entry["parent_session_id"]
+        side_session_id = entry["side_session_id"]
+        _commit_gateway_session_boundary(session, current_session_id)
+        db.end_session(side_session_id, "side_session_returned")
+        db.reopen_session(parent_session_id)
+        restored = db.get_messages_as_conversation(parent_session_id)
+        restored = [
+            {key: value for key, value in message.items() if key != "timestamp"}
+            for message in (restored or [])
+            if message.get("role") != "session_meta"
+        ]
+        info = _switch_live_session(
+            sid,
+            session,
+            parent_session_id,
+            restored,
+            reason="back",
+        )
+        return _ok(
+            rid,
+            {
+                "mode": "main",
+                "returned": True,
+                "parent_session_id": parent_session_id,
+                "side_session_id": side_session_id,
+                "message_count": len(restored),
+                "messages": _history_to_messages(restored),
+                "info": info,
+            },
+        )
+    except Exception as exc:
+        return _err(rid, 5006, f"side session return failed: {exc}")
+
+
+@method("session.side.start")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    sid = params.get("session_id", "")
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+    wait_err = _wait_agent(session, rid)
+    if wait_err:
+        return wait_err
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    parent_session_id = session.get("session_key") or sid
+    side_session_id = _new_session_key()
+    source = _side_source()
+    raw_title = str(params.get("title") or "").strip()
+    title = None
+    try:
+        if raw_title:
+            from hermes_state import SessionDB
+
+            title = SessionDB.sanitize_title(raw_title)
+        agent = session.get("agent")
+        _commit_gateway_session_boundary(session, parent_session_id)
+        if not db.get_session(parent_session_id):
+            db.create_session(
+                session_id=parent_session_id,
+                source=source,
+                model=(
+                    getattr(agent, "model", _resolve_model())
+                    if agent
+                    else _resolve_model()
+                ),
+            )
+        db.end_session(parent_session_id, "side_session")
+        model_config = None
+        if agent:
+            model_config = {
+                "max_iterations": getattr(agent, "max_iterations", None),
+                "reasoning_config": getattr(agent, "reasoning_config", None),
+            }
+        db.create_session(
+            session_id=side_session_id,
+            source=source,
+            model=(
+                getattr(agent, "model", _resolve_model())
+                if agent
+                else _resolve_model()
+            ),
+            model_config=model_config,
+            parent_session_id=parent_session_id,
+        )
+        if title:
+            db.set_session_title(side_session_id, title)
+        db.push_side_session(
+            source=source,
+            parent_session_id=parent_session_id,
+            side_session_id=side_session_id,
+            title=title,
+        )
+        info = _switch_live_session(
+            sid,
+            session,
+            side_session_id,
+            [],
+            reason="side",
+        )
+        return _ok(
+            rid,
+            {
+                "mode": "side",
+                "parent_session_id": parent_session_id,
+                "side_session_id": side_session_id,
+                "title": title or "",
+                "info": info,
+            },
+        )
+    except ValueError as exc:
+        return _err(rid, 4007, str(exc))
+    except Exception as exc:
+        return _err(rid, 5006, f"side session start failed: {exc}")
 
 
 @method("session.steer")

@@ -664,6 +664,35 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
+        if block_message is None:
+            try:
+                from agent.cui_actor_context import (
+                    cui_admin_memory_block_result,
+                    memory_write_blocked_for_cui_admin,
+                )
+
+                if memory_write_blocked_for_cui_admin(function_name, final_args):
+                    _advance_start_order()
+                    state["blocked"] = True
+                    result = cui_admin_memory_block_result(function_name)
+                    _emit_terminal_post_tool_call(
+                        agent,
+                        function_name=function_name,
+                        function_args=final_args,
+                        result=result,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=tool_call_id,
+                        status="blocked",
+                        error_type="cui_actor_memory_block",
+                        error_message="Non-customer CUI actor cannot write customer memory",
+                        middleware_trace=list(state["middleware_trace"]),
+                    )
+                    return result
+            except ImportError:
+                # The guard module is part of the base runtime; an import failure
+                # is handled by normal tool policy compatibility for non-CUI paths.
+                pass
+
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
@@ -1008,7 +1037,7 @@ def _begin_tool_execution(
     """Run user-visible and checkpoint preflight on final tool arguments."""
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         display_args = (
-            _redact_tool_args_for_display(function_name, function_args) or function_args
+            _redact_tool_args_for_display(function_name, function_args)
         )
         args_str = json.dumps(display_args, ensure_ascii=False)
         prefix = f"Tool {display_index}" if display_index is not None else "Tool"
@@ -1881,7 +1910,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         if not blocked and agent.tool_complete_callback:
             try:
-                display_args = _redact_tool_args_for_display(name, args) or args
+                display_args = _redact_tool_args_for_display(name, args)
                 agent.tool_complete_callback(
                     tool_call_id, name, display_args, display_function_result,
                 )
@@ -2425,7 +2454,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
                 emoji = _get_tool_emoji(function_name)
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+                display_args = _redact_tool_args_for_display(function_name, function_args)
                 preview = _build_tool_label(function_name, display_args) or function_name
                 spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=agent._print_fn)
                 spinner.start()
@@ -2461,7 +2490,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
                 emoji = _get_tool_emoji(function_name)
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+                display_args = _redact_tool_args_for_display(function_name, function_args)
                 preview = _build_tool_label(function_name, display_args) or function_name
                 spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=agent._print_fn)
                 spinner.start()
@@ -2495,7 +2524,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
                 emoji = _get_tool_emoji(function_name)
-                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+                display_args = _redact_tool_args_for_display(function_name, function_args)
                 preview = _build_tool_label(function_name, display_args) or function_name
                 spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=agent._print_fn)
                 spinner.start()

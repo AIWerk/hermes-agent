@@ -360,6 +360,27 @@ class TestRateLimit:
 
 
 class TestLoginPageRender:
+    def test_aiwerk_german_branding(self):
+        clear_providers()
+        register_provider(PasswordProvider())
+        try:
+            html = render_login_html()
+            assert '<html lang="de">' in html
+            assert "<title>Anmelden — AIWerk</title>" in html
+            assert "AIWerk" in html
+            assert "Melde dich an" in html
+            assert "Nous Research" not in html
+        finally:
+            clear_providers()
+
+    def test_aiwerk_german_fail_closed_unavailable_surface(self):
+        clear_providers()
+        html = render_login_html()
+        assert '<html lang="de">' in html
+        assert "<title>Anmeldung nicht verfügbar — AIWerk</title>" in html
+        assert "Bitte AIWerk Support kontaktieren" in html
+        assert "Der Zugriff bleibt bis zur Korrektur geschlossen" in html
+
     def test_password_provider_renders_credential_form_and_script(self):
         clear_providers()
         register_provider(PasswordProvider())

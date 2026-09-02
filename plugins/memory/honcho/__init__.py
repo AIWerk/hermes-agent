@@ -267,6 +267,14 @@ ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCH
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
+_HONCHO_IDENTITY_KEYS = (
+    "user_id",
+    "user_id_alt",
+    "gateway_session_key",
+    "session_title",
+)
+
+
 class HonchoMemoryProvider(MemoryProvider):
     """Honcho AI-native memory with dialectic Q&A and persistent user modeling."""
 
@@ -287,11 +295,15 @@ class HonchoMemoryProvider(MemoryProvider):
         self._manager = None   # HonchoSessionManager
         self._config = None    # HonchoClientConfig
         self._session_key = ""
+        self._session_generation = 0
         self._query_rewriter = query_rewriter
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
+        self._write_threads: set[threading.Thread] = set()
+        self._write_threads_lock = threading.Lock()
+        self._identity_kwargs: Dict[str, Any] = {}
 
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
 
@@ -418,6 +430,11 @@ class HonchoMemoryProvider(MemoryProvider):
 
             self._lazy_init_kwargs = dict(kwargs)
             self._lazy_init_session_id = session_id
+            self._identity_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in _HONCHO_IDENTITY_KEYS
+            }
             self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
 
             # Network-backed session creation can block on Honcho service or DB
@@ -513,8 +530,9 @@ class HonchoMemoryProvider(MemoryProvider):
         from plugins.memory.honcho.client import get_honcho_client
         from plugins.memory.honcho.session import HonchoSessionManager
 
+        generation = self._session_generation
         client = get_honcho_client(cfg)
-        self._manager = HonchoSessionManager(
+        manager = HonchoSessionManager(
             honcho=client,
             config=cfg,
             context_tokens=cfg.context_tokens,
@@ -522,15 +540,19 @@ class HonchoMemoryProvider(MemoryProvider):
             runtime_user_peer_name_alt=kwargs.get("user_id_alt") or None,
         )
 
-        self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
-        logger.debug("Honcho session key resolved: %s", self._session_key)
+        session_key = self._resolve_session_key(cfg, session_id, **kwargs)
+        logger.debug("Honcho session key resolved: %s", session_key)
+        if generation != self._session_generation:
+            return
+        self._manager = manager
+        self._session_key = session_key
 
         # Create the remote session before running startup-only migration and
         # prewarm work. Do not mark the provider ready until this method's
         # synchronous setup has finished; background startup sets _manager before
         # get_or_create()/migration/prewarm are complete, and lifecycle hooks must
         # not treat that partially initialized state as usable.
-        session = self._manager.get_or_create(self._session_key)
+        session = manager.get_or_create(session_key)
 
         # Skip under per-session strategy: every Hermes run creates a fresh
         # Honcho session by design, so uploading MEMORY.md/USER.md/SOUL.md to
@@ -540,19 +562,26 @@ class HonchoMemoryProvider(MemoryProvider):
             if not session.messages and cfg.session_strategy != "per-session":
                 from hermes_constants import get_hermes_home
                 mem_dir = str(get_hermes_home() / "memories")
-                self._manager.migrate_memory_files(self._session_key, mem_dir)
-                logger.debug("Honcho memory file migration attempted for new session: %s", self._session_key)
+                manager.migrate_memory_files(session_key, mem_dir)
+                logger.debug(
+                    "Honcho memory file migration attempted for new session: %s",
+                    session_key,
+                )
             elif cfg.session_strategy == "per-session":
                 logger.debug(
                     "Honcho memory file migration skipped: per-session strategy creates a fresh session per run (%s)",
-                    self._session_key,
+                    session_key,
                 )
         except Exception as e:
             logger.debug("Honcho memory file migration skipped: %s", e)
 
         # Query-aware base retrieval starts with the first substantive message.
         # Generic dialectic prewarm is incompatible with latest-message rewriting.
-        if self._recall_mode in {"context", "hybrid"}:
+        include_dialectic = self._injection_flag("includeDialectic", False)
+        if (
+            self._recall_mode in {"context", "hybrid"}
+            and include_dialectic
+        ):
             if self._query_rewriter is None or not self._query_rewrite_enabled:
                 _prewarm_query = (
                     "Summarize what you know about this user. "
@@ -569,6 +598,8 @@ class HonchoMemoryProvider(MemoryProvider):
                         self._note_dialectic_failure(exc)
                         return
                     if r and r.strip():
+                        if generation != self._session_generation:
+                            return
                         with self._prefetch_lock:
                             self._prefetch_result = r
                             self._prefetch_result_fired_at = 0
@@ -590,7 +621,8 @@ class HonchoMemoryProvider(MemoryProvider):
                     "Honcho generic dialectic prewarm skipped: awaiting first user message"
                 )
 
-        self._session_initialized = True
+        if generation == self._session_generation:
+            self._session_initialized = True
 
     def _ensure_session(self) -> bool:
         """Lazily initialize the Honcho session (for tools-only mode).
@@ -631,6 +663,30 @@ class HonchoMemoryProvider(MemoryProvider):
             logger.warning("Honcho lazy session init failed: %s", e)
             return False
 
+    def _injection_flag(self, name: str, default: bool) -> bool:
+        """Return a context-injection flag with per-host overrides."""
+        try:
+            raw = (self._config.raw or {}) if self._config else {}
+            root_candidate = raw.get("injection")
+            root_injection = root_candidate if isinstance(root_candidate, dict) else {}
+            hosts = raw.get("hosts") or {}
+            host_block = (
+                hosts.get(getattr(self._config, "host", ""), {})
+                if isinstance(hosts, dict) and self._config
+                else {}
+            )
+            host_candidate = (
+                host_block.get("injection") if isinstance(host_block, dict) else None
+            )
+            host_injection = host_candidate if isinstance(host_candidate, dict) else {}
+            if name in host_injection:
+                return bool(host_injection[name])
+            if name in root_injection:
+                return bool(root_injection[name])
+        except Exception:
+            pass
+        return default
+
     def _record_init_auth_failure(self, exc: BaseException) -> None:
         """Keep the auth detail so the one-time notice survives the manager discard."""
         self._init_auth_failure = str(exc)
@@ -661,23 +717,23 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Session summary — session-scoped context, placed first for relevance
         summary = ctx.get("summary", "")
-        if summary:
+        if summary and self._injection_flag("includeSummary", False):
             parts.append(f"## Session Summary\n{summary}")
 
         rep = ctx.get("representation", "")
-        if rep:
+        if rep and self._injection_flag("includeUserRepresentation", False):
             parts.append(f"## User Representation\n{rep}")
 
         card = ctx.get("card", "")
-        if card:
+        if card and self._injection_flag("includeUserCard", True):
             parts.append(f"## User Peer Card\n{card}")
 
         ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
+        if ai_rep and self._injection_flag("includeAiRepresentation", False):
             parts.append(f"## AI Self-Representation\n{ai_rep}")
 
         ai_card = ctx.get("ai_card", "")
-        if ai_card:
+        if ai_card and self._injection_flag("includeAiCard", True):
             parts.append(f"## AI Identity Card\n{ai_card}")
 
         if not parts:
@@ -1020,6 +1076,7 @@ class HonchoMemoryProvider(MemoryProvider):
         # Cadence advances only on a non-empty result so empty returns
         # (transient API error, sparse representation) retry next turn.
         _fired_at = self._turn_count
+        _generation = self._session_generation
 
         def _run():
             try:
@@ -1029,6 +1086,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._note_dialectic_failure(e)
                 return
             if result and result.strip():
+                if _generation != self._session_generation:
+                    return
                 with self._prefetch_lock:
                     self._prefetch_result = result
                     self._prefetch_result_fired_at = _fired_at
@@ -1094,6 +1153,28 @@ class HonchoMemoryProvider(MemoryProvider):
             )
             return False
         return True
+
+    def _join_thread_for_shutdown(
+        self,
+        thread: Optional[threading.Thread],
+        *,
+        timeout: float,
+        label: str,
+    ) -> None:
+        """Give Honcho background work a bounded chance to finish."""
+        if not thread or not thread.is_alive():
+            return
+        try:
+            thread.join(timeout=timeout)
+        except Exception as exc:
+            logger.debug("Honcho %s shutdown join failed: %s", label, exc)
+            return
+        if thread.is_alive():
+            logger.debug(
+                "Honcho %s thread still running after %.1fs shutdown join",
+                label,
+                timeout,
+            )
 
     def _effective_cadence(self) -> int:
         """Cadence plus empty-streak backoff, capped at _BACKOFF_MAX × base."""
@@ -1310,6 +1391,109 @@ class HonchoMemoryProvider(MemoryProvider):
         """Track turn count for cadence and injection_frequency logic."""
         self._turn_count = turn_number
 
+    def _reset_runtime_context_cache(self) -> None:
+        """Invalidate session-scoped injection state and late worker writes."""
+        self._session_generation += 1
+        with self._base_context_lock:
+            self._base_context_cache = None
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+            self._prefetch_result_fired_at = -999
+        self._prefetch_thread = None
+        self._prefetch_thread_started_at = 0.0
+        self._last_context_turn = -999
+        self._last_dialectic_turn = -999
+        self._dialectic_empty_streak = 0
+        self._turn_count = 0
+
+    def _start_background_write(
+        self, target: Callable[[], None], *, name: str
+    ) -> threading.Thread:
+        """Start and retain a durable-write worker until it exits."""
+        worker: threading.Thread
+
+        def _run() -> None:
+            try:
+                target()
+            finally:
+                with self._write_threads_lock:
+                    self._write_threads.discard(worker)
+
+        worker = spawn_context_thread(_run, daemon=True, name=name)
+        with self._write_threads_lock:
+            self._write_threads.add(worker)
+        worker.start()
+        return worker
+
+    def _drain_background_writes(self, timeout: float) -> None:
+        """Wait up to one shared deadline for in-flight durable writes."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._write_threads_lock:
+            workers = list(self._write_threads)
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        with self._write_threads_lock:
+            self._write_threads = {
+                worker for worker in self._write_threads if worker.is_alive()
+            }
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        **kwargs,
+    ) -> None:
+        """Rotate Honcho runtime state without crossing session boundaries."""
+        if self._cron_skipped or not new_session_id:
+            return
+
+        self._drain_background_writes(timeout=5.0)
+        if self._init_thread and self._init_thread.is_alive():
+            self._init_thread.join(timeout=5.0)
+
+        old_manager = self._manager
+        if old_manager is not None:
+            try:
+                old_manager.flush_all()
+            except Exception as exc:
+                logger.debug("Honcho flush before session switch failed: %s", exc)
+            try:
+                old_manager.shutdown()
+            except Exception as exc:
+                logger.debug("Honcho shutdown during session switch failed: %s", exc)
+
+        self._manager = None
+        self._session_key = ""
+        self._session_initialized = False
+        self._lazy_init_kwargs = None
+        self._lazy_init_session_id = None
+        self._reset_runtime_context_cache()
+        if self._config is None:
+            return
+
+        merged = {**self._identity_kwargs, **kwargs}
+        self._identity_kwargs = {
+            key: value
+            for key, value in merged.items()
+            if key in _HONCHO_IDENTITY_KEYS
+        }
+        if (
+            self._recall_mode == "tools"
+            and not self._config.init_on_session_start
+        ):
+            self._lazy_init_kwargs = merged
+            self._lazy_init_session_id = new_session_id
+            return
+        try:
+            self._do_session_init(self._config, new_session_id, **merged)
+        except Exception as exc:
+            logger.warning("Honcho session switch failed: %s", exc)
+
     @staticmethod
     def _chunk_message(content: str, limit: int) -> list[str]:
         """Split content into chunks that fit within the Honcho message limit.
@@ -1452,9 +1636,15 @@ class HonchoMemoryProvider(MemoryProvider):
         if not clean_user_content and not clean_assistant_content:
             return
 
+        generation = self._session_generation
+        manager = self._manager
+        session_key = self._session_key
+
         def _sync():
             try:
-                session = self._manager.get_or_create(self._session_key)
+                if generation != self._session_generation or manager is None:
+                    return
+                session = manager.get_or_create(session_key)
                 if clean_user_content:
                     for chunk in self._chunk_message(clean_user_content, msg_limit):
                         session.add_message("user", chunk)
@@ -1464,14 +1654,15 @@ class HonchoMemoryProvider(MemoryProvider):
                 # Route through save() so writeFrequency is honored —
                 # _flush_session() directly bypassed "session"/N batching
                 # and flushed every turn regardless of config.
-                self._manager.save(session)
+                manager.save(session)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
-        self._sync_thread = spawn_context_thread(_sync, name="honcho-sync")
-        self._sync_thread.start()
+        self._sync_thread = self._start_background_write(
+            _sync, name="honcho-sync"
+        )
 
     def on_memory_write(
         self,
@@ -1512,28 +1703,51 @@ class HonchoMemoryProvider(MemoryProvider):
             self._start_session_init_background()
             return
 
+        generation = self._session_generation
+        manager = self._manager
+        session_key = self._session_key
+
         def _write():
             try:
-                self._manager.create_conclusion(self._session_key, content)
+                if generation != self._session_generation or manager is None:
+                    return
+                manager.create_conclusion(session_key, content)
             except Exception as e:
                 logger.debug("Honcho memory mirror failed: %s", e)
 
-        self._memwrite_thread = spawn_context_thread(_write, name="honcho-memwrite")
-        self._memwrite_thread.start()
+        self._memwrite_thread = self._start_background_write(
+            _write, name="honcho-memwrite"
+        )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
         if self._cron_skipped:
             return
+        join_timeout = min(
+            10.0,
+            float(
+                self._config.timeout
+                if self._config and self._config.timeout
+                else 8.0
+            ),
+        )
+        self._join_thread_for_shutdown(
+            self._init_thread,
+            timeout=join_timeout,
+            label="session-init",
+        )
+        self._join_thread_for_shutdown(
+            self._prefetch_thread,
+            timeout=min(3.0, join_timeout),
+            label="prefetch",
+        )
         if not getattr(self._config, "save_messages", True):
             return
         if not self._manager:
             return
         if not self._session_initialized and self._init_thread and self._init_thread.is_alive():
             return
-        # Wait for pending sync
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=10.0)
+        self._drain_background_writes(timeout=10.0)
         try:
             self._manager.flush_all()
         except Exception as e:
@@ -1553,6 +1767,13 @@ class HonchoMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         """Handle a Honcho tool call, with lazy session init for tools-only mode."""
         from plugins.memory.honcho.session import HonchoAuthError
+        from agent.cui_actor_context import (
+            cui_admin_memory_block_result,
+            memory_write_blocked_for_cui_admin,
+        )
+
+        if memory_write_blocked_for_cui_admin(tool_name, args):
+            return cui_admin_memory_block_result(tool_name)
 
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")

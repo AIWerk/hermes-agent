@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
@@ -768,6 +768,54 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    def _retry_admitted_correction() -> Optional[Dict[str, Any]]:
+        """Atomically drain a response-boundary correction and retry this turn."""
+        take = getattr(
+            agent, "_take_text_commit_correction_and_close_admission", None
+        )
+        if callable(take):
+            correction = take()
+        else:
+            legacy_take = getattr(
+                agent, "_take_pending_redirect_and_close_response_window", None
+            )
+            correction = legacy_take() if callable(legacy_take) else None
+        if not isinstance(correction, str) or not correction.strip():
+            return None
+        correction = correction.strip()
+
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        _apply_active_turn_redirect(agent, messages, correction)
+        corrected_input = (
+            f"{user_message}\n\nUser correction during the turn: {correction}"
+        )
+        corrected_original = original_user_message
+        if isinstance(corrected_original, str):
+            corrected_original = (
+                f"{corrected_original}\n\n"
+                f"User correction during the turn: {correction}"
+            )
+        agent._persist_session(
+            messages, getattr(agent, "conversation_history", None)
+        )
+        try:
+            agent.clear_interrupt()
+        except Exception:
+            agent._interrupt_requested = False
+            agent._interrupt_message = None
+        reopen = getattr(agent, "_open_turn_correction_admission", None)
+        if callable(reopen):
+            reopen()
+        return run_codex_app_server_turn(
+            agent,
+            user_message=corrected_input,
+            original_user_message=corrected_original,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
+
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -787,6 +835,9 @@ def run_codex_app_server_turn(
             if _user_interrupted
             else None
         )
+        retried = _retry_admitted_correction()
+        if retried is not None:
+            return retried
         if _user_interrupted:
             agent.clear_interrupt()
         return {
@@ -806,6 +857,10 @@ def run_codex_app_server_turn(
             ),
             "error": str(exc),
         }
+
+    retried = _retry_admitted_correction()
+    if retried is not None:
+        return retried
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a

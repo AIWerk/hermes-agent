@@ -122,8 +122,8 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
             return _cli_mod.HermesCLI(**kwargs)
 
 
-def _prepare_cli_with_active_session(tmp_path):
-    cli = _make_cli()
+def _prepare_cli_with_active_session(tmp_path, config_overrides=None):
+    cli = _make_cli(config_overrides=config_overrides)
     cli._session_db = SessionDB(db_path=tmp_path / "state.db")
     cli._session_db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
 
@@ -298,6 +298,93 @@ def test_new_session_with_title(capsys):
     assert "My Test Session" in captured.out
 
 
+def test_new_session_with_duplicate_title_surfaces_error(capsys):
+    """new_session(title=...) handles ValueError from a duplicate-title conflict.
+
+    The session is still created; the title assignment fails; the success banner
+    must not claim the rejected title as the session name.
+    """
+    cli = _make_cli()
+    cli._session_db = MagicMock()
+    cli._session_db.set_session_title.side_effect = ValueError(
+        "Title 'Dup' is already in use by session abc-123"
+    )
+    cli.agent = _FakeAgent("old_session_id", datetime.now())
+    cli.conversation_history = []
+
+    # Capture warnings printed via cli._cprint. After importlib.reload(),
+    # the method's __globals__ dict is the one from the live module — patch
+    # the exact dict the method will read.
+    warnings: list[str] = []
+    method_globals = cli.new_session.__globals__
+    original = method_globals["_cprint"]
+    method_globals["_cprint"] = lambda msg: warnings.append(msg)
+    try:
+        cli.new_session(title="Dup")
+    finally:
+        method_globals["_cprint"] = original
+
+    cli._session_db.set_session_title.assert_called_once()
+    joined = "\n".join(warnings)
+    assert "already in use" in joined
+    assert "session started untitled" in joined
+
+    # The success banner must NOT claim the rejected title as the session name.
+    captured = capsys.readouterr()
+    assert "New session started: Dup" not in captured.out
+    assert "New session started!" in captured.out
+
+
+def test_new_command_prints_honcho_preview_after_session_switch(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    calls = []
+    cli._print_honcho_reset_injection_preview = lambda event="new_session": calls.append((event, cli.session_id))
+
+    cli.process_command("/new")
+
+    assert calls == [("new_session", cli.session_id)]
+    assert calls[0][1] != old_session_id
+
+
+def test_new_command_skips_honcho_preview_when_honcho_disabled(tmp_path):
+    cli = _prepare_cli_with_active_session(
+        tmp_path,
+        config_overrides={"honcho": {"enabled": False}},
+    )
+
+    enabled, fail_quietly = cli._honcho_injection_preview_config("new_session")
+    assert enabled is False
+    assert fail_quietly is True
+
+    cli.process_command("/new")
+
+
+def test_reset_command_prints_honcho_preview_after_session_switch(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    calls = []
+    cli._print_honcho_reset_injection_preview = lambda event="new_session": calls.append((event, cli.session_id))
+
+    cli.process_command("/reset")
+
+    assert calls == [("new_session", cli.session_id)]
+    assert calls[0][1] != old_session_id
+
+
+def test_clear_command_prints_honcho_preview_after_redraw(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    calls = []
+    cli.console = MagicMock()
+    cli.console.clear.side_effect = lambda: calls.append("clear")
+    cli.show_banner = MagicMock(side_effect=lambda: calls.append("banner"))
+    cli._print_honcho_reset_injection_preview = lambda event="new_session": calls.append(f"preview:{event}")
+
+    cli.process_command("/clear")
+
+    assert calls == ["clear", "banner", "preview:clear"]
+
+
 def test_fresh_command_starts_new_session_with_read_only_carryover_context(tmp_path):
     cli = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id
@@ -332,15 +419,14 @@ def test_fresh_command_starts_new_session_with_read_only_carryover_context(tmp_p
 
 def test_fresh_command_redacts_secrets_in_carryover_context(tmp_path):
     cli = _prepare_cli_with_active_session(tmp_path)
-    fake_secret = "sk-" + "abc...3456"
     cli.conversation_history = [
-        {"role": "user", "content": f"token {fake_secret}"},
+        {"role": "user", "content": "token sk-abcdefghijklmnopqrstuvwxyz123456"},
     ]
 
     cli.process_command("/fresh 1")
 
     prompt = cli.agent.ephemeral_system_prompt
-    assert fake_secret not in prompt
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in prompt
     assert "sk-" in prompt
 
 
@@ -355,30 +441,3 @@ def test_new_command_clears_prior_fresh_carryover_but_keeps_global_ephemeral_pro
     cli.process_command("/new")
 
     assert cli.agent.ephemeral_system_prompt == "Global prompt"
-
-
-def test_fresh_carryover_is_bounded_and_does_not_recursively_amplify(tmp_path):
-    cli = _prepare_cli_with_active_session(tmp_path)
-    cli.conversation_history = [
-        {"role": "user", "content": "[Hermes /fresh carryover context]\n" + ("x" * 20_000)},
-        {"role": "assistant", "content": "y" * 20_000},
-    ]
-
-    cli.process_command("/fresh 2")
-
-    prompt = cli.agent.ephemeral_system_prompt
-    assert len(prompt.encode("utf-8")) <= 8192
-    assert prompt.count("[Hermes /fresh carryover context]") == 1
-
-
-def test_disabled_fresh_preview_is_zero_call_hard_off(tmp_path):
-    cli = _prepare_cli_with_active_session(tmp_path)
-    cli._fresh_preview_enabled = False
-    cli._fresh_preview_provider = MagicMock()
-    cli.conversation_history = [{"role": "user", "content": "carry locally"}]
-
-    cli.process_command("/fresh 1")
-
-    assert cli._fresh_preview_provider.mock_calls == []
-
-

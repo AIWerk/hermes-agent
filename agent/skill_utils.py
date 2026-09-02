@@ -6,6 +6,7 @@ tool registration or provider resolution.
 """
 
 import ast
+import hashlib
 import logging
 import os
 import re
@@ -16,6 +17,83 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
 logger = logging.getLogger(__name__)
+
+# ── Actor visibility ------------------------------------------------------
+
+_SKILL_VISIBILITY_KEYS = ("visibility", "cui_visibility", "slash_visibility")
+_CUSTOMER_SKILL_VISIBILITIES = frozenset({"customer", "user", "public", "all"})
+_ADMIN_SKILL_VISIBILITIES = frozenset({"admin", "operator"})
+_FULL_CATALOG_ACTOR_ROLES = frozenset({"admin", "owner", "tenant_admin"})
+
+
+def skill_visibility_from_frontmatter(frontmatter: Any) -> str:
+    """Normalize historical skill offer metadata; unknown values fail internal."""
+    if not isinstance(frontmatter, dict):
+        return "internal"
+
+    value = None
+    for key in _SKILL_VISIBILITY_KEYS:
+        candidate = frontmatter.get(key)
+        if candidate is not None and str(candidate).strip():
+            value = candidate
+            break
+    if value is None:
+        metadata = frontmatter.get("metadata")
+        if isinstance(metadata, dict):
+            for namespace in ("aiwerk", "hermes"):
+                scoped = metadata.get(namespace)
+                if not isinstance(scoped, dict):
+                    continue
+                for key in _SKILL_VISIBILITY_KEYS:
+                    candidate = scoped.get(key)
+                    if candidate is not None and str(candidate).strip():
+                        value = candidate
+                        break
+                if value is not None:
+                    break
+
+    normalized = str(value or "").strip().lower()
+    if normalized in _CUSTOMER_SKILL_VISIBILITIES:
+        return "customer"
+    if normalized in _ADMIN_SKILL_VISIBILITIES:
+        return "admin"
+    return "internal"
+
+
+def _skill_full_catalog_actor(actor: Any) -> bool:
+    """Keep historical catalog roles separate from runtime-mutation authority."""
+    from hermes_cli.dashboard_auth.identity import normalize_role
+
+    return normalize_role((actor or {}).get("role")) in _FULL_CATALOG_ACTOR_ROLES
+
+
+def skill_visible_for_current_actor(visibility: Any) -> bool:
+    """Apply fail-closed skill offering to the bound authenticated actor."""
+    from agent.cui_actor_context import current_bound_cui_actor_context
+    from hermes_cli.dashboard_auth.identity import is_complete_authenticated_identity
+
+    actor = current_bound_cui_actor_context()
+    if not actor:
+        return True
+    if actor.get("_restricted") == "1" or not is_complete_authenticated_identity(actor):
+        return False
+    if _skill_full_catalog_actor(actor):
+        return True
+    return str(visibility or "internal").strip().lower() == "customer"
+
+
+def skill_visibility_scope_for_current_actor() -> str:
+    """Stable cache discriminator matching skill_visible_for_current_actor."""
+    from agent.cui_actor_context import current_bound_cui_actor_context
+    from hermes_cli.dashboard_auth.identity import is_complete_authenticated_identity
+
+    actor = current_bound_cui_actor_context()
+    if not actor:
+        return "local"
+    if actor.get("_restricted") == "1" or not is_complete_authenticated_identity(actor):
+        return "restricted"
+    return "admin" if _skill_full_catalog_actor(actor) else "customer"
+
 
 # ── Platform mapping ──────────────────────────────────────────────────────
 
@@ -391,7 +469,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int, int, bytes], Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -400,7 +478,7 @@ def _raw_config_cache_clear() -> None:
 
 
 def _load_raw_config() -> Dict[str, Any]:
-    """Read config.yaml with a shared mtime+size keyed cache.
+    """Read config.yaml with a shared content-aware cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
     skill prompt/build path. A tiny local cache gives the same repeated-read
@@ -410,8 +488,20 @@ def _load_raw_config() -> Dict[str, Any]:
     if not config_path.exists():
         return {}
     try:
+        raw_config = config_path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.debug("Could not read skill config %s: %s", config_path, e)
+        return {}
+
+    try:
         stat = config_path.stat()
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
+        cache_key = (
+            str(config_path),
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_size,
+            hashlib.blake2b(raw_config.encode("utf-8"), digest_size=16).digest(),
+        )
     except OSError:
         cache_key = None
 
@@ -421,7 +511,7 @@ def _load_raw_config() -> Dict[str, Any]:
             return cached
 
     try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        parsed = yaml_load(raw_config)
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
