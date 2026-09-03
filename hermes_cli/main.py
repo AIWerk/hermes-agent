@@ -6327,6 +6327,12 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     lock is held — so a process that queued behind the builder skips the
     rebuild, and the (os.walk-based) check runs at most once per boot.
     """
+    project_root = web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
+    dist_index = project_root / "hermes_cli" / "web_dist" / "index.html"
+    if (project_root / "qualified-release.json").is_file():
+        # A qualified release is immutable: use its builder-produced UI when
+        # complete, otherwise fail closed instead of repairing it in place.
+        return dist_index.is_file()
     if not (web_dir / "package.json").exists():
         return True
     try:
@@ -6334,10 +6340,12 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     except ImportError:
         # Windows: no flock — fall through to the unserialized build.
         return _do_build_web_ui(web_dir, fatal=fatal)
-    project_root = web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
-    dist_index = project_root / "hermes_cli" / "web_dist" / "index.html"
+    from hermes_constants import get_hermes_home
+
+    lock_path = get_hermes_home() / ".web_ui_build.lock"
     try:
-        lock_file = open(project_root / ".web_ui_build.lock", "a", encoding="utf-8")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a", encoding="utf-8")
     except OSError:
         return _do_build_web_ui(web_dir, fatal=fatal)
     try:

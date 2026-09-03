@@ -1,5 +1,8 @@
 """Tests for the central command registry and autocomplete."""
 
+import ast
+from pathlib import Path
+
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
@@ -59,6 +62,34 @@ class TestCommandRegistry:
     def test_no_duplicate_canonical_names(self):
         names = [cmd.name for cmd in COMMAND_REGISTRY]
         assert len(names) == len(set(names)), f"Duplicate names: {[n for n in names if names.count(n) > 1]}"
+
+    def test_every_non_gateway_command_has_a_cli_dispatch_branch(self):
+        """Registry additions must not silently become accepted no-ops in the CLI."""
+        cli_source = Path(__file__).resolve().parents[2] / "cli.py"
+        tree = ast.parse(cli_source.read_text(encoding="utf-8"))
+        dispatchers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "process_command"
+        ]
+        assert len(dispatchers) == 1
+        dispatched = {
+            comparator.value
+            for node in ast.walk(dispatchers[0])
+            if isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Name)
+            and node.left.id == "canonical"
+            for comparator in node.comparators
+            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str)
+        }
+        expected = {
+            command.name
+            for command in COMMAND_REGISTRY
+            if not command.gateway_only and command.name != "quit"
+        }
+
+        assert expected <= dispatched, f"Missing CLI dispatch branches: {sorted(expected - dispatched)}"
 
     def test_no_alias_collides_with_canonical_name(self):
         """An alias must not shadow another command's canonical name."""

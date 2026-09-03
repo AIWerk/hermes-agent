@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.message_content import flatten_message_text
+from agent.session_notes import format_notes_for_prompt, redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -849,6 +850,16 @@ def _materially_different(old_title: Optional[str], new_title: Optional[str]) ->
         return True
     overlap = len(old_words & new_words) / max(1, min(len(old_words), len(new_words)))
     return overlap < 0.60
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return flatten_message_text(content)
+    return "" if content is None else str(content)
+
 
 def _format_recent_exchange(messages: list[dict[str, Any]], max_messages: int = 10) -> str:
     lines = []

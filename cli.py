@@ -12418,6 +12418,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.undo_last(_undo_n)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "side":
+            self._handle_side_command(cmd_original)
+        elif canonical == "back":
+            self._handle_back_command(cmd_original)
         elif canonical == "worktree":
             self._handle_worktree_command(cmd_original)
         elif canonical == "save":

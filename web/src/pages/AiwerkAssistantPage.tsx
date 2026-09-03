@@ -116,10 +116,6 @@ interface SlashCommandItem {
   category?: string;
 }
 
-interface SlashCommandCatalogResponse {
-  pairs?: Array<[string, string]>;
-  categories?: Array<{ name?: string; pairs?: Array<[string, string]> }>;
-}
 
 type SlashCommandMenuState = { target: ConversationMode; query: string } | null;
 
@@ -391,13 +387,6 @@ function persistentSessionIdFromOpenResult(result: SessionOpenResult): string {
   return result.resumed || result.session_key || result.info?.session_id || result.session_id || "";
 }
 
-function readStoredSessionId(): string {
-  try {
-    return window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY)?.trim() || "";
-  } catch {
-    return "";
-  }
-}
 
 function storeActiveSessionId(sessionId?: string | null): void {
   const value = sessionId?.trim();
@@ -2185,44 +2174,18 @@ export default function AiwerkAssistantPage() {
       try {
         setConnection("connecting");
         await gateway.connect();
-        try {
-          const catalog = await gateway.request<SlashCommandCatalogResponse>("commands.catalog", {}, 15_000);
-          const categoryByCommand = new Map<string, string>();
-          for (const category of catalog.categories ?? []) {
-            const name = category.name || "";
-            for (const pair of category.pairs ?? []) {
-              if (pair[0]) categoryByCommand.set(pair[0], name);
-            }
-          }
-          const deduped = new Map<string, SlashCommandItem>();
-          for (const pair of catalog.pairs ?? []) {
-            const command = String(pair[0] || "").trim();
-            if (!command.startsWith("/")) continue;
-            if (!CUI_SUPPORTED_SLASH_COMMANDS.has(command.toLowerCase())) continue;
-            const rawDescription = String(pair[1] || "").trim();
-            const rawCategory = categoryByCommand.get(command) || "Skills";
-            deduped.set(command.toLowerCase(), {
-              command,
-              description: localizeSlashCommandDescription(command, rawDescription, cuiLocale),
-              category: localizeSlashCategory(rawCategory, cuiLocale),
-            });
-          }
-          setSlashCommands([...deduped.values()].sort((a, b) => a.command.localeCompare(b.command)));
-        } catch {
-          setSlashCommands([]);
-        }
-        const storedSessionId = readStoredSessionId();
-        let result: SessionOpenResult;
-        if (storedSessionId) {
-          try {
-            result = await gateway.request<SessionOpenResult>("session.resume", { session_id: storedSessionId, cols: 100 }, 30_000);
-          } catch {
-            storeActiveSessionId(null);
-            result = await gateway.request<SessionOpenResult>("session.create", { cols: 100 });
-          }
-        } else {
-          result = await gateway.request<SessionOpenResult>("session.create", { cols: 100 });
-        }
+        setSlashCommands(["/stop", "/compress", "/reload-mcp"]
+          .filter((command) => CUI_SUPPORTED_SLASH_COMMANDS.has(command))
+          .map((command) => ({
+            command,
+            description: localizeSlashCommandDescription(command, "", cuiLocale),
+            category: localizeSlashCategory("Session", cuiLocale),
+          })));
+        storeActiveSessionId(null);
+        const result = await gateway.request<SessionOpenResult>("session.create", {
+          source: "web",
+          close_on_disconnect: true,
+        });
         if (!cancelled) {
           reconnectAttemptRef.current = 0;
           setError(null);
@@ -2242,18 +2205,15 @@ export default function AiwerkAssistantPage() {
       try {
         setConnection("connecting");
         await gateway.connect();
-        const storedSessionId = readStoredSessionId() || activeSessionKeyRef.current || sessionIdRef.current || "";
-        if (storedSessionId) {
-          const result = await gateway.request<SessionOpenResult>("session.resume", { session_id: storedSessionId, cols: 100 }, 30_000);
-          if (!cancelled) {
-            reconnectAttemptRef.current = 0;
-            setError(null);
-            await applySessionOpenResult(result, { recovered: true });
-            showToast("Verbindung wiederhergestellt");
-          }
-        } else if (!cancelled) {
+        const result = await gateway.request<SessionOpenResult>("session.create", {
+          source: "web",
+          close_on_disconnect: true,
+        });
+        if (!cancelled) {
           reconnectAttemptRef.current = 0;
           setError(null);
+          await applySessionOpenResult(result, { recovered: true });
+          showToast("Verbindung wiederhergestellt");
         }
       } catch (e) {
         if (!cancelled) {
@@ -2392,7 +2352,10 @@ export default function AiwerkAssistantPage() {
     setIsCompressing(false);
     stopReadAloud();
     try {
-      const result = await gateway.request<SessionOpenResult>("session.create", { cols: 100 }, 30_000);
+      const result = await gateway.request<SessionOpenResult>("session.create", {
+        source: "web",
+        close_on_disconnect: true,
+      }, 30_000);
       const persistentSessionId = persistentSessionIdFromOpenResult(result);
       const nextSessionId = result.session_id;
       const activeId = persistentSessionId || nextSessionId;
@@ -2492,9 +2455,16 @@ export default function AiwerkAssistantPage() {
     setError(null);
     try {
       const uploadFiles = attachments.map((attachment) => attachment.file).filter((file): file is File => Boolean(file));
-      const uploaded = uploadFiles.length > 0
+      const uploaded: AssistantUploadedAttachment[] = uploadFiles.length > 0
         ? (await api.uploadAssistantAttachments(uploadFiles, sessionId)).attachments
         : attachments.map((attachment) => attachment.uploaded).filter((attachment): attachment is AssistantUploadedAttachment => Boolean(attachment));
+      const uploadedRefs = uploaded
+        .map((attachment) => attachment.path?.trim())
+        .filter((path): path is string => Boolean(path))
+        .map((path) => `@file:\`${path}\``);
+      const requestText = uploadedRefs.length > 0
+        ? `${gatewayText}\n\n${uploadedRefs.join("\n")}`
+        : gatewayText;
       if (target === "side") {
         const userMessageId = newId("user");
         activeSideToolAnchorRef.current = userMessageId;
@@ -2508,7 +2478,7 @@ export default function AiwerkAssistantPage() {
         if (fileInputRef.current) fileInputRef.current.value = "";
         setMessages((prev) => [...prev, { id: userMessageId, role: "user", text: submitText, status: "complete", attachments }]);
       }
-      await gateway.request("prompt.submit", { session_id: sessionId, text: gatewayText, attachments: uploaded });
+      await gateway.request("prompt.submit", { session_id: sessionId, text: requestText });
       window.setTimeout(() => void refreshSessionMeta(gateway, sessionId), 800);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -2689,7 +2659,7 @@ export default function AiwerkAssistantPage() {
     if (base === "/stop") {
       if (!gateway || !sessionId) return;
       try {
-        await gateway.request("session.interrupt", { session_id: sessionId }, 15_000);
+        await gateway.request("slash.exec", { session_id: sessionId, command: "/stop" }, 15_000);
         setBusy(false);
         setError(null);
         showToast("Laufende Antwort gestoppt");

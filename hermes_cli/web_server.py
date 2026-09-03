@@ -600,18 +600,47 @@ _ASSISTANT_ALLOWED_RPC_METHODS = frozenset(
     {
         "gateway.ping",
         "session.create",
+        "session.resume",
+        "session.title",
+        "session.notes",
+        "session.usage",
+        "session.interrupt",
+        "session.steer",
+        "session.side.start",
+        "session.side.back",
         "prompt.submit",
+        "prompt.learn",
         "approval.respond",
+        "config.get",
+        "config.set",
+        "commands.catalog",
         "slash.exec",
     }
 )
-_ASSISTANT_ALLOWED_RPC_PARAMS: dict[str, frozenset[str]] = {
-    "gateway.ping": frozenset(),
-    "session.create": frozenset({"source", "close_on_disconnect"}),
-    "prompt.submit": frozenset({"session_id", "text"}),
-    "approval.respond": frozenset({"session_id", "request_id", "choice"}),
-    "slash.exec": frozenset({"session_id", "command"}),
+_ASSISTANT_ALLOWED_RPC_PARAMS: dict[str, frozenset[frozenset[str]]] = {
+    "gateway.ping": frozenset({frozenset()}),
+    "session.create": frozenset({frozenset({"source", "close_on_disconnect"})}),
+    "session.resume": frozenset({frozenset({"session_id", "cols"})}),
+    "session.title": frozenset(
+        {frozenset({"session_id"}), frozenset({"session_id", "title"})}
+    ),
+    "session.notes": frozenset({frozenset({"session_id", "limit"})}),
+    "session.usage": frozenset({frozenset({"session_id"})}),
+    "session.interrupt": frozenset({frozenset({"session_id"})}),
+    "session.steer": frozenset({frozenset({"session_id", "text"})}),
+    "session.side.start": frozenset({frozenset({"session_id"})}),
+    "session.side.back": frozenset({frozenset({"session_id"})}),
+    "prompt.submit": frozenset({frozenset({"session_id", "text"})}),
+    "prompt.learn": frozenset({frozenset({"session_id", "text"})}),
+    "approval.respond": frozenset(
+        {frozenset({"session_id", "request_id", "choice"})}
+    ),
+    "config.get": frozenset({frozenset({"session_id", "key"})}),
+    "config.set": frozenset({frozenset({"session_id", "key", "value"})}),
+    "commands.catalog": frozenset({frozenset()}),
+    "slash.exec": frozenset({frozenset({"session_id", "command"})}),
 }
+_ASSISTANT_ALLOWED_CONFIG_KEYS = frozenset({"busy", "reasoning", "fast", "yolo"})
 _ASSISTANT_ALLOWED_SLASH_COMMANDS = frozenset({"stop", "compress", "reload-mcp"})
 _ASSISTANT_ACTOR_PARAM_KEYS = (
     "_cui_actor_role",
@@ -676,17 +705,17 @@ def _assistant_ws_request_gate(
         return "request params must be an object in assistant mode"
 
     client_keys = set(params).difference(_ASSISTANT_ACTOR_PARAM_KEYS)
-    expected_keys = _ASSISTANT_ALLOWED_RPC_PARAMS[method]
-    if client_keys != expected_keys:
+    expected_key_sets = _ASSISTANT_ALLOWED_RPC_PARAMS[method]
+    if frozenset(client_keys) not in expected_key_sets:
         return f"invalid parameter contract for assistant method: {method}"
 
     if method == "session.create":
         if params.get("source") != "web" or params.get("close_on_disconnect") is not True:
             return "invalid session.create contract in assistant mode"
-    elif method in {"prompt.submit", "slash.exec"}:
+    elif method not in {"gateway.ping", "commands.catalog"}:
         if not isinstance(params.get("session_id"), str) or not params["session_id"].strip():
             return f"session_id required for assistant method: {method}"
-    if method == "prompt.submit":
+    if method in {"prompt.submit", "prompt.learn", "session.steer"}:
         if not isinstance(params.get("text"), str) or not params["text"].strip():
             return "prompt text required in assistant mode"
     elif method == "approval.respond":
@@ -698,6 +727,10 @@ def _assistant_ws_request_gate(
             or params.get("choice") not in {"once", "deny"}
         ):
             return "invalid approval response in assistant mode"
+    elif method in {"config.get", "config.set"}:
+        key = str(params.get("key") or "").strip().lower()
+        if key not in _ASSISTANT_ALLOWED_CONFIG_KEYS:
+            return f"config key not available in assistant mode: {key or '(none)'}"
     elif method == "slash.exec":
         raw = str(params.get("command") or "").strip()
         command = raw.lstrip("/").split(maxsplit=1)[0].lower() if raw else ""
@@ -836,6 +869,10 @@ _ASSISTANT_UPLOAD_EXTENSIONS = frozenset(
         ".webm", ".ogg", ".aac", ".flac", ".mp4", ".mov", ".mkv",
     }
 )
+_ASSISTANT_AUDIO_EXTENSIONS = frozenset(
+    {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
+)
+_ASSISTANT_AUDIO_MAX_BYTES = 25 * 1024 * 1024
 _SHARED_FOLDER_ACTIVE_CONTENT_MEDIA_TYPES = frozenset(
     {
         "text/html", "application/xhtml+xml", "image/svg+xml", "application/xml",

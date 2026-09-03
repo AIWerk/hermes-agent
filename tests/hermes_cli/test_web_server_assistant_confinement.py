@@ -1,7 +1,11 @@
 import asyncio
+from io import BytesIO
+from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException, UploadFile
 
 
 @pytest.fixture
@@ -92,12 +96,207 @@ def test_assistant_ws_gate_allows_exact_customer_contract(
     assert request["params"]["_cui_actor_id"] == "tenant-a:user-1"
 
 
+def test_assistant_frontend_startup_requests_match_ws_gate(
+    web_server, assistant_identity
+) -> None:
+    """Exercise every session-create literal shipped by the customer UI."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "web/src/pages/AiwerkAssistantPage.tsx"
+    ).read_text(encoding="utf-8")
+    assert "commands.catalog" not in source
+    create_literals = re.findall(
+        r'gateway\.request(?:<[^>]+>)?\(\s*"session\.create"\s*,\s*\{([^}]*)\}'
+        r'(?:\s*,\s*[\d_]+)?\s*\)',
+        source,
+        re.DOTALL,
+    )
+    assert len(create_literals) == 3
+    for literal in create_literals:
+        assert set(re.findall(r"([a-z_]+)\s*:", literal)) == {
+            "source",
+            "close_on_disconnect",
+        }
+        request = {
+            "method": "session.create",
+            "params": {
+                "source": re.search(r'source:\s*"([^"]+)"', literal).group(1),
+                "close_on_disconnect": bool(
+                    re.search(r"close_on_disconnect:\s*true", literal)
+                ),
+            },
+        }
+        assert web_server._assistant_ws_request_gate(request, assistant_identity) is None
+
+
+def test_assistant_frontend_stop_uses_allowed_slash_rpc(
+    web_server, assistant_identity
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "web/src/pages/AiwerkAssistantPage.tsx"
+    ).read_text(encoding="utf-8")
+    stop_block = source.split('if (base === "/stop")', 1)[1].split(
+        'if (base === "/compress")', 1
+    )[0]
+    assert 'gateway.request("slash.exec"' in stop_block
+    assert 'command: "/stop"' in stop_block
+    request = {
+        "method": "slash.exec",
+        "params": {"session_id": "sid", "command": "/stop"},
+    }
+    assert web_server._assistant_ws_request_gate(request, assistant_identity) is None
+
+
+def test_assistant_frontend_prompt_submit_matches_ws_gate(
+    web_server, assistant_identity
+) -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "web/src/pages/AiwerkAssistantPage.tsx"
+    ).read_text(encoding="utf-8")
+    call = re.search(
+        r'gateway\.request\(\s*"prompt\.submit"\s*,\s*\{(?P<params>[^}]*)\}\s*\)',
+        source,
+        re.DOTALL,
+    )
+    assert call is not None
+    assert set(re.findall(r"([a-z_]+)\s*:", call.group("params"))) == {
+        "session_id",
+        "text",
+    }
+
+    request = {
+        "method": "prompt.submit",
+        "params": {"session_id": "sid", "text": "hello"},
+    }
+    assert web_server._assistant_ws_request_gate(request, assistant_identity) is None
+
+
+def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
+    web_server, assistant_identity
+) -> None:
+    """Freeze all customer-UI RPC call sites against the server-side gate."""
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "web/src/pages/AiwerkAssistantPage.tsx").read_text(encoding="utf-8")
+    call_pattern = re.compile(
+        r'gateway\.request(?:<[^;()]*?>)?\(\s*"(?P<method>[^"]+)"\s*,',
+        re.MULTILINE,
+    )
+    matches = list(call_pattern.finditer(source))
+    assert len(matches) == 22
+
+    def object_keys_after(start: int) -> set[str]:
+        brace = source.find("{", start)
+        assert brace >= 0
+        depth = 0
+        for index in range(brace, len(source)):
+            depth += source[index] == "{"
+            depth -= source[index] == "}"
+            if depth == 0:
+                return set(
+                    re.findall(
+                        r"(?m)(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
+                        source[brace + 1 : index],
+                    )
+                )
+        raise AssertionError("unterminated frontend RPC params object")
+
+    approval_source = (root / "web/src/lib/cui-approval.ts").read_text(encoding="utf-8")
+    approval_body = approval_source.split("return {", 1)[1].split("};", 1)[0]
+    approval_keys = set(
+        re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", approval_body)
+    )
+    assert approval_keys == {"session_id", "request_id", "choice"}
+
+    values = {
+        "session_id": "sid",
+        "source": "web",
+        "close_on_disconnect": True,
+        "cols": 100,
+        "title": "Customer title",
+        "limit": 12,
+        "text": "hello",
+        "request_id": "req",
+        "choice": "once",
+        "value": "on",
+    }
+    seen_methods: set[str] = set()
+    for match in matches:
+        method = match.group("method")
+        seen_methods.add(method)
+        keys = approval_keys if method == "approval.respond" else object_keys_after(match.end())
+        params = {key: values[key] for key in keys if key not in {"key", "command"}}
+        if "key" in keys:
+            tail = source[match.end() : source.find("}", match.end())]
+            literal = re.search(r'key:\s*"([^"]+)"', tail)
+            params["key"] = literal.group(1) if literal else "busy"
+        if "command" in keys:
+            tail = source[match.end() : source.find("}", match.end())]
+            literal = re.search(r'command:\s*"([^"]+)"', tail)
+            assert literal is not None
+            params["command"] = literal.group(1)
+        request = {"method": method, "params": params}
+        assert web_server._assistant_ws_request_gate(request, assistant_identity) is None, (
+            method,
+            keys,
+        )
+
+    assert seen_methods <= web_server._ASSISTANT_ALLOWED_RPC_METHODS
+    assert web_server._ASSISTANT_ALLOWED_RPC_METHODS == {
+        "gateway.ping",
+        "session.create",
+        "session.resume",
+        "session.title",
+        "session.notes",
+        "session.usage",
+        "session.interrupt",
+        "session.steer",
+        "session.side.start",
+        "session.side.back",
+        "prompt.submit",
+        "prompt.learn",
+        "approval.respond",
+        "config.get",
+        "config.set",
+        "commands.catalog",
+        "slash.exec",
+    }
+
+
+def test_assistant_audio_rejects_unsupported_extension_before_transcription(
+    web_server, monkeypatch
+) -> None:
+    monkeypatch.setattr(web_server, "_require_token", lambda _request: None)
+    upload = UploadFile(filename="voice.exe", file=BytesIO(b"audio"))
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(web_server.transcribe_assistant_audio(SimpleNamespace(), upload))
+
+    assert exc.value.status_code == 415
+
+
+def test_assistant_audio_rejects_oversized_upload_before_transcription(
+    web_server, monkeypatch
+) -> None:
+    monkeypatch.setattr(web_server, "_require_token", lambda _request: None)
+    upload = UploadFile(
+        filename="voice.webm",
+        file=BytesIO(b"x" * (25 * 1024 * 1024 + 1)),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(web_server.transcribe_assistant_audio(SimpleNamespace(), upload))
+
+    assert exc.value.status_code == 413
+
+
 @pytest.mark.parametrize(
     "method,params",
     [
         ("session.resume", {"session_id": "sid"}),
-        ("config.get", {"key": "reasoning"}),
-        ("config.set", {"key": "yolo", "value": True}),
+        ("config.get", {"session_id": "sid", "key": "model"}),
+        ("config.set", {"session_id": "sid", "key": "model", "value": "x"}),
         ("session.events.since", {"session_id": "sid", "last_seen": 0}),
         ("session.create", {"profile": "other"}),
         ("session.create", {"cwd": "/tmp"}),
