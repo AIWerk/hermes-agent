@@ -15,6 +15,7 @@ from agent.title_generator import (
     finalize_session_title,
     maybe_auto_title,
     maybe_retitle_session,
+    retitle_session,
 )
 from hermes_state import SessionDB
 
@@ -30,6 +31,20 @@ def _messages(user_turns=5):
         messages.append({"role": "user", "content": f"User turn {i}: discuss session notes and title drift."})
         messages.append({"role": "assistant", "content": f"Assistant turn {i}: implementation details."})
     return messages
+
+
+def test_retitle_session_formats_real_message_content_without_name_errors(db):
+    db.create_session("s1", "cli")
+    db.set_session_title("s1", "Old title", source="auto_initial", turn_index=1)
+    with patch("agent.title_generator._auto_title_enabled", return_value=True), patch(
+        "agent.title_generator._call_lifecycle_title_llm", return_value="Runtime Recovery"
+    ) as call:
+        assert retitle_session(db, "s1", _messages(1), turn_index=6) is True
+
+    prompt = call.call_args.kwargs["user_prompt"]
+    assert "user: User turn 0" in prompt
+    assert "assistant: Assistant turn 0" in prompt
+    assert db.get_session_title_metadata("s1")["title_source"] == "auto_mid"
 
 
 def test_set_session_title_tracks_source_metadata(db):

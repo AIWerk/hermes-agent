@@ -285,7 +285,7 @@ class TestBuildWebUIRetryAndStaleFallback:
 class TestBuildWebUIFlock:
     """Cross-process build serialization (salvaged from PR #63455).
 
-    One process builds under an exclusive flock on <root>/.web_ui_build.lock;
+    One process builds under an exclusive flock under $HERMES_HOME;
     contenders either serve the existing (possibly stale) dist or, when no
     dist exists yet, block until the builder finishes. The staleness walk
     itself runs inside _do_build_web_ui, i.e. under the lock, so a process
@@ -304,7 +304,8 @@ class TestBuildWebUIFlock:
 
         web_dir, dist_dir = _make_web_dir(tmp_path)
         # No dist yet — contender must take the blocking-wait path.
-        lock_path = tmp_path / ".web_ui_build.lock"
+        lock_path = _web_ui_stamp_path().parent / ".web_ui_build.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         holder = open(lock_path, "a")
         fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
 
@@ -329,6 +330,72 @@ class TestBuildWebUIFlock:
     def test_lock_file_is_gitignored(self):
         gitignore = Path(__file__).resolve().parents[2] / ".gitignore"
         assert ".web_ui_build.lock" in gitignore.read_text(encoding="utf-8")
+
+    def test_qualified_release_with_prebuilt_dist_is_not_modified(self, tmp_path):
+        release = tmp_path / "release"
+        web_dir, dist_dir = _make_web_dir(release)
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        (dist_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+        (release / "qualified-release.json").write_text("{}\n", encoding="utf-8")
+        before = {
+            path.relative_to(release): path.read_bytes()
+            for path in release.rglob("*")
+            if path.is_file()
+        }
+
+        with patch("hermes_cli.main._do_build_web_ui") as build:
+            assert _build_web_ui(web_dir) is True
+
+        build.assert_not_called()
+        after = {
+            path.relative_to(release): path.read_bytes()
+            for path in release.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+
+    def test_qualified_release_without_dist_fails_closed_without_writes(self, tmp_path):
+        release = tmp_path / "release"
+        web_dir, _ = _make_web_dir(release)
+        (release / "qualified-release.json").write_text("{}\n", encoding="utf-8")
+        before = {
+            path.relative_to(release): path.read_bytes()
+            for path in release.rglob("*")
+            if path.is_file()
+        }
+
+        with patch("hermes_cli.main._do_build_web_ui") as build:
+            assert _build_web_ui(web_dir, fatal=True) is False
+
+        build.assert_not_called()
+        after = {
+            path.relative_to(release): path.read_bytes()
+            for path in release.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
+
+    def test_qualified_release_without_package_or_dist_fails_closed(self, tmp_path):
+        release = tmp_path / "release"
+        release.mkdir()
+        (release / "qualified-release.json").write_text("{}\n", encoding="utf-8")
+        web_dir = release / "web"
+        before = {
+            path.relative_to(release): path.read_bytes()
+            for path in release.rglob("*")
+            if path.is_file()
+        }
+
+        with patch("hermes_cli.main._do_build_web_ui") as build:
+            assert _build_web_ui(web_dir, fatal=True) is False
+
+        build.assert_not_called()
+        after = {
+            path.relative_to(release): path.read_bytes()
+            for path in release.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
 
 
 def _link_shims(bin_dir: Path, *names: str) -> None:

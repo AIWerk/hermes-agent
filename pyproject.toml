@@ -491,12 +491,33 @@ preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
 # which silently corrupts any non-ASCII file content.  We had three
 # separate Windows sandbox regressions in one debug session before
 # adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
+select = ["PLW1514", "F821", "F822"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.
-"tests/**" = ["PLW1514"]
+"tests/**" = ["PLW1514", "F821", "F822"]
 # Skills and plugins are partially user-authored — their own conventions.
-"skills/**" = ["PLW1514"]
-"optional-skills/**" = ["PLW1514"]
+"skills/**" = ["PLW1514", "F821", "F822"]
+"optional-skills/**" = ["PLW1514", "F821", "F822"]
 "plugins/**" = ["PLW1514"]
+# These trees are outside the first-party gate's declared scan roots.
+"cron/**" = ["F821", "F822"]
+# These exact paths contain inherited 8bd56009 F821/F822 findings. Keep the
+# first-party gate delta-clean without expanding this corrective product PR;
+# each baseline exception remains explicit rather than hiding a whole tree.
+"agent/agent_init.py" = ["F821"]
+"gateway/platforms/__init__.py" = ["F822"]
+"gateway/platforms/whatsapp_common.py" = ["F821"]
+"gateway/run.py" = ["F821"]
+"hermes_cli/cli_agent_setup_mixin.py" = ["F821"]
+"hermes_cli/web_server.py" = ["F821"]
+"plugins/context_engine/__init__.py" = ["F821"]
+"plugins/google_meet/cli.py" = ["F821"]
+"plugins/memory/holographic/retrieval.py" = ["F821"]
+"plugins/platforms/sms/adapter.py" = ["F821"]
+"plugins/platforms/teams/adapter.py" = ["F821"]
+"plugins/platforms/whatsapp/adapter.py" = ["F821"]
+"tools/patch_parser.py" = ["F821"]
+# HandlerRegistry injects these module globals before dispatch.
+"tui_gateway/methods_*.py" = ["F821", "F822"]
+"tui_gateway/server.py" = ["F821"]
