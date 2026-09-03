@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from agent.i18n import t
+
 # rich and prompt_toolkit are imported lazily (inside the functions that use
 # them) rather than at module level.  Importing this module is on the TUI
 # gateway's critical startup path purely to reach the lightweight update-check
@@ -674,10 +676,13 @@ def format_banner_version_label() -> str:
     ahead = int(state.get("ahead") or 0)
 
     if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
+        return f"{base} · {t('cli.banner.version_upstream', upstream=upstream)}"
 
-    carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    carried_key = "cli.banner.version_carried_one" if ahead == 1 else "cli.banner.version_carried_many"
+    return (
+        f"{base} · {t('cli.banner.version_upstream', upstream=upstream)}"
+        f" · {t('cli.banner.version_local_carried', local=local, carried=t(carried_key, count=ahead))}"
+    )
 
 
 # =========================================================================
@@ -1054,7 +1059,11 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         if len(preset_name) > 28:
             preset_name = preset_name[:25] + "..."
         agg_str = f" [dim {dim}]·[/] [dim {dim}]agg {agg_label}[/]" if agg_label else ""
-        ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
+        ctx_str = (
+            f" [dim {dim}]·[/] [dim {dim}]"
+            f"{t('cli.banner.context_label', tokens=_format_context_length(context_length))}[/]"
+            if context_length else ""
+        )
         left_lines.append(f"[{accent}]MoA: {preset_name}[/]{agg_str}{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
     else:
         if not (model or "").strip() or (model or "").strip().lower() == "unknown":
@@ -1062,8 +1071,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             # slug — this is the single clearest place to tell the user what
             # is wrong and how to fix it.
             left_lines.append(
-                f"[bold red]no model configured[/] "
-                f"[dim {dim}]— run /model or hermes setup[/]"
+                f"[bold red]{t('cli.banner.no_model_configured')}[/] "
+                f"[dim {dim}]— {t('cli.banner.run_model_or_setup')}[/]"
             )
         else:
             model_short = model.split("/")[-1] if "/" in model else model
@@ -1071,17 +1080,24 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
                 model_short = model_short[:-5]
             if len(model_short) > 28:
                 model_short = model_short[:25] + "..."
-            ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
+            ctx_str = (
+                f" [dim {dim}]·[/] [dim {dim}]"
+                f"{t('cli.banner.context_label', tokens=_format_context_length(context_length))}[/]"
+                if context_length else ""
+            )
             left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
 
     if os.getenv("HERMES_YOLO_MODE"):
-        left_lines.append(f"[bold red]⚠ YOLO mode[/] [dim {dim}]— all approval prompts bypassed[/]")
+        left_lines.append(
+            f"[bold red]⚠ {t('cli.banner.yolo_mode')}[/] "
+            f"[dim {dim}]— {t('cli.banner.approvals_bypassed')}[/]"
+        )
     left_lines.append(f"[dim {dim}]{cwd}[/]")
     if session_id:
-        left_lines.append(f"[dim {session_color}]Session: {session_id}[/]")
+        left_lines.append(f"[dim {session_color}]{t('cli.banner.session_label', session_id=session_id)}[/]")
     left_content = "\n".join(left_lines)
 
-    right_lines = [f"[bold {accent}]Available Tools[/]"]
+    right_lines = [f"[bold {accent}]{t('cli.banner.available_tools')}[/]"]
     toolsets_dict: Dict[str, list] = {}
 
     for tool in tools:
@@ -1138,7 +1154,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         right_lines.append(f"[dim {dim}]{toolset}:[/] {tools_str}")
 
     if remaining_toolsets > 0:
-        right_lines.append(f"[dim {dim}](and {remaining_toolsets} more toolsets...)[/]")
+        right_lines.append(f"[dim {dim}]({t('cli.banner.more_toolsets', count=remaining_toolsets)})[/]")
 
     # MCP Servers section (only if configured). Probe cheaply first: the
     # full get_mcp_status() path resolves portable plugin MCP servers,
@@ -1167,13 +1183,13 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     if mcp_status:
         right_lines.append("")
-        right_lines.append(f"[bold {accent}]MCP Servers[/]")
+        right_lines.append(f"[bold {accent}]{t('cli.banner.mcp_servers')}[/]")
         for srv in mcp_status:
             status = srv.get("status")
             if srv["connected"]:
                 right_lines.append(
                     f"[dim {dim}]{srv['name']}[/] [{text}]({srv['transport']})[/] "
-                    f"[dim {dim}]—[/] [{text}]{srv['tools']} tool(s)[/]"
+                    f"[dim {dim}]—[/] [{text}]{t('cli.banner.mcp_tool_count', count=srv['tools'])}[/]"
                 )
             elif srv.get("disabled") or status == "disabled":
                 right_lines.append(
@@ -1193,11 +1209,11 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             else:
                 right_lines.append(
                     f"[red]{srv['name']}[/] [dim]({srv['transport']})[/] "
-                    f"[red]— failed[/]"
+                    f"[red]— {t('cli.banner.failed')}[/]"
                 )
 
     right_lines.append("")
-    right_lines.append(f"[bold {accent}]Available Skills[/]")
+    right_lines.append(f"[bold {accent}]{t('cli.banner.available_skills')}[/]")
     # The skills catalog is only reachable when the `skills` toolset is enabled
     # (it exposes skill_view / skill_manage). When it's disabled — e.g. a Blank
     # Slate install — the agent literally cannot load any skill, so advertising
@@ -1231,24 +1247,28 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
                 _needed = len(_sep) + len(name)
                 # Estimate indicator size IF we were to add this skill then stop
                 _after = len(skill_names) - (i + 1)  # remaining after adding this
-                _ind_len = len(f", +{_after} more") if _after > 0 else 0
+                _suffix = t('cli.banner.more_skills_suffix', count=_after) if _after > 0 else ""
+                _ind_len = len(", " + _suffix) if _suffix else 0
                 if parts and length + _needed + _ind_len > _avail:
                     remaining = len(skill_names) - len(parts)
-                    parts.append(f"+{remaining} more")
+                    parts.append(t('cli.banner.more_skills_suffix', count=remaining))
                     break
                 parts.append(name)
                 length += _needed
             skills_str = ", ".join(parts)
             right_lines.append(f"[dim {dim}]{category}:[/] [{text}]{skills_str}[/]")
     else:
-        right_lines.append(f"[dim {dim}]No skills installed[/]")
+        right_lines.append(f"[dim {dim}]{t('cli.banner.no_skills_installed')}[/]")
 
     right_lines.append("")
     mcp_connected = sum(1 for s in mcp_status if s["connected"]) if mcp_status else 0
-    summary_parts = [f"{len(tools)} tools", f"{total_skills} skills"]
+    summary_parts = [
+        t('cli.banner.summary_tools', count=len(tools)),
+        t('cli.banner.summary_skills', count=total_skills),
+    ]
     if mcp_connected:
-        summary_parts.append(f"{mcp_connected} MCP servers")
-    summary_parts.append("/help for commands")
+        summary_parts.append(t('cli.banner.summary_mcp_servers', count=mcp_connected))
+    summary_parts.append(t('cli.banner.help_for_commands'))
     # Indicate when the codex_app_server runtime is active so users
     # understand why tool counts may not match what's actually reachable
     # (codex builds its own tool list inside the spawned subprocess).
@@ -1257,8 +1277,8 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         from hermes_cli.config import load_config as _load_cfg
         if get_current_runtime(_load_cfg()) == "codex_app_server":
             right_lines.append(
-                f"[bold {accent}]Runtime:[/] [{text}]codex app-server[/] "
-                f"[dim {dim}](terminal/file ops/MCP run inside codex)[/]"
+                f"[bold {accent}]{t('cli.banner.runtime_label')}[/] [{text}]codex app-server[/] "
+                f"[dim {dim}]({t('cli.banner.codex_runtime_note')})[/]"
             )
     except Exception:
         pass
@@ -1267,7 +1287,7 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         from hermes_cli.profiles import get_active_profile_name
         _profile_name = get_active_profile_name()
         if _profile_name and _profile_name != "default":
-            right_lines.append(f"[bold {accent}]Profile:[/] [{text}]{_profile_name}[/]")
+            right_lines.append(f"[bold {accent}]{t('cli.banner.profile_label')}[/] [{text}]{_profile_name}[/]")
     except Exception:
         pass  # Never break the banner over a profiles.py bug
 

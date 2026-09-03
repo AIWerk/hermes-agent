@@ -608,6 +608,7 @@ _ASSISTANT_ALLOWED_RPC_METHODS = frozenset(
         "session.steer",
         "session.side.start",
         "session.side.back",
+        "session.events.since",
         "prompt.submit",
         "prompt.learn",
         "approval.respond",
@@ -630,6 +631,9 @@ _ASSISTANT_ALLOWED_RPC_PARAMS: dict[str, frozenset[frozenset[str]]] = {
     "session.steer": frozenset({frozenset({"session_id", "text"})}),
     "session.side.start": frozenset({frozenset({"session_id"})}),
     "session.side.back": frozenset({frozenset({"session_id"})}),
+    "session.events.since": frozenset(
+        {frozenset({"session_id", "last_seen"})}
+    ),
     "prompt.submit": frozenset({frozenset({"session_id", "text"})}),
     "prompt.learn": frozenset({frozenset({"session_id", "text"})}),
     "approval.respond": frozenset(
@@ -718,6 +722,10 @@ def _assistant_ws_request_gate(
     if method in {"prompt.submit", "prompt.learn", "session.steer"}:
         if not isinstance(params.get("text"), str) or not params["text"].strip():
             return "prompt text required in assistant mode"
+    elif method == "session.events.since":
+        last_seen = params.get("last_seen")
+        if isinstance(last_seen, bool) or not isinstance(last_seen, int) or last_seen < 0:
+            return "invalid replay watermark in assistant mode"
     elif method == "approval.respond":
         if (
             not isinstance(params.get("session_id"), str)

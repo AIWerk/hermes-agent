@@ -3791,6 +3791,9 @@ def _(rid, params: dict) -> dict:
     the client knows to refetch history instead of silently accepting a gap.
     """
     sid = str(params.get("session_id") or "")
+    _session, err = _sess_nowait(params, rid)
+    if err:
+        return err
     try:
         last_seen = int(params.get("last_seen", 0))
     except (TypeError, ValueError):
