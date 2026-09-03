@@ -33,10 +33,165 @@ def test_assistant_http_allowlist_is_method_specific_and_default_deny(web_server
     assert allowed("/api/auth/me", "GET") is True
     assert allowed("/api/auth/ws-ticket", "POST") is True
     assert allowed("/api/auth/ws-ticket", "GET") is False
+    for path in (
+        "/api/model/info",
+        "/api/sessions",
+        "/api/sessions/customer-session",
+        "/api/dashboard/themes",
+        "/api/dashboard/font",
+    ):
+        assert allowed(path, "GET") is True
+        assert allowed(path, "HEAD") is True
+        assert allowed(path, "OPTIONS") is True
+    assert allowed("/api/sessions/customer-session", "DELETE") is False
+    assert allowed("/api/sessions/customer-session", "PATCH") is False
+    assert allowed("/api/sessions/prune", "POST") is False
+    assert allowed("/api/sessions/bulk-delete", "POST") is False
     assert allowed("/api/config", "GET") is False
     assert allowed("/api/env", "GET") is False
     assert allowed("/api/plugins", "GET") is False
     assert allowed("/api/status/extra", "GET") is False
+
+
+def test_assistant_frontend_http_startup_contract_is_source_derived(web_server) -> None:
+    root = Path(__file__).resolve().parents[2]
+    page_source = (root / "web/src/pages/AiwerkAssistantPage.tsx").read_text(
+        encoding="utf-8"
+    )
+    theme_source = (root / "web/src/themes/context.tsx").read_text(encoding="utf-8")
+    status_source = (root / "web/src/hooks/useSidebarStatus.ts").read_text(encoding="utf-8")
+    api_source = (root / "web/src/lib/api.ts").read_text(encoding="utf-8")
+
+    api_call_pattern = r"\bapi\s*\.\s*([A-Za-z0-9_]+)\("
+    page_methods = set(re.findall(api_call_pattern, page_source))
+    theme_methods = set(re.findall(api_call_pattern, theme_source))
+    status_methods = set(re.findall(api_call_pattern, status_source))
+    assert page_methods == {
+        "addAssistantTodo",
+        "attachAssistantResource",
+        "createCuiContact",
+        "editAssistantTodo",
+        "getAssistantResources",
+        "getAuthMe",
+        "getModelInfo",
+        "getSessionMessages",
+        "getSessions",
+        "hideCuiContact",
+        "openAssistantSharedFolder",
+        "searchCuiContacts",
+        "sendAssistantSupport",
+        "synthesizeAssistantSpeech",
+        "transcribeAssistantAudio",
+        "updateAssistantTodo",
+        "uploadAssistantAttachments",
+    }
+    assert theme_methods == {"getFontPref", "getThemes", "setFontPref", "setTheme"}
+    assert status_methods == {"getStatus"}
+    assert {
+        "getAuthMe",
+        "getSessions",
+        "getAssistantResources",
+        "getModelInfo",
+    } <= page_methods
+    assert {"getThemes", "getFontPref"} <= theme_methods
+    assert "getStatus" in status_methods
+    assert "getWsTicket()" in api_source
+
+    startup_paths = {
+        "/api/status",
+        "/api/auth/me",
+        "/api/auth/ws-ticket",
+        "/api/assistant/resources",
+        "/api/model/info",
+        "/api/sessions",
+        "/api/dashboard/themes",
+        "/api/dashboard/font",
+    }
+    for path in startup_paths:
+        assert path in api_source
+        method = "POST" if path == "/api/auth/ws-ticket" else "GET"
+        assert web_server._assistant_api_allowed(path, method) is True
+
+
+def test_assistant_get_sessions_filters_foreign_actor_before_pagination(
+    web_server, monkeypatch
+) -> None:
+    from hermes_cli.web_routers import sessions as sessions_routes
+
+    own = {
+        "id": "own",
+        "source": "web",
+        "model_config": (
+            '{"_cui_visibility_scope":"customer",'
+            '"_cui_actor_role":"user",'
+            '"_cui_actor_id":"tenant-a:user-1",'
+            '"_cui_tenant_id":"tenant-a"}'
+        ),
+        "started_at": 1,
+        "last_active": 1,
+        "ended_at": None,
+    }
+    foreign = {
+        **own,
+        "id": "foreign",
+        "model_config": own["model_config"].replace("tenant-a", "tenant-b"),
+    }
+
+    class DB:
+        def close(self):
+            return None
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            session=SimpleNamespace(
+                role="user", actor_id="tenant-a:user-1", tenant_id="tenant-a"
+            )
+        )
+    )
+    monkeypatch.setattr(web_server, "_maybe_auto_archive_for_profile", lambda _p: None)
+    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda *_a, **_k: DB())
+    own_2 = {**own, "id": "own-2"}
+    foreign_2 = {**foreign, "id": "foreign-2"}
+    monkeypatch.setattr(
+        web_server,
+        "_list_sessions_rich_all",
+        lambda *_a, **_k: [foreign, own, foreign_2, own_2],
+    )
+
+    result = sessions_routes.get_sessions(
+        request,
+        limit=1,
+        offset=0,
+        min_messages=0,
+        archived="exclude",
+        order="created",
+        source=None,
+        sources=None,
+        exclude_sources=None,
+        cwd_prefix=None,
+        full=False,
+        profile=None,
+    )
+
+    assert result["total"] == 2
+    assert [row["id"] for row in result["sessions"]] == ["own"]
+
+    second_page = sessions_routes.get_sessions(
+        request,
+        limit=1,
+        offset=1,
+        min_messages=0,
+        archived="exclude",
+        order="created",
+        source=None,
+        sources=None,
+        exclude_sources=None,
+        cwd_prefix=None,
+        full=False,
+        profile=None,
+    )
+    assert second_page["total"] == 2
+    assert [row["id"] for row in second_page["sessions"]] == ["own-2"]
 
 
 def test_assistant_http_middleware_allows_customer_status_and_hides_admin_api(

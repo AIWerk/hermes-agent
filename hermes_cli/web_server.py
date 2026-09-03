@@ -573,29 +573,38 @@ _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 _DASHBOARD_MODE = "admin"
 app.state.dashboard_mode = _DASHBOARD_MODE
 
-_ASSISTANT_ALLOWED_HTTP: dict[str, frozenset[str]] = {
-    "/api/status": frozenset({"GET"}),
-    "/api/auth/me": frozenset({"GET"}),
+_ASSISTANT_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_ASSISTANT_ALLOWED_API_EXACT: dict[str, frozenset[str]] = {
+    "/api/status": _ASSISTANT_SAFE_METHODS,
+    "/api/auth/me": _ASSISTANT_SAFE_METHODS,
     "/api/auth/ws-ticket": frozenset({"POST"}),
-    "/api/assistant/resources": frozenset({"GET"}),
+    "/api/sessions": _ASSISTANT_SAFE_METHODS,
+    "/api/model/info": _ASSISTANT_SAFE_METHODS,
+    "/api/dashboard/themes": _ASSISTANT_SAFE_METHODS,
+    "/api/dashboard/font": _ASSISTANT_SAFE_METHODS,
+    "/api/assistant/resources": _ASSISTANT_SAFE_METHODS,
+    "/api/assistant/artifacts/open": _ASSISTANT_SAFE_METHODS,
     "/api/assistant/attachments/resource": frozenset({"POST"}),
-    "/api/cui/contacts/search": frozenset({"GET"}),
-    "/api/cui/context/contacts": frozenset({"GET"}),
-    "/api/cui/contacts/frequent": frozenset({"GET"}),
+    "/api/cui/contacts/search": _ASSISTANT_SAFE_METHODS,
+    "/api/cui/context/contacts": _ASSISTANT_SAFE_METHODS,
+    "/api/cui/contacts/frequent": _ASSISTANT_SAFE_METHODS,
     "/api/cui/contacts": frozenset({"POST"}),
     "/api/cui/contacts/hide": frozenset({"POST"}),
     "/api/assistant/support": frozenset({"POST"}),
     "/api/assistant/todos/add": frozenset({"POST"}),
     "/api/assistant/todos/update": frozenset({"POST"}),
     "/api/assistant/todos/edit": frozenset({"POST"}),
-    "/api/assistant/email/view": frozenset({"GET"}),
-    "/api/assistant/calendar/view": frozenset({"GET"}),
+    "/api/assistant/email/view": _ASSISTANT_SAFE_METHODS,
+    "/api/assistant/calendar/view": _ASSISTANT_SAFE_METHODS,
     "/api/assistant/shared-folder/open-folder": frozenset({"POST"}),
-    "/api/assistant/shared-folder/open": frozenset({"GET"}),
+    "/api/assistant/shared-folder/open": _ASSISTANT_SAFE_METHODS,
     "/api/assistant/attachments": frozenset({"POST"}),
     "/api/assistant/transcribe": frozenset({"POST"}),
     "/api/assistant/tts": frozenset({"POST"}),
 }
+_ASSISTANT_ALLOWED_API_PREFIXES: tuple[str, ...] = ("/api/sessions/",)
+# Compatibility alias for extensions/tests that inspect the prior method map.
+_ASSISTANT_ALLOWED_HTTP = _ASSISTANT_ALLOWED_API_EXACT
 _ASSISTANT_ALLOWED_RPC_METHODS = frozenset(
     {
         "gateway.ping",
@@ -667,7 +676,13 @@ def _set_dashboard_mode(mode: str) -> None:
 
 
 def _assistant_api_allowed(path: str, method: str) -> bool:
-    return method.upper() in _ASSISTANT_ALLOWED_HTTP.get(path, frozenset())
+    normalized_method = method.upper()
+    exact_methods = _ASSISTANT_ALLOWED_API_EXACT.get(path)
+    if exact_methods is not None:
+        return normalized_method in exact_methods
+    return normalized_method in _ASSISTANT_SAFE_METHODS and any(
+        path.startswith(prefix) for prefix in _ASSISTANT_ALLOWED_API_PREFIXES
+    )
 
 
 def _inject_trusted_cui_actor(params: dict, auth_identity: dict | None) -> None:
