@@ -75,6 +75,32 @@ def test_empty_provider_login_page_fails_closed_without_operator_internals():
     assert "SSH tunnel" not in html
     assert "Tailscale" not in html
     assert "hermes-agent.nousresearch.com" not in html
+    assert "--background-base: #f4f1ec" in html
+    assert "--midground: #8a6842" in html
+    assert "--foreground: #292720" in html
+    assert "#170d02" not in html
+    assert "#ffac02" not in html
+
+
+def test_login_page_uses_restored_aiwerk_customer_palette():
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from hermes_cli.dashboard_auth.login_page import render_login_html
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    clear_providers()
+    register_provider(StubAuthProvider())
+    try:
+        html = render_login_html()
+    finally:
+        clear_providers()
+
+    assert "<title>Anmelden — AIWerk</title>" in html
+    assert "--background-base: #f4f1ec" in html
+    assert "--midground: #8a6842" in html
+    assert "--foreground: #292720" in html
+    assert "#170d02" not in html
+    assert "#ffac02" not in html
+    assert "Sign in — Hermes Agent" not in html
 
 
 # ---------------------------------------------------------------------------

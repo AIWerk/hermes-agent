@@ -388,14 +388,12 @@ class TestLoginPageRender:
             html = render_login_html(next_path="/sessions")
             unmet_provenance = []
             if not (
-                ".brand {\n    text-align: center;\n    margin-bottom: 1.75rem;\n"
-                "    font-family: 'Rules Compressed', 'Collapse', sans-serif;"
+                'font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;'
                 in html
-                and "h1 {\n    margin: 0 0 0.4rem;\n"
-                "    font-family: 'Rules Compressed', 'Collapse', sans-serif;"
-                in html
+                and "font-family: 'Rules Compressed', 'Collapse', sans-serif;"
+                not in html
             ):
-                unmet_provenance.append("global typography")
+                unmet_provenance.append("fork typography")
             if not (
                 "Mit Benutzername und Passwort anmelden — Test Password" in html
                 and 'aria-label="Mit Benutzername und Passwort anmelden — Test Password"'

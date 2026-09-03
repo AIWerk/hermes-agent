@@ -85,6 +85,7 @@ def test_assistant_ws_gate_denies_admin_and_unknown_methods(web_server, method: 
             {"session_id": "sid", "request_id": "req", "choice": "once"},
         ),
         ("slash.exec", {"session_id": "sid", "command": "/stop"}),
+        ("session.events.since", {"session_id": "sid", "last_seen": 0}),
     ],
 )
 def test_assistant_ws_gate_allows_exact_customer_contract(
@@ -176,16 +177,91 @@ def test_assistant_frontend_prompt_submit_matches_ws_gate(
 def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
     web_server, assistant_identity
 ) -> None:
-    """Freeze all customer-UI RPC call sites against the server-side gate."""
+    """Gate every RPC in the assistant page's transitive @/ import closure."""
     root = Path(__file__).resolve().parents[2]
-    source = (root / "web/src/pages/AiwerkAssistantPage.tsx").read_text(encoding="utf-8")
-    call_pattern = re.compile(
-        r'gateway\.request(?:<[^;()]*?>)?\(\s*"(?P<method>[^"]+)"\s*,',
-        re.MULTILINE,
+    web_root = (root / "web/src").resolve()
+    entrypoint = web_root / "pages/AiwerkAssistantPage.tsx"
+    import_pattern = re.compile(
+        r'(?:import|export)\s+(?:[^;]*?\s+from\s+)?["\']@/(?P<path>[^"\']+)["\']',
+        re.MULTILINE | re.DOTALL,
     )
-    matches = list(call_pattern.finditer(source))
-    assert len(matches) == 22
 
+    def resolve_web_import(import_path: str) -> Path:
+        base = web_root / import_path
+        candidates = (
+            base.with_suffix(".ts"),
+            base.with_suffix(".tsx"),
+            base / "index.ts",
+            base / "index.tsx",
+        )
+        resolved = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+        assert resolved is not None, f"unresolved assistant import: {import_path}"
+        assert resolved.is_relative_to(web_root)
+        return resolved
+
+    closure: set[Path] = set()
+    pending = [entrypoint.resolve()]
+    while pending:
+        path = pending.pop()
+        if path in closure:
+            continue
+        closure.add(path)
+        candidate = path.read_text(encoding="utf-8")
+        pending.extend(
+            resolve_web_import(match.group("path"))
+            for match in import_pattern.finditer(candidate)
+        )
+
+    assert {str(path.relative_to(web_root)) for path in closure} == {
+        "components/Markdown.tsx",
+        "lib/aiwerk-cui-i18n.ts",
+        "lib/api.ts",
+        "lib/cui-approval.ts",
+        "lib/cui-greeting.ts",
+        "lib/cui-slash.ts",
+        "lib/dashboard-auth-reload.ts",
+        "lib/gatewayClient.ts",
+        "lib/safe-open.ts",
+        "pages/AiwerkAssistantPage.tsx",
+        "themes/types.ts",
+    }
+
+    call_pattern = re.compile(
+        r'\.request(?:<[^()]*>)?\(\s*"(?P<method>[^"]+)"\s*,',
+        re.MULTILINE | re.DOTALL,
+    )
+    closure_calls: list[tuple[str, re.Match[str]]] = []
+    for path in sorted(closure):
+        candidate = path.read_text(encoding="utf-8")
+        closure_calls.extend(
+            (str(path.relative_to(web_root)), match)
+            for match in call_pattern.finditer(candidate)
+        )
+
+    assert len(closure_calls) == 25
+    assert {path for path, _match in closure_calls} == {
+        "lib/gatewayClient.ts",
+        "pages/AiwerkAssistantPage.tsx",
+    }
+    closure_method_calls = {
+        (path, match.group("method")) for path, match in closure_calls
+    }
+    closure_methods = {method for _path, method in closure_method_calls}
+    assert "complete.slash" not in closure_methods
+    assert "command.dispatch" not in closure_methods
+    assert ("lib/gatewayClient.ts", "prompt.submit") in closure_method_calls
+    assert web_server._assistant_ws_request_gate(
+        {"method": "prompt.submit", "params": {"session_id": "sid", "text": "hello"}},
+        assistant_identity,
+    ) is None
+
+    source = entrypoint.read_text(encoding="utf-8")
+    matches = [
+        match
+        for path, match in closure_calls
+        if path == "pages/AiwerkAssistantPage.tsx"
+    ]
+    assert len(matches) == 24
     def object_keys_after(start: int) -> set[str]:
         brace = source.find("{", start)
         assert brace >= 0
@@ -196,7 +272,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
             if depth == 0:
                 return set(
                     re.findall(
-                        r"(?m)(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
+                        r"(?m)(?:^|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?=:|,|$)",
                         source[brace + 1 : index],
                     )
                 )
@@ -254,6 +330,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         "session.steer",
         "session.side.start",
         "session.side.back",
+        "session.events.since",
         "prompt.submit",
         "prompt.learn",
         "approval.respond",
@@ -262,6 +339,24 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         "commands.catalog",
         "slash.exec",
     }
+
+    transport = (root / "apps/shared/src/json-rpc-gateway.ts").read_text(
+        encoding="utf-8"
+    )
+    replay = re.search(
+        r"'session\.events\.since'\s*,\s*"
+        r"\{\s*session_id:\s*sid,\s*last_seen:\s*lastSeen\s*\}",
+        transport,
+        re.DOTALL,
+    )
+    assert replay is not None
+    replay_request = {
+        "method": "session.events.since",
+        "params": {"session_id": "sid", "last_seen": 0},
+    }
+    assert web_server._assistant_ws_request_gate(
+        replay_request, assistant_identity
+    ) is None
 
 
 def test_assistant_audio_rejects_unsupported_extension_before_transcription(
@@ -297,7 +392,10 @@ def test_assistant_audio_rejects_oversized_upload_before_transcription(
         ("session.resume", {"session_id": "sid"}),
         ("config.get", {"session_id": "sid", "key": "model"}),
         ("config.set", {"session_id": "sid", "key": "model", "value": "x"}),
-        ("session.events.since", {"session_id": "sid", "last_seen": 0}),
+        ("session.events.since", {"session_id": "sid"}),
+        ("session.events.since", {"session_id": "sid", "last_seen": -1}),
+        ("session.events.since", {"session_id": "sid", "last_seen": "0"}),
+        ("session.events.since", {"session_id": "sid", "last_seen": True}),
         ("session.create", {"profile": "other"}),
         ("session.create", {"cwd": "/tmp"}),
         ("prompt.submit", {"session_id": "sid", "text": "hi", "profile": "other"}),

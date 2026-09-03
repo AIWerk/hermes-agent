@@ -144,3 +144,62 @@ def test_persisted_session_iterator_pages_past_foreign_rows_without_leaking_meta
         }
     ]
     assert "model_config" not in visible[0]
+
+
+def test_replay_rpc_honors_bound_actor_session_ownership(monkeypatch):
+    from tui_gateway import event_replay, server
+
+    own_sid = "replay-owned-by-a"
+    foreign_sid = "replay-owned-by-b"
+    monkeypatch.setitem(server._sessions, own_sid, {"cui_actor_context": ACTOR_A})
+    monkeypatch.setitem(server._sessions, foreign_sid, {"cui_actor_context": ACTOR_B})
+    event_replay.reset_replay_state()
+    event_replay._stamp_event(
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "message.delta",
+                "session_id": own_sid,
+                "payload": {"text": "owned"},
+            },
+        }
+    )
+    event_replay._stamp_event(
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "message.delta",
+                "session_id": foreign_sid,
+                "payload": {"text": "foreign-secret"},
+            },
+        }
+    )
+
+    try:
+        owned = server.dispatch(
+            {
+                "id": "owned",
+                "method": "session.events.since",
+                "params": {"session_id": own_sid, "last_seen": 0},
+            },
+            actor_context=ACTOR_A,
+        )
+        foreign = server.dispatch(
+            {
+                "id": "foreign",
+                "method": "session.events.since",
+                "params": {"session_id": foreign_sid, "last_seen": 0},
+            },
+            actor_context=ACTOR_A,
+        )
+    finally:
+        event_replay.reset_replay_state()
+
+    assert owned["result"]["events"][0]["payload"]["text"] == "owned"
+    assert foreign == {
+        "jsonrpc": "2.0",
+        "id": "foreign",
+        "error": {"code": 4001, "message": "session not found"},
+    }
