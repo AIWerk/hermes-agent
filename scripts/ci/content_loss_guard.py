@@ -8,6 +8,7 @@ content is inspected as Git objects and is never imported or executed.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -22,6 +23,9 @@ BASELINE_PATH = ".ci/content-loss/baseline.json"
 RETIREMENTS_PATH = ".ci/content-loss/retirements.json"
 _HISTORICAL_ACTIVE = "8bd56009c186b6e0fddc8aa96898201a42a1efb4"
 _HISTORICAL_TARGET = "7b0cf741a009bc3c61b44f9cefef7815aab88da3"
+_HISTORICAL_CUI_TARGET = "c398f61c1436247987b882b7569a1bc26d2afe6c"
+_HISTORICAL_HTTP_TARGET = "6453f2cc6cf3c8f91604c1e40cdf6ad165cbd4fd"
+_HISTORICAL_HTTP_RESTORED = "b6a15fdb786dd145f39fb70c70080937747adff4"
 _HISTORICAL_UPSTREAM = "8f2f4caff42cfce29d6fc0992b9f4157409f8d03"
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 _REGULAR_MODES = {"100644", "100755"}
@@ -399,7 +403,45 @@ def _historical_baseline() -> tuple[dict[str, Any], dict[str, Any], dict[str, st
             {"id": "aiwerk-cui-page", "path": "web/src/pages/AiwerkAssistantPage.tsx", "required": True},
             {"id": "aiwerk-cui-slash", "path": "web/src/lib/cui-slash.ts", "required": True},
         ],
-        "selectors": [],
+        "selectors": [
+            {
+                "id": "cui-supported-slash-command-floor",
+                "type": "typescript_set_superset",
+                "path": "web/src/lib/cui-slash.ts",
+                "sets": {
+                    "CUI_NATIVE_SLASH_COMMANDS": [
+                        "/back",
+                        "/help",
+                        "/learn",
+                        "/new",
+                        "/side",
+                        "/status",
+                        "/stop",
+                        "/usage",
+                    ],
+                    "CUI_EXEC_SLASH_COMMANDS": ["/compress", "/reload-mcp"],
+                    "CUI_SUPPORTED_SLASH_COMMANDS": [
+                        "/back",
+                        "/compress",
+                        "/help",
+                        "/learn",
+                        "/new",
+                        "/reload-mcp",
+                        "/side",
+                        "/status",
+                        "/stop",
+                        "/usage",
+                    ],
+                },
+                "union": {
+                    "target": "CUI_SUPPORTED_SLASH_COMMANDS",
+                    "members": [
+                        "CUI_NATIVE_SLASH_COMMANDS",
+                        "CUI_EXEC_SLASH_COMMANDS",
+                    ],
+                },
+            }
+        ],
         "protected_controls": [BASELINE_PATH, RETIREMENTS_PATH],
     }
     return (
@@ -553,6 +595,547 @@ def _json_pointer(value: Any, pointer: str) -> Any:
     return current
 
 
+def _text_blob(
+    repo: Path,
+    entries: dict[str, dict[str, str]],
+    path: str,
+    label: str,
+) -> str:
+    entry = entries.get(path)
+    if entry is None or entry["type"] != "blob" or entry["mode"] not in _REGULAR_MODES:
+        raise ContentLossError(f"{label} is not a regular file: {path}")
+    try:
+        return _read_blob(repo, entry["oid"]).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContentLossError(f"{label} is not UTF-8: {path}") from exc
+
+
+def _strip_javascript_comments(source: str) -> str:
+    output = list(source)
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if source.startswith("//", index):
+            end = source.find("\n", index)
+            end = len(source) if end < 0 else end
+            output[index:end] = " " * (end - index)
+            index = end
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end < 0:
+                raise ContentLossError("unterminated JavaScript block comment")
+            end += 2
+            for offset in range(index, end):
+                if output[offset] != "\n":
+                    output[offset] = " "
+            index = end
+            continue
+        index += 1
+    return "".join(output)
+
+
+def _typescript_sets(source: str) -> dict[str, set[str]]:
+    source = _strip_javascript_comments(source)
+    raw_sets: dict[str, tuple[set[str], set[str]]] = {}
+    pattern = re.compile(
+        r"export\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+Set(?:<[^>]+>)?\s*\(\s*(?:\[(.*?)\])?\s*\)\s*;",
+        re.DOTALL,
+    )
+    token = re.compile(r"\.\.\.([A-Za-z_][A-Za-z0-9_]*)|(['\"])(.*?)\2", re.DOTALL)
+    for match in pattern.finditer(source):
+        name, body = match.group(1), match.group(2) or ""
+        values: set[str] = set()
+        references: set[str] = set()
+        end = 0
+        for item in token.finditer(body):
+            if body[end : item.start()].strip(" \t\r\n,"):
+                raise ContentLossError(f"unsupported TypeScript Set expression: {name}")
+            end = item.end()
+            if item.group(1):
+                references.add(item.group(1))
+            else:
+                values.add(item.group(3))
+        if body[end:].strip(" \t\r\n,"):
+            raise ContentLossError(f"unsupported TypeScript Set expression: {name}")
+        raw_sets[name] = (values, references)
+
+    resolved: dict[str, set[str]] = {}
+
+    def resolve(name: str, stack: tuple[str, ...] = ()) -> set[str]:
+        if name in resolved:
+            return resolved[name]
+        if name in stack or name not in raw_sets:
+            raise ContentLossError(f"unresolved TypeScript Set reference: {name}")
+        values, references = raw_sets[name]
+        result = set(values)
+        for reference in references:
+            result.update(resolve(reference, (*stack, name)))
+        resolved[name] = result
+        return result
+
+    for name in raw_sets:
+        resolve(name)
+    return resolved
+
+
+def _typescript_set_selector(source: str, selector: dict[str, Any]) -> bool:
+    expected = selector.get("sets")
+    union = selector.get("union")
+    if not isinstance(expected, dict) or not isinstance(union, dict):
+        raise ContentLossError("invalid TypeScript Set selector")
+    sets = _typescript_sets(source)
+    for name, minimum in expected.items():
+        if not isinstance(name, str) or not isinstance(minimum, list) or not all(
+            isinstance(value, str) and value for value in minimum
+        ):
+            raise ContentLossError("invalid TypeScript Set selector floor")
+        if not set(minimum) <= sets.get(name, set()):
+            return False
+    target = union.get("target")
+    members = union.get("members")
+    if not isinstance(target, str) or not isinstance(members, list) or not all(
+        isinstance(name, str) for name in members
+    ):
+        raise ContentLossError("invalid TypeScript Set union selector")
+    expected_union: set[str] = set()
+    for name in members:
+        expected_union.update(sets.get(name, set()))
+    return target in sets and sets[target] == expected_union
+
+
+_TS_LITERAL = re.compile(r"(['\"`])([^'\"`\n]*?/api/[^'\"`\n]*)\1")
+_FETCH_CALL = re.compile(r"\b(?:fetch|fetchBlob|fetchJSON(?:<[^>]+>)?)\s*\(")
+
+
+def _enclosing_fetch_call(source: str, literal_start: int) -> str | None:
+    starts = [match for match in _FETCH_CALL.finditer(source, 0, literal_start)]
+    if not starts:
+        return None
+    start = starts[-1]
+    open_parenthesis = source.find("(", start.start(), start.end())
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(open_parenthesis, len(source)):
+        char = source[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                if literal_start > index:
+                    return None
+                return source[start.start() : index + 1]
+    return None
+
+
+def _top_level_call_arguments(call: str) -> list[str] | None:
+    open_parenthesis = call.find("(")
+    if open_parenthesis < 0 or not call.endswith(")"):
+        return None
+    arguments: list[str] = []
+    start = open_parenthesis + 1
+    depths = {"(": 0, "[": 0, "{": 0}
+    closing = {")": "(", "]": "[", "}": "{"}
+    quote: str | None = None
+    escaped = False
+    for index in range(start, len(call) - 1):
+        char = call[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char in depths:
+            depths[char] += 1
+        elif char in closing:
+            opener = closing[char]
+            if depths[opener] == 0:
+                return None
+            depths[opener] -= 1
+        elif char == "," and not any(depths.values()):
+            arguments.append(call[start:index].strip())
+            start = index + 1
+    if quote is not None or any(depths.values()):
+        return None
+    arguments.append(call[start:-1].strip())
+    if arguments[-1] == "" and len(arguments) > 1:
+        arguments.pop()
+    return arguments
+
+
+def _api_requests(source: str) -> set[tuple[str, str]] | None:
+    source = _strip_javascript_comments(source)
+    requests: set[tuple[str, str]] = set()
+    matches = list(_TS_LITERAL.finditer(source))
+    for match in matches:
+        call = _enclosing_fetch_call(source, match.start())
+        if call is None:
+            continue
+        value = match.group(2)
+        path = value[value.find("/api/") :].split("${", 1)[0].split("?", 1)[0]
+        if path == "/api/" or not re.fullmatch(r"/api/[A-Za-z0-9_./-]+", path):
+            return None
+        literal = match.group(0)
+        relative_start = call.find(literal)
+        argument_start = call.find("(") + 1
+        argument_prefix = call[argument_start:relative_start]
+        argument_prefix = re.sub(
+            r"\b(?:appendProfileParam|appendSessionFilters)\s*\(",
+            "",
+            argument_prefix,
+        )
+        if relative_start < argument_start or argument_prefix.strip():
+            return None
+        if match.group(1) != "`" and not re.match(
+            r"\s*(?:,|\))", call[relative_start + len(literal) :]
+        ):
+            return None
+        arguments = _top_level_call_arguments(call)
+        if not arguments or literal not in arguments[0]:
+            return None
+        callee_match = _FETCH_CALL.match(call)
+        callee = callee_match.group(0).split("(", 1)[0].strip() if callee_match else ""
+        if len(arguments) == 1:
+            method = "GET"
+        elif len(arguments) in {2, 3}:
+            if len(arguments) == 3 and not callee.startswith("fetchJSON"):
+                return None
+            options = arguments[1]
+            if options in {"undefined", "null"}:
+                method = "GET"
+            else:
+                if (
+                    not options.startswith("{")
+                    or not options.endswith("}")
+                    or "..." in options
+                ):
+                    return None
+                method_match = re.search(
+                    r"\bmethod\s*:\s*(['\"])([A-Za-z]+)\1", options
+                )
+                if re.search(r"\bmethod\b", options) and method_match is None:
+                    return None
+                method = method_match.group(2).upper() if method_match else "GET"
+            if len(arguments) == 3:
+                behavior_options = arguments[2]
+                if (
+                    not behavior_options.startswith("{")
+                    or not behavior_options.endswith("}")
+                    or "..." in behavior_options
+                ):
+                    return None
+        else:
+            return None
+        requests.add((path, method))
+    return requests
+
+
+def _typescript_exported_function_blocks(source: str) -> dict[str, str]:
+    starts = list(
+        re.finditer(
+            r"\bexport\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            source,
+        )
+    )
+    blocks: dict[str, str] = {}
+    for start in starts:
+        parameter_open = source.find("(", start.start(), start.end())
+        parenthesis_depth = 0
+        parameter_close = -1
+        for index in range(parameter_open, len(source)):
+            if source[index] == "(":
+                parenthesis_depth += 1
+            elif source[index] == ")":
+                parenthesis_depth -= 1
+                if parenthesis_depth == 0:
+                    parameter_close = index
+                    break
+        if parameter_close < 0:
+            continue
+        brace = -1
+        angle_depth = 0
+        square_depth = 0
+        type_brace_depth = 0
+        for index in range(parameter_close + 1, len(source)):
+            char = source[index]
+            if char == "<":
+                angle_depth += 1
+            elif char == ">" and angle_depth:
+                angle_depth -= 1
+            elif char == "[":
+                square_depth += 1
+            elif char == "]" and square_depth:
+                square_depth -= 1
+            elif char == "{" and (angle_depth or square_depth or type_brace_depth):
+                type_brace_depth += 1
+            elif char == "}" and type_brace_depth:
+                type_brace_depth -= 1
+            elif char == "{" and not angle_depth and not square_depth:
+                brace = index
+                break
+            elif char == ";" and not angle_depth and not square_depth and not type_brace_depth:
+                break
+        if brace < 0:
+            continue
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for index in range(brace, len(source)):
+            char = source[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"', "`"}:
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks[start.group(1)] = source[start.start() : index + 1]
+                    break
+    return blocks
+
+
+def _imported_api_calls(source: str) -> set[str]:
+    names: set[str] = set()
+    for match in re.finditer(
+        r'import\s*\{([^}]*)\}\s*from\s*["\']@/lib/api["\']', source
+    ):
+        for item in match.group(1).split(","):
+            original = item.strip().split(" as ", 1)[0].strip()
+            local = item.strip().split(" as ", 1)[-1].strip()
+            if original and re.search(rf"\b{re.escape(local)}\s*\(", source[match.end() :]):
+                names.add(original)
+    return names
+
+
+def _api_paths(source: str) -> set[str]:
+    requests = _api_requests(source)
+    return set() if requests is None else {path for path, _method in requests}
+
+
+def _ast_string_set(
+    node: ast.AST, named_sets: dict[str, set[str]]
+) -> set[str] | None:
+    if isinstance(node, ast.Name):
+        return named_sets.get(node.id)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "frozenset"
+        and len(node.args) == 1
+    ):
+        node = node.args[0]
+    if not isinstance(node, (ast.Set, ast.Tuple, ast.List)):
+        return None
+    values = {
+        item.value
+        for item in node.elts
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    }
+    return values if len(values) == len(node.elts) else None
+
+
+def _python_assistant_http_allowlist(
+    source: str,
+) -> tuple[dict[str, set[str]], set[str], set[str]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise ContentLossError("assistant allowlist source is invalid Python") from exc
+    named_sets: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        name = next((target.id for target in targets if isinstance(target, ast.Name)), None)
+        if name is None or node.value is None:
+            continue
+        values = _ast_string_set(node.value, named_sets)
+        if values is not None:
+            named_sets[name] = values
+    exact: dict[str, set[str]] | None = None
+    prefixes: set[str] | None = None
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        name = next((target.id for target in targets if isinstance(target, ast.Name)), None)
+        value = node.value
+        if name in {"_ASSISTANT_ALLOWED_API_EXACT", "_ASSISTANT_ALLOWED_HTTP"} and isinstance(
+            value, ast.Dict
+        ):
+            parsed: dict[str, set[str]] = {}
+            for key, methods_node in zip(value.keys, value.values, strict=True):
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    raise ContentLossError("assistant HTTP allowlist has a non-literal path")
+                if methods_node is None:
+                    raise ContentLossError("assistant HTTP allowlist has invalid methods")
+                methods = _ast_string_set(methods_node, named_sets)
+                if not methods:
+                    raise ContentLossError("assistant HTTP allowlist has invalid methods")
+                parsed[key.value] = {method.upper() for method in methods}
+            exact = parsed
+        elif name == "_ASSISTANT_ALLOWED_API_PREFIXES":
+            parsed_prefixes = _ast_string_set(value, named_sets)
+            if parsed_prefixes is not None:
+                prefixes = parsed_prefixes
+    if exact is None:
+        raise ContentLossError("assistant HTTP allowlist definitions missing")
+    safe_methods = named_sets.get("_ASSISTANT_SAFE_METHODS", {"GET", "HEAD", "OPTIONS"})
+    return exact, prefixes or set(), {method.upper() for method in safe_methods}
+
+
+def _frontend_api_subset_selector(
+    repo: Path,
+    target_entries: dict[str, dict[str, str]],
+    selector: dict[str, Any],
+) -> tuple[bool, str | None]:
+    path = selector.get("path")
+    support_paths = selector.get("support_paths", [])
+    required_paths = selector.get("required_paths", [path])
+    allowlist_path = selector.get("allowlist_path")
+    api_path = selector.get("api_path")
+    if (
+        not isinstance(path, str)
+        or not isinstance(support_paths, list)
+        or not all(isinstance(item, str) for item in support_paths)
+        or not isinstance(required_paths, list)
+        or not required_paths
+        or not all(isinstance(item, str) for item in required_paths)
+        or not isinstance(allowlist_path, str)
+        or (api_path is not None and not isinstance(api_path, str))
+    ):
+        raise ContentLossError("invalid frontend API subset selector")
+    consumer_paths = list(dict.fromkeys([path, *support_paths, *required_paths]))
+    consumers = {
+        item: _text_blob(repo, target_entries, item, "frontend API consumer")
+        for item in consumer_paths
+        if item != api_path
+    }
+    calls: set[tuple[str, str]] = set()
+    names: set[str] = set()
+    recognized_paths: set[str] = set()
+    for consumer_path, source in consumers.items():
+        path_names = set(
+            re.findall(r"\bapi\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", source)
+        )
+        path_names.update(_imported_api_calls(source))
+        if _FETCH_CALL.search(source):
+            requests = _api_requests(source)
+            if requests is None:
+                return False, None
+            calls.update(requests)
+            if requests:
+                recognized_paths.add(consumer_path)
+        if path_names:
+            recognized_paths.add(consumer_path)
+        names.update(path_names)
+    api_source = ""
+    if api_path is not None:
+        api_source = _text_blob(repo, target_entries, api_path, "frontend API definitions")
+        method_start = re.compile(r"(?m)^  ([A-Za-z_][A-Za-z0-9_]*):")
+        starts = list(method_start.finditer(api_source))
+        blocks = {
+            item.group(1): api_source[item.start() : starts[index + 1].start() if index + 1 < len(starts) else len(api_source)]
+            for index, item in enumerate(starts)
+        }
+        blocks.update(_typescript_exported_function_blocks(api_source))
+        for block in blocks.values():
+            if not _FETCH_CALL.search(block):
+                continue
+            requests = _api_requests(block)
+            if requests is None:
+                continue
+            if requests:
+                recognized_paths.add(api_path)
+        pending = list(names)
+        visited: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            if name not in blocks:
+                if api_path in required_paths:
+                    return False, api_path
+                raise ContentLossError(f"frontend API method definition missing: {name}")
+            block = blocks[name]
+            if _FETCH_CALL.search(block):
+                requests = _api_requests(block)
+                if requests is None:
+                    return False, None
+                calls.update(requests)
+                if requests:
+                    recognized_paths.add(api_path)
+            pending.extend(
+                child
+                for child in blocks
+                if child not in visited
+                and re.search(rf"\b{re.escape(child)}\s*\(", block)
+            )
+    missing_required_path = next(
+        (item for item in required_paths if item not in recognized_paths), None
+    )
+    if missing_required_path is not None:
+        return False, missing_required_path
+    if not calls:
+        return False, None
+    allowlist_source = _text_blob(
+        repo, target_entries, allowlist_path, "assistant HTTP allowlist"
+    )
+    exact, prefixes, safe_methods = _python_assistant_http_allowlist(allowlist_source)
+    return (
+        all(
+            method in exact.get(path, set())
+            or (
+                method in safe_methods
+                and any(path.startswith(prefix) for prefix in prefixes)
+            )
+            for path, method in calls
+        ),
+        None,
+    )
+
+
 def _evaluate_selectors(
     repo: Path,
     target_entries: dict[str, dict[str, str]],
@@ -565,6 +1148,7 @@ def _evaluate_selectors(
         selector_id = selector.get("id")
         selector_type = selector.get("type")
         path = selector.get("path")
+        selector_failure_detail: str | None = None
         if not isinstance(selector_id, str) or not isinstance(path, str):
             raise ContentLossError("selector id and path must be strings")
         if selector_id in statuses:
@@ -594,11 +1178,29 @@ def _evaluate_selectors(
                         and all(key in item for key in required_keys)
                         for item in selected
                     )
-        elif selector_type not in {"path_exists", "json_pointer_equals", "json_array_contains_object"}:
+        elif passed and selector_type == "typescript_set_superset":
+            source = _text_blob(repo, target_entries, path, f"selector file {path}")
+            passed = _typescript_set_selector(source, selector)
+        elif passed and selector_type == "frontend_api_subset":
+            passed, selector_failure_detail = _frontend_api_subset_selector(
+                repo, target_entries, selector
+            )
+        elif selector_type not in {
+            "path_exists",
+            "json_pointer_equals",
+            "json_array_contains_object",
+            "typescript_set_superset",
+            "frontend_api_subset",
+        }:
             raise ContentLossError(f"unsupported selector type: {selector_type}")
         statuses[selector_id] = "passed" if passed else "failed"
         if not passed:
             reasons.append("CAPABILITY_SELECTOR_FAILED")
+            if selector_failure_detail is not None:
+                reasons.append(
+                    "CAPABILITY_SELECTOR_FAILED_PATH:"
+                    f"{selector_id}:{selector_failure_detail}:NO_RECOGNIZED_API_CALLS"
+                )
     return statuses, reasons
 
 
@@ -1028,6 +1630,35 @@ def _cli() -> argparse.ArgumentParser:
     return parser
 
 
+def _historical_selector_pair(
+    repo: Path,
+    positive: str,
+    negative: str,
+    upstream: str,
+    selector_id: str,
+) -> dict[str, str]:
+    positive_report = evaluate_range(
+        repo, positive, positive, upstream, pr_number=None
+    )
+    negative_report = evaluate_range(
+        repo, positive, negative, upstream, pr_number=None
+    )
+    if (
+        positive_report.get("verdict") != "PASS"
+        or positive_report.get("selectors", {}).get(selector_id) != "passed"
+        or negative_report.get("verdict") != "FAIL"
+        or negative_report.get("selectors", {}).get(selector_id) != "failed"
+    ):
+        raise ContentLossError(f"historical selector pair failed: {selector_id}")
+    return {
+        "active": positive,
+        "target": negative,
+        "positive_verdict": "PASS",
+        "negative_verdict": "FAIL",
+        "verdict": "FAIL",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _cli().parse_args(argv)
     try:
@@ -1047,8 +1678,48 @@ def main(argv: list[str] | None = None) -> int:
             validate_historical_recovery_bijection(
                 report, baseline["recovery_ledger"]
             )
+            cui_pair = _historical_selector_pair(
+                args.repo,
+                _HISTORICAL_ACTIVE,
+                _HISTORICAL_CUI_TARGET,
+                _HISTORICAL_UPSTREAM,
+                "cui-supported-slash-command-floor",
+            )
+            frontend_selector = {
+                "allowlist_path": "hermes_cli/web_server.py",
+                "api_path": "web/src/lib/api.ts",
+                "id": "assistant-frontend-api-subset",
+                "path": "web/src/pages/AiwerkAssistantPage.tsx",
+                "support_paths": ["web/src/hooks/useSidebarStatus.ts"],
+                "type": "frontend_api_subset",
+            }
+            broken_http, _ = _evaluate_selectors(
+                args.repo,
+                _tree_entries(args.repo, _HISTORICAL_HTTP_TARGET),
+                [frontend_selector],
+            )
+            restored_http, _ = _evaluate_selectors(
+                args.repo,
+                _tree_entries(args.repo, _HISTORICAL_HTTP_RESTORED),
+                [frontend_selector],
+            )
+            if (
+                broken_http.get("assistant-frontend-api-subset") != "failed"
+                or restored_http.get("assistant-frontend-api-subset") != "passed"
+            ):
+                raise ContentLossError(
+                    "historical assistant HTTP allowlist regression was not detected"
+                )
+            report["class_self_tests"] = {
+                "assistant-frontend-api-subset": {
+                    "restored": _HISTORICAL_HTTP_RESTORED,
+                    "target": _HISTORICAL_HTTP_TARGET,
+                    "verdict": "FAIL",
+                },
+                "cui-supported-slash-command-floor": cui_pair,
+            }
             write_reports(report, json_out=args.json_out, markdown_out=args.markdown_out)
-            print("Historical fixture correctly blocked known AIWerk losses")
+            print("Historical fixtures correctly blocked known AIWerk losses")
             return 0
         active = args.active if args.command == "check-range" else args.base
         target = args.target if args.command == "check-range" else make_effective_merge_tree(
