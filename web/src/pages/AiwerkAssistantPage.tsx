@@ -116,6 +116,11 @@ interface SlashCommandItem {
   category?: string;
 }
 
+interface SlashCommandCatalogResponse {
+  pairs?: Array<[string, string]>;
+  categories?: Array<{ name?: string; pairs?: Array<[string, string]> }>;
+}
+
 
 type SlashCommandMenuState = { target: ConversationMode; query: string } | null;
 
@@ -2183,13 +2188,32 @@ export default function AiwerkAssistantPage() {
       try {
         setConnection("connecting");
         await gateway.connect();
-        setSlashCommands(["/stop", "/compress", "/reload-mcp"]
-          .filter((command) => CUI_SUPPORTED_SLASH_COMMANDS.has(command))
-          .map((command) => ({
-            command,
-            description: localizeSlashCommandDescription(command, "", cuiLocale),
-            category: localizeSlashCategory("Session", cuiLocale),
-          })));
+        try {
+          const catalog = await gateway.request<SlashCommandCatalogResponse>("commands.catalog", {}, 15_000);
+          const categoryByCommand = new Map<string, string>();
+          for (const category of catalog.categories ?? []) {
+            const name = category.name || "";
+            for (const pair of category.pairs ?? []) {
+              if (pair[0]) categoryByCommand.set(pair[0], name);
+            }
+          }
+          const deduped = new Map<string, SlashCommandItem>();
+          for (const pair of catalog.pairs ?? []) {
+            const command = String(pair[0] || "").trim();
+            if (!command.startsWith("/")) continue;
+            if (!CUI_SUPPORTED_SLASH_COMMANDS.has(command.toLowerCase())) continue;
+            const rawDescription = String(pair[1] || "").trim();
+            const rawCategory = categoryByCommand.get(command) || "Skills";
+            deduped.set(command.toLowerCase(), {
+              command,
+              description: localizeSlashCommandDescription(command, rawDescription, cuiLocale),
+              category: localizeSlashCategory(rawCategory, cuiLocale),
+            });
+          }
+          setSlashCommands([...deduped.values()].sort((a, b) => a.command.localeCompare(b.command)));
+        } catch {
+          setSlashCommands([]);
+        }
         const storedSessionId = readStoredSessionId();
         let result: SessionOpenResult;
         if (storedSessionId) {

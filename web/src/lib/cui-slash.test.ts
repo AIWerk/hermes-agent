@@ -1,6 +1,15 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
-import { CUI_SUPPORTED_SLASH_COMMANDS, formatCuiUsage, isCuiSlashInput, slashBase } from "./cui-slash";
+import {
+  CUI_EXEC_SLASH_COMMANDS,
+  CUI_NATIVE_SLASH_COMMANDS,
+  CUI_SUPPORTED_SLASH_COMMANDS,
+  formatCuiUsage,
+  isCuiSlashInput,
+  slashBase,
+} from "./cui-slash";
 
 describe("CUI slash helpers", () => {
   it("recognizes slash input before it can be sent as an agent prompt", () => {
@@ -14,15 +23,44 @@ describe("CUI slash helpers", () => {
     expect(slashBase("hello")).toBe("");
   });
 
-  it("keeps the CUI command contract bijective with the server gate", () => {
-    expect([...CUI_SUPPORTED_SLASH_COMMANDS].sort()).toEqual([
+  it("keeps native, exec, and supported CUI command sets aligned with safe handlers", () => {
+    expect([...CUI_NATIVE_SLASH_COMMANDS].sort()).toEqual([
+      "/back",
+      "/help",
+      "/learn",
+      "/new",
+      "/side",
+      "/status",
+      "/stop",
+      "/usage",
+    ]);
+    expect([...CUI_EXEC_SLASH_COMMANDS].sort()).toEqual([
       "/compress",
       "/reload-mcp",
-      "/stop",
     ]);
-    expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/usage")).toBe(false);
-    expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/help")).toBe(false);
+    expect([...CUI_SUPPORTED_SLASH_COMMANDS].sort()).toEqual([
+      "/back",
+      "/compress",
+      "/help",
+      "/learn",
+      "/new",
+      "/reload-mcp",
+      "/side",
+      "/status",
+      "/stop",
+      "/usage",
+    ]);
+    expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/usage")).toBe(true);
+    expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/help")).toBe(true);
     expect(CUI_SUPPORTED_SLASH_COMMANDS.has("/model")).toBe(false);
+  });
+
+  it("loads the CUI palette from the filtered server command catalog", () => {
+    const page = readFileSync(new URL("../pages/AiwerkAssistantPage.tsx", import.meta.url), "utf8");
+
+    expect(page).toContain('gateway.request<SlashCommandCatalogResponse>("commands.catalog", {}, 15_000)');
+    expect(page).toContain("CUI_SUPPORTED_SLASH_COMMANDS.has(command.toLowerCase())");
+    expect(page).not.toContain('setSlashCommands(["/stop", "/compress", "/reload-mcp"]');
   });
 
   it("formats session usage without needing the agent to interpret /usage", () => {
