@@ -233,6 +233,7 @@ def test_assistant_ws_gate_denies_admin_and_unknown_methods(web_server, method: 
     "method,params",
     [
         ("gateway.ping", {}),
+        ("commands.catalog", {}),
         ("session.create", {"source": "web", "close_on_disconnect": True}),
         ("prompt.submit", {"session_id": "sid", "text": "hello"}),
         (
@@ -260,7 +261,7 @@ def test_assistant_frontend_startup_requests_match_ws_gate(
         Path(__file__).resolve().parents[2]
         / "web/src/pages/AiwerkAssistantPage.tsx"
     ).read_text(encoding="utf-8")
-    assert "commands.catalog" not in source
+    assert '"commands.catalog"' in source
     assert "function readStoredSessionId()" in source
     startup = source.split("async function connect()", 1)[1].split(
         "async function recoverConnection()", 1
@@ -434,7 +435,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
             for match in call_pattern.finditer(candidate)
         )
 
-    assert len(closure_calls) == 29
+    assert len(closure_calls) == 30
     assert {path for path, _match in closure_calls} == {
         "lib/gatewayClient.ts",
         "pages/AiwerkAssistantPage.tsx",
@@ -457,7 +458,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         for path, match in closure_calls
         if path == "pages/AiwerkAssistantPage.tsx"
     ]
-    assert len(matches) == 28
+    assert len(matches) == 29
     def object_keys_after(start: int) -> set[str]:
         brace = source.find("{", start)
         assert brace >= 0
