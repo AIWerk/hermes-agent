@@ -609,6 +609,61 @@
       "where": {
         "name": "dashboard-entry"
       }
+    },
+    {
+      "id": "cui-supported-slash-command-floor",
+      "path": "web/src/lib/cui-slash.ts",
+      "sets": {
+        "CUI_EXEC_SLASH_COMMANDS": [
+          "/compress",
+          "/reload-mcp"
+        ],
+        "CUI_NATIVE_SLASH_COMMANDS": [
+          "/back",
+          "/help",
+          "/learn",
+          "/new",
+          "/side",
+          "/status",
+          "/stop",
+          "/usage"
+        ],
+        "CUI_SUPPORTED_SLASH_COMMANDS": [
+          "/back",
+          "/compress",
+          "/help",
+          "/learn",
+          "/new",
+          "/reload-mcp",
+          "/side",
+          "/status",
+          "/stop",
+          "/usage"
+        ]
+      },
+      "type": "typescript_set_superset",
+      "union": {
+        "members": [
+          "CUI_NATIVE_SLASH_COMMANDS",
+          "CUI_EXEC_SLASH_COMMANDS"
+        ],
+        "target": "CUI_SUPPORTED_SLASH_COMMANDS"
+      }
+    },
+    {
+      "allowlist_path": "hermes_cli/web_server.py",
+      "api_path": "web/src/lib/api.ts",
+      "id": "assistant-frontend-api-subset",
+      "path": "web/src/pages/AiwerkAssistantPage.tsx",
+      "required_paths": [
+        "web/src/pages/AiwerkAssistantPage.tsx",
+        "web/src/lib/api.ts",
+        "web/src/lib/gatewayClient.ts"
+      ],
+      "support_paths": [
+        "web/src/hooks/useSidebarStatus.ts"
+      ],
+      "type": "frontend_api_subset"
     }
   ]
 }

@@ -386,6 +386,362 @@ def test_immutable_release_semantic_selector_blocks_hollow_contract(
     assert report["selectors"]["release-preserve-repository"] == "failed"
 
 
+def test_cui_slash_set_contract_blocks_supported_command_shrink(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "cui-supported-slash-command-floor",
+            "type": "typescript_set_superset",
+            "path": "web/src/lib/cui-slash.ts",
+            "sets": {
+                "CUI_NATIVE_SLASH_COMMANDS": ["/back", "/help", "/stop"],
+                "CUI_EXEC_SLASH_COMMANDS": ["/compress"],
+                "CUI_SUPPORTED_SLASH_COMMANDS": ["/back", "/compress", "/help", "/stop"],
+            },
+            "union": {
+                "target": "CUI_SUPPORTED_SLASH_COMMANDS",
+                "members": ["CUI_NATIVE_SLASH_COMMANDS", "CUI_EXEC_SLASH_COMMANDS"],
+            },
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(
+        root,
+        "web/src/lib/cui-slash.ts",
+        """export const CUI_NATIVE_SLASH_COMMANDS = new Set([\"/back\", \"/help\", \"/stop\"]);
+export const CUI_EXEC_SLASH_COMMANDS = new Set([\"/compress\"]);
+export const CUI_SUPPORTED_SLASH_COMMANDS = new Set([...CUI_NATIVE_SLASH_COMMANDS, ...CUI_EXEC_SLASH_COMMANDS]);
+""",
+    )
+    active = _commit(root, "protect CUI slash contract")
+    assert evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)[
+        "verdict"
+    ] == "PASS"
+
+    _write(
+        root,
+        "web/src/lib/cui-slash.ts",
+        """export const CUI_NATIVE_SLASH_COMMANDS = new Set();
+export const CUI_EXEC_SLASH_COMMANDS = new Set([\"/compress\"]);
+export const CUI_SUPPORTED_SLASH_COMMANDS = new Set([...CUI_EXEC_SLASH_COMMANDS]);
+""",
+    )
+    target = _commit(root, "shrink supported CUI slash commands")
+
+    report = evaluate_range(root, active, target, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert "CAPABILITY_SELECTOR_FAILED" in _codes(report)
+    assert report["selectors"]["cui-supported-slash-command-floor"] == "failed"
+
+
+def test_cui_slash_set_contract_ignores_commented_out_sets(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "cui-supported-slash-command-floor",
+            "type": "typescript_set_superset",
+            "path": "web/src/lib/cui-slash.ts",
+            "sets": {
+                "CUI_NATIVE_SLASH_COMMANDS": ["/back"],
+                "CUI_EXEC_SLASH_COMMANDS": ["/compress"],
+                "CUI_SUPPORTED_SLASH_COMMANDS": ["/back", "/compress"],
+            },
+            "union": {
+                "target": "CUI_SUPPORTED_SLASH_COMMANDS",
+                "members": ["CUI_NATIVE_SLASH_COMMANDS", "CUI_EXEC_SLASH_COMMANDS"],
+            },
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(
+        root,
+        "web/src/lib/cui-slash.ts",
+        """export const CUI_NATIVE_SLASH_COMMANDS = new Set();
+export const CUI_EXEC_SLASH_COMMANDS = new Set();
+export const CUI_SUPPORTED_SLASH_COMMANDS = new Set();
+/*
+export const CUI_NATIVE_SLASH_COMMANDS = new Set([\"/back\"]);
+export const CUI_EXEC_SLASH_COMMANDS = new Set([\"/compress\"]);
+export const CUI_SUPPORTED_SLASH_COMMANDS = new Set([...CUI_NATIVE_SLASH_COMMANDS, ...CUI_EXEC_SLASH_COMMANDS]);
+*/
+""",
+    )
+    active = _commit(root, "comment-shadowed CUI contract")
+
+    report = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["selectors"]["cui-supported-slash-command-floor"] == "failed"
+
+
+def test_assistant_frontend_api_calls_must_be_allowlisted(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "assistant-frontend-api-subset",
+            "type": "frontend_api_subset",
+            "path": "web/src/pages/AiwerkAssistantPage.tsx",
+            "support_paths": ["web/src/lib/api.ts"],
+            "allowlist_path": "hermes_cli/web_server.py",
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(root, "web/src/pages/AiwerkAssistantPage.tsx", 'fetch("/api/status")\n')
+    _write(root, "web/src/lib/api.ts", "")
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        '_ASSISTANT_ALLOWED_API_EXACT = {"/api/status": frozenset({"GET"})}\n'
+        '_ASSISTANT_ALLOWED_API_PREFIXES = ("/api/sessions/",)\n',
+    )
+    active = _commit(root, "protect assistant frontend API surface")
+    assert evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)[
+        "verdict"
+    ] == "PASS"
+
+    _write(
+        root,
+        "web/src/pages/AiwerkAssistantPage.tsx",
+        'fetch("/api/status")\nfetch("/api/admin/config")\n',
+    )
+    target = _commit(root, "add unallowlisted assistant endpoint")
+
+    report = evaluate_range(root, active, target, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert "CAPABILITY_SELECTOR_FAILED" in _codes(report)
+    assert report["selectors"]["assistant-frontend-api-subset"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'fetch("/api/" + "admin/config")',
+        'fetch("/api/status" + "/admin/config")',
+        'fetch(prefix + "/api/status")',
+        "fetch(`/api/${tail}`)",
+        'fetch("/api/status", {method: "DELETE"})',
+        'fetch("/api/status", {method: selectedMethod})',
+        'fetch("/api/status", {...options})',
+        'fetch("/api/status", options)',
+    ],
+)
+def test_assistant_frontend_api_selector_rejects_dynamic_or_wrong_method(
+    repo: tuple[Path, str, str], call: str
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "assistant-frontend-api-subset",
+            "type": "frontend_api_subset",
+            "path": "web/src/pages/AiwerkAssistantPage.tsx",
+            "allowlist_path": "hermes_cli/web_server.py",
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(root, "web/src/pages/AiwerkAssistantPage.tsx", call + "\n")
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        '_ASSISTANT_ALLOWED_API_EXACT = {"/api/status": frozenset({"GET"})}\n'
+        '_ASSISTANT_ALLOWED_API_PREFIXES = ("/api/sessions/",)\n',
+    )
+    active = _commit(root, "reject non-static or wrong-method API call")
+
+    report = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["selectors"]["assistant-frontend-api-subset"] == "failed"
+
+
+def test_assistant_frontend_api_selector_requires_paths_and_nonzero_calls(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "assistant-frontend-api-subset",
+            "type": "frontend_api_subset",
+            "path": "web/src/pages/AiwerkAssistantPage.tsx",
+            "required_paths": [
+                "web/src/pages/AiwerkAssistantPage.tsx",
+                "web/src/lib/api.ts",
+                "web/src/lib/gatewayClient.ts",
+            ],
+            "api_path": "web/src/lib/api.ts",
+            "allowlist_path": "hermes_cli/web_server.py",
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(root, "web/src/pages/AiwerkAssistantPage.tsx", "export const empty = true;\n")
+    _write(root, "web/src/lib/api.ts", "export const empty = true;\n")
+    _write(root, "web/src/lib/gatewayClient.ts", "export const empty = true;\n")
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        '_ASSISTANT_ALLOWED_API_EXACT = {"/api/auth/ws-ticket": frozenset({"POST"})}\n',
+    )
+    active = _commit(root, "require nonempty API scan")
+
+    report = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["selectors"]["assistant-frontend-api-subset"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "inert_path",
+    [
+        "web/src/pages/AiwerkAssistantPage.tsx",
+        "web/src/lib/api.ts",
+        "web/src/lib/gatewayClient.ts",
+    ],
+)
+def test_each_required_frontend_api_path_must_have_a_recognized_call(
+    repo: tuple[Path, str, str], inert_path: str
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    required_paths = [
+        "web/src/pages/AiwerkAssistantPage.tsx",
+        "web/src/lib/api.ts",
+        "web/src/lib/gatewayClient.ts",
+    ]
+    baseline["selectors"].append(
+        {
+            "id": "assistant-frontend-api-subset",
+            "type": "frontend_api_subset",
+            "path": required_paths[0],
+            "required_paths": required_paths,
+            "api_path": required_paths[1],
+            "allowlist_path": "hermes_cli/web_server.py",
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(root, required_paths[0], 'fetch("/api/status")\n')
+    _write(
+        root,
+        required_paths[1],
+        "export async function getWsTicket() {\n"
+        '  return fetch("/api/auth/ws-ticket", { method: "POST" });\n'
+        "}\n",
+    )
+    _write(
+        root,
+        required_paths[2],
+        'import { getWsTicket } from "@/lib/api";\n'
+        "export async function connect() { return getWsTicket(); }\n",
+    )
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        '_ASSISTANT_ALLOWED_API_EXACT = {\n'
+        '    "/api/status": frozenset({"GET"}),\n'
+        '    "/api/auth/ws-ticket": frozenset({"POST"}),\n'
+        '}\n',
+    )
+    _write(root, inert_path, "export const inert = true;\n")
+    active = _commit(root, f"make required path inert: {inert_path}")
+
+    report = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["selectors"]["assistant-frontend-api-subset"] == "failed"
+    assert any(inert_path in reason for reason in report["reason_codes"])
+
+
+def test_required_gateway_path_resolves_ws_ticket_post(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "assistant-frontend-api-subset",
+            "type": "frontend_api_subset",
+            "path": "web/src/lib/gatewayClient.ts",
+            "required_paths": ["web/src/lib/gatewayClient.ts", "web/src/lib/api.ts"],
+            "api_path": "web/src/lib/api.ts",
+            "allowlist_path": "hermes_cli/web_server.py",
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(
+        root,
+        "web/src/lib/gatewayClient.ts",
+        'import { buildWsAuthParam } from "@/lib/api";\n'
+        "export async function connect() { return buildWsAuthParam(); }\n",
+    )
+    _write(
+        root,
+        "web/src/lib/api.ts",
+        "const BASE = window.location.origin;\n"
+        "export async function getWsTicket(): Promise<{ ticket: string; expires_at: string }> {\n"
+        "  const res = await fetch(`${BASE}/api/auth/ws-ticket`, { method: \"POST\" });\n"
+        "  if (!res.ok) throw new Error(`/api/auth/ws-ticket: HTTP ${res.status}`);\n"
+        "  return res.json();\n"
+        "}\n"
+        "export async function buildWsAuthParam() { return getWsTicket(); }\n",
+    )
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        '_ASSISTANT_ALLOWED_API_EXACT = {"/api/auth/ws-ticket": frozenset({"POST"})}\n',
+    )
+    active = _commit(root, "trace required gateway API helper")
+
+    report = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "PASS"
+
+
+def test_historical_selector_pair_requires_positive_before_negative(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_evaluate(_repo, active, target, _upstream, *, pr_number):
+        assert pr_number is None
+        calls.append(target)
+        status = "passed" if active == target == "positive" else "failed"
+        return {
+            "verdict": "PASS" if status == "passed" else "FAIL",
+            "selectors": {"floor": status},
+        }
+
+    monkeypatch.setattr(_guard, "evaluate_range", fake_evaluate)
+
+    result = _guard._historical_selector_pair(
+        Path("."), "positive", "negative", "upstream", "floor"
+    )
+
+    assert calls == ["positive", "negative"]
+    assert result == {
+        "active": "positive",
+        "target": "negative",
+        "positive_verdict": "PASS",
+        "negative_verdict": "FAIL",
+        "verdict": "FAIL",
+    }
+
+
 def test_protected_regular_file_replaced_by_symlink_fails_closed(
     repo: tuple[Path, str, str]
 ) -> None:
@@ -873,3 +1229,64 @@ def test_exact_historical_8bd_to_7b_fixture_blocks_known_losses() -> None:
         "web/src/lib/cui-slash.ts",
     } <= missing
     assert "FORK_MARKER_ZEROED" in _codes(report)
+
+
+def test_exact_historical_c398_confinement_commit_trips_cui_slash_floor() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    historical_target = "c398f61c1436247987b882b7569a1bc26d2afe6c"
+    required = {_guard._HISTORICAL_ACTIVE, historical_target, _guard._HISTORICAL_UPSTREAM}
+    if any(
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+        ).returncode
+        for ref in required
+    ):
+        pytest.skip("historical CUI commit unavailable in this checkout")
+
+    pair = _guard._historical_selector_pair(
+        repo_root,
+        _guard._HISTORICAL_ACTIVE,
+        historical_target,
+        _guard._HISTORICAL_UPSTREAM,
+        "cui-supported-slash-command-floor",
+    )
+
+    assert pair["positive_verdict"] == "PASS"
+    assert pair["negative_verdict"] == "FAIL"
+    assert pair["active"] == _guard._HISTORICAL_ACTIVE
+    assert pair["target"] == historical_target
+
+
+def test_exact_pre_102_frontend_api_surface_trips_subset_selector() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    broken = "6453f2cc6cf3c8f91604c1e40cdf6ad165cbd4fd"
+    restored = "b6a15fdb786dd145f39fb70c70080937747adff4"
+    if any(
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+        ).returncode
+        for ref in (broken, restored)
+    ):
+        pytest.skip("historical #102 commits unavailable in this checkout")
+    baseline = json.loads(
+        (repo_root / ".ci/content-loss/baseline.json").read_text(encoding="utf-8")
+    )
+    selector = next(
+        item
+        for item in baseline["selectors"]
+        if item["id"] == "assistant-frontend-api-subset"
+    )
+
+    broken_statuses, _ = _guard._evaluate_selectors(
+        repo_root, _guard._tree_entries(repo_root, broken), [selector]
+    )
+    restored_statuses, _ = _guard._evaluate_selectors(
+        repo_root, _guard._tree_entries(repo_root, restored), [selector]
+    )
+
+    assert broken_statuses["assistant-frontend-api-subset"] == "failed"
+    assert restored_statuses["assistant-frontend-api-subset"] == "passed"
