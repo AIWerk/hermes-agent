@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import ipaddress
 import json
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -36,9 +40,54 @@ EXPECTED_PALETTE = (
 )
 
 
+def _public_netloc(parsed: urllib.parse.SplitResult) -> str:
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL host is required")
+    rendered = f"[{host}]" if ":" in host else host
+    return f"{rendered}:{parsed.port}" if parsed.port is not None else rendered
+
+
+def normalize_base_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("base URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base URL must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base URL must not contain a query or fragment")
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, _public_netloc(parsed), parsed.path.rstrip("/"), "", "")
+    )
+
+
+def public_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "[redacted-url]"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, _public_netloc(parsed), parsed.path, "", "")
+    )
+
+
+def public_error(exc: Exception) -> dict[str, str]:
+    return {"type": type(exc).__name__, "message": "smoke execution failed"}
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(host).is_loopback
+    return False
+
+
 def load_cookie_records(path: Path, base_url: str) -> list[dict[str, Any]]:
     """Parse curl/Netscape cookies without logging their values."""
-    parsed = urllib.parse.urlsplit(base_url)
+    parsed = urllib.parse.urlsplit(normalize_base_url(base_url))
+    target_host = (parsed.hostname or "").lower().rstrip(".")
+    origin = urllib.parse.urlunsplit((parsed.scheme, _public_netloc(parsed), "", "", ""))
+    now = int(time.time())
     records: list[dict[str, Any]] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         http_only = raw.startswith("#HttpOnly_")
@@ -48,18 +97,44 @@ def load_cookie_records(path: Path, base_url: str) -> list[dict[str, Any]]:
         parts = line.split("\t")
         if len(parts) != 7:
             raise ValueError("invalid Netscape cookie record")
-        domain, _include_subdomains, cookie_path, secure, _expires, name, value = parts
-        records.append(
-            {
-                "domain": domain.lstrip("."),
-                "httpOnly": http_only,
-                "name": name,
-                "path": cookie_path or "/",
-                "secure": secure.upper() == "TRUE",
-                "url": f"{parsed.scheme}://{parsed.netloc}",
-                "value": value,
-            }
+        domain, include_subdomains, cookie_path, secure, expires_raw, name, value = parts
+        domain = domain.lstrip(".").lower().rstrip(".")
+        include = include_subdomains.upper() == "TRUE"
+        if include_subdomains.upper() not in {"TRUE", "FALSE"}:
+            raise ValueError("invalid cookie subdomain flag")
+        domain_matches = target_host == domain or (
+            include and target_host.endswith(f".{domain}")
         )
+        if not domain or not domain_matches:
+            raise ValueError("cookie domain does not match target host")
+        if not cookie_path.startswith("/") or not name:
+            raise ValueError("invalid cookie path or name")
+        try:
+            expires = int(expires_raw)
+        except ValueError as exc:
+            raise ValueError("invalid cookie expiry") from exc
+        if expires < 0:
+            raise ValueError("invalid cookie expiry")
+        if expires and expires <= now:
+            continue
+        is_secure = secure.upper() == "TRUE"
+        if secure.upper() not in {"TRUE", "FALSE"}:
+            raise ValueError("invalid cookie secure flag")
+        if is_secure and parsed.scheme != "https" and not _is_loopback(target_host):
+            raise ValueError("secure cookie requires HTTPS")
+        record: dict[str, Any] = {
+            "httpOnly": http_only,
+            "name": name,
+            "path": cookie_path,
+            "secure": is_secure,
+            "url": origin,
+            "value": value,
+        }
+        if include:
+            record["domain"] = f".{domain}"
+        if expires:
+            record["expires"] = expires
+        records.append(record)
     if not records:
         raise ValueError("cookie jar contains no cookies")
     return records
@@ -70,11 +145,10 @@ def client_error_responses(events: list[dict[str, Any]]) -> list[dict[str, Any]]
     for event in events:
         status = int(event.get("status", 0))
         if 400 <= status < 500:
-            split = urllib.parse.urlsplit(str(event.get("url", "")))
             failures.append(
                 {
                     "status": status,
-                    "url": urllib.parse.urlunsplit((split.scheme, split.netloc, split.path, "", "")),
+                    "url": public_url(str(event.get("url", ""))),
                 }
             )
     return failures
@@ -240,12 +314,98 @@ def _network_observations(events: list[dict[str, Any]]) -> tuple[list[dict[str, 
     return responses, catalog_sent, catalog_received, ws_101
 
 
+def install_cookies(cdp: Any, records: list[dict[str, Any]]) -> None:
+    for cookie in records:
+        result = cdp.call("Network.setCookie", cookie)
+        if result.get("success") is not True:
+            raise RuntimeError("Chrome rejected an authentication cookie")
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _cookie_path_matches(request_path: str, cookie_path: str) -> bool:
+    return request_path == cookie_path or (
+        request_path.startswith(cookie_path)
+        and (cookie_path.endswith("/") or request_path[len(cookie_path) :].startswith("/"))
+    )
+
+
+def wait_for_persisted_marker(
+    base_url: str,
+    session_id: str,
+    marker: str,
+    cookies: list[dict[str, Any]],
+    timeout: float,
+    *,
+    opener: Any = None,
+    sleep: Any = time.sleep,
+) -> None:
+    endpoint_path = (
+        f"/api/sessions/{urllib.parse.quote(session_id, safe='')}/messages"
+    )
+    pairs: list[str] = []
+    for cookie in cookies:
+        name = str(cookie.get("name", ""))
+        value = str(cookie.get("value", ""))
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or re.search(
+            r"[\x00-\x20\x7f;]", value
+        ):
+            raise ValueError("cookie is unsafe for persistence probe")
+        cookie_path = str(cookie.get("path", ""))
+        if _cookie_path_matches(endpoint_path, cookie_path):
+            pairs.append(f"{name}={value}")
+    if not pairs:
+        raise ValueError("no authentication cookie applies to persistence probe")
+    endpoint = (
+        f"{base_url}{endpoint_path}?limit=500&order=latest"
+    )
+    open_request = opener or urllib.request.build_opener(NoRedirectHandler()).open
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        request = urllib.request.Request(endpoint, headers={"Cookie": "; ".join(pairs)})
+        try:
+            with open_request(request, timeout=min(5, timeout)) as response:
+                payload = json.loads(response.read(1_000_001))
+            if marker in json.dumps(payload, ensure_ascii=False):
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise RuntimeError("persistence probe HTTP failure") from exc
+        sleep(0.25)
+    raise TimeoutError("persisted smoke marker did not become visible")
+
+
+def cleanup(cdp: Any, browser: Any, profile: Path) -> None:
+    try:
+        if cdp is not None:
+            with contextlib.suppress(Exception):
+                cdp.close()
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                browser.terminate()
+            try:
+                browser.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(Exception):
+                    browser.kill()
+                with contextlib.suppress(Exception):
+                    browser.wait(timeout=5)
+            except Exception:
+                pass
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     profile = Path(tempfile.mkdtemp(prefix="aiwerk-cui-smoke-"))
     browser: subprocess.Popen[bytes] | None = None
     cdp: CDP | None = None
     report: dict[str, Any] = {"schema_version": 1, "verdict": "FAIL"}
     try:
+        base_url = normalize_base_url(args.base_url)
         if args.cdp_port != 0:
             raise ValueError("--cdp-port must be 0; dynamic owned CDP is required")
         browser = _start_browser(_browser_binary(args.chrome_binary), profile)
@@ -255,10 +415,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cdp.call("Page.enable")
         cdp.call("Network.enable")
         cdp.call("Runtime.enable")
-        for cookie in load_cookie_records(args.cookie_jar, args.base_url):
-            cdp.call("Network.setCookie", cookie)
+        cookie_records = load_cookie_records(args.cookie_jar, base_url)
+        install_cookies(cdp, cookie_records)
 
-        cdp.call("Page.navigate", {"url": args.base_url})
+        cdp.call("Page.navigate", {"url": base_url})
         cdp.wait_for("document.readyState === 'complete'", args.timeout, "page load")
         cdp.wait_for("document.querySelector('textarea') !== null", args.timeout, "chat input")
         cdp.wait_for(
@@ -268,7 +428,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         login_has_palette = cdp.evaluate(
-            f"fetch({json.dumps(args.base_url.rstrip('/') + '/login')}, {{credentials:'include'}})"
+            f"fetch({json.dumps(base_url + '/login')}, {{credentials:'include'}})"
             f".then(r => r.text()).then(t => t.toLowerCase().includes('{LOGIN_BACKGROUND_TOKEN}'))",
             await_promise=True,
         )
@@ -308,7 +468,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.timeout,
             "rendered smoke marker",
         )
-        time.sleep(1.0)
+        wait_for_persisted_marker(
+            base_url,
+            str(session_before),
+            marker,
+            cookie_records,
+            args.timeout,
+        )
         cdp.call("Page.reload", {"ignoreCache": True})
         cdp.wait_for("document.querySelector('textarea') !== null", args.timeout, "reloaded chat input")
         cdp.wait_for(f"document.body.innerText.includes({json.dumps(marker)})", args.timeout, "persisted marker")
@@ -370,9 +536,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ]
         report.update(
             {
-                "base_url": urllib.parse.urlunsplit(
-                    (*urllib.parse.urlsplit(args.base_url)[:3], "", "")
-                ),
+                "base_url": base_url,
                 "checks": checks,
                 "client_errors": errors_4xx,
                 "failures": failures,
@@ -381,7 +545,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         return report
     except Exception as exc:
-        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        report["error"] = public_error(exc)
         if cdp is not None:
             try:
                 screenshot = cdp.call("Page.captureScreenshot", {"format": "png"})
@@ -391,16 +555,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 pass
         return report
     finally:
-        if cdp is not None:
-            cdp.close()
-        if browser is not None:
-            browser.terminate()
-            try:
-                browser.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                browser.kill()
-                browser.wait(timeout=5)
-        shutil.rmtree(profile, ignore_errors=True)
+        cleanup(cdp, browser, profile)
 
 
 def _parser() -> argparse.ArgumentParser:
