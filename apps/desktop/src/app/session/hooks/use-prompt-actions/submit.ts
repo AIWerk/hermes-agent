@@ -801,6 +801,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
+
           submitResult = submit.result
           effectiveSessionId = submit.sessionId
         } catch (firstErr) {

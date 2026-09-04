@@ -5536,25 +5536,24 @@ describe('background auto-reset isolation', () => {
     const selectedRef = { current: 'stored-foreground' }
     const updates: { sessionId: string; storedSessionId: null | string | undefined }[] = []
 
-    const requestGateway = vi.fn(async (method: string) =>
-      (method === 'prompt.submit'
-        ? {
-            auto_reset: true,
-            previous_session_key: 'stored-background-old',
-            session_key: 'stored-background-new',
-            stored_session_id: 'stored-background-new',
-            status: 'streaming'
-          }
-        : {}) as never
+    const requestGateway = vi.fn(
+      async (method: string) =>
+        (method === 'prompt.submit'
+          ? {
+              auto_reset: true,
+              previous_session_key: 'stored-background-old',
+              session_key: 'stored-background-new',
+              stored_session_id: 'stored-background-new',
+              status: 'streaming'
+            }
+          : {}) as never
     )
 
     let handle: HarnessHandle | null = null
     render(
       <Harness
         activeSessionId="rt-foreground"
-        getRuntimeIdForStoredSession={storedId =>
-          storedId === 'stored-background-old' ? 'rt-background' : null
-        }
+        getRuntimeIdForStoredSession={storedId => (storedId === 'stored-background-old' ? 'rt-background' : null)}
         onReady={h => (handle = h)}
         onUpdateState={(sessionId, storedSessionId) => updates.push({ sessionId, storedSessionId })}
         refreshSessions={async () => undefined}
