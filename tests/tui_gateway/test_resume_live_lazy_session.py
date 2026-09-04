@@ -52,6 +52,27 @@ def _resume(params):
     return srv._methods["session.resume"](1, params)
 
 
+def test_create_and_resume_expose_the_same_persistent_session_key(home, monkeypatch):
+    monkeypatch.setattr(srv, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(srv, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(srv, "_schedule_session_cap_enforcement", lambda: None)
+
+    created = srv._methods["session.create"](1, {"cols": 100})
+    result = created["result"]
+    live_id = result["session_id"]
+    persistent_id = result["stored_session_id"]
+    try:
+        assert result["session_key"] == persistent_id
+
+        resumed = _resume({"session_id": persistent_id, "omit_messages": True})
+        assert "error" not in resumed, resumed
+        assert resumed["result"]["session_id"] == live_id
+        assert resumed["result"]["stored_session_id"] == persistent_id
+        assert resumed["result"]["session_key"] == persistent_id
+    finally:
+        srv._sessions.pop(live_id, None)
+
+
 def test_resume_by_stored_key_reattaches(live_lazy_session):
     sid, record = live_lazy_session
     out = _resume({"profile": "ops", "session_id": record["session_key"], "omit_messages": True})

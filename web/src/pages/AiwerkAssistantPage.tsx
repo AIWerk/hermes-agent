@@ -375,6 +375,7 @@ interface SessionInflightTurn {
 interface SessionOpenResult {
   session_id: string;
   session_key?: string;
+  stored_session_id?: string;
   resumed?: string;
   messages?: GatewayHistoryMessage[];
   info?: { session_id?: string };
@@ -384,7 +385,7 @@ interface SessionOpenResult {
 }
 
 function persistentSessionIdFromOpenResult(result: SessionOpenResult): string {
-  return result.resumed || result.session_key || result.info?.session_id || result.session_id || "";
+  return result.resumed || result.session_key || result.stored_session_id || result.info?.session_id || result.session_id || "";
 }
 
 function readStoredSessionId(): string {

@@ -129,6 +129,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "session_id": sid,
+            "session_key": key,
             "stored_session_id": key,
             "message_count": len(history),
             "messages": _history_to_messages(history),
@@ -470,6 +471,7 @@ def _(rid, params: dict) -> dict:
                         rid,
                         {
                             "session_id": live_sid,
+                            "session_key": str(live.get("session_key") or ""),
                             "stored_session_id": str(live.get("session_key") or ""),
                             "message_count": len(history),
                             "messages": [] if omit_messages else _history_to_messages(history),
@@ -604,6 +606,9 @@ def _(rid, params: dict) -> dict:
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
+            persistent_id = str(session.get("session_key") or target)
+            payload["session_key"] = persistent_id
+            payload["stored_session_id"] = persistent_id
             if defer_history:
                 payload["messages"] = []
                 payload["message_count"] = int(
@@ -711,6 +716,7 @@ def _(rid, params: dict) -> dict:
                     "inflight": None,
                     "running": child_running,
                     "session_key": target,
+                    "stored_session_id": target,
                     "started_at": record["created_at"],
                     "status": "streaming" if child_running else "idle",
                 },
@@ -777,6 +783,7 @@ def _(rid, params: dict) -> dict:
                     "inflight": None,
                     "running": False,
                     "session_key": target,
+                    "stored_session_id": target,
                     "started_at": record["created_at"],
                     "status": "resuming",
                 },
@@ -867,6 +874,7 @@ def _(rid, params: dict) -> dict:
                 "inflight": None,
                 "running": False,
                 "session_key": target,
+                "stored_session_id": target,
                 "started_at": record["created_at"],
                 "status": "idle",
             }
@@ -1069,6 +1077,7 @@ def _(rid, params: dict) -> dict:
         "inflight": None,
         "running": False,
         "session_key": target,
+        "stored_session_id": target,
         "started_at": float(session.get("created_at") or time.time()),
         "status": "idle",
     }

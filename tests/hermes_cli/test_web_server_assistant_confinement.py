@@ -302,6 +302,30 @@ def test_assistant_frontend_startup_requests_match_ws_gate(
         assert web_server._assistant_ws_request_gate(request, assistant_identity) is None
 
 
+def test_assistant_frontend_persists_the_server_session_key() -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "web/src/pages/AiwerkAssistantPage.tsx"
+    ).read_text(encoding="utf-8")
+    assert 'const ACTIVE_SESSION_STORAGE_KEY = "aiwerk-cui.active-session-id";' in source
+    helper = source.split(
+        "function persistentSessionIdFromOpenResult", 1
+    )[1].split("function readStoredSessionId", 1)[0]
+    assert re.search(
+        r"result\.resumed\s*\|\|\s*result\.session_key\s*\|\|\s*"
+        r"result\.stored_session_id\s*\|\|\s*result\.info\?\.session_id\s*\|\|\s*"
+        r"result\.session_id",
+        helper,
+    )
+
+    apply_result = source.split("async function applySessionOpenResult", 1)[1].split(
+        "async function connect()", 1
+    )[0]
+    assert "const persistentSessionId = persistentSessionIdFromOpenResult(result);" in apply_result
+    assert "const activeId = persistentSessionId || result.session_id;" in apply_result
+    assert "storeActiveSessionId(activeId);" in apply_result
+
+
 def test_assistant_frontend_stop_uses_allowed_slash_rpc(
     web_server, assistant_identity
 ) -> None:
