@@ -7905,6 +7905,7 @@ _EMPTY_MODEL_INFO: dict = {
     "config_context_length": 0,
     "effective_context_length": 0,
     "capabilities": {},
+    "agent_name": "Agent",
 }
 
 
@@ -7934,7 +7935,11 @@ def get_model_info(profile: Optional[str] = None):
             config_ctx = None
 
         if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider)
+            return dict(
+                _EMPTY_MODEL_INFO,
+                provider=provider,
+                agent_name=_assistant_display_name_from_config(cfg),
+            )
 
         # Resolve auto-detected context length (pass config_ctx=None to get
         # purely auto-detected value, then separately report the override)
@@ -7980,6 +7985,7 @@ def get_model_info(profile: Optional[str] = None):
             "config_context_length": config_ctx_int,
             "effective_context_length": effective_ctx,
             "capabilities": caps,
+            "agent_name": _assistant_display_name_from_config(cfg),
         }
     except HTTPException:
         # Unknown/invalid profile must surface as 404, not degrade into a

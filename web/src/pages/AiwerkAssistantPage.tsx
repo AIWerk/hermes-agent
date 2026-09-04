@@ -387,6 +387,14 @@ function persistentSessionIdFromOpenResult(result: SessionOpenResult): string {
   return result.resumed || result.session_key || result.info?.session_id || result.session_id || "";
 }
 
+function readStoredSessionId(): string {
+  try {
+    return window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY)?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
 
 function storeActiveSessionId(sessionId?: string | null): void {
   const value = sessionId?.trim();
@@ -2181,11 +2189,28 @@ export default function AiwerkAssistantPage() {
             description: localizeSlashCommandDescription(command, "", cuiLocale),
             category: localizeSlashCategory("Session", cuiLocale),
           })));
-        storeActiveSessionId(null);
-        const result = await gateway.request<SessionOpenResult>("session.create", {
-          source: "web",
-          close_on_disconnect: true,
-        });
+        const storedSessionId = readStoredSessionId();
+        let result: SessionOpenResult;
+        if (storedSessionId) {
+          try {
+            result = await gateway.request<SessionOpenResult>(
+              "session.resume",
+              { session_id: storedSessionId, cols: 100 },
+              30_000,
+            );
+          } catch {
+            storeActiveSessionId(null);
+            result = await gateway.request<SessionOpenResult>("session.create", {
+              source: "web",
+              close_on_disconnect: true,
+            });
+          }
+        } else {
+          result = await gateway.request<SessionOpenResult>("session.create", {
+            source: "web",
+            close_on_disconnect: true,
+          });
+        }
         if (!cancelled) {
           reconnectAttemptRef.current = 0;
           setError(null);
@@ -2205,10 +2230,28 @@ export default function AiwerkAssistantPage() {
       try {
         setConnection("connecting");
         await gateway.connect();
-        const result = await gateway.request<SessionOpenResult>("session.create", {
-          source: "web",
-          close_on_disconnect: true,
-        });
+        const storedSessionId = readStoredSessionId();
+        let result: SessionOpenResult;
+        if (storedSessionId) {
+          try {
+            result = await gateway.request<SessionOpenResult>(
+              "session.resume",
+              { session_id: storedSessionId, cols: 100 },
+              30_000,
+            );
+          } catch {
+            storeActiveSessionId(null);
+            result = await gateway.request<SessionOpenResult>("session.create", {
+              source: "web",
+              close_on_disconnect: true,
+            });
+          }
+        } else {
+          result = await gateway.request<SessionOpenResult>("session.create", {
+            source: "web",
+            close_on_disconnect: true,
+          });
+        }
         if (!cancelled) {
           reconnectAttemptRef.current = 0;
           setError(null);
