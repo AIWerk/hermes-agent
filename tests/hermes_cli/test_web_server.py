@@ -3355,6 +3355,45 @@ class TestModelInfoEndpoint:
         assert data["auto_context_length"] == 200000
         assert data["config_context_length"] == 100000
         assert data["effective_context_length"] == 100000  # override wins
+        assert data["agent_name"] == "Agent"
+
+    def test_model_info_returns_dashboard_agent_name(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "load_config", lambda: {
+            "model": "openai/gpt-5.6",
+            "dashboard": {"agent_name": "Rocky"},
+        })
+
+        with patch("agent.model_metadata.get_model_context_length", return_value=200000):
+            resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["agent_name"] == "Rocky"
+
+    def test_model_info_empty_model_uses_dashboard_agent_name(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(
+            ws,
+            "load_config",
+            lambda: {"dashboard": {"agent_name": "Theo"}},
+        )
+
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["agent_name"] == "Theo"
+
+    def test_model_info_empty_config_returns_agent_fallback(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "load_config", lambda: {})
+
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["agent_name"] == "Agent"
 
 
     def test_model_info_graceful_on_metadata_error(self, monkeypatch):

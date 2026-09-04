@@ -255,19 +255,36 @@ def test_assistant_ws_gate_allows_exact_customer_contract(
 def test_assistant_frontend_startup_requests_match_ws_gate(
     web_server, assistant_identity
 ) -> None:
-    """Exercise every session-create literal shipped by the customer UI."""
+    """Exercise every startup resume/create literal shipped by the customer UI."""
     source = (
         Path(__file__).resolve().parents[2]
         / "web/src/pages/AiwerkAssistantPage.tsx"
     ).read_text(encoding="utf-8")
     assert "commands.catalog" not in source
+    assert "function readStoredSessionId()" in source
+    startup = source.split("async function connect()", 1)[1].split(
+        "async function recoverConnection()", 1
+    )[0]
+    reconnect = source.split("async function recoverConnection()", 1)[1].split(
+        "void connect();", 1
+    )[0]
+    for block in (startup, reconnect):
+        assert "readStoredSessionId()" in block
+        assert '"session.resume"' in block
+        assert re.search(
+            r'"session\.resume"\s*,\s*\{\s*session_id:\s*storedSessionId,\s*cols:\s*100\s*\}',
+            block,
+        )
+        assert '"session.create"' in block
+        assert 'source: "web"' in block
+        assert "close_on_disconnect: true" in block
     create_literals = re.findall(
         r'gateway\.request(?:<[^>]+>)?\(\s*"session\.create"\s*,\s*\{([^}]*)\}'
         r'(?:\s*,\s*[\d_]+)?\s*\)',
         source,
         re.DOTALL,
     )
-    assert len(create_literals) == 3
+    assert len(create_literals) == 5
     for literal in create_literals:
         assert set(re.findall(r"([a-z_]+)\s*:", literal)) == {
             "source",
@@ -393,7 +410,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
             for match in call_pattern.finditer(candidate)
         )
 
-    assert len(closure_calls) == 25
+    assert len(closure_calls) == 29
     assert {path for path, _match in closure_calls} == {
         "lib/gatewayClient.ts",
         "pages/AiwerkAssistantPage.tsx",
@@ -416,7 +433,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         for path, match in closure_calls
         if path == "pages/AiwerkAssistantPage.tsx"
     ]
-    assert len(matches) == 24
+    assert len(matches) == 28
     def object_keys_after(start: int) -> set[str]:
         brace = source.find("{", start)
         assert brace >= 0
