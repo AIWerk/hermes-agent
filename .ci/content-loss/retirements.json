@@ -39,6 +39,36 @@
       "not_before": "2026-09-02T13:00:00Z",
       "expires_at": "2026-09-09T13:00:00Z",
       "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension after the guard schema transition."
+    },
+    {
+      "id": "CUI-CONTROL-BASELINE-PR107",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "fce91773628be47bd4969ccce3814b77fa8e7764",
+      "allowed_target_state": "blob:885d520c3b04a3ff0828a81d6471a09f2b75ba86",
+      "valid_for_pr": 107,
+      "not_before": "2026-09-04T19:24:57Z",
+      "expires_at": "2026-09-11T19:24:57Z",
+      "reason": "Authorize the exact CUI slash-command floor and frontend API required-path baseline extension as an isolated control-plane transition."
+    },
+    {
+      "id": "CUI-CONTROL-GUARD-PR107",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "expected_old_blob": "e8926a2858cad6215018725c18262d99b646138a",
+      "allowed_target_state": "blob:9a2c3117d660dae94b0c8f73948838b92a10a400",
+      "valid_for_pr": 107,
+      "not_before": "2026-09-04T19:24:57Z",
+      "expires_at": "2026-09-11T19:24:57Z",
+      "reason": "Authorize the exact v5 class-level CUI slash-command floor and frontend API subset enforcement as an isolated control-plane transition."
+    },
+    {
+      "id": "CUI-CONTROL-GUARD-TESTS-PR107",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "expected_old_blob": "afe5965b174577737a6f92ce201e2b2aabe02120",
+      "allowed_target_state": "blob:bfddc3ed5492d9d15bff8129dee6c02eb07eb0f8",
+      "valid_for_pr": 107,
+      "not_before": "2026-09-04T19:24:57Z",
+      "expires_at": "2026-09-11T19:24:57Z",
+      "reason": "Authorize the exact v5 regression coverage for the isolated CUI control-plane transition."
     }
   ],
   "schema_version": 1
