@@ -1445,6 +1445,7 @@ class CLICommandsMixin:
                 source=source,
                 model=self.model,
                 model_config={
+                    "_side_from": parent_session_id,
                     "max_iterations": self.max_turns,
                     "reasoning_config": self.reasoning_config,
                 },

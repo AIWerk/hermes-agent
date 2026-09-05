@@ -3653,12 +3653,14 @@ def _(rid, params: dict) -> dict:
                 ),
             )
         db.end_session(parent_session_id, "side_session")
-        model_config = None
+        model_config = {"_side_from": parent_session_id}
         if agent:
-            model_config = {
-                "max_iterations": getattr(agent, "max_iterations", None),
-                "reasoning_config": getattr(agent, "reasoning_config", None),
-            }
+            model_config.update(
+                {
+                    "max_iterations": getattr(agent, "max_iterations", None),
+                    "reasoning_config": getattr(agent, "reasoning_config", None),
+                }
+            )
         db.create_session(
             session_id=side_session_id,
             source=source,

@@ -1065,6 +1065,11 @@ class SessionSchemaMixin:
         # session_stack tables require a one-time table-shape rebuild.
         self._reconcile_session_stack_fk(cursor)
 
+        # Older /side implementations recorded the relationship only in
+        # session_stack. Persist the durable discriminator before readers can
+        # mistake those rows for compression continuations.
+        self._backfill_side_session_markers(cursor)
+
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
         # the one table-shape repair reconciliation can't express.
@@ -1542,6 +1547,74 @@ class SessionSchemaMixin:
                 self._migrate_broad_fts_update_triggers(cursor)
 
         self._conn.commit()
+
+    def _backfill_side_session_markers(
+        self, cursor: sqlite3.Cursor, *, dry_run: bool = False
+    ) -> dict[str, int]:
+        """Mark only consistent legacy side links and report skipped rows."""
+        rows = cursor.execute(
+            """
+            SELECT stack.side_session_id,
+                   stack.parent_session_id AS stack_parent_session_id,
+                   child.id AS child_id,
+                   child.parent_session_id AS child_parent_session_id,
+                   child.model_config,
+                   parent.id AS parent_id
+              FROM session_stack AS stack
+              LEFT JOIN sessions AS child ON child.id = stack.side_session_id
+              LEFT JOIN sessions AS parent ON parent.id = stack.parent_session_id
+             ORDER BY stack.id DESC
+            """
+        ).fetchall()
+        report = {
+            "candidates": len(rows),
+            "marked": 0,
+            "already_marked": 0,
+            "skipped_inconsistent": 0,
+        }
+        resolved_side_ids: set[str] = set()
+        for row in rows:
+            side_id = row["side_session_id"]
+            stack_parent = row["stack_parent_session_id"]
+            consistent = (
+                row["child_id"] is not None
+                and row["parent_id"] is not None
+                and side_id != stack_parent
+                and row["child_parent_session_id"] == stack_parent
+            )
+            if not consistent:
+                report["skipped_inconsistent"] += 1
+                continue
+            if side_id in resolved_side_ids:
+                report["already_marked"] += 1
+                continue
+            raw_config = row["model_config"]
+            try:
+                config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+            except (json.JSONDecodeError, TypeError):
+                config = None
+            if not isinstance(config, dict):
+                config = {}
+            if config.get("_side_from") == stack_parent:
+                resolved_side_ids.add(side_id)
+                report["already_marked"] += 1
+                continue
+            resolved_side_ids.add(side_id)
+            report["marked"] += 1
+            if not dry_run:
+                updated = dict(config)
+                updated["_side_from"] = stack_parent
+                cursor.execute(
+                    "UPDATE sessions SET model_config = ? WHERE id = ?",
+                    (json.dumps(updated), side_id),
+                )
+        if report["skipped_inconsistent"]:
+            logger.warning(
+                "Skipped %d inconsistent legacy side-session link(s) during %s",
+                report["skipped_inconsistent"],
+                "dry-run" if dry_run else "startup backfill",
+            )
+        return report
 
     def _run_admitted_startup_rebuild(self, cursor, rebuild_fn) -> None:
         """Run a full trigger-repair FTS rebuild under cross-process admission.

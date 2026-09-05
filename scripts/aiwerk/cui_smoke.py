@@ -289,6 +289,83 @@ def _new_tab(port: int, url: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def websocket_rpc_result(
+    events: list[dict[str, Any]], method_name: str
+) -> dict[str, Any] | None:
+    """Return the response correlated to a WebSocket JSON-RPC method call."""
+    request_methods: dict[tuple[str, str | int], Any] = {}
+    poisoned: set[tuple[str, str | int]] = set()
+    for event in events:
+        event_method = event.get("method")
+        if event_method not in {
+            "Network.webSocketFrameSent",
+            "Network.webSocketFrameReceived",
+        }:
+            continue
+        try:
+            socket_id = event["params"]["requestId"]
+            payload = json.loads(event["params"]["response"]["payloadData"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(socket_id, str) or not socket_id or not isinstance(payload, dict):
+            continue
+        rpc_id = payload.get("id")
+        if isinstance(rpc_id, bool) or not isinstance(rpc_id, (str, int)):
+            continue
+        request_key = (socket_id, rpc_id)
+        if event_method == "Network.webSocketFrameSent":
+            sent_method = payload.get("method")
+            if (
+                request_key in poisoned
+                or request_key in request_methods
+                or not isinstance(sent_method, str)
+                or "result" in payload
+                or "error" in payload
+            ):
+                request_methods.pop(request_key, None)
+                poisoned.add(request_key)
+                continue
+            request_methods[request_key] = sent_method
+            continue
+        if event_method == "Network.webSocketFrameReceived":
+            if (
+                request_key in poisoned
+                or request_key not in request_methods
+                or "method" in payload
+                or (("result" in payload) == ("error" in payload))
+            ):
+                request_methods.pop(request_key, None)
+                poisoned.add(request_key)
+                continue
+            sent_method = request_methods.pop(request_key, None)
+            if sent_method != method_name:
+                continue
+            if "error" in payload:
+                raise RuntimeError(f"{method_name} RPC failed")
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError(f"{method_name} RPC returned an invalid result")
+            return result
+    return None
+
+
+def wait_for_websocket_rpc(
+    cdp: Any,
+    method_name: str,
+    *,
+    start_index: int,
+    timeout: float,
+) -> dict[str, Any]:
+    """Wait for a browser-originated WebSocket RPC and its matching response."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = websocket_rpc_result(cdp.events[start_index:], method_name)
+        if result is not None:
+            return result
+        cdp.drain(min(0.25, max(0.01, deadline - time.monotonic())))
+    raise TimeoutError(f"timed out waiting for {method_name} RPC")
+
+
 def _network_observations(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int, int]:
     responses: list[dict[str, Any]] = []
     catalog_sent = catalog_received = ws_101 = 0
@@ -417,6 +494,27 @@ def customer_bootstrap_checks(
     }
 
 
+def side_isolation_checks(
+    parent_session_id: str,
+    session_after_reload: Any,
+    main_panel_text: Any,
+    side_marker: str,
+    side_back_parent_id: Any,
+) -> dict[str, bool]:
+    """Return fail-closed assertions for the real side-session smoke."""
+    return {
+        "side_message_absent_after_reload": (
+            isinstance(main_panel_text, str)
+            and bool(main_panel_text.strip())
+            and side_marker not in main_panel_text
+        ),
+        "side_parent_session_preserved": bool(parent_session_id)
+        and session_after_reload == parent_session_id,
+        "side_back_returned_parent": bool(parent_session_id)
+        and side_back_parent_id == parent_session_id,
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     profile = Path(tempfile.mkdtemp(prefix="aiwerk-cui-smoke-"))
     browser: subprocess.Popen[bytes] | None = None
@@ -513,6 +611,115 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
         )
 
+        side_marker = f"AIWerk CUI side smoke {time.time_ns()}"
+        side_start_event_index = len(cdp.events)
+        cdp.wait_for(
+            "(() => { const b=[...document.querySelectorAll('button')].find("
+            "x=>(x.innerText||'').trim()==='Nebenfrage');"
+            "if(!b||b.disabled)return false;b.click();return true;})()",
+            args.timeout,
+            "Nebenfrage button",
+        )
+        side_start_result = wait_for_websocket_rpc(
+            cdp,
+            "session.side.start",
+            start_index=side_start_event_index,
+            timeout=args.timeout,
+        )
+        side_session_id = str(side_start_result.get("side_session_id") or "")
+        if not side_session_id:
+            raise AssertionError("session.side.start returned no side_session_id")
+        if side_start_result.get("parent_session_id") not in (None, session_before):
+            raise AssertionError("session.side.start returned the wrong parent")
+        cdp.wait_for(
+            "document.querySelector('aside[aria-label=\"Nebenunterhaltung\"]"
+            "[data-open=\"true\"] textarea') !== null",
+            args.timeout,
+            "side conversation input",
+        )
+        cdp.evaluate(
+            "(() => { const e=document.querySelector("
+            "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"] textarea');"
+            f"const v={json.dumps(side_marker)}; const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
+            "s.call(e,v); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+        )
+        cdp.wait_for(
+            "(() => { const d=document.querySelector("
+            "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"]');"
+            "const b=d&&[...d.querySelectorAll('button')].find("
+            "x=>(x.innerText||'').trim()==='Senden');"
+            "if(!b||b.disabled)return false;b.click();return true;})()",
+            args.timeout,
+            "side send button",
+        )
+        cdp.wait_for(
+            f"document.body.innerText.includes({json.dumps(side_marker)})",
+            args.timeout,
+            "rendered side marker",
+        )
+        wait_for_persisted_marker(
+            base_url,
+            side_session_id,
+            side_marker,
+            cookie_records,
+            args.timeout,
+        )
+        cdp.wait_for(
+            "[...document.querySelectorAll('button')].some("
+            "x=>(x.innerText||'').trim()==='Stop')",
+            args.timeout,
+            "side response started",
+        )
+        cdp.wait_for(
+            "![...document.querySelectorAll('button')].some("
+            "x=>(x.innerText||'').trim()==='Stop')",
+            args.timeout,
+            "completed side response",
+        )
+        side_back_event_index = len(cdp.events)
+        cdp.wait_for(
+            "(() => { const d=document.querySelector("
+            "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"]');"
+            "const b=d&&[...d.querySelectorAll('header button')].find("
+            "x=>(x.innerText||'').trim()==='Schliessen');"
+            "if(!b||b.disabled)return false;b.click();return true;})()",
+            args.timeout,
+            "Schliessen button",
+        )
+        side_back_result = wait_for_websocket_rpc(
+            cdp,
+            "session.side.back",
+            start_index=side_back_event_index,
+            timeout=args.timeout,
+        )
+        side_back_parent_id = side_back_result.get("parent_session_id")
+        cdp.wait_for(
+            "document.querySelector('aside[aria-label=\"Nebenunterhaltung\"]')"
+            ".getAttribute('data-open') !== 'true'",
+            args.timeout,
+            "closed side conversation",
+        )
+        cdp.call("Page.reload", {"ignoreCache": True})
+        cdp.wait_for("document.querySelector('textarea') !== null", args.timeout, "post-side reload")
+        cdp.wait_for(
+            f"document.body.innerText.includes({json.dumps(marker)})",
+            args.timeout,
+            "main marker after side reload",
+        )
+        session_after_side_reload = cdp.evaluate(
+            f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+        )
+        main_panel_text = cdp.evaluate(
+            "document.querySelector('.aiwerk-messages')?.innerText || ''"
+        )
+        side_checks = side_isolation_checks(
+            str(session_before),
+            session_after_side_reload,
+            main_panel_text,
+            side_marker,
+            side_back_parent_id,
+        )
+
         cdp.evaluate(
             "(() => { const e=document.querySelector('textarea');"
             "const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
@@ -539,6 +746,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "active_session_preserved": session_before == session_after,
             "agent_header_matches_status": header_name == agent_name,
             **bootstrap_checks,
+            **side_checks,
             "document_title": document_title,
             "catalog_request_count": catalog_sent,
             "catalog_response_count": catalog_received,
@@ -561,6 +769,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ],
                 "document_title_contains_agent_name": checks[
                     "document_title_contains_agent_name"
+                ],
+                "side_message_absent_after_reload": checks[
+                    "side_message_absent_after_reload"
+                ],
+                "side_parent_session_preserved": checks[
+                    "side_parent_session_preserved"
+                ],
+                "side_back_returned_parent": checks[
+                    "side_back_returned_parent"
                 ],
                 "catalog_once_per_connection": (
                     ws_101 >= 1 and catalog_sent == ws_101 and catalog_received == ws_101

@@ -186,6 +186,18 @@ _COMPRESSION_CHILD_SQL = (
     "EXISTS (SELECT 1 FROM sessions p"
     "        WHERE p.id = {a}.parent_session_id"
     "        AND p.end_reason = 'compression')"
+    " AND COALESCE(json_extract(COALESCE({a}.model_config, '{{}}'),"
+    "                                  '$._branched_from'), '')"
+    "     != {a}.parent_session_id"
+    " AND COALESCE(json_extract(COALESCE({a}.model_config, '{{}}'),"
+    "                                  '$._side_from'), '')"
+    "     != {a}.parent_session_id"
+    " AND COALESCE(json_extract(COALESCE({a}.model_config, '{{}}'),"
+    "                                  '$._delegate_from'), '')"
+    "     != {a}.parent_session_id"
+    " AND COALESCE({a}.source, '') != 'tool'"
+    " AND NOT EXISTS (SELECT 1 FROM session_stack side_stack"
+    "                  WHERE side_stack.side_session_id = {a}.id)"
 )
 
 
