@@ -40,6 +40,8 @@ def test_osc52_fallback_never_retries_native_clipboard(monkeypatch) -> None:
     monkeypatch.setattr(
         cli.HermesCLI, "_write_native_clipboard", reject_native_attempt, raising=False
     )
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     instance = object.__new__(cli.HermesCLI)
     writes: list[str] = []
 
