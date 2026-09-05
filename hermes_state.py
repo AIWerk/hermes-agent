@@ -7756,7 +7756,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 not parent_id
                 or parent_id in seen
-                or self._is_explicit_fork_child_row(current)
+                or self._is_explicit_fork_child_row_on_conn(current, conn)
             ):
                 break
             parent = _row(parent_id)
@@ -13155,25 +13155,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Export and cleanup
     # =========================================================================
 
-    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
-        """True when ``session`` is a branch, side, delegate, or tool child."""
+    def _is_explicit_fork_child_row_on_conn(
+        self, session: Dict[str, Any], conn
+    ) -> bool:
+        """Lock-free fork-child check using the caller's connection."""
         if session.get("source") == "tool":
             return True
         session_id = session.get("id")
-        if session_id:
-            with self._lock:
-                conn = self._conn
-                evidence = (
-                    conn.execute(
-                        "SELECT EXISTS (SELECT 1 FROM session_stack "
-                        "WHERE side_session_id = ?) AS stack_candidate, "
-                        "(SELECT end_reason FROM sessions WHERE id = ?) "
-                        "AS parent_end_reason",
-                        (session_id, session.get("parent_session_id")),
-                    ).fetchone()
-                    if conn is not None
-                    else None
-                )
+        if session_id and conn is not None:
+            evidence = conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM session_stack "
+                "WHERE side_session_id = ?) AS stack_candidate, "
+                "(SELECT end_reason FROM sessions WHERE id = ?) "
+                "AS parent_end_reason",
+                (session_id, session.get("parent_session_id")),
+            ).fetchone()
             if evidence is not None and (
                 evidence["stack_candidate"]
                 or evidence["parent_end_reason"] == "side_session"
@@ -13199,6 +13195,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 or delegated == parent_id
             )
         return branched is not None or side is not None or delegated is not None
+
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
+        """True when ``session`` is a branch, side, delegate, or tool child."""
+        with self._lock:
+            return self._is_explicit_fork_child_row_on_conn(session, self._conn)
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
