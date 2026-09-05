@@ -664,6 +664,61 @@
         "web/src/hooks/useSidebarStatus.ts"
       ],
       "type": "frontend_api_subset"
+    },
+    {
+      "root_function": "mount_spa",
+      "helper_functions": [
+        "_dashboard_mode_bootstrap_js"
+      ],
+      "globals": [
+        "window.__AIWERK_CUI_LOCALE__",
+        "window.__HERMES_AGENT_DISPLAY_NAME__",
+        "window.__HERMES_DASHBOARD_MODE__",
+        "window.__HERMES_USER_DISPLAY_NAME__"
+      ],
+      "id": "assistant-spa-bootstrap-global-floor",
+      "path": "hermes_cli/web_server.py",
+      "type": "python_scoped_window_globals_superset"
+    },
+    {
+      "dependencies": [
+        "certifi",
+        "concurrent-log-handler",
+        "croniter",
+        "cryptography",
+        "defusedxml",
+        "fastapi",
+        "fire",
+        "httpx",
+        "jinja2",
+        "markdown",
+        "nemo-relay",
+        "openai",
+        "packaging",
+        "pathspec",
+        "pillow",
+        "prompt-toolkit",
+        "psutil",
+        "ptyprocess",
+        "pydantic",
+        "pyjwt",
+        "python-dotenv",
+        "python-multipart",
+        "pywin32",
+        "pywinpty",
+        "pyyaml",
+        "requests",
+        "rich",
+        "ruamel-yaml",
+        "tenacity",
+        "tzdata",
+        "urllib3",
+        "uvicorn",
+        "websockets"
+      ],
+      "id": "core-project-dependency-floor",
+      "path": "pyproject.toml",
+      "type": "toml_project_dependencies_superset"
     }
   ]
 }

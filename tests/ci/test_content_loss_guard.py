@@ -1290,3 +1290,372 @@ def test_exact_pre_102_frontend_api_surface_trips_subset_selector() -> None:
 
     assert broken_statuses["assistant-frontend-api-subset"] == "failed"
     assert restored_statuses["assistant-frontend-api-subset"] == "passed"
+
+
+_BOOTSTRAP_GLOBALS = {
+    "window.__AIWERK_CUI_LOCALE__",
+    "window.__HERMES_AGENT_DISPLAY_NAME__",
+    "window.__HERMES_DASHBOARD_MODE__",
+    "window.__HERMES_USER_DISPLAY_NAME__",
+}
+
+_CORE_DEPENDENCIES = {
+    "certifi",
+    "concurrent-log-handler",
+    "croniter",
+    "cryptography",
+    "defusedxml",
+    "fastapi",
+    "fire",
+    "httpx",
+    "jinja2",
+    "markdown",
+    "nemo-relay",
+    "openai",
+    "packaging",
+    "pathspec",
+    "pillow",
+    "prompt-toolkit",
+    "psutil",
+    "ptyprocess",
+    "pydantic",
+    "pyjwt",
+    "python-dotenv",
+    "python-multipart",
+    "pywin32",
+    "pywinpty",
+    "pyyaml",
+    "requests",
+    "rich",
+    "ruamel-yaml",
+    "tenacity",
+    "tzdata",
+    "urllib3",
+    "uvicorn",
+    "websockets",
+}
+
+
+def _bootstrap_selector() -> dict:
+    return {
+        "id": "assistant-spa-bootstrap-global-floor",
+        "type": "python_scoped_window_globals_superset",
+        "path": "hermes_cli/web_server.py",
+        "root_function": "mount_spa",
+        "helper_functions": ["_dashboard_mode_bootstrap_js"],
+        "globals": sorted(_BOOTSTRAP_GLOBALS),
+    }
+
+
+def _core_dependencies_selector() -> dict:
+    return {
+        "id": "core-project-dependency-floor",
+        "type": "toml_project_dependencies_superset",
+        "path": "pyproject.toml",
+        "dependencies": sorted(_CORE_DEPENDENCIES),
+    }
+
+
+def test_spa_bootstrap_global_floor_blocks_one_removed_global(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(_bootstrap_selector())
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        "def _dashboard_mode_bootstrap_js():\n"
+        "    return 'window.__AIWERK_CUI_LOCALE__=1; window.__HERMES_AGENT_DISPLAY_NAME__=1'\n\n"
+        "def mount_spa(application):\n"
+        "    return _dashboard_mode_bootstrap_js() + ' window.__HERMES_DASHBOARD_MODE__=1; "
+        "window.__HERMES_USER_DISPLAY_NAME__=1'\n",
+    )
+    active = _commit(root, "full bootstrap global floor")
+
+    passed = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+    assert passed["verdict"] == "PASS"
+
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        "def mount_spa(application):\n"
+        "    return 'window.__AIWERK_CUI_LOCALE__=1; "
+        "window.__HERMES_AGENT_DISPLAY_NAME__=1; "
+        "window.__HERMES_DASHBOARD_MODE__=1'\n",
+    )
+    target = _commit(root, "remove user bootstrap global")
+    failed = evaluate_range(root, active, target, upstream, pr_number=17, now=_NOW)
+
+    assert failed["verdict"] == "FAIL"
+    assert failed["selectors"]["assistant-spa-bootstrap-global-floor"] == "failed"
+    assert "CAPABILITY_SELECTOR_FAILED" in _codes(failed)
+
+
+def test_spa_bootstrap_global_floor_rejects_uncalled_helper_decoy(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(_bootstrap_selector())
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(
+        root,
+        "hermes_cli/web_server.py",
+        "def _dashboard_mode_bootstrap_js():\n"
+        "    return 'window.__AIWERK_CUI_LOCALE__=1; "
+        "window.__HERMES_AGENT_DISPLAY_NAME__=1; "
+        "window.__HERMES_DASHBOARD_MODE__=1; "
+        "window.__HERMES_USER_DISPLAY_NAME__=1'\n\n"
+        "def mount_spa(application):\n"
+        "    return 'no bootstrap globals here'\n",
+    )
+    active = _commit(root, "uncalled helper decoy")
+
+    report = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["selectors"]["assistant-spa-bootstrap-global-floor"] == "failed"
+
+
+def test_core_dependency_floor_normalizes_names_and_blocks_removal(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["selectors"].append(
+        {
+            "id": "core-project-dependency-floor",
+            "type": "toml_project_dependencies_superset",
+            "path": "pyproject.toml",
+            "dependencies": ["defusedxml", "python-dotenv"],
+        }
+    )
+    _write(root, ".ci/content-loss/baseline.json", json.dumps(baseline, sort_keys=True) + "\n")
+    _write(
+        root,
+        "pyproject.toml",
+        '[project]\nname = "fixture"\nversion = "1"\ndependencies = ['
+        '"Python_DotEnv>=1", "defusedxml==0.7.1", "extra-package"]\n',
+    )
+    active = _commit(root, "full dependency floor")
+
+    passed = evaluate_range(root, active, active, upstream, pr_number=17, now=_NOW)
+    assert passed["verdict"] == "PASS"
+
+    _write(
+        root,
+        "pyproject.toml",
+        '[project]\nname = "fixture"\nversion = "1"\ndependencies = ['
+        '"Python_DotEnv>=1", "extra-package"]\n',
+    )
+    target = _commit(root, "remove defusedxml core dependency")
+    failed = evaluate_range(root, active, target, upstream, pr_number=17, now=_NOW)
+
+    assert failed["verdict"] == "FAIL"
+    assert failed["selectors"]["core-project-dependency-floor"] == "failed"
+
+
+def test_committed_class_floors_bind_exact_product_sets() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    baseline = json.loads(
+        (repo_root / ".ci/content-loss/baseline.json").read_text(encoding="utf-8")
+    )
+    selectors = {item["id"]: item for item in baseline["selectors"]}
+
+    bootstrap = selectors["assistant-spa-bootstrap-global-floor"]
+    dependencies = selectors["core-project-dependency-floor"]
+    assert set(bootstrap["globals"]) == _BOOTSTRAP_GLOBALS
+    assert bootstrap["root_function"] == "mount_spa"
+    assert bootstrap["helper_functions"] == ["_dashboard_mode_bootstrap_js"]
+    assert set(dependencies["dependencies"]) == _CORE_DEPENDENCIES
+    assert "defusedxml" in dependencies["dependencies"]
+
+
+def test_exact_historical_fork_passes_and_main_fails_both_new_class_floors() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    positive = "8bd56009c186b6e0fddc8aa96898201a42a1efb4"
+    negative = "3315381c9d81b58147e3d7da68af2f594dbccc38"
+    if any(
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+        ).returncode
+        for ref in (positive, negative)
+    ):
+        pytest.skip("historical class-control commits unavailable")
+    selectors = [_bootstrap_selector(), _core_dependencies_selector()]
+
+    positive_statuses, positive_reasons = _guard._evaluate_selectors(
+        repo_root, _guard._tree_entries(repo_root, positive), selectors
+    )
+    negative_statuses, negative_reasons = _guard._evaluate_selectors(
+        repo_root, _guard._tree_entries(repo_root, negative), selectors
+    )
+
+    assert positive_statuses == {
+        "assistant-spa-bootstrap-global-floor": "passed",
+        "core-project-dependency-floor": "passed",
+    }
+    assert positive_reasons == []
+    assert negative_statuses == {
+        "assistant-spa-bootstrap-global-floor": "failed",
+        "core-project-dependency-floor": "failed",
+    }
+    assert negative_reasons.count("CAPABILITY_SELECTOR_FAILED") == 2
+
+
+def test_historical_self_test_reports_both_new_class_pairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    positive = "8bd56009c186b6e0fddc8aa96898201a42a1efb4"
+    negative = "3315381c9d81b58147e3d7da68af2f594dbccc38"
+    if any(
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+        ).returncode
+        for ref in (positive, negative)
+    ):
+        pytest.skip("historical class-control commits unavailable")
+    json_out = tmp_path / "historical.json"
+    markdown_out = tmp_path / "historical.md"
+    candidate_baseline = _guard._validate_baseline(
+        json.loads(
+            (repo_root / ".ci/content-loss/baseline.json").read_text(encoding="utf-8")
+        )
+    )
+    monkeypatch.setattr(
+        _guard, "_candidate_baseline", lambda _repo: candidate_baseline
+    )
+
+    rc = main(
+        [
+            "historical-self-test",
+            "--repo",
+            str(repo_root),
+            "--json-out",
+            str(json_out),
+            "--markdown-out",
+            str(markdown_out),
+        ]
+    )
+    report = json.loads(json_out.read_text(encoding="utf-8"))
+
+    assert rc == 0
+    for selector_id in (
+        "assistant-spa-bootstrap-global-floor",
+        "core-project-dependency-floor",
+    ):
+        pair = report["class_self_tests"][selector_id]
+        assert pair == {
+            "active": positive,
+            "target": negative,
+            "positive_verdict": "PASS",
+            "negative_verdict": "FAIL",
+            "verdict": "FAIL",
+        }
+    range_self_test = report["approved_merge_range_self_test"]
+    assert range_self_test == {
+        "active": "8ee097959ae9383ce8f38e4980a0fb7615007f5e",
+        "target": "3315381c9d81b58147e3d7da68af2f594dbccc38",
+        "pr_numbers": [105, 106, 107],
+        "verdict": "PASS",
+    }
+
+
+def test_exact_historical_approved_merge_range_replays_pr_bindings() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    active = "8ee097959ae9383ce8f38e4980a0fb7615007f5e"
+    target = "3315381c9d81b58147e3d7da68af2f594dbccc38"
+    upstream = "cbd8de8ad64530be01efea23b7764d5c37c634ed"
+    if any(
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+        ).returncode
+        for ref in (active, target, upstream)
+    ):
+        pytest.skip("historical approved merge range unavailable")
+
+    report = _guard.evaluate_approved_merge_range(
+        repo_root, active, target, upstream
+    )
+
+    assert report["verdict"] == "PASS"
+    assert report["reason_codes"] == []
+    assert [hop["pr_number"] for hop in report["range_hops"]] == [105, 106, 107]
+    assert report["control_transition_approvals_added"] == [
+        "CUI-CONTROL-BASELINE-PR107",
+        "CUI-CONTROL-GUARD-PR107",
+        "CUI-CONTROL-GUARD-TESTS-PR107",
+    ]
+    assert report["control_transitions_applied"] == [
+        "CUI-CONTROL-BASELINE-PR107",
+        "CUI-CONTROL-GUARD-PR107",
+        "CUI-CONTROL-GUARD-TESTS-PR107",
+    ]
+
+
+def test_approved_merge_range_rejects_noncanonical_merge_subject(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, active = repo
+    _git(root, "checkout", "-q", "-b", "feature")
+    _write(root, "feature.py", "feature = True\n")
+    _commit(root, "feature")
+    _git(root, "checkout", "-q", "master")
+    _git(root, "merge", "--no-ff", "-m", "merge feature without PR binding", "feature")
+    target = _git(root, "rev-parse", "HEAD")
+
+    with pytest.raises(ContentLossError, match="merge subject"):
+        _guard.evaluate_approved_merge_range(root, active, target, upstream)
+
+
+def test_approved_merge_range_rejects_wrong_pr_binding(
+    repo: tuple[Path, str, str]
+) -> None:
+    root, upstream, base0 = repo
+    candidate_bytes = (json.dumps(_baseline(upstream), sort_keys=True) + "\n\n").encode()
+    candidate_blob = _git(root, "hash-object", "--stdin", input_bytes=candidate_bytes)
+    approval = _control_approval(
+        root,
+        base0,
+        approval_id="CTRL-17",
+        subject_path=".ci/content-loss/baseline.json",
+        target_blob=candidate_blob,
+        valid_for_pr=17,
+    )
+    _write(
+        root,
+        ".ci/content-loss/retirements.json",
+        json.dumps({"approvals": [approval], "schema_version": 1}, sort_keys=True) + "\n",
+    )
+    active = _commit(root, "approval authority")
+    _git(root, "checkout", "-q", "-b", "control-change")
+    _write(root, ".ci/content-loss/baseline.json", candidate_bytes)
+    _commit(root, "candidate control change")
+    _git(root, "checkout", "-q", "master")
+    _git(
+        root,
+        "merge",
+        "--no-ff",
+        "-m",
+        "Merge pull request #18 from AIWerk/control-change",
+        "control-change",
+    )
+    target = _git(root, "rev-parse", "HEAD")
+
+    report = _guard.evaluate_approved_merge_range(root, active, target, upstream)
+
+    assert report["verdict"] == "FAIL"
+    assert "UNAPPROVED_CONTROL_PLANE_CHANGE" in report["reason_codes"]
+    assert report["range_hops"][0]["pr_number"] == 18

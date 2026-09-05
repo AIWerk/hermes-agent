@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,10 @@ _HISTORICAL_CUI_TARGET = "c398f61c1436247987b882b7569a1bc26d2afe6c"
 _HISTORICAL_HTTP_TARGET = "6453f2cc6cf3c8f91604c1e40cdf6ad165cbd4fd"
 _HISTORICAL_HTTP_RESTORED = "b6a15fdb786dd145f39fb70c70080937747adff4"
 _HISTORICAL_UPSTREAM = "8f2f4caff42cfce29d6fc0992b9f4157409f8d03"
+_HISTORICAL_CLASS_TARGET = "3315381c9d81b58147e3d7da68af2f594dbccc38"
+_HISTORICAL_RANGE_ACTIVE = "8ee097959ae9383ce8f38e4980a0fb7615007f5e"
+_HISTORICAL_RANGE_TARGET = _HISTORICAL_CLASS_TARGET
+_HISTORICAL_RANGE_UPSTREAM = "cbd8de8ad64530be01efea23b7764d5c37c634ed"
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 _REGULAR_MODES = {"100644", "100755"}
 _GUARD_VERSION = "r7a-v1"
@@ -719,6 +724,100 @@ def _typescript_set_selector(source: str, selector: dict[str, Any]) -> bool:
     return target in sets and sets[target] == expected_union
 
 
+_WINDOW_GLOBAL_NAME_RE = re.compile(r"window\.__[A-Z][A-Z0-9_]*__")
+_WINDOW_GLOBAL_ASSIGNMENT_RE = re.compile(
+    r"(window\.__[A-Z][A-Z0-9_]*__)\s*="
+)
+_DEPENDENCY_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _validated_string_floor(selector: dict[str, Any], field: str, label: str) -> set[str]:
+    raw = selector.get(field)
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or not all(isinstance(value, str) and value for value in raw)
+        or len(raw) != len(set(raw))
+    ):
+        raise ContentLossError(f"invalid {label} selector floor")
+    return set(raw)
+
+
+def _python_scoped_window_globals_selector(
+    source: str, selector: dict[str, Any]
+) -> bool:
+    root_name = selector.get("root_function")
+    if not isinstance(root_name, str) or not root_name:
+        raise ContentLossError("invalid Python root function")
+    helper_names = _validated_string_floor(
+        selector, "helper_functions", "Python helper function"
+    )
+    expected = _validated_string_floor(selector, "globals", "window global")
+    if any(_WINDOW_GLOBAL_NAME_RE.fullmatch(value) is None for value in expected):
+        raise ContentLossError("invalid window global selector value")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise ContentLossError("selector Python source is not parseable") from exc
+    definitions: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            definitions.setdefault(node.name, []).append(node)
+    roots = definitions.get(root_name, [])
+    if len(roots) != 1:
+        return False
+    root = roots[0]
+    called_helpers = {
+        node.func.id
+        for node in ast.walk(root)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in helper_names
+    }
+    scoped = [root]
+    for name in sorted(called_helpers):
+        helpers = definitions.get(name, [])
+        if len(helpers) != 1:
+            return False
+        scoped.append(helpers[0])
+    actual: set[str] = set()
+    for function in scoped:
+        for node in ast.walk(function):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                actual.update(_WINDOW_GLOBAL_ASSIGNMENT_RE.findall(node.value))
+    return expected <= actual
+
+
+def _normalise_dependency_name(requirement: str) -> str:
+    match = _DEPENDENCY_NAME_RE.match(requirement)
+    if match is None:
+        raise ContentLossError("project dependency has no valid package name")
+    return re.sub(r"[-_.]+", "-", match.group(1)).lower()
+
+
+def _toml_project_dependencies_selector(
+    source: str, selector: dict[str, Any]
+) -> bool:
+    expected_raw = _validated_string_floor(selector, "dependencies", "dependency")
+    expected = {_normalise_dependency_name(value) for value in expected_raw}
+    if len(expected) != len(expected_raw):
+        raise ContentLossError("dependency selector floor contains normalized duplicates")
+    try:
+        document = tomllib.loads(source)
+    except (tomllib.TOMLDecodeError, UnicodeError) as exc:
+        raise ContentLossError("selector TOML source is not parseable") from exc
+    project = document.get("project")
+    if not isinstance(project, dict):
+        return False
+    dependencies = project.get("dependencies")
+    if not isinstance(dependencies, list) or not all(
+        isinstance(value, str) and value for value in dependencies
+    ):
+        return False
+    actual = {_normalise_dependency_name(value) for value in dependencies}
+    return expected <= actual
+
+
 _TS_LITERAL = re.compile(r"(['\"`])([^'\"`\n]*?/api/[^'\"`\n]*)\1")
 _FETCH_CALL = re.compile(r"\b(?:fetch|fetchBlob|fetchJSON(?:<[^>]+>)?)\s*\(")
 
@@ -1181,6 +1280,12 @@ def _evaluate_selectors(
         elif passed and selector_type == "typescript_set_superset":
             source = _text_blob(repo, target_entries, path, f"selector file {path}")
             passed = _typescript_set_selector(source, selector)
+        elif passed and selector_type == "python_scoped_window_globals_superset":
+            source = _text_blob(repo, target_entries, path, f"selector file {path}")
+            passed = _python_scoped_window_globals_selector(source, selector)
+        elif passed and selector_type == "toml_project_dependencies_superset":
+            source = _text_blob(repo, target_entries, path, f"selector file {path}")
+            passed = _toml_project_dependencies_selector(source, selector)
         elif passed and selector_type == "frontend_api_subset":
             passed, selector_failure_detail = _frontend_api_subset_selector(
                 repo, target_entries, selector
@@ -1190,6 +1295,8 @@ def _evaluate_selectors(
             "json_pointer_equals",
             "json_array_contains_object",
             "typescript_set_superset",
+            "python_scoped_window_globals_superset",
+            "toml_project_dependencies_superset",
             "frontend_api_subset",
         }:
             raise ContentLossError(f"unsupported selector type: {selector_type}")
@@ -1498,6 +1605,148 @@ def evaluate_range(
     return report
 
 
+_MERGE_PR_SUBJECT_RE = re.compile(
+    r"^Merge pull request #([1-9][0-9]*) from AIWerk/\S+$"
+)
+
+
+def _commit_subject(repo: Path, commit: str) -> str:
+    return _run_git(repo, "show", "-s", "--format=%s", commit).decode(
+        "utf-8", "strict"
+    ).rstrip("\n")
+
+
+def _commit_time(repo: Path, commit: str) -> datetime:
+    raw = _run_git(repo, "show", "-s", "--format=%cI", commit).decode(
+        "ascii", "strict"
+    ).strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ContentLossError(f"merge commit has invalid committer time: {commit}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ContentLossError(f"merge commit time has no timezone: {commit}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _approved_merge_hops(
+    repo: Path, active_sha: str, target_sha: str
+) -> list[tuple[str, str, int, datetime]]:
+    if active_sha == target_sha:
+        return []
+    reverse_hops: list[tuple[str, str, int, datetime]] = []
+    seen_commits: set[str] = set()
+    seen_prs: set[int] = set()
+    current = target_sha
+    while current != active_sha:
+        if current in seen_commits:
+            raise ContentLossError("cycle in first-parent merge range")
+        seen_commits.add(current)
+        parents = _commit_parents(repo, current)
+        if len(parents) != 2:
+            raise ContentLossError(
+                f"check-range requires two-parent PR merges: {current}"
+            )
+        subject = _commit_subject(repo, current)
+        match = _MERGE_PR_SUBJECT_RE.fullmatch(subject)
+        if match is None:
+            raise ContentLossError(f"noncanonical merge subject: {current}")
+        pr_number = int(match.group(1))
+        if pr_number in seen_prs:
+            raise ContentLossError(f"duplicate PR number in merge range: {pr_number}")
+        seen_prs.add(pr_number)
+        first_parent = parents[0]
+        reverse_hops.append(
+            (first_parent, current, pr_number, _commit_time(repo, current))
+        )
+        current = first_parent
+    reverse_hops.reverse()
+    return reverse_hops
+
+
+def evaluate_approved_merge_range(
+    repo: Path | str,
+    active_ref: str,
+    target_ref: str,
+    upstream_ref: str,
+) -> dict[str, Any]:
+    root = Path(repo).resolve()
+    active_sha = _resolve(root, active_ref, "commit")
+    target_sha = _resolve(root, target_ref, "commit")
+    upstream_sha = _resolve(root, upstream_ref, "commit")
+    hops = _approved_merge_hops(root, active_sha, target_sha)
+    if not hops:
+        report = evaluate_range(
+            root, active_sha, target_sha, upstream_sha, pr_number=None
+        )
+        report["range_hops"] = []
+        return report
+
+    reports: list[dict[str, Any]] = []
+    hop_evidence: list[dict[str, Any]] = []
+    for hop_base, hop_target, pr_number, commit_time in hops:
+        hop_report = evaluate_range(
+            root,
+            hop_base,
+            hop_target,
+            upstream_sha,
+            pr_number=pr_number,
+            now=commit_time,
+        )
+        reports.append(hop_report)
+        hop_evidence.append(
+            {
+                "active": hop_base,
+                "target": hop_target,
+                "pr_number": pr_number,
+                "committed_at": commit_time.isoformat().replace("+00:00", "Z"),
+                "verdict": hop_report["verdict"],
+                "reason_codes": hop_report["reason_codes"],
+                "authority_blobs": hop_report["authority_blobs"],
+            }
+        )
+        if hop_report["verdict"] != "PASS":
+            break
+
+    complete = len(reports) == len(hops)
+    first = reports[0]
+    report = dict(reports[-1])
+    report["authority_ref"] = active_sha
+    report["authority_blobs"] = first["authority_blobs"]
+    report["authority_manifest_blob"] = first["authority_manifest_blob"]
+    report["base_tree"] = _resolve(root, active_sha, "tree")
+    report["target_tree"] = _resolve(root, target_sha, "tree")
+    report["input_refs"] = {
+        "active": active_sha,
+        "target": target_sha,
+        "upstream": upstream_sha,
+    }
+    report["mode"] = "range"
+    report["pr_number"] = None
+    report["range_hops"] = hop_evidence
+    report["reason_codes"] = sorted(
+        {code for item in reports for code in item["reason_codes"]}
+    )
+    for field in (
+        "control_transition_approvals_added",
+        "control_transitions_applied",
+        "path_retirement_approvals_added",
+        "retirements_applied",
+    ):
+        report[field] = sorted({value for item in reports for value in item[field]})
+    report["control_plane_changes"] = sorted(
+        {value for item in reports for value in item["control_plane_changes"]}
+    )
+    report["completeness"] = {
+        **report["completeness"],
+        "range_replay_complete": complete,
+    }
+    report["verdict"] = (
+        "PASS" if complete and not report["reason_codes"] else "FAIL"
+    )
+    return report
+
+
 def validate_historical_recovery_bijection(
     report: dict[str, Any], recovery_ledger: dict[str, Any]
 ) -> None:
@@ -1659,6 +1908,47 @@ def _historical_selector_pair(
     }
 
 
+def _historical_selector_status_pair(
+    repo: Path,
+    positive: str,
+    negative: str,
+    selector: dict[str, Any],
+) -> dict[str, str]:
+    selector_id = selector.get("id")
+    if not isinstance(selector_id, str) or not selector_id:
+        raise ContentLossError("historical selector has no id")
+    positive_statuses, positive_reasons = _evaluate_selectors(
+        repo, _tree_entries(repo, positive), [selector]
+    )
+    negative_statuses, _negative_reasons = _evaluate_selectors(
+        repo, _tree_entries(repo, negative), [selector]
+    )
+    if (
+        positive_statuses.get(selector_id) != "passed"
+        or positive_reasons
+        or negative_statuses.get(selector_id) != "failed"
+    ):
+        raise ContentLossError(f"historical selector pair failed: {selector_id}")
+    return {
+        "active": positive,
+        "target": negative,
+        "positive_verdict": "PASS",
+        "negative_verdict": "FAIL",
+        "verdict": "FAIL",
+    }
+
+
+def _candidate_baseline(repo: Path) -> dict[str, Any]:
+    head = _resolve(repo, "HEAD", "commit")
+    entries = _tree_entries(repo, head)
+    entry = entries.get(BASELINE_PATH)
+    if entry is None or entry["type"] != "blob" or entry["mode"] not in _REGULAR_MODES:
+        raise ContentLossError("candidate HEAD baseline is missing or not a regular blob")
+    return _validate_baseline(
+        _strict_json(_read_blob(repo, entry["oid"]), "candidate HEAD baseline")
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _cli().parse_args(argv)
     try:
@@ -1710,6 +2000,20 @@ def main(argv: list[str] | None = None) -> int:
                 raise ContentLossError(
                     "historical assistant HTTP allowlist regression was not detected"
                 )
+            class_selectors = {
+                item["id"]: item
+                for item in _candidate_baseline(args.repo)["selectors"]
+                if item.get("id")
+                in {
+                    "assistant-spa-bootstrap-global-floor",
+                    "core-project-dependency-floor",
+                }
+            }
+            if set(class_selectors) != {
+                "assistant-spa-bootstrap-global-floor",
+                "core-project-dependency-floor",
+            }:
+                raise ContentLossError("candidate baseline is missing product class selectors")
             report["class_self_tests"] = {
                 "assistant-frontend-api-subset": {
                     "restored": _HISTORICAL_HTTP_RESTORED,
@@ -1717,21 +2021,59 @@ def main(argv: list[str] | None = None) -> int:
                     "verdict": "FAIL",
                 },
                 "cui-supported-slash-command-floor": cui_pair,
+                **{
+                    selector_id: _historical_selector_status_pair(
+                        args.repo,
+                        _HISTORICAL_ACTIVE,
+                        _HISTORICAL_CLASS_TARGET,
+                        selector,
+                    )
+                    for selector_id, selector in sorted(class_selectors.items())
+                },
+            }
+            historical_range = evaluate_approved_merge_range(
+                args.repo,
+                _HISTORICAL_RANGE_ACTIVE,
+                _HISTORICAL_RANGE_TARGET,
+                _HISTORICAL_RANGE_UPSTREAM,
+            )
+            if historical_range["verdict"] != "PASS":
+                raise ContentLossError(
+                    "historical approved merge range was not accepted"
+                )
+            report["approved_merge_range_self_test"] = {
+                "active": _HISTORICAL_RANGE_ACTIVE,
+                "target": _HISTORICAL_RANGE_TARGET,
+                "pr_numbers": [
+                    hop["pr_number"] for hop in historical_range["range_hops"]
+                ],
+                "verdict": historical_range["verdict"],
             }
             write_reports(report, json_out=args.json_out, markdown_out=args.markdown_out)
             print("Historical fixtures correctly blocked known AIWerk losses")
             return 0
-        active = args.active if args.command == "check-range" else args.base
-        target = args.target if args.command == "check-range" else make_effective_merge_tree(
-            args.repo, args.base, args.head
-        )
-        report = evaluate_range(
-            args.repo,
-            active,
-            target,
-            args.upstream,
-            pr_number=args.pr_number,
-        )
+        if args.command == "check-range":
+            if args.pr_number is not None:
+                raise ContentLossError(
+                    "check-range derives PR numbers from merge commits"
+                )
+            report = evaluate_approved_merge_range(
+                args.repo,
+                args.active,
+                args.target,
+                args.upstream,
+            )
+        else:
+            if args.pr_number is None:
+                raise ContentLossError("check-pr requires --pr-number")
+            target = make_effective_merge_tree(args.repo, args.base, args.head)
+            report = evaluate_range(
+                args.repo,
+                args.base,
+                target,
+                args.upstream,
+                pr_number=args.pr_number,
+            )
         if args.command == "check-pr":
             head_sha = _resolve(args.repo, args.head, "commit")
             report["mode"] = "pull-request"
