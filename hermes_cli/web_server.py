@@ -9230,12 +9230,14 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     env_var = custom_endpoint_key_env(endpoint_id)
     submitted_key = body.api_key.strip() if body.api_key is not None else None
     if submitted_key:
-        save_env_value(env_var, submitted_key)
+        if not save_env_value(env_var, submitted_key):
+            raise RuntimeError(f"credential persistence refused for {env_var}")
         entry["key_env"] = env_var
         entry.pop("api_key", None)
     elif submitted_key is not None:
         # Blank field means "clear the key", not "leave it alone".
-        remove_env_value(env_var)
+        if env_var in load_env() and not remove_env_value(env_var):
+            raise RuntimeError(f"credential removal refused for {env_var}")
         entry.pop("key_env", None)
         entry.pop("api_key", None)
     elif str(entry.get("api_key") or "").strip() and not _config_api_key_is_env_ref(endpoint_id):
@@ -9243,7 +9245,8 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         # release wrote in plaintext. Migrate it on the next save so endpoints
         # configured before the fix get cleaned up too, without the user
         # having to re-enter the key.
-        save_env_value(env_var, entry["api_key"].strip())
+        if not save_env_value(env_var, entry["api_key"].strip()):
+            raise RuntimeError(f"credential migration refused for {env_var}")
         entry["key_env"] = env_var
         entry.pop("api_key", None)
 
