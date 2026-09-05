@@ -5916,7 +5916,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             target_clause = "WHERE id = ?"
             query_params = []
             if include_compression_ancestors:
-                lineage_cte = """
+                compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
+                lineage_cte = f"""
                     WITH RECURSIVE compression_lineage(id) AS (
                         SELECT ?
                         UNION
@@ -5924,16 +5925,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         FROM compression_lineage lineage
                         JOIN sessions child ON child.id = lineage.id
                         JOIN sessions parent ON parent.id = child.parent_session_id
-                        WHERE parent.end_reason = 'compression'
-                          AND json_extract(
-                              COALESCE(child.model_config, '{}'),
-                              '$._branched_from'
-                          ) IS NULL
-                          AND json_extract(
-                              COALESCE(child.model_config, '{}'),
-                              '$._delegate_from'
-                          ) IS NULL
-                          AND COALESCE(child.source, '') != 'tool'
+                        WHERE {compression_child}
                     )
                 """
                 target_clause = "WHERE id IN (SELECT id FROM compression_lineage)"
@@ -6482,10 +6474,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND EXISTS (SELECT 1 FROM messages m
                                WHERE m.session_id = o.id)
                   AND COALESCE(o.source, '') != 'tool'
-                  AND json_extract(COALESCE(o.model_config, '{{}}'),
+                  AND (
+                      json_extract(COALESCE(o.model_config, '{{}}'),
                                    '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(o.model_config, '{{}}'),
+                      OR (
+                          o.parent_session_id IS NOT NULL
+                          AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                           '$._branched_from') != o.parent_session_id
+                      )
+                  )
+                  AND (
+                      json_extract(COALESCE(o.model_config, '{{}}'),
+                                   '$._side_from') IS NULL
+                      OR (
+                          o.parent_session_id IS NOT NULL
+                          AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                           '$._side_from') != o.parent_session_id
+                      )
+                  )
+                  AND (
+                      json_extract(COALESCE(o.model_config, '{{}}'),
                                    '$._delegate_from') IS NULL
+                      OR (
+                          o.parent_session_id IS NOT NULL
+                          AND json_extract(COALESCE(o.model_config, '{{}}'),
+                                           '$._delegate_from') != o.parent_session_id
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_stack side_stack
+                       WHERE side_stack.side_session_id = o.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions side_parent
+                       WHERE side_parent.id = o.parent_session_id
+                         AND side_parent.end_reason = 'side_session'
+                  )
                 ORDER BY o.started_at ASC
                 """
             ).fetchall()
@@ -6604,7 +6628,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (donor_id,),
             ).fetchone()
             orphan = conn.execute(
-                "SELECT session_key, source FROM sessions WHERE id = ?",
+                "SELECT session_key, source, parent_session_id, model_config, "
+                "EXISTS (SELECT 1 FROM session_stack "
+                "WHERE side_session_id = sessions.id) AS side_stack_candidate, "
+                "(SELECT end_reason FROM sessions AS parent "
+                "WHERE parent.id = sessions.parent_session_id) AS parent_end_reason "
+                "FROM sessions WHERE id = ?",
                 (orphan_id,),
             ).fetchone()
             if donor is None or orphan is None:
@@ -6613,8 +6642,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return False
             if (donor["source"] or "") != (orphan["source"] or ""):
                 return False
+            if (orphan["source"] or "") == "tool":
+                return False
+            if (
+                orphan["side_stack_candidate"]
+                or orphan["parent_end_reason"] == "side_session"
+            ):
+                return False
+            raw_config = orphan["model_config"]
+            try:
+                config = (
+                    json.loads(raw_config)
+                    if isinstance(raw_config, str)
+                    else raw_config
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if config is None:
+                config = {}
+            if not isinstance(config, dict):
+                return False
+            parent_id = orphan["parent_session_id"]
+            for marker_name in (
+                "_branched_from",
+                "_side_from",
+                "_delegate_from",
+            ):
+                if marker_name in config and config[marker_name] is not None and (
+                    parent_id is None or config[marker_name] == parent_id
+                ):
+                    return False
 
-            conn.execute(
+            updated = conn.execute(
                 """UPDATE sessions
                       SET session_key = ?,
                           chat_id = COALESCE(chat_id, ?),
@@ -6637,6 +6696,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     orphan_id,
                 ),
             )
+            if updated.rowcount != 1:
+                return False
             # Retire the predecessor under a reason recovery does NOT treat
             # as resumable — 'agent_close'/'ws_orphan_reap' would keep it in
             # the running, and the newly keyed orphan could lose the chat
@@ -6651,21 +6712,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(_do)
 
     # Children that carry a ``parent_session_id`` but are NOT compression
-    # continuations: branches, delegate/subagent runs, and tool sessions.
+    # continuations: branches, side sessions, delegate/subagent runs, and tool
+    # sessions.
     # A marker only disqualifies a child when it points at the parent being
     # queried — compression continuations inherit the rotated agent's
     # ``model_config`` verbatim (``publish_compression_child`` callers pass
     # ``agent._session_init_model_config``), so a delegate subagent's
     # continuation carries ``_delegate_from=<the delegate's own parent>``.
-    # Matching markers by mere presence misclassified those real
-    # continuations as delegate children (fail-open for orphan reopen,
-    # fail-closed for adoption). Bind the parent id for both markers.
+    # Matching markers against the queried parent avoids misclassifying true
+    # continuations that inherited an ancestor's marker. Bind the parent id for
+    # every lineage-isolation marker.
     _NON_CONTINUATION_CHILD_FILTER_SQL = (
         "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
         " '$._branched_from'), '') != ?\n"
         "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        " '$._side_from'), '') != ?\n"
+        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
         " '$._delegate_from'), '') != ?\n"
         "  AND COALESCE({alias}source, '') != 'tool'\n"
+        "  AND NOT EXISTS (SELECT 1 FROM session_stack side_stack"
+        "                  WHERE side_stack.side_session_id = {alias}id)\n"
     )
 
     def find_live_compression_child(
@@ -6707,7 +6773,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
-                (parent_session_id, parent_session_id, parent_session_id),
+                (parent_session_id, parent_session_id, parent_session_id, parent_session_id),
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
@@ -6748,7 +6814,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 + """
                 LIMIT 1
                 """,
-                (session_id, session_id, session_id),
+                (session_id, session_id, session_id, session_id),
             ).fetchone()
             if child is not None:
                 return False
@@ -6830,6 +6896,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
         """
+        child_model_config = dict(model_config) if model_config else None
+        if child_model_config is not None:
+            # `_side_from` marks the root of an isolated side conversation.
+            # Compression descendants are continuations inside that boundary,
+            # not new side roots, so they must not inherit the marker.
+            child_model_config.pop("_side_from", None)
+
         def _do(conn):
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
@@ -6871,7 +6944,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     child_session_id,
                     source,
                     model,
-                    json.dumps(model_config) if model_config else None,
+                    json.dumps(child_model_config) if child_model_config else None,
                     system_prompt_hash,
                     parent_session_id,
                     cwd or parent["cwd"],
@@ -7683,7 +7756,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 not parent_id
                 or parent_id in seen
-                or self._is_explicit_fork_child_row(current)
+                or self._is_explicit_fork_child_row_on_conn(current, conn)
             ):
                 break
             parent = _row(parent_id)
@@ -9550,8 +9623,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns True when at least one row was updated.
         """
         def _do(conn):
+            compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -9560,7 +9634,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -9569,7 +9643,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -9659,8 +9733,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         least one row changed.
         """
         def _do(conn):
+            compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -9669,7 +9744,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -9678,7 +9753,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -9713,8 +9788,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         changed.
         """
         def _do(conn):
+            compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -9723,7 +9799,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -9732,7 +9808,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -9773,8 +9849,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         holds. Returns True when at least one row changed.
         """
         def _do(conn):
+            compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -9783,7 +9860,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -9792,7 +9869,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {compression_child}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -9927,6 +10004,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         current = session_id
         seen = {current} if current else set()
+        compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
@@ -9937,10 +10015,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
+                      AND {compression_child}
                     ORDER BY
                       CASE
                         WHEN child.end_reason = 'compression' THEN 0
@@ -10190,6 +10265,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.hidden = 0")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        compression_child = _COMPRESSION_CHILD_SQL.format(a="child")
         # Snapshot the filter params before the query builders below extend
         # them with LIMIT/OFFSET — the pinned back-fill reuses the same WHERE.
         base_where_params = list(params)
@@ -10282,10 +10358,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
+                    WHERE {compression_child}
                 ),
                 chain_max AS (
                     SELECT
@@ -11957,8 +12030,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     child_row = self._conn.execute(
                         "SELECT id FROM sessions AS child "
                         "WHERE child.parent_session_id = ? "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND COALESCE(json_extract(COALESCE(child.model_config, '{}'), '$._branched_from'), '') != child.parent_session_id "
+                        "  AND COALESCE(json_extract(COALESCE(child.model_config, '{}'), '$._side_from'), '') != child.parent_session_id "
+                        "  AND COALESCE(json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from'), '') != child.parent_session_id "
+                        "  AND NOT EXISTS (SELECT 1 FROM session_stack side_stack WHERE side_stack.side_session_id = child.id) "
+                        "  AND NOT EXISTS (SELECT 1 FROM sessions side_parent WHERE side_parent.id = child.parent_session_id AND side_parent.end_reason = 'side_session') "
                         "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
                         f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
                         "  AND COALESCE(child.source, '') != 'tool' "
@@ -12438,31 +12514,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return prefix
 
     def _is_explicit_branch_session(self, session_id: str) -> bool:
-        """Return whether *session_id* is a copied user-facing branch.
+        """Return whether *session_id* owns history isolated from its parent.
 
         Branches and compression continuations both use ``parent_session_id``,
         but they have different history semantics: a branch owns a copied
         transcript, while a compression continuation needs its ended parent's
         archived rows for display. The durable ``_branched_from`` marker is the
-        existing discriminator written by all branch creation paths.
+        existing discriminator written by all branch creation paths. Side
+        sessions likewise own only their own transcript and carry ``_side_from``.
         """
         if not session_id:
             return False
         with self._read_ctx() as conn:
             row = conn.execute(
-                "SELECT model_config FROM sessions WHERE id = ?",
+                "SELECT parent_session_id, model_config, "
+                "EXISTS (SELECT 1 FROM session_stack "
+                "WHERE side_session_id = sessions.id) AS legacy_side_candidate, "
+                "(SELECT end_reason FROM sessions AS parent "
+                "WHERE parent.id = sessions.parent_session_id) AS parent_end_reason "
+                "FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
             return False
-        raw_config = row["model_config"] if hasattr(row, "keys") else row[0]
+        legacy_side_candidate = (
+            row["legacy_side_candidate"] if hasattr(row, "keys") else row[2]
+        )
+        if legacy_side_candidate or (
+            row["parent_end_reason"] if hasattr(row, "keys") else row[3]
+        ) == "side_session":
+            return True
+        raw_config = row["model_config"] if hasattr(row, "keys") else row[1]
+        parent_id = (
+            row["parent_session_id"] if hasattr(row, "keys") else row[0]
+        )
         if not raw_config:
             return False
         try:
             config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
         except (json.JSONDecodeError, TypeError):
             return False
-        return isinstance(config, dict) and bool(config.get("_branched_from"))
+        if not isinstance(config, dict):
+            return False
+        return bool(
+            (parent_id and config.get("_branched_from") == parent_id)
+            or (parent_id and config.get("_side_from") == parent_id)
+        )
 
     def get_conversation_root(self, session_id: str) -> str:
         """Return the ROOT id of *session_id*'s lineage chain.
@@ -12492,12 +12589,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 seen.add(current)
                 chain.append(current)
                 row = conn.execute(
-                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    "SELECT parent_session_id, model_config, "
+                    "EXISTS (SELECT 1 FROM session_stack "
+                    "WHERE side_session_id = sessions.id) AS legacy_side_candidate, "
+                    "(SELECT end_reason FROM sessions AS parent "
+                    "WHERE parent.id = sessions.parent_session_id) AS parent_end_reason "
+                    "FROM sessions WHERE id = ?",
                     (current,),
                 ).fetchone()
                 if row is None:
                     break
-                current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
+                legacy_side_candidate = (
+                    row["legacy_side_candidate"] if hasattr(row, "keys") else row[2]
+                )
+                if legacy_side_candidate or (
+                    row["parent_end_reason"] if hasattr(row, "keys") else row[3]
+                ) == "side_session":
+                    break
+                raw_config = (
+                    row["model_config"] if hasattr(row, "keys") else row[1]
+                )
+                try:
+                    config = (
+                        json.loads(raw_config)
+                        if isinstance(raw_config, str)
+                        else raw_config
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    config = None
+                parent_id = (
+                    row["parent_session_id"] if hasattr(row, "keys") else row[0]
+                )
+                if parent_id and isinstance(config, dict) and (
+                    config.get("_branched_from") == parent_id
+                    or config.get("_side_from") == parent_id
+                ):
+                    break
+                current = parent_id
         return list(reversed(chain)) or [session_id]
 
     @staticmethod
@@ -13027,20 +13155,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Export and cleanup
     # =========================================================================
 
-    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
-        """True when ``session`` is a branch, delegate, or tool child of its parent.
-
-        Markers only count as a fork when they point at ``parent_session_id``.
-        Compression copies ``model_config`` onto the continuation
-        (``publish_compression_child`` callers pass
-        ``agent._session_init_model_config``), so a delegate's continuation
-        carries ``_delegate_from=<the delegate's own parent>``. Presence-only
-        matching would treat that real continuation as a fork — the same
-        misclassification ``_NON_CONTINUATION_CHILD_FILTER_SQL`` already
-        avoids by binding both markers to the queried parent.
-        """
+    def _is_explicit_fork_child_row_on_conn(
+        self, session: Dict[str, Any], conn
+    ) -> bool:
+        """Lock-free fork-child check using the caller's connection."""
         if session.get("source") == "tool":
             return True
+        session_id = session.get("id")
+        if session_id and conn is not None:
+            evidence = conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM session_stack "
+                "WHERE side_session_id = ?) AS stack_candidate, "
+                "(SELECT end_reason FROM sessions WHERE id = ?) "
+                "AS parent_end_reason",
+                (session_id, session.get("parent_session_id")),
+            ).fetchone()
+            if evidence is not None and (
+                evidence["stack_candidate"]
+                or evidence["parent_end_reason"] == "side_session"
+            ):
+                return True
         raw = session.get("model_config")
         if not raw:
             return False
@@ -13052,10 +13186,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         parent_id = session.get("parent_session_id")
         branched = cfg.get("_branched_from")
+        side = cfg.get("_side_from")
         delegated = cfg.get("_delegate_from")
         if parent_id:
-            return branched == parent_id or delegated == parent_id
-        return branched is not None or delegated is not None
+            return (
+                branched == parent_id
+                or side == parent_id
+                or delegated == parent_id
+            )
+        return branched is not None or side is not None or delegated is not None
+
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
+        """True when ``session`` is a branch, side, delegate, or tool child."""
+        with self._lock:
+            return self._is_explicit_fork_child_row_on_conn(session, self._conn)
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
