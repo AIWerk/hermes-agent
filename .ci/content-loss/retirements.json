@@ -69,6 +69,36 @@
       "not_before": "2026-09-04T19:24:57Z",
       "expires_at": "2026-09-11T19:24:57Z",
       "reason": "Authorize the exact v5 regression coverage for the isolated CUI control-plane transition."
+    },
+    {
+      "id": "FORKLOSS-CONTROL-BASELINE-PR110",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "885d520c3b04a3ff0828a81d6471a09f2b75ba86",
+      "allowed_target_state": "blob:c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
+      "valid_for_pr": 110,
+      "not_before": "2026-09-05T11:12:05Z",
+      "expires_at": "2026-09-12T11:12:05Z",
+      "reason": "Authorize the exact fork-loss SPA bootstrap and core dependency capability floors as an isolated control-plane transition."
+    },
+    {
+      "id": "FORKLOSS-CONTROL-GUARD-PR110",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "expected_old_blob": "9a2c3117d660dae94b0c8f73948838b92a10a400",
+      "allowed_target_state": "blob:9054171a6157b88013d151160be540ecbe8e8255",
+      "valid_for_pr": 110,
+      "not_before": "2026-09-05T11:12:05Z",
+      "expires_at": "2026-09-12T11:12:05Z",
+      "reason": "Authorize the exact fork-loss class selectors and merge-PR-aware range replay as an isolated control-plane transition."
+    },
+    {
+      "id": "FORKLOSS-CONTROL-GUARD-TESTS-PR110",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "expected_old_blob": "bfddc3ed5492d9d15bff8129dee6c02eb07eb0f8",
+      "allowed_target_state": "blob:7381ec1d6d55869309831b27bae3a895df2ca556",
+      "valid_for_pr": 110,
+      "not_before": "2026-09-05T11:12:05Z",
+      "expires_at": "2026-09-12T11:12:05Z",
+      "reason": "Authorize the exact fork-loss class and approved merge-range regression coverage."
     }
   ],
   "schema_version": 1
