@@ -73,6 +73,27 @@ def test_smoke_contract_pins_the_ten_supported_palette_commands() -> None:
     assert _smoke.LOGIN_BACKGROUND_TOKEN == "#f4f1ec"
 
 
+def test_smoke_contract_pins_customer_bootstrap_and_title_assertions() -> None:
+    checks = _smoke.customer_bootstrap_checks(
+        {
+            "__AIWERK_CUI_LOCALE__": "hu",
+            "__HERMES_AGENT_DISPLAY_NAME__": "Mira",
+            "__HERMES_USER_DISPLAY_NAME__": "Attila",
+        },
+        "Mira AI Assistant",
+        "Mira",
+    )
+
+    assert checks == {
+        "customer_bootstrap_globals_present": True,
+        "document_title_contains_agent_name": True,
+    }
+    assert _smoke.customer_bootstrap_checks({}, "AI Assistant", "Mira") == {
+        "customer_bootstrap_globals_present": False,
+        "document_title_contains_agent_name": False,
+    }
+
+
 def test_dynamic_cdp_port_is_read_only_from_the_owned_profile(tmp_path: Path) -> None:
     marker = tmp_path / "DevToolsActivePort"
     marker.write_text("45123\n/devtools/browser/owned\n", encoding="utf-8")

@@ -399,6 +399,24 @@ def cleanup(cdp: Any, browser: Any, profile: Path) -> None:
         shutil.rmtree(profile, ignore_errors=True)
 
 
+def customer_bootstrap_checks(
+    globals_: dict[str, Any], document_title: str, agent_name: str
+) -> dict[str, bool]:
+    required = (
+        "__AIWERK_CUI_LOCALE__",
+        "__HERMES_AGENT_DISPLAY_NAME__",
+        "__HERMES_USER_DISPLAY_NAME__",
+    )
+    return {
+        "customer_bootstrap_globals_present": all(
+            key in globals_ and globals_[key] is not None for key in required
+        ),
+        "document_title_contains_agent_name": bool(
+            agent_name and agent_name in document_title
+        ),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     profile = Path(tempfile.mkdtemp(prefix="aiwerk-cui-smoke-"))
     browser: subprocess.Popen[bytes] | None = None
@@ -439,6 +457,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         agent_name = str(model_info.get("agent_name") or "").strip() if isinstance(model_info, dict) else ""
         if not agent_name:
             raise AssertionError("dashboard.agent_name is empty")
+        bootstrap_globals = cdp.evaluate(
+            "({"
+            "__AIWERK_CUI_LOCALE__:window.__AIWERK_CUI_LOCALE__,"
+            "__HERMES_AGENT_DISPLAY_NAME__:window.__HERMES_AGENT_DISPLAY_NAME__,"
+            "__HERMES_USER_DISPLAY_NAME__:window.__HERMES_USER_DISPLAY_NAME__"
+            "})"
+        )
+        document_title = str(cdp.evaluate("document.title") or "")
+        bootstrap_checks = customer_bootstrap_checks(
+            bootstrap_globals if isinstance(bootstrap_globals, dict) else {},
+            document_title,
+            agent_name,
+        )
         header_name = cdp.wait_for(
             "(() => [...document.querySelectorAll('aside strong')].map(e=>e.textContent.trim()).find(Boolean) || '')()",
             args.timeout,
@@ -507,6 +538,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checks = {
             "active_session_preserved": session_before == session_after,
             "agent_header_matches_status": header_name == agent_name,
+            **bootstrap_checks,
+            "document_title": document_title,
             "catalog_request_count": catalog_sent,
             "catalog_response_count": catalog_received,
             "client_error_count": len(errors_4xx),
@@ -523,6 +556,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for name, passed in {
                 "active_session_preserved": checks["active_session_preserved"],
                 "agent_header_matches_status": checks["agent_header_matches_status"],
+                "customer_bootstrap_globals_present": checks[
+                    "customer_bootstrap_globals_present"
+                ],
+                "document_title_contains_agent_name": checks[
+                    "document_title_contains_agent_name"
+                ],
                 "catalog_once_per_connection": (
                     ws_101 >= 1 and catalog_sent == ws_101 and catalog_received == ws_101
                 ),
