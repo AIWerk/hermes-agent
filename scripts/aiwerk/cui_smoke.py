@@ -16,13 +16,14 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 ACTIVE_SESSION_STORAGE_KEY = "aiwerk-cui.active-session-id"
 LOGIN_BACKGROUND_TOKEN = "#f4f1ec"
@@ -38,6 +39,67 @@ EXPECTED_PALETTE = (
     "/stop",
     "/usage",
 )
+
+T = TypeVar("T")
+
+
+class StepLog:
+    """Record named smoke steps in the report and on stderr."""
+
+    def __init__(self, steps: list[dict[str, Any]], *, stderr: Any = None) -> None:
+        self.steps = steps
+        self.stderr = sys.stderr if stderr is None else stderr
+
+    def run(self, name: str, operation: Callable[[], T]) -> T:
+        print(f"[cui-smoke] START {name}", file=self.stderr, flush=True)
+        started = time.monotonic()
+        try:
+            result = operation()
+        except Exception as exc:
+            elapsed = round(time.monotonic() - started, 3)
+            self.steps.append(
+                {"name": name, "elapsed_seconds": elapsed, "status": "FAIL"}
+            )
+            print(
+                f"[cui-smoke] FAIL {name} ({elapsed:.3f}s)",
+                file=self.stderr,
+                flush=True,
+            )
+            if isinstance(exc, TimeoutError):
+                raise TimeoutError(f"{name}: {exc}") from exc
+            raise
+        elapsed = round(time.monotonic() - started, 3)
+        self.steps.append(
+            {"name": name, "elapsed_seconds": elapsed, "status": "PASS"}
+        )
+        print(
+            f"[cui-smoke] PASS {name} ({elapsed:.3f}s)",
+            file=self.stderr,
+            flush=True,
+        )
+        return result
+
+
+def completed_response_count(cdp: Any, scope_selector: str) -> int:
+    value = cdp.evaluate(
+        "(() => { const root=document.querySelector("
+        f"{json.dumps(scope_selector)}); return root ? "
+        "root.querySelectorAll('button[aria-label=\"Diese Antwort vorlesen\"]').length : 0; })()"
+    )
+    return int(value or 0)
+
+
+def turn_completion_expression(scope_selector: str, completed_before: int) -> str:
+    """Require a newly completed answer and no scoped running indicator."""
+    return (
+        "(() => { const root=document.querySelector("
+        f"{json.dumps(scope_selector)}); if(!root)return false; "
+        "const completed=root.querySelectorAll("
+        "'button[aria-label=\"Diese Antwort vorlesen\"]').length; "
+        "const running=Boolean(root.querySelector("
+        "'[role=\"status\"][aria-label=\"Der Assistent arbeitet an der Antwort\"]')); "
+        f"return completed > {completed_before} && !running; }})()"
+    )
 
 
 def _public_netloc(parsed: urllib.parse.SplitResult) -> str:
@@ -70,8 +132,11 @@ def public_url(value: str) -> str:
     )
 
 
-def public_error(exc: Exception) -> dict[str, str]:
-    return {"type": type(exc).__name__, "message": "smoke execution failed"}
+def public_error(exc: Exception, step: str | None = None) -> dict[str, str]:
+    error = {"type": type(exc).__name__, "message": "smoke execution failed"}
+    if step:
+        error["step"] = step
+    return error
 
 
 def _is_loopback(host: str) -> bool:
@@ -349,6 +414,64 @@ def websocket_rpc_result(
     return None
 
 
+def message_complete_result(
+    events: list[dict[str, Any]], prompt_text: str
+) -> dict[str, Any] | None:
+    """Return successful completion on the socket that submitted this prompt."""
+    submitted_sockets: set[str] = set()
+    for event in events:
+        event_method = event.get("method")
+        if event_method not in {
+            "Network.webSocketFrameSent",
+            "Network.webSocketFrameReceived",
+        }:
+            continue
+        try:
+            socket_id = event["params"]["requestId"]
+            frame = json.loads(event["params"]["response"]["payloadData"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(socket_id, str) or not socket_id or not isinstance(frame, dict):
+            continue
+        if event_method == "Network.webSocketFrameSent":
+            params = frame.get("params")
+            if (
+                frame.get("method") == "prompt.submit"
+                and isinstance(params, dict)
+                and params.get("text") == prompt_text
+            ):
+                submitted_sockets.add(socket_id)
+            continue
+        if socket_id not in submitted_sockets or frame.get("method") != "event":
+            continue
+        params = frame.get("params")
+        if not isinstance(params, dict) or params.get("type") != "message.complete":
+            continue
+        payload = params.get("payload")
+        if not isinstance(payload, dict):
+            raise RuntimeError("message.complete returned an invalid payload")
+        if payload.get("status") == "error":
+            raise RuntimeError("message.complete reported an error")
+        return payload
+    return None
+
+
+def wait_for_message_complete(
+    cdp: Any,
+    prompt_text: str,
+    *,
+    start_index: int,
+    timeout: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = message_complete_result(cdp.events[start_index:], prompt_text)
+        if result is not None:
+            return result
+        cdp.drain(min(0.25, max(0.01, deadline - time.monotonic())))
+    raise TimeoutError("timed out waiting for successful message.complete")
+
+
 def wait_for_websocket_rpc(
     cdp: Any,
     method_name: str,
@@ -519,198 +642,363 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     profile = Path(tempfile.mkdtemp(prefix="aiwerk-cui-smoke-"))
     browser: subprocess.Popen[bytes] | None = None
     cdp: CDP | None = None
-    report: dict[str, Any] = {"schema_version": 1, "verdict": "FAIL"}
+    report: dict[str, Any] = {"schema_version": 1, "steps": [], "verdict": "FAIL"}
+    step_log = StepLog(report["steps"])
     try:
         base_url = normalize_base_url(args.base_url)
         if args.cdp_port != 0:
             raise ValueError("--cdp-port must be 0; dynamic owned CDP is required")
-        browser = _start_browser(_browser_binary(args.chrome_binary), profile)
-        cdp_port = _wait_debugger(profile, browser, args.timeout)
-        tab = _new_tab(cdp_port, "about:blank")
-        cdp = CDP(tab["webSocketDebuggerUrl"])
-        cdp.call("Page.enable")
-        cdp.call("Network.enable")
-        cdp.call("Runtime.enable")
-        cookie_records = load_cookie_records(args.cookie_jar, base_url)
-        install_cookies(cdp, cookie_records)
-
-        cdp.call("Page.navigate", {"url": base_url})
-        cdp.wait_for("document.readyState === 'complete'", args.timeout, "page load")
-        cdp.wait_for("document.querySelector('textarea') !== null", args.timeout, "chat input")
-        cdp.wait_for(
-            f"Boolean(localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)}))",
-            args.timeout,
-            "connected active session",
+        browser = step_log.run(
+            "start owned Chrome",
+            lambda: _start_browser(_browser_binary(args.chrome_binary), profile),
+        )
+        cdp_port = step_log.run(
+            "wait Chrome DevTools ready",
+            lambda: _wait_debugger(profile, browser, args.timeout),
+        )
+        tab = step_log.run(
+            "open owned Chrome tab", lambda: _new_tab(cdp_port, "about:blank")
+        )
+        cdp = step_log.run(
+            "connect owned Chrome CDP", lambda: CDP(tab["webSocketDebuggerUrl"])
+        )
+        step_log.run("enable Page domain", lambda: cdp.call("Page.enable"))
+        step_log.run("enable Network domain", lambda: cdp.call("Network.enable"))
+        step_log.run("enable Runtime domain", lambda: cdp.call("Runtime.enable"))
+        cookie_records = step_log.run(
+            "load authentication cookies",
+            lambda: load_cookie_records(args.cookie_jar, base_url),
+        )
+        step_log.run(
+            "install authentication cookies",
+            lambda: install_cookies(cdp, cookie_records),
         )
 
-        login_has_palette = cdp.evaluate(
-            f"fetch({json.dumps(base_url + '/login')}, {{credentials:'include'}})"
-            f".then(r => r.text()).then(t => t.toLowerCase().includes('{LOGIN_BACKGROUND_TOKEN}'))",
-            await_promise=True,
+        step_log.run(
+            "navigate to assistant", lambda: cdp.call("Page.navigate", {"url": base_url})
         )
-        model_info = cdp.evaluate(
-            "fetch('/api/model/info',{credentials:'include'}).then(r=>r.json())",
-            await_promise=True,
+        step_log.run(
+            "wait page load",
+            lambda: cdp.wait_for(
+                "document.readyState === 'complete'", args.timeout, "page load"
+            ),
+        )
+        step_log.run(
+            "wait chat input",
+            lambda: cdp.wait_for(
+                "document.querySelector('textarea') !== null", args.timeout, "chat input"
+            ),
+        )
+        step_log.run(
+            "wait connected active session",
+            lambda: cdp.wait_for(
+                f"Boolean(localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)}))",
+                args.timeout,
+                "connected active session",
+            ),
+        )
+
+        login_has_palette = step_log.run(
+            "fetch login appearance",
+            lambda: cdp.evaluate(
+                f"fetch({json.dumps(base_url + '/login')}, {{credentials:'include'}})"
+                f".then(r => r.text()).then(t => t.toLowerCase().includes('{LOGIN_BACKGROUND_TOKEN}'))",
+                await_promise=True,
+            ),
+        )
+        model_info = step_log.run(
+            "fetch model info",
+            lambda: cdp.evaluate(
+                "fetch('/api/model/info',{credentials:'include'}).then(r=>r.json())",
+                await_promise=True,
+            ),
         )
         agent_name = str(model_info.get("agent_name") or "").strip() if isinstance(model_info, dict) else ""
         if not agent_name:
             raise AssertionError("dashboard.agent_name is empty")
-        bootstrap_globals = cdp.evaluate(
-            "({"
-            "__AIWERK_CUI_LOCALE__:window.__AIWERK_CUI_LOCALE__,"
-            "__HERMES_AGENT_DISPLAY_NAME__:window.__HERMES_AGENT_DISPLAY_NAME__,"
-            "__HERMES_USER_DISPLAY_NAME__:window.__HERMES_USER_DISPLAY_NAME__"
-            "})"
+        bootstrap_globals = step_log.run(
+            "read customer bootstrap globals",
+            lambda: cdp.evaluate(
+                "({"
+                "__AIWERK_CUI_LOCALE__:window.__AIWERK_CUI_LOCALE__,"
+                "__HERMES_AGENT_DISPLAY_NAME__:window.__HERMES_AGENT_DISPLAY_NAME__,"
+                "__HERMES_USER_DISPLAY_NAME__:window.__HERMES_USER_DISPLAY_NAME__"
+                "})"
+            ),
         )
-        document_title = str(cdp.evaluate("document.title") or "")
+        document_title = str(
+            step_log.run("read document title", lambda: cdp.evaluate("document.title"))
+            or ""
+        )
         bootstrap_checks = customer_bootstrap_checks(
             bootstrap_globals if isinstance(bootstrap_globals, dict) else {},
             document_title,
             agent_name,
         )
-        header_name = cdp.wait_for(
-            "(() => [...document.querySelectorAll('aside strong')].map(e=>e.textContent.trim()).find(Boolean) || '')()",
-            args.timeout,
-            "assistant header name",
+        header_name = step_log.run(
+            "wait assistant header name",
+            lambda: cdp.wait_for(
+                "(() => [...document.querySelectorAll('aside strong')].map(e=>e.textContent.trim()).find(Boolean) || '')()",
+                args.timeout,
+                "assistant header name",
+            ),
         )
 
-        session_before = cdp.evaluate(
-            f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+        session_before = step_log.run(
+            "read active session before prompt",
+            lambda: cdp.evaluate(
+                f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+            ),
         )
         if not session_before:
             raise AssertionError("active session storage key is empty")
 
         marker = f"AIWerk CUI smoke {int(time.time())}"
-        cdp.evaluate(
-            "(() => { const e=document.querySelector('textarea');"
-            f"const v={json.dumps(marker)}; const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
-            "s.call(e,v); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+        main_scope = ".aiwerk-messages"
+        main_responses_before = step_log.run(
+            "count completed main responses",
+            lambda: completed_response_count(cdp, main_scope),
         )
-        cdp.wait_for(
-            "(() => { const b=[...document.querySelectorAll('button')].find(x=>(x.innerText||'').trim()==='Senden');"
-            "if(!b||b.disabled)return false;b.click();return true;})()",
-            args.timeout,
-            "enabled send button",
+        main_turn_event_index = len(cdp.events)
+        step_log.run(
+            "enter main smoke prompt",
+            lambda: cdp.evaluate(
+                "(() => { const e=document.querySelector('textarea');"
+                f"const v={json.dumps(marker)}; const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
+                "s.call(e,v); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+            ),
         )
-        cdp.wait_for(
-            f"document.body.innerText.includes({json.dumps(marker)})",
-            args.timeout,
-            "rendered smoke marker",
+        step_log.run(
+            "wait enabled main send button",
+            lambda: cdp.wait_for(
+                "(() => { const b=[...document.querySelectorAll('button')].find(x=>(x.innerText||'').trim()==='Senden');"
+                "if(!b||b.disabled)return false;b.click();return true;})()",
+                args.timeout,
+                "enabled send button",
+            ),
         )
-        wait_for_persisted_marker(
-            base_url,
-            str(session_before),
-            marker,
-            cookie_records,
-            args.timeout,
+        step_log.run(
+            "wait rendered main marker",
+            lambda: cdp.wait_for(
+                f"document.body.innerText.includes({json.dumps(marker)})",
+                args.timeout,
+                "rendered smoke marker",
+            ),
         )
-        cdp.call("Page.reload", {"ignoreCache": True})
-        cdp.wait_for("document.querySelector('textarea') !== null", args.timeout, "reloaded chat input")
-        cdp.wait_for(f"document.body.innerText.includes({json.dumps(marker)})", args.timeout, "persisted marker")
-        session_after = cdp.evaluate(
-            f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+        step_log.run(
+            "wait successful main message.complete",
+            lambda: wait_for_message_complete(
+                cdp,
+                marker,
+                start_index=main_turn_event_index,
+                timeout=args.timeout,
+            ),
+        )
+        step_log.run(
+            "wait main turn complete",
+            lambda: cdp.wait_for(
+                turn_completion_expression(main_scope, main_responses_before),
+                args.timeout,
+                "completed main response",
+            ),
+        )
+        step_log.run(
+            "wait persisted main marker",
+            lambda: wait_for_persisted_marker(
+                base_url,
+                str(session_before),
+                marker,
+                cookie_records,
+                args.timeout,
+            ),
+        )
+        step_log.run(
+            "reload after main prompt",
+            lambda: cdp.call("Page.reload", {"ignoreCache": True}),
+        )
+        step_log.run(
+            "wait reloaded chat input",
+            lambda: cdp.wait_for(
+                "document.querySelector('textarea') !== null",
+                args.timeout,
+                "reloaded chat input",
+            ),
+        )
+        step_log.run(
+            "wait rendered persisted main marker",
+            lambda: cdp.wait_for(
+                f"document.body.innerText.includes({json.dumps(marker)})",
+                args.timeout,
+                "persisted marker",
+            ),
+        )
+        session_after = step_log.run(
+            "read active session after main reload",
+            lambda: cdp.evaluate(
+                f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+            ),
         )
 
         side_marker = f"AIWerk CUI side smoke {time.time_ns()}"
         side_start_event_index = len(cdp.events)
-        cdp.wait_for(
-            "(() => { const b=[...document.querySelectorAll('button')].find("
-            "x=>(x.innerText||'').trim()==='Nebenfrage');"
-            "if(!b||b.disabled)return false;b.click();return true;})()",
-            args.timeout,
-            "Nebenfrage button",
+        step_log.run(
+            "wait Nebenfrage button",
+            lambda: cdp.wait_for(
+                "(() => { const b=[...document.querySelectorAll('button')].find("
+                "x=>(x.innerText||'').trim()==='Nebenfrage');"
+                "if(!b||b.disabled)return false;b.click();return true;})()",
+                args.timeout,
+                "Nebenfrage button",
+            ),
         )
-        side_start_result = wait_for_websocket_rpc(
-            cdp,
-            "session.side.start",
-            start_index=side_start_event_index,
-            timeout=args.timeout,
+        side_start_result = step_log.run(
+            "wait session.side.start RPC",
+            lambda: wait_for_websocket_rpc(
+                cdp,
+                "session.side.start",
+                start_index=side_start_event_index,
+                timeout=args.timeout,
+            ),
         )
         side_session_id = str(side_start_result.get("side_session_id") or "")
         if not side_session_id:
             raise AssertionError("session.side.start returned no side_session_id")
         if side_start_result.get("parent_session_id") not in (None, session_before):
             raise AssertionError("session.side.start returned the wrong parent")
-        cdp.wait_for(
-            "document.querySelector('aside[aria-label=\"Nebenunterhaltung\"]"
-            "[data-open=\"true\"] textarea') !== null",
-            args.timeout,
-            "side conversation input",
+        side_scope = 'aside[aria-label="Nebenunterhaltung"][data-open="true"]'
+        step_log.run(
+            "wait side conversation input",
+            lambda: cdp.wait_for(
+                "document.querySelector('aside[aria-label=\"Nebenunterhaltung\"]"
+                "[data-open=\"true\"] textarea') !== null",
+                args.timeout,
+                "side conversation input",
+            ),
         )
-        cdp.evaluate(
-            "(() => { const e=document.querySelector("
-            "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"] textarea');"
-            f"const v={json.dumps(side_marker)}; const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
-            "s.call(e,v); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+        side_responses_before = step_log.run(
+            "count completed side responses",
+            lambda: completed_response_count(cdp, side_scope),
         )
-        cdp.wait_for(
-            "(() => { const d=document.querySelector("
-            "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"]');"
-            "const b=d&&[...d.querySelectorAll('button')].find("
-            "x=>(x.innerText||'').trim()==='Senden');"
-            "if(!b||b.disabled)return false;b.click();return true;})()",
-            args.timeout,
-            "side send button",
+        side_turn_event_index = len(cdp.events)
+        step_log.run(
+            "enter side smoke prompt",
+            lambda: cdp.evaluate(
+                "(() => { const e=document.querySelector("
+                "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"] textarea');"
+                f"const v={json.dumps(side_marker)}; const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
+                "s.call(e,v); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+            ),
         )
-        cdp.wait_for(
-            f"document.body.innerText.includes({json.dumps(side_marker)})",
-            args.timeout,
-            "rendered side marker",
+        step_log.run(
+            "wait enabled side send button",
+            lambda: cdp.wait_for(
+                "(() => { const d=document.querySelector("
+                "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"]');"
+                "const b=d&&[...d.querySelectorAll('button')].find("
+                "x=>(x.innerText||'').trim()==='Senden');"
+                "if(!b||b.disabled)return false;b.click();return true;})()",
+                args.timeout,
+                "side send button",
+            ),
         )
-        wait_for_persisted_marker(
-            base_url,
-            side_session_id,
-            side_marker,
-            cookie_records,
-            args.timeout,
+        step_log.run(
+            "wait rendered side marker",
+            lambda: cdp.wait_for(
+                f"document.body.innerText.includes({json.dumps(side_marker)})",
+                args.timeout,
+                "rendered side marker",
+            ),
         )
-        cdp.wait_for(
-            "[...document.querySelectorAll('button')].some("
-            "x=>(x.innerText||'').trim()==='Stop')",
-            args.timeout,
-            "side response started",
+        step_log.run(
+            "wait successful side message.complete",
+            lambda: wait_for_message_complete(
+                cdp,
+                side_marker,
+                start_index=side_turn_event_index,
+                timeout=args.timeout,
+            ),
         )
-        cdp.wait_for(
-            "![...document.querySelectorAll('button')].some("
-            "x=>(x.innerText||'').trim()==='Stop')",
-            args.timeout,
-            "completed side response",
+        step_log.run(
+            "wait side turn complete",
+            lambda: cdp.wait_for(
+                turn_completion_expression(side_scope, side_responses_before),
+                args.timeout,
+                "completed side response",
+            ),
+        )
+        step_log.run(
+            "wait persisted side marker",
+            lambda: wait_for_persisted_marker(
+                base_url,
+                side_session_id,
+                side_marker,
+                cookie_records,
+                args.timeout,
+            ),
         )
         side_back_event_index = len(cdp.events)
-        cdp.wait_for(
-            "(() => { const d=document.querySelector("
-            "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"]');"
-            "const b=d&&[...d.querySelectorAll('header button')].find("
-            "x=>(x.innerText||'').trim()==='Schliessen');"
-            "if(!b||b.disabled)return false;b.click();return true;})()",
-            args.timeout,
-            "Schliessen button",
+        step_log.run(
+            "wait Schliessen button",
+            lambda: cdp.wait_for(
+                "(() => { const d=document.querySelector("
+                "'aside[aria-label=\"Nebenunterhaltung\"][data-open=\"true\"]');"
+                "const b=d&&[...d.querySelectorAll('header button')].find("
+                "x=>(x.innerText||'').trim()==='Schliessen');"
+                "if(!b||b.disabled)return false;b.click();return true;})()",
+                args.timeout,
+                "Schliessen button",
+            ),
         )
-        side_back_result = wait_for_websocket_rpc(
-            cdp,
-            "session.side.back",
-            start_index=side_back_event_index,
-            timeout=args.timeout,
+        side_back_result = step_log.run(
+            "wait session.side.back RPC",
+            lambda: wait_for_websocket_rpc(
+                cdp,
+                "session.side.back",
+                start_index=side_back_event_index,
+                timeout=args.timeout,
+            ),
         )
         side_back_parent_id = side_back_result.get("parent_session_id")
-        cdp.wait_for(
-            "document.querySelector('aside[aria-label=\"Nebenunterhaltung\"]')"
-            ".getAttribute('data-open') !== 'true'",
-            args.timeout,
-            "closed side conversation",
+        step_log.run(
+            "wait closed side conversation",
+            lambda: cdp.wait_for(
+                "document.querySelector('aside[aria-label=\"Nebenunterhaltung\"]')"
+                ".getAttribute('data-open') !== 'true'",
+                args.timeout,
+                "closed side conversation",
+            ),
         )
-        cdp.call("Page.reload", {"ignoreCache": True})
-        cdp.wait_for("document.querySelector('textarea') !== null", args.timeout, "post-side reload")
-        cdp.wait_for(
-            f"document.body.innerText.includes({json.dumps(marker)})",
-            args.timeout,
-            "main marker after side reload",
+        step_log.run(
+            "reload after side prompt",
+            lambda: cdp.call("Page.reload", {"ignoreCache": True}),
         )
-        session_after_side_reload = cdp.evaluate(
-            f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+        step_log.run(
+            "wait post-side reload",
+            lambda: cdp.wait_for(
+                "document.querySelector('textarea') !== null",
+                args.timeout,
+                "post-side reload",
+            ),
         )
-        main_panel_text = cdp.evaluate(
-            "document.querySelector('.aiwerk-messages')?.innerText || ''"
+        step_log.run(
+            "wait main marker after side reload",
+            lambda: cdp.wait_for(
+                f"document.body.innerText.includes({json.dumps(marker)})",
+                args.timeout,
+                "main marker after side reload",
+            ),
+        )
+        session_after_side_reload = step_log.run(
+            "read active session after side reload",
+            lambda: cdp.evaluate(
+                f"localStorage.getItem({json.dumps(ACTIVE_SESSION_STORAGE_KEY)})"
+            ),
+        )
+        main_panel_text = step_log.run(
+            "read main panel after side reload",
+            lambda: cdp.evaluate(
+                "document.querySelector('.aiwerk-messages')?.innerText || ''"
+            ),
         )
         side_checks = side_isolation_checks(
             str(session_before),
@@ -720,25 +1008,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             side_back_parent_id,
         )
 
-        cdp.evaluate(
-            "(() => { const e=document.querySelector('textarea');"
-            "const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
-            "s.call(e,'/'); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+        step_log.run(
+            "open command palette",
+            lambda: cdp.evaluate(
+                "(() => { const e=document.querySelector('textarea');"
+                "const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
+                "s.call(e,'/'); e.dispatchEvent(new Event('input',{bubbles:true})); return true; })()"
+            ),
         )
-        time.sleep(0.5)
-        palette = cdp.evaluate(
-            "(() => [...new Set([...document.querySelectorAll('button')].map(b =>"
-            "(b.innerText||'').trim().split(/\\s+/)[0]).filter(x=>x&&x.startsWith('/')))].sort())()"
+        step_log.run("wait palette render", lambda: time.sleep(0.5))
+        palette = step_log.run(
+            "read command palette",
+            lambda: cdp.evaluate(
+                "(() => [...new Set([...document.querySelectorAll('button')].map(b =>"
+                "(b.innerText||'').trim().split(/\\s+/)[0]).filter(x=>x&&x.startsWith('/')))].sort())()"
+            ),
         )
-        overlay_count = cdp.evaluate(
-            "[...document.querySelectorAll('.fixed.inset-0')].filter(e=>{const s=getComputedStyle(e);"
-            "const r=e.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&"
-            "r.width>=innerWidth*.9&&r.height>=innerHeight*.9}).length"
+        overlay_count = step_log.run(
+            "read fullscreen overlays",
+            lambda: cdp.evaluate(
+                "[...document.querySelectorAll('.fixed.inset-0')].filter(e=>{const s=getComputedStyle(e);"
+                "const r=e.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&"
+                "r.width>=innerWidth*.9&&r.height>=innerHeight*.9}).length"
+            ),
         )
-        screenshot = cdp.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
+        screenshot = step_log.run(
+            "capture smoke screenshot",
+            lambda: cdp.call(
+                "Page.captureScreenshot",
+                {"format": "png", "captureBeyondViewport": True},
+            ),
+        )
         args.screenshot.parent.mkdir(parents=True, exist_ok=True)
         args.screenshot.write_bytes(base64.b64decode(screenshot["data"]))
-        cdp.drain()
+        step_log.run("wait final network drain", cdp.drain)
         responses, catalog_sent, catalog_received, ws_101 = _network_observations(cdp.events)
         errors_4xx = client_error_responses(responses)
 
@@ -801,7 +1104,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         return report
     except Exception as exc:
-        report["error"] = public_error(exc)
+        failed_steps = [
+            str(step.get("name") or "")
+            for step in report["steps"]
+            if step.get("status") == "FAIL"
+        ]
+        report["error"] = public_error(exc, failed_steps[-1] if failed_steps else None)
         if cdp is not None:
             try:
                 screenshot = cdp.call("Page.captureScreenshot", {"format": "png"})

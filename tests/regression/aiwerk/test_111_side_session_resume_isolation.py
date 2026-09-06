@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import threading
 from pathlib import Path
+
+import pytest
 
 from hermes_state import SessionDB
 from tui_gateway import server
@@ -618,6 +621,62 @@ def test_cui_smoke_waits_for_correlated_rpc_response_from_cdp_events():
     assert cdp.drains == 1
 
 
+def test_cui_smoke_requires_successful_message_complete_for_the_exact_session():
+    submitted = _ws_frame(
+        "Sent",
+        {
+            "id": "w7",
+            "method": "prompt.submit",
+            "params": {"session_id": "side", "text": "marker"},
+        },
+        "ws-A",
+    )
+    unrelated = _ws_frame(
+        "Received",
+        {
+            "method": "event",
+            "params": {
+                "type": "message.complete",
+                "session_id": "opaque-runtime-id",
+                "payload": {"status": "complete"},
+            },
+        },
+        "ws-B",
+    )
+    success = _ws_frame(
+        "Received",
+        {
+            "method": "event",
+            "params": {
+                "type": "message.complete",
+                "session_id": "opaque-runtime-id",
+                "payload": {"status": "complete", "text": "done"},
+            },
+        },
+        "ws-A",
+    )
+
+    assert _smoke.message_complete_result([submitted, unrelated, success], "marker") == {
+        "status": "complete",
+        "text": "done",
+    }
+
+    failed = _ws_frame(
+        "Received",
+        {
+            "method": "event",
+            "params": {
+                "type": "message.complete",
+                "session_id": "opaque-runtime-id",
+                "payload": {"status": "error"},
+            },
+        },
+        "ws-A",
+    )
+    with pytest.raises(RuntimeError, match="reported an error"):
+        _smoke.message_complete_result([submitted, failed], "marker")
+
+
 def test_cui_smoke_side_checks_fail_closed_for_leak_or_session_switch():
     assert _smoke.side_isolation_checks(
         "parent", "parent", "MAIN-A", "SIDE-B", "parent"
@@ -641,3 +700,64 @@ def test_cui_smoke_side_checks_fail_closed_for_leak_or_session_switch():
         "side_parent_session_preserved": False,
         "side_back_returned_parent": False,
     }
+
+
+def test_cui_smoke_step_log_records_elapsed_time_in_json_and_stderr(monkeypatch):
+    clock = iter((10.0, 10.125))
+    monkeypatch.setattr(_smoke.time, "monotonic", lambda: next(clock))
+    stderr = io.StringIO()
+    steps = []
+    log = _smoke.StepLog(steps, stderr=stderr)
+
+    assert log.run("wait main turn complete", lambda: "done") == "done"
+    assert steps == [
+        {
+            "name": "wait main turn complete",
+            "elapsed_seconds": 0.125,
+            "status": "PASS",
+        }
+    ]
+    assert "wait main turn complete" in stderr.getvalue()
+    assert "PASS" in stderr.getvalue()
+
+
+def test_cui_smoke_step_log_names_the_failed_timeout(monkeypatch):
+    clock = iter((20.0, 20.5))
+    monkeypatch.setattr(_smoke.time, "monotonic", lambda: next(clock))
+    stderr = io.StringIO()
+    steps = []
+    log = _smoke.StepLog(steps, stderr=stderr)
+
+    with pytest.raises(TimeoutError, match="wait side turn complete"):
+        log.run(
+            "wait side turn complete",
+            lambda: (_ for _ in ()).throw(TimeoutError("old unscoped timeout")),
+        )
+
+    assert steps == [
+        {
+            "name": "wait side turn complete",
+            "elapsed_seconds": 0.5,
+            "status": "FAIL",
+        }
+    ]
+    assert "wait side turn complete" in stderr.getvalue()
+    assert "FAIL" in stderr.getvalue()
+    assert _smoke.public_error(
+        TimeoutError("sensitive detail"), "wait side turn complete"
+    ) == {
+        "type": "TimeoutError",
+        "message": "smoke execution failed",
+        "step": "wait side turn complete",
+    }
+
+
+def test_cui_smoke_turn_completion_requires_new_answer_and_no_running_indicator():
+    expression = _smoke.turn_completion_expression(
+        'aside[aria-label="Nebenunterhaltung"][data-open="true"]', 3
+    )
+
+    assert "Diese Antwort vorlesen" in expression
+    assert "Der Assistent arbeitet an der Antwort" in expression
+    assert "> 3" in expression
+    assert 'aside[aria-label=\\"Nebenunterhaltung\\"][data-open=\\"true\\"]' in expression
