@@ -313,7 +313,9 @@ class TestChatCompletionsBuildKwargs:
             base_url="https://api.mistral.ai/v1",
         )
         assert kw.get("extra_body", {}).get("think") is None
-        assert kw.get("reasoning_effort") == "none"
+        # AIWerk retained contract: strict remote custom providers must omit
+        # generic reasoning controls they have not explicitly advertised.
+        assert "reasoning_effort" not in kw
 
 
 

@@ -3950,6 +3950,12 @@ class SessionStore:
         from hermes_state import SessionDB
 
         if isinstance(exc, sqlite3.DatabaseError):
+            # Rank 19's legacy helper deliberately accepts a code-less generic
+            # malformed-image error for the lower-level write path.  The
+            # gateway boundary is stricter: only explicit SQLite provenance
+            # may authorize its rebuild-and-retry path.
+            if getattr(exc, "sqlite_errorcode", None) is None:
+                return text.startswith("fts5:") and "corrupt structure" in text
             return SessionDB._is_fts_write_corruption_error(exc)
         return False
 
