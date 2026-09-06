@@ -232,6 +232,12 @@ class TestMarkdownSynchronization:
         source = inspect.getsource(init_agent)
         assert "TodoStore(markdown_path=default_todo_markdown_path())" in source
 
+    def test_default_path_honors_cui_env(self, monkeypatch, tmp_path):
+        path = tmp_path / "panel.md"
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(path))
+
+        assert default_todo_markdown_path() == path
+
     def test_round_trip_preserves_all_statuses_and_ascii_normalized_ids(self, tmp_path):
         path = tmp_path / "TODO.md"
         original = [
