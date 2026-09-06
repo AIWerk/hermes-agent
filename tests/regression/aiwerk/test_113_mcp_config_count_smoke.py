@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -182,3 +183,76 @@ def test_private_plan_file_is_required_and_values_are_not_reported(tmp_path: Pat
 
     plan_path.chmod(0o600)
     assert _smoke.load_plan(plan_path) == _plan()
+
+
+def test_fail_report_includes_exact_safe_exception_message_without_dynamic_values() -> None:
+    report = _smoke._failure_report(
+        RuntimeError("call-plan servers do not equal enabled config servers")
+    )
+
+    assert report == {
+        "error": {
+            "message": "call-plan servers do not equal enabled config servers",
+            "type": "RuntimeError",
+        },
+        "status": "FAIL",
+    }
+
+    sensitive_value = "secret-token-from-handler"
+    redacted = _smoke._failure_report(RuntimeError(f"handler failed: {sensitive_value}"))
+    assert redacted["error"] == {
+        "message": "MCP smoke failed",
+        "type": "RuntimeError",
+    }
+    assert sensitive_value not in json.dumps(redacted)
+
+
+def test_main_writes_safe_failure_report_without_dynamic_exception_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan_path = tmp_path / "mcp-plan.json"
+    plan_path.write_text(json.dumps(_plan()), encoding="utf-8")
+    plan_path.chmod(0o600)
+    report_path = tmp_path / "mcp-report.json"
+
+    mcp_tool = ModuleType("tools.mcp_tool")
+    setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+    setattr(mcp_tool, "get_mcp_status", lambda: _statuses(bridge_connected=False))
+    setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+    registry = SimpleNamespace(
+        get_tool_names_for_toolset=lambda _toolset: [],
+        get_entry=lambda _name: None,
+    )
+    registry_module = ModuleType("tools.registry")
+    setattr(registry_module, "registry", registry)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", mcp_tool)
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_module)
+
+    assert _smoke.main(["--plan", str(plan_path), "--json-out", str(report_path)]) == 1
+    assert json.loads(report_path.read_text(encoding="utf-8")) == {
+        "error": {
+            "message": "connected servers do not equal enabled config servers",
+            "type": "RuntimeError",
+        },
+        "status": "FAIL",
+    }
+
+    sensitive_value = "secret-token-from-handler"
+    setattr(mcp_tool, "get_mcp_status", lambda: _statuses())
+    registry.get_tool_names_for_toolset = lambda toolset: {
+        "mcp-tenant_neo4j": ["mcp__tenant_neo4j__graph_summary"],
+        "mcp-aiwerk_bridge": ["mcp__aiwerk_bridge__mcp"],
+    }[toolset]
+    registry.get_entry = lambda _name: SimpleNamespace(
+        handler=lambda _args: (_ for _ in ()).throw(
+            RuntimeError(f"handler failed: {sensitive_value}")
+        )
+    )
+
+    assert _smoke.main(["--plan", str(plan_path), "--json-out", str(report_path)]) == 1
+    redacted = report_path.read_text(encoding="utf-8")
+    assert json.loads(redacted)["error"] == {
+        "message": "MCP smoke failed",
+        "type": "RuntimeError",
+    }
+    assert sensitive_value not in redacted

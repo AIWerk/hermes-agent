@@ -167,6 +167,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _failure_report(exc: Exception) -> dict[str, Any]:
+    """Build a useful FAIL report without exposing dynamic exception values."""
+    safe_messages = {
+        "MCP status contained an invalid server name",
+        "MCP status contained duplicate server names",
+        "MCP status returned an invalid result",
+        "call-plan servers do not equal enabled config servers",
+        "connected servers do not equal enabled config servers",
+        "no enabled MCP servers; refusing vacuous smoke PASS",
+        "MCP topology changed during real-call smoke",
+        "real-call count does not equal enabled server count",
+    }
+    message = str(exc)
+    if message not in safe_messages:
+        message = "MCP smoke failed"
+    return {
+        "error": {
+            "message": message,
+            "type": type(exc).__name__,
+        },
+        "status": "FAIL",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     plan = load_plan(args.plan)
@@ -192,16 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     except Exception as exc:
-        _write_json_private(
-            args.json_out,
-            {
-                "error": {
-                    "message": "MCP smoke failed",
-                    "type": type(exc).__name__,
-                },
-                "status": "FAIL",
-            },
-        )
+        _write_json_private(args.json_out, _failure_report(exc))
         print(f"MCP smoke FAIL ({type(exc).__name__})", file=sys.stderr)
         return 1
     finally:
