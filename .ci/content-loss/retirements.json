@@ -99,6 +99,26 @@
       "not_before": "2026-09-05T11:12:05Z",
       "expires_at": "2026-09-12T11:12:05Z",
       "reason": "Authorize the exact fork-loss class and approved merge-range regression coverage."
+    },
+    {
+      "id": "UPSTREAM-29112BEF-BASELINE-TRANSITION",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
+      "allowed_target_state": "blob:a38ffab3a8ec7ac6c29c51b91e350215258dd92c",
+      "valid_for_pr": 115,
+      "not_before": "2026-09-06T20:58:06Z",
+      "expires_at": "2026-09-13T20:58:06Z",
+      "reason": "Authorize the exact upstream-pin transition to v2026.8.31 by changing only accepted_upstream_commit in a separate control PR; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired."
+    },
+    {
+      "id": "UPSTREAM-29112BEF-WORKFLOW-DERIVATION",
+      "subject_path": ".github/workflows/aiwerk-content-loss-guard.yml",
+      "expected_old_blob": "ef484275048c83dc0a72b16ceb5910c81db91fb0",
+      "allowed_target_state": "blob:089ebddf11237483c6afdc2e8b120e08584c0153",
+      "valid_for_pr": 115,
+      "not_before": "2026-09-06T20:58:06Z",
+      "expires_at": "2026-09-13T20:58:06Z",
+      "reason": "Authorize only the exact workflow transition that derives the upstream pin from the protected base baseline for both guard modes; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired."
     }
   ],
   "schema_version": 1
