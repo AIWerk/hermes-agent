@@ -15,6 +15,7 @@ the late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 import asyncio  # noqa: F401 — used by handlers
 import json
 import logging
+import sqlite3
 import time  # noqa: F401
 from typing import Any, Dict, List, Optional  # noqa: F401
 
@@ -26,9 +27,11 @@ from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
     SessionImport,
+    SessionOwnerBackfill,
     SessionPrune,
     SessionRename,
 )
+from hermes_state import is_malformed_db_error
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -52,6 +55,39 @@ _cui_actor_context_from_request = late("_cui_actor_context_from_request")
 _list_sessions_rich_all = late("_list_sessions_rich_all")
 _session_visible_to_cui_actor = late("_session_visible_to_cui_actor")
 _project_session_list_rows_public = late("_project_session_list_rows_public")
+
+
+def _resolve_session_id(db, session_id: str) -> Optional[str]:
+    """Resolve *session_id*, distinguishing "absent" from "unreadable".
+
+    A corrupt ``state.db`` does not raise on every read. The exact-match
+    lookup goes through the ``sessions`` primary-key index, so a damaged
+    index simply *misses* and returns None — indistinguishable from a
+    session that was never there. Only the prefix fallback scans the base
+    b-tree and raises ``database disk image is malformed``.
+
+    Both outcomes used to end at ``404 Session not found``: one silently, one
+    as an unhandled 500 that the Desktop surfaced as "session unavailable".
+    Reporting a corrupt store as an empty one cost a day of looking at
+    session logic during the 2026-08-31 incident, so classify it here and say
+    what is actually wrong.
+    """
+    try:
+        return db.resolve_session_id(session_id)
+    except sqlite3.DatabaseError as exc:
+        if not is_malformed_db_error(exc):
+            raise
+        _log.error(
+            "state.db is corrupt while resolving session %s: %s", session_id, exc
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Session store is corrupt (database disk image is malformed). "
+                "Sessions cannot be read until it is repaired — run "
+                "`hermes doctor` for diagnosis."
+            ),
+        ) from exc
 
 
 @list_router.get("/api/sessions")
@@ -568,6 +604,11 @@ async def delete_empty_sessions_endpoint(request: Request, profile: Optional[str
 
     Safety contract mirrors :meth:`SessionDB.delete_empty_sessions`:
 
+    * "Empty" means the session owns no rows in ``messages`` at all — not
+      merely ``message_count == 0``. A rewound or in-place-compacted chat
+      keeps its dropped turns as soft-archived (``active = 0``) rows while
+      the counter reads zero, and those rows are the only recoverable copy
+      of the transcript (#95868).
     * Active sessions are skipped (``ended_at IS NULL``) so a live
       agent isn't yanked mid-handshake.
     * Archived sessions are skipped — the user explicitly chose to
@@ -633,7 +674,7 @@ async def get_session_detail(session_id: str, request: Request, profile: Optiona
     actor = late("_cui_actor_context_from_request")(request)
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
-        sid = db.resolve_session_id(session_id)
+        sid = _resolve_session_id(db, session_id)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -706,7 +747,7 @@ async def get_session_messages(
     def _read():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
-            sid = db.resolve_session_id(session_id)
+            sid = _resolve_session_id(db, session_id)
             if not sid:
                 return None
             late("_enforce_cui_session_visible")(db.get_session(sid), actor)
@@ -784,7 +825,7 @@ async def delete_session_endpoint(session_id: str, request: Request, profile: Op
             # leaves transient empty rows (reaped by empty-session hygiene) that
             # race the sidebar snapshot, which is exactly when this fired. Mirrors
             # the bulk-delete endpoint, which already treats ghost ids as success.
-            sid = db.resolve_session_id(session_id)
+            sid = _resolve_session_id(db, session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
             late("_enforce_cui_session_visible")(db.get_session(sid), actor)
@@ -796,12 +837,58 @@ async def delete_session_endpoint(session_id: str, request: Request, profile: Op
     return await asyncio.to_thread(_delete)
 
 
+@manage_router.post("/api/sessions/owner-backfill")
+async def backfill_session_owner_profiles(body: SessionOwnerBackfill):
+    """Stamp legacy ``profile_name = NULL`` session rows with this store's own
+    serving-profile identity (#94724 legacy-session migration).
+
+    Pre-#95407 rows never recorded an owning profile. That was fine while one
+    backend served everything, but a Desktop with registry topology (≥2
+    registered connections) fails closed on unowned rows by design — leaving
+    every pre-campaign session unresumable with no migration path. Each
+    profile's ``state.db`` belongs to exactly one profile, so stamping that
+    store's own name is a single-match backfill, never a guess; the value
+    written is the SAME serving-profile identity the list endpoints already
+    stamp onto outgoing rows (``row_profile`` in ``get_sessions``). Idempotent
+    and one-shot-per-row: non-NULL owners are never overwritten and a second
+    call reports 0.
+    """
+    profile_name: Optional[str] = None
+    if body.profile:
+        profile_name, _ = _cron_profile_home(body.profile)
+    stamp = profile_name or _cron_default_profile()
+
+    def _backfill():
+        db = _open_session_db_for_profile(body.profile, read_only=False)
+        try:
+            return db.backfill_null_session_profiles(stamp)
+        finally:
+            db.close()
+
+    try:
+        stamped = await asyncio.to_thread(_backfill)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/sessions/owner-backfill failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    if stamped:
+        _log.info(
+            "owner-backfill: stamped %d legacy NULL-profile session row(s) with profile %r",
+            stamped,
+            stamp,
+        )
+    return {"ok": True, "stamped": stamped, "profile": stamp}
+
+
 @manage_router.patch("/api/sessions/{session_id}")
 async def rename_session_endpoint(session_id: str, body: SessionRename, request: Request):
-    """Update a session: rename, archive, pin, and/or mark read/unread.
+    """Update a session: rename, archive, hide, pin, and/or mark read/unread.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
-    restores the session; ``pinned`` sets the durable keep flag (exempts the
+    restores the session; ``hidden`` controls generic list visibility;
+    ``pinned`` sets the durable keep flag (exempts the
     session from the auto-archive sweep); ``unread`` toggles the read-state
     watermark (True = explicitly unread, False = read up to now — see
     ``SessionDB.set_session_read``). Any field may be omitted. ``profile``
@@ -809,7 +896,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
     """
     db = _open_session_db_for_profile(body.profile, read_only=False)
     try:
-        sid = db.resolve_session_id(session_id)
+        sid = _resolve_session_id(db, session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
         late("_enforce_cui_session_visible")(
@@ -818,12 +905,13 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
         if (
             body.title is None
             and body.archived is None
+            and body.hidden is None
             and body.pinned is None
             and body.unread is None
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', 'pinned', and/or 'unread'.",
+                detail="Nothing to update; provide 'title', 'archived', 'hidden', 'pinned', and/or 'unread'.",
             )
         if body.title is not None:
             try:
@@ -833,6 +921,8 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
                 raise HTTPException(status_code=400, detail=str(e))
         if body.archived is not None:
             db.set_session_archived(sid, body.archived)
+        if body.hidden is not None:
+            db.set_session_hidden(sid, body.hidden)
         if body.pinned is not None:
             db.set_session_pinned(sid, body.pinned)
         if body.unread is not None:
@@ -840,6 +930,8 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
         result = {"ok": True, "title": db.get_session_title(sid) or ""}
         if body.archived is not None:
             result["archived"] = bool(body.archived)
+        if body.hidden is not None:
+            result["hidden"] = bool(body.hidden)
         if body.pinned is not None:
             result["pinned"] = bool(body.pinned)
         if body.unread is not None:
