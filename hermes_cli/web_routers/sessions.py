@@ -948,7 +948,7 @@ async def export_session_endpoint(session_id: str, request: Request, profile: Op
     def _prepare_export():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
-            sid = db.resolve_session_id(session_id)
+            sid = _resolve_session_id(db, session_id)
             if not sid:
                 return None
             session = db.get_session(sid)

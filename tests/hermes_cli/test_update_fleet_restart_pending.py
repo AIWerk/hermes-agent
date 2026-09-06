@@ -86,6 +86,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed", lambda *a, **k: None
     )
+    # Keep mocked gateway readers installed across the simulated code update.
+    # Production module purging would discard them and discover live gateways.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
     monkeypatch.setattr(
         hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None

@@ -276,14 +276,9 @@ class TestRuntimeFtsRebuild:
         os.chmod(proc_root / "222" / "fd", 0o755)
 
     def test_corruption_error_classification_requires_fts_evidence(self):
-        """Generic structural corruption must not enter live FTS repair.
-
-        Older SQLite builds may use the generic malformed-image text for an FTS
-        virtual-table failure, but still expose SQLITE_CORRUPT_VTAB.  Preserve
-        that route while failing closed for unscoped SQLITE_CORRUPT errors.
-        """
+        """Rank 19: legacy no-code text heals; explicit codes take precedence."""
         generic = sqlite3.DatabaseError("database disk image is malformed")
-        assert not SessionDB._is_fts_write_corruption_error(generic)
+        assert SessionDB._is_fts_write_corruption_error(generic)
 
         structural = sqlite3.DatabaseError("database disk image is malformed")
         structural.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
@@ -377,22 +372,23 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "hello world")
 
         _corrupt_fts(db_path)
-        monkeypatch.setattr(
-            db,
-            "rebuild_fts",
-            lambda: pytest.fail("live write must not rebuild the full FTS index"),
-        )
+        # Rank 19: first corruption gets one real live rebuild, not detach.
+        from unittest.mock import Mock
+        rebuild = Mock(wraps=db.rebuild_fts)
+        monkeypatch.setattr(db, "rebuild_fts", rebuild)
 
-        # The canonical write survives without waiting for a full index scan.
+        # Rank 19: the canonical write retries after the admitted index repair.
         msg_id = db.append_message("s1", "user", "healed append")
         assert msg_id is not None
         assert _message_contents(db_path) == [
             "hello world",
             "healed append",
         ]
-        assert db._fts_stale is True
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
+        assert db._fts_runtime_rebuild_attempted is True
+        assert rebuild.call_count == 1
+        assert db._fts_stale is False
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
 
     def test_search_works_from_canonical_rows_after_fail_open(self, db, tmp_path):
         if not db._fts_enabled:
@@ -403,6 +399,9 @@ class TestRuntimeFtsRebuild:
         _corrupt_fts(db_path)
         db.append_message("s1", "user", "searchable needle text")
 
+        # Rank 19: consume the successful first heal, then force corruption
+        # again so all durable fail-open/offline assertions remain unchanged.
+        _corrupt_fts(db_path)
         results = db.search_messages("needle")
         assert results
         assert any("needle" in (row.get("snippet") or "") for row in results)
@@ -412,7 +411,7 @@ class TestRuntimeFtsRebuild:
         self, db, tmp_path, monkeypatch
     ):
         """A read-only session that only SEARCHES (no write after corruption)
-        must stay available without starting an unbounded index scan.
+        uses the Rank 19 one-shot live self-heal before durable degradation.
         """
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
@@ -421,17 +420,18 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "a searchable needle here")
 
         _corrupt_fts(db_path)
-        monkeypatch.setattr(
-            db,
-            "rebuild_fts",
-            lambda: pytest.fail("live search must not rebuild the full FTS index"),
-        )
+        # Rank 19: first corruption gets one real live rebuild, not detach.
+        from unittest.mock import Mock
+        rebuild = Mock(wraps=db.rebuild_fts)
+        monkeypatch.setattr(db, "rebuild_fts", rebuild)
 
         results = db.search_messages("needle")
 
-        assert db._fts_stale is True
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
+        assert db._fts_runtime_rebuild_attempted is True
+        assert rebuild.call_count == 1
+        assert db._fts_stale is False
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
         assert results
         assert any("needle" in (r.get("snippet") or "") for r in results)
 
@@ -439,7 +439,7 @@ class TestRuntimeFtsRebuild:
         self, db, tmp_path, monkeypatch
     ):
         """The CJK/trigram MATCH branch has the same read-corruption exposure
-        as the main FTS5 branch and must fall back to canonical rows.
+        as the main FTS5 branch: Rank 19 repairs once before canonical fallback.
         """
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
@@ -450,20 +450,23 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "关于大别山项目的进展报告")
 
         _corrupt_trigram_fts(db_path)
-        monkeypatch.setattr(
-            db,
-            "rebuild_fts",
-            lambda: pytest.fail("live search must not rebuild the full FTS index"),
-        )
+        # Rank 19: first corruption gets one real live rebuild, not detach.
+        from unittest.mock import Mock
+        rebuild = Mock(wraps=db.rebuild_fts)
+        monkeypatch.setattr(db, "rebuild_fts", rebuild)
 
         # >=3 CJK chars per token → routed to the trigram branch.
         results = db.search_messages("大别山项目")
 
-        assert db._fts_stale is True
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
+        assert db._fts_runtime_rebuild_attempted is True
+        assert rebuild.call_count == 1
+        assert db._fts_stale is False
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
         assert results
         assert any("大别山项目" in (r.get("snippet") or "") for r in results)
+
+        assert any(">>>" in r["snippet"] and "<<<" in r["snippet"] for r in results)
 
     def test_non_fts_write_error_after_fail_open_raises_not_hangs(
         self, db, tmp_path
@@ -473,6 +476,10 @@ class TestRuntimeFtsRebuild:
         db_path = tmp_path / "state.db"
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+        # Rank 19: consume the successful first heal, then force corruption
+        # again so all durable fail-open/offline assertions remain unchanged.
+        assert db.search_messages("seed")
         _corrupt_fts(db_path)
         db.append_message("s1", "user", "canonical survives")
 
@@ -652,6 +659,10 @@ class TestRuntimeFtsRebuild:
         db_path = tmp_path / "state.db"
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "seed")
+        _corrupt_fts(db_path)
+        # Rank 19: consume the successful first heal, then force corruption
+        # again so all durable fail-open/offline assertions remain unchanged.
+        assert db.search_messages("seed")
         _corrupt_fts(db_path)
         db.append_message("s1", "user", "corruption survives")
         assert _message_contents(db_path) == [

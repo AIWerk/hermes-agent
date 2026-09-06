@@ -26,7 +26,9 @@ class TestRealProfileResolvers:
 
     def test_data_dir_linux_edge(self):
         import hermes_cli.browser_connect as bc
-        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/home/t/.config"}, clear=False):
+        # This native-layout case must not discover host snap/Flatpak profiles.
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/home/t/.config"}, clear=False), \
+             patch.object(bc.os.path, "isdir", return_value=False):
             got = bc.real_profile_data_dir("edge", "Linux")
         assert got == "/home/t/.config/microsoft-edge"
 
@@ -49,7 +51,9 @@ class TestRealProfileResolvers:
         with patch.dict(os.environ, {"LOCALAPPDATA": r"C:\Users\T\AppData\Local"}, clear=False):
             win = bc.real_profile_data_dir("brave-origin", "Windows")
         assert win and win.endswith(ntpath.join("BraveSoftware", "Brave-Origin", "User Data"))
-        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/home/t/.config"}, clear=False):
+        # This native-layout case must not discover host snap/Flatpak profiles.
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/home/t/.config"}, clear=False), \
+             patch.object(bc.os.path, "isdir", return_value=False):
             assert (
                 bc.real_profile_data_dir("brave-origin", "Linux")
                 == "/home/t/.config/BraveSoftware/Brave-Origin"

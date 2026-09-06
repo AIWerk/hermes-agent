@@ -315,12 +315,17 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         def _handle(tool_name, tool_args, task_id=None):
             from tools.thread_context import _callback_api
 
-            get_approval, _get_sudo, _set_a, _set_s = _callback_api()
+            callback_api = _callback_api()
+            get_approval = callback_api[0]
+            get_operator = callback_api[4]
+            get_secret = callback_api[6]
             seen.append(
                 {
                     "tool": tool_name,
                     "task_id": task_id,
                     "approval_cb": get_approval(),
+                    "operator_cb": get_operator(),
+                    "secret_cb": get_secret(),
                 }
             )
             return json.dumps({"ok": True})
@@ -328,6 +333,8 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         return _handle
 
     def test_a_later_cells_rpc_runs_under_that_cells_authority(self):
+        from hermes_cli.operator_verification import set_operator_verification_callback
+        from tools.skills_tool import set_secret_capture_callback
         from tools.terminal_tool import set_approval_callback
 
         seen = []
@@ -341,18 +348,40 @@ class TestPerCellRpcAuthority(unittest.TestCase):
             def cb_two():
                 return "two"
 
+            def operator_one(*_args, **_kwargs):
+                return "operator-one"
+
+            def operator_two(*_args, **_kwargs):
+                return "operator-two"
+
+            def secret_one(*_args, **_kwargs):
+                return "secret-one"
+
+            def secret_two(*_args, **_kwargs):
+                return "secret-two"
+
             set_approval_callback(cb_one)
+            set_operator_verification_callback(operator_one)
+            set_secret_capture_callback(secret_one)
             try:
                 first = _run(cell)
                 set_approval_callback(cb_two)
+                set_operator_verification_callback(operator_two)
+                set_secret_capture_callback(secret_two)
                 second = _run(cell)
             finally:
                 set_approval_callback(None)
+                set_operator_verification_callback(None)
+                set_secret_capture_callback(None)
         self.assertEqual(first["status"], "success", first)
         self.assertEqual(second["status"], "success", second)
         self.assertEqual(len(seen), 2)
         self.assertIs(seen[0]["approval_cb"], cb_one)
         self.assertIs(seen[1]["approval_cb"], cb_two)
+        self.assertIs(seen[0]["operator_cb"], operator_one)
+        self.assertIs(seen[1]["operator_cb"], operator_two)
+        self.assertIs(seen[0]["secret_cb"], secret_one)
+        self.assertIs(seen[1]["secret_cb"], secret_two)
         self.assertEqual(seen[0]["task_id"], "kernel-test")
 
     def test_cross_cell_alias_dispatches_under_the_current_cell(self):

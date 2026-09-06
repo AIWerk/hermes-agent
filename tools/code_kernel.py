@@ -190,16 +190,33 @@ class CellAuthority:
         self.task_id = task_id
         self.ctx = contextvars.copy_context()
         self.active = True
-        self._approval_cb = None
-        self._sudo_cb = None
+        self._callback_values = None
         self._callback_setters = None
         try:
             from tools.thread_context import _callback_api
 
-            get_approval, get_sudo, set_approval, set_sudo = _callback_api()
-            self._approval_cb = get_approval()
-            self._sudo_cb = get_sudo()
-            self._callback_setters = (set_approval, set_sudo)
+            (
+                get_approval,
+                get_sudo,
+                set_approval,
+                set_sudo,
+                get_operator,
+                set_operator,
+                get_secret,
+                set_secret,
+            ) = _callback_api()
+            self._callback_values = (
+                get_approval(),
+                get_sudo(),
+                get_operator(),
+                get_secret(),
+            )
+            self._callback_setters = (
+                set_approval,
+                set_sudo,
+                set_operator,
+                set_secret,
+            )
         except Exception:
             # Fail-closed, mirroring propagate_context_to_thread: with no
             # callbacks installed, dangerous approvals deny.
@@ -223,24 +240,45 @@ class CellAuthority:
         from model_tools import handle_function_call
 
         previous = None
-        if self._callback_setters is not None:
+        if self._callback_setters is not None and self._callback_values is not None:
             try:
                 from tools.thread_context import _callback_api
 
-                get_approval, get_sudo, set_approval, set_sudo = _callback_api()
-                previous = (get_approval(), get_sudo())
-                set_approval(self._approval_cb)
-                set_sudo(self._sudo_cb)
+                (
+                    get_approval,
+                    get_sudo,
+                    _set_approval,
+                    _set_sudo,
+                    get_operator,
+                    _set_operator,
+                    get_secret,
+                    _set_secret,
+                ) = _callback_api()
+                previous = (
+                    get_approval(),
+                    get_sudo(),
+                    get_operator(),
+                    get_secret(),
+                )
+                for setter, callback in zip(
+                    self._callback_setters,
+                    self._callback_values,
+                    strict=True,
+                ):
+                    setter(callback)
             except Exception:
                 previous = None
         try:
             return handle_function_call(tool_name, tool_args, task_id=self.task_id)
         finally:
             if previous is not None and self._callback_setters is not None:
-                set_approval, set_sudo = self._callback_setters
                 try:
-                    set_approval(previous[0])
-                    set_sudo(previous[1])
+                    for setter, callback in zip(
+                        self._callback_setters,
+                        previous,
+                        strict=True,
+                    ):
+                        setter(callback)
                 except Exception:
                     pass
 

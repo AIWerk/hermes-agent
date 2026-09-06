@@ -1486,7 +1486,10 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "usage"})
+#   - restart: low-frequency process maintenance; remains available as
+#     /hermes restart on Slack. Declaring the demotion prevents the 50-command
+#     cap from silently clamping it.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "usage", "restart"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

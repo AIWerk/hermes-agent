@@ -4901,6 +4901,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._write_count = 0
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
+        self._fts_runtime_rebuild_attempted = False
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
         self._fts_stale = False
@@ -5808,14 +5809,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
-                # Corrupt FTS shadow tables make every write raise the
-                # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. Never run a
-                # full-message FTS5 rebuild from this live persistence path:
-                # on a multi-gigabyte state.db that can hold the writer lock
-                # for minutes. Atomically detach the derived indexes instead,
-                # then retry the canonical write. The existing stale-open and
-                # explicit repair paths retain rebuild ownership.
+                # Rank 19: one admitted live repair precedes durable fail-open.
+                # A consumed/refused/failed repair detaches indexes atomically;
+                # explicit canonical corruption still propagates untouched.
+                if self._try_runtime_fts_rebuild(exc):
+                    continue
                 if self._enter_fts_fail_open(exc):
                     continue
                 raise
@@ -5859,21 +5857,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
-        """Return true only when SQLite identifies corruption as FTS-scoped.
+        """Rank 19 legacy-text compatibility, with modern code precedence.
 
-        Newer SQLite builds include ``fts5`` in the error text.  Older builds
-        may emit only ``database disk image is malformed`` while exposing the
-        extended ``SQLITE_CORRUPT_VTAB`` result code.  A bare
-        ``SQLITE_CORRUPT``/malformed-image error is structural and must not
-        trigger live FTS maintenance: it does not prove that canonical B-trees
-        are intact.
+        Explicit SQLITE_CORRUPT and contradictory codes fail closed. Only
+        code-less legacy malformed-image errors use the ambiguous text route.
         """
         corrupt_vtab = getattr(sqlite3, "SQLITE_CORRUPT_VTAB", 267)
         error_code = getattr(exc, "sqlite_errorcode", None)
         if error_code is not None:
             return error_code == corrupt_vtab
         msg = str(exc).lower()
-        return msg.startswith("fts5:") and "corrupt structure" in msg
+        return "database disk image is malformed" in msg or (
+            msg.startswith("fts5:") and "corrupt structure" in msg
+        )
 
     def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
         """Return foreign processes holding this DB or its WAL sidecars.
@@ -6039,6 +6035,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except Exception:
                 pass
         return signalled
+
+    def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
+        """Attempt one admitted live repair; never clear durable repair state."""
+        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+            return False
+        with self._lock:
+            if self._fts_runtime_rebuild_attempted:
+                return False
+            self._fts_runtime_rebuild_attempted = True
+        try:
+            if self._foreign_state_db_holders():
+                logger.warning("Deferring live FTS repair: foreign database holder")
+                return False
+            # rebuild_fts retains the cross-process admission authority.
+            rebuilt = self.rebuild_fts()
+        except Exception as rebuild_exc:
+            logger.warning("One-shot live FTS repair failed: %s", rebuild_exc)
+            return False
+        return bool(rebuilt)
 
     def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
         """Detach corrupt FTS indexes so canonical writes can continue.
@@ -6597,8 +6612,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def get_active_side_session(self, source: str = "cli") -> Optional[Dict[str, Any]]:
         """Return the newest active side-session stack entry for *source*."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 """SELECT * FROM session_stack
                    WHERE source = ? AND status = 'active'
                    ORDER BY id DESC LIMIT 1""",
@@ -10586,8 +10601,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The approved pin lifecycle no longer mutates the legacy update-time/turn
         fields, but retaining this read API avoids breaking third-party callers.
         """
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_ctx() as conn:
+            row = conn.execute(
                 """
                 SELECT title, title_source, title_updated_at, title_turn_index
                 FROM sessions WHERE id = ?
@@ -16270,9 +16285,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ),
         }
 
-    def _repair_stale_cjk_fts_offline(self) -> bool:
-        """Rebuild a detached CJK index inside the active repair transaction."""
-        stale = self._conn.execute(
+    def _repair_stale_cjk_fts_offline(self, conn: sqlite3.Connection) -> bool:
+        """Rebuild using the caller-owned locked repair transaction connection."""
+        stale = conn.execute(
             "SELECT 1 FROM state_meta WHERE key = ?",
             (FTS_CJK_STALE_KEY,),
         ).fetchone()
@@ -16282,7 +16297,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise sqlite3.DatabaseError(
                 "CJK repair is required but cjk_unicode61 is unavailable"
             )
-        cursor = self._conn.cursor()
+        cursor = conn.cursor()
         for trigger in _FTS_CJK_TRIGGERS:
             cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         cursor.execute("DROP TABLE IF EXISTS messages_fts_cjk")
@@ -16460,17 +16475,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return value != ""
         return False
 
-    def _verify_fts_repair(self) -> Tuple[bool, str]:
-        """Verify canonical SQLite and each present FTS index after rebuilding."""
+    def _verify_fts_repair(self, conn: sqlite3.Connection) -> Tuple[bool, str]:
+        """Verify using the caller-owned locked repair transaction connection."""
         try:
-            integrity_rows = self._conn.execute("PRAGMA integrity_check").fetchall()
+            integrity_rows = conn.execute("PRAGMA integrity_check").fetchall()
             if [tuple(row) for row in integrity_rows] != [("ok",)]:
                 return False, f"integrity_check returned {integrity_rows!r}"
             checked = 0
             for table in self._FTS_TABLES:
-                if not self._fts_table_exists(table):
+                try:
+                    conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
+                except sqlite3.DatabaseError:
                     continue
-                schema_row = self._conn.execute(
+                schema_row = conn.execute(
                     "SELECT sql FROM sqlite_master "
                     "WHERE type = 'table' AND name = ?",
                     (table,),
@@ -16487,12 +16504,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # rank=1 additionally compares an external-content FTS
                     # index against its canonical table/view, not only its
                     # internal b-tree structure.
-                    self._conn.execute(
+                    conn.execute(
                         f"INSERT INTO {table}({table}, rank) "
                         "VALUES('integrity-check', 1)"
                     )
                 else:
-                    self._conn.execute(
+                    conn.execute(
                         f"INSERT INTO {table}({table}) VALUES('integrity-check')"
                     )
                 checked += 1
@@ -16596,9 +16613,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "reason": "rebuild-failed",
                     }
                 stage = "rebuild-cjk-index"
-                cjk_rebuilt = self._repair_stale_cjk_fts_offline()
+                cjk_rebuilt = self._repair_stale_cjk_fts_offline(self._conn)
                 stage = "verify-indexes"
-                verified, detail = self._verify_fts_repair()
+                verified, detail = self._verify_fts_repair(self._conn)
                 if not verified:
                     raise sqlite3.DatabaseError(detail)
                 stage = "clear-repair-marker"

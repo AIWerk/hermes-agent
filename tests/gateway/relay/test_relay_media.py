@@ -568,7 +568,7 @@ async def test_client_upload_rejects_oversize_and_missing(tmp_path: Path):
     assert await c.upload(str(empty)) is None
 
 @pytest.mark.asyncio
-async def test_download_sends_a_user_agent_on_every_request():
+async def test_download_sends_a_user_agent_on_every_request(monkeypatch):
     """Discord's CDN 403s the default ``Python-urllib/x.y`` User-Agent.
 
     Live-verified on staging 2026-08-26: every Discord CDN pass-through
@@ -583,32 +583,31 @@ async def test_download_sends_a_user_agent_on_every_request():
     """
     seen: list[dict] = []
 
-    class _Resp:
-        headers = {"Content-Type": "audio/ogg", "Content-Length": "4"}
+    _public_dns(monkeypatch)
 
-        def read(self, *_a):
-            return b"OggS"
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
-
-    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+    def _fake_open_pinned_response(req, addresses, timeout):
+        assert addresses, "download must validate DNS before opening a connection"
         seen.append(dict(req.headers))
-        return _Resp()
+        return _DownloadResponse(
+            b"OggS", status=200,
+            **{"Content-Type": "audio/ogg", "Content-Length": "4"}
+        )
 
-    import urllib.request as _ur
-
-    orig = _ur.urlopen
-    _ur.urlopen = _fake_urlopen  # type: ignore[assignment]
-    try:
-        c = RelayMediaClient("https://conn.example", "gw1", "sec")
-        assert await c.download("https://cdn.discordapp.com/attachments/1/2/v.ogg")
-        assert await c.download("https://conn.example/relay/media/deadbeef")
-    finally:
-        _ur.urlopen = orig  # type: ignore[assignment]
+    monkeypatch.setattr(
+        relay_media, "_open_pinned_response", _fake_open_pinned_response
+    )
+    c = RelayMediaClient("https://conn.example", "gw1", "sec")
+    for url in (
+        "https://cdn.discordapp.com/attachments/1/2/v.ogg",
+        "https://conn.example/relay/media/deadbeef",
+    ):
+        result = await c.download(url)
+        assert result is not None
+        path = Path(result)
+        try:
+            assert path.read_bytes() == b"OggS"
+        finally:
+            path.unlink()
 
     assert len(seen) == 2
     for headers in seen:
@@ -616,6 +615,8 @@ async def test_download_sends_a_user_agent_on_every_request():
         ua = headers.get("User-agent") or headers.get("User-Agent")
         assert ua, f"no User-Agent sent; urllib would default to Python-urllib (403s on Discord CDN): {headers}"
         assert "python-urllib" not in ua.lower()
+    # Public pass-through must not leak the connector bearer.
+    assert seen[0].get("Authorization") is None
     # The re-host request must still carry its bearer (no regression).
     rehost_headers = seen[1]
     assert (rehost_headers.get("Authorization") or "").startswith("Bearer ")

@@ -233,7 +233,7 @@ def test_mixed_legacy_base_uses_external_integrity_for_cjk():
     db._conn = conn
     try:
         assert db._db_has_legacy_inline_fts(conn.cursor()) is True
-        verified, detail = db._verify_fts_repair()
+        verified, detail = db._verify_fts_repair(conn)
         assert verified is False
         assert detail != "ok"
     finally:
@@ -300,7 +300,7 @@ def test_failed_offline_repair_keeps_state_and_triggers_detached(stale_db, monke
     db, db_path = stale_db
     cjk_was_stale = _meta(db_path, FTS_CJK_STALE_KEY) is not None
 
-    def injected_verification_failure():
+    def injected_verification_failure(conn):
         intruder = sqlite3.connect(str(db_path), timeout=0)
         try:
             with pytest.raises(sqlite3.OperationalError, match="locked"):
@@ -322,12 +322,12 @@ def test_failed_offline_repair_keeps_state_and_triggers_detached(stale_db, monke
 
 def test_repeated_failure_injection_never_reports_healthy(stale_db, monkeypatch):
     db, db_path = stale_db
-    monkeypatch.setattr(db, "_verify_fts_repair", lambda: (False, "injected failure one"))
+    monkeypatch.setattr(db, "_verify_fts_repair", lambda conn: (False, "injected failure one"))
     assert db.repair_fts_offline()["verified"] is False
     db.close()
     reopened = SessionDB(db_path=db_path)
     try:
-        monkeypatch.setattr(reopened, "_verify_fts_repair", lambda: (False, "injected failure two"))
+        monkeypatch.setattr(reopened, "_verify_fts_repair", lambda conn: (False, "injected failure two"))
         assert reopened.repair_fts_offline()["verified"] is False
         assert reopened.fts_health_state()["repair_required"] is True
         rows = reopened.search_messages("needle")

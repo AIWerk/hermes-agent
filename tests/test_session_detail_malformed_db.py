@@ -14,10 +14,18 @@ A corrupt store is an unavailable store, not an empty one.
 import sqlite3
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from hermes_cli import web_server
 from hermes_cli.web_routers import sessions as sessions_router
+
+
+@pytest.fixture
+def no_actor_request():
+    """Operator request without a CUI actor; keep real actor lookup enabled."""
+    request = Request({"type": "http"})
+    request.state.session = None
+    return request
 
 
 class _MalformedDB:
@@ -46,9 +54,9 @@ def malformed_db(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_corrupt_db_is_not_reported_as_missing_session(malformed_db):
+async def test_corrupt_db_is_not_reported_as_missing_session(malformed_db, no_actor_request):
     with pytest.raises(HTTPException) as excinfo:
-        await sessions_router.get_session_detail("20260830_180820_744f05")
+        await sessions_router.get_session_detail("20260830_180820_744f05", no_actor_request)
 
     assert excinfo.value.status_code != 404, (
         "corruption reported as 'Session not found' - this is the bug"
@@ -57,18 +65,18 @@ async def test_corrupt_db_is_not_reported_as_missing_session(malformed_db):
 
 
 @pytest.mark.asyncio
-async def test_corrupt_db_detail_names_the_real_cause(malformed_db):
+async def test_corrupt_db_detail_names_the_real_cause(malformed_db, no_actor_request):
     with pytest.raises(HTTPException) as excinfo:
-        await sessions_router.get_session_detail("20260830_180820_744f05")
+        await sessions_router.get_session_detail("20260830_180820_744f05", no_actor_request)
 
     detail = str(excinfo.value.detail).lower()
     assert "corrupt" in detail or "malformed" in detail
 
 
 @pytest.mark.asyncio
-async def test_db_is_closed_even_when_corruption_raises(malformed_db):
+async def test_db_is_closed_even_when_corruption_raises(malformed_db, no_actor_request):
     with pytest.raises(HTTPException):
-        await sessions_router.get_session_detail("20260830_180820_744f05")
+        await sessions_router.get_session_detail("20260830_180820_744f05", no_actor_request)
 
     assert malformed_db.closed, "connection leaked on the corruption path"
 
@@ -82,37 +90,55 @@ async def test_db_is_closed_even_when_corruption_raises(malformed_db):
 
 
 @pytest.mark.asyncio
-async def test_messages_endpoint_reports_corruption(malformed_db):
+async def test_messages_endpoint_reports_corruption(malformed_db, no_actor_request):
     with pytest.raises(HTTPException) as excinfo:
         await sessions_router.get_session_messages(
-            "20260830_180820_744f05", None, None, 0, None, False
+            "20260830_180820_744f05",
+            no_actor_request,
+            profile=None,
+            limit=None,
+            offset=0,
+            order=None,
+            include_compacted=False,
         )
     assert excinfo.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_delete_does_not_claim_success_on_a_corrupt_store(malformed_db):
+async def test_delete_does_not_claim_success_on_a_corrupt_store(malformed_db, no_actor_request):
     with pytest.raises(HTTPException) as excinfo:
-        await sessions_router.delete_session_endpoint("20260830_180820_744f05")
+        await sessions_router.delete_session_endpoint("20260830_180820_744f05", no_actor_request)
     assert excinfo.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_rename_endpoint_reports_corruption(malformed_db):
+async def test_rename_endpoint_reports_corruption(malformed_db, no_actor_request):
     from hermes_cli.web_models import SessionRename
 
     with pytest.raises(HTTPException) as excinfo:
         await sessions_router.rename_session_endpoint(
-            "20260830_180820_744f05", SessionRename(title="neu")
+            "20260830_180820_744f05", SessionRename(title="neu"), no_actor_request
         )
     assert excinfo.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_export_endpoint_reports_corruption(malformed_db):
+async def test_export_endpoint_reports_corruption(malformed_db, no_actor_request):
     with pytest.raises(HTTPException) as excinfo:
-        await sessions_router.export_session_endpoint("20260830_180820_744f05")
+        await sessions_router.export_session_endpoint("20260830_180820_744f05", no_actor_request)
     assert excinfo.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_export_db_is_closed_even_when_corruption_raises(
+    malformed_db, no_actor_request
+):
+    with pytest.raises(HTTPException) as excinfo:
+        await sessions_router.export_session_endpoint(
+            "20260830_180820_744f05", no_actor_request
+        )
+    assert excinfo.value.status_code == 503
+    assert malformed_db.closed, "export connection leaked on the corruption path"
 
 
 # ── A genuinely absent session must still be a 404, not a 503 ──────────────
@@ -133,14 +159,14 @@ class _EmptyDB:
 
 
 @pytest.mark.asyncio
-async def test_absent_session_is_still_404(monkeypatch):
+async def test_absent_session_is_still_404(monkeypatch, no_actor_request):
     monkeypatch.setattr(
         web_server,
         "_open_session_db_for_profile",
         lambda profile, *, read_only: _EmptyDB(),
     )
     with pytest.raises(HTTPException) as excinfo:
-        await sessions_router.get_session_detail("does_not_exist")
+        await sessions_router.get_session_detail("does_not_exist", no_actor_request)
     assert excinfo.value.status_code == 404
 
 
@@ -153,11 +179,11 @@ class _OtherErrorDB(_EmptyDB):
 
 
 @pytest.mark.asyncio
-async def test_non_corruption_database_error_is_not_swallowed(monkeypatch):
+async def test_non_corruption_database_error_is_not_swallowed(monkeypatch, no_actor_request):
     monkeypatch.setattr(
         web_server,
         "_open_session_db_for_profile",
         lambda profile, *, read_only: _OtherErrorDB(),
     )
     with pytest.raises(sqlite3.DatabaseError):
-        await sessions_router.get_session_detail("20260830_180820_744f05")
+        await sessions_router.get_session_detail("20260830_180820_744f05", no_actor_request)

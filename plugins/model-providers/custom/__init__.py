@@ -4,7 +4,9 @@ Covers any endpoint registered as provider="custom", including local
 Ollama instances and OpenAI-compatible reasoning endpoints (GLM-5.2 on
 Volcengine ARK, vLLM, llama.cpp). Key quirks:
   - ollama_num_ctx → extra_body.options.num_ctx (local context window)
-  - reasoning_config disabled → top-level reasoning_effort="none"
+  - remote reasoning fields require offline model capability metadata or
+    the existing model_overrides.custom.<model>.supports_reasoning config
+  - reasoning_config disabled (capable endpoint) → reasoning_effort="none"
     (Ollama /v1/chat/completions ignores think=False — ollama#14820)
     + extra_body.think = False only on Ollama URLs (/api/chat and proxies)
   - reasoning_config enabled + effort → top-level reasoning_effort
@@ -86,17 +88,27 @@ class CustomProfile(ProviderProfile):
         # constraint applies to ``think=False`` on disable — Mistral/Groq
         # reject unknown fields (HTTP 422 extra_forbidden) rather than ignoring
         # them, so that flag stays Ollama-URL-gated.
-        if reasoning_config and isinstance(reasoning_config, dict):
+        # Generic OpenAI compatibility does not imply reasoning support.
+        # Reuse the offline capability catalog/model_overrides contract rather
+        # than sending unsupported fields to strict or unknown endpoints.
+        is_ollama = _looks_like_ollama_endpoint(ctx.get("base_url"))
+        from agent.models_dev import get_model_capabilities
+
+        capabilities = get_model_capabilities(self.name, ctx.get("model") or "")
+        reasoning_supported = is_ollama or (
+            capabilities is not None and capabilities.supports_reasoning
+        )
+        if reasoning_supported and reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
                 # Ollama's /v1/chat/completions silently ignores
                 # extra_body.think (only /api/chat honours it — ollama#14820)
                 # but respects the top-level reasoning_effort field (#25758).
-                # Always emit reasoning_effort="none"; only add think=False
-                # when the URL is actually Ollama.
+                # Capable endpoints receive reasoning_effort="none"; add the
+                # native think=False flag only when the URL is Ollama.
                 top_level["reasoning_effort"] = "none"
-                if _looks_like_ollama_endpoint(ctx.get("base_url")):
+                if is_ollama:
                     extra_body["think"] = False
             elif _effort:
                 # Clamp the internal ladder onto the widest OpenAI-compatible

@@ -1956,17 +1956,19 @@ class SessionSearchMixin:
                         "trigram/LIKE", exc_info=True,
                     )
                 except sqlite3.DatabaseError as exc:
-                    # A full-message rebuild is unbounded and holds the writer
-                    # lock, so a live search never performs one. Detach the
-                    # derived indexes and answer from canonical rows instead.
-                    # Non-FTS corruption is not safe to reinterpret here.
-                    if not self._enter_fts_fail_open(exc):
+                    # Rank 19: retry the exact MATCH once before degradation.
+                    if self._try_runtime_fts_rebuild(exc):
+                        try:
+                            with self._read_ctx() as conn:
+                                matches = [dict(row) for row in conn.execute(
+                                    cjk_sql, cjk_params
+                                ).fetchall()]
+                            _trigram_succeeded = True
+                        except sqlite3.DatabaseError as retry_exc:
+                            if not self._enter_fts_fail_open(retry_exc):
+                                raise
+                    elif not self._enter_fts_fail_open(exc):
                         raise
-                    logger.warning(
-                        "CJK-bigram FTS search hit a corruption error (%s); "
-                        "detached FTS and falling back to canonical LIKE.",
-                        exc,
-                    )
 
             if (
                 not _trigram_succeeded
@@ -2027,17 +2029,19 @@ class SessionSearchMixin:
                     # Trigram query failed at runtime — fall through to LIKE.
                     pass
                 except sqlite3.DatabaseError as exc:
-                    # Preserve the same bounded recovery contract as the CJK
-                    # and main FTS paths: detach derived indexes, then fall
-                    # through to the canonical LIKE query. A non-FTS storage
-                    # error remains fatal rather than being hidden as a miss.
-                    if not self._enter_fts_fail_open(exc):
+                    # Rank 19: retry the exact MATCH once before degradation.
+                    if self._try_runtime_fts_rebuild(exc):
+                        try:
+                            with self._read_ctx() as conn:
+                                matches = [dict(row) for row in conn.execute(
+                                    tri_sql, tri_params
+                                ).fetchall()]
+                            _trigram_succeeded = True
+                        except sqlite3.DatabaseError as retry_exc:
+                            if not self._enter_fts_fail_open(retry_exc):
+                                raise
+                    elif not self._enter_fts_fail_open(exc):
                         raise
-                    logger.warning(
-                        "Trigram FTS search hit a corruption error (%s); "
-                        "detached FTS and falling back to canonical LIKE.",
-                        exc,
-                    )
             if not _trigram_succeeded:
                 # Short / mixed CJK query, trigram unavailable, or trigram
                 # <3 CJK chars. Fall back to LIKE substring search.
@@ -2099,25 +2103,31 @@ class SessionSearchMixin:
                 # FTS5 query syntax error despite sanitization — return empty
                 return []
             except sqlite3.DatabaseError as exc:
-                # A corrupt FTS index raises the malformed / "fts5: corrupt
-                # structure record" class on the MATCH read, the same class the
-                # write path handles (#66296). OperationalError (query syntax)
-                # is a subclass caught above; this arm is the corruption
-                # parent. Live search must remain bounded, so detach the
-                # derived indexes and answer from canonical message rows. The
-                # existing stale-open/repair paths retain rebuild ownership.
-                if not self._enter_fts_fail_open(exc):
+                # Rank 19: one-shot live repair, then durable canonical fallback.
+                repaired = False
+                if self._try_runtime_fts_rebuild(exc):
+                    try:
+                        with self._read_ctx() as conn:
+                            matches = [dict(row) for row in conn.execute(
+                                sql, params
+                            ).fetchall()]
+                        repaired = True
+                    except sqlite3.DatabaseError as retry_exc:
+                        if not self._enter_fts_fail_open(retry_exc):
+                            raise
+                elif not self._enter_fts_fail_open(exc):
                     raise
-                matches = self._search_messages_like_fallback(
-                    query,
-                    source_filter=source_filter,
-                    exclude_sources=exclude_sources,
-                    role_filter=role_filter,
-                    limit=limit,
-                    offset=offset,
-                    sort=sort,
-                    include_inactive=include_inactive,
-                )
+                if not repaired:
+                    matches = self._search_messages_like_fallback(
+                        query,
+                        source_filter=source_filter,
+                        exclude_sources=exclude_sources,
+                        role_filter=role_filter,
+                        limit=limit,
+                        offset=offset,
+                        sort=sort,
+                        include_inactive=include_inactive,
+                    )
 
         # Deferred-rebuild supplement (schema v23): while the background
         # backfill is pending, the FTS indexes only cover rows outside the

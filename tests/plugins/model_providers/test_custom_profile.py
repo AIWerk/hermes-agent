@@ -8,7 +8,8 @@ was silently dropped for every custom endpoint.
 
 These tests pin the wire-shape contract:
     - disabled on Ollama  → extra_body.think = False + reasoning_effort=none
-    - disabled elsewhere  → reasoning_effort=none, no think (strict APIs 422)
+    - disabled, capable   → reasoning_effort=none, no think on remote APIs
+    - strict/unknown      → no reasoning fields without a capability override
     - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect), passed through verbatim
                           including ``max``/``xhigh``
@@ -22,7 +23,7 @@ import pytest
 
 
 @pytest.fixture
-def custom_profile():
+def custom_profile(monkeypatch, tmp_path):
     """Resolve the registered custom profile via the global registry.
 
     Importing ``model_tools`` triggers plugin discovery, which registers the
@@ -32,6 +33,15 @@ def custom_profile():
     """
     import model_tools  # noqa: F401
     import providers
+
+    # Exercise the existing explicit custom-model capability configuration.
+    # Unknown/strict models remain unconfigured and fail closed.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "model_overrides:\n  custom:\n    glm-5.2:\n"
+        "      supports_reasoning: true\n    qwen3:\n"
+        "      supports_reasoning: true\n"
+    )
 
     profile = providers.get_provider_profile("custom")
     assert profile is not None, "custom provider profile must be registered"
@@ -83,7 +93,7 @@ class TestCustomReasoningWireShape:
             base_url="https://api.mistral.ai/v1",
         )
         assert "think" not in eb
-        assert tl == {"reasoning_effort": "none"}
+        assert tl == {}
 
     def test_disabled_omits_think_without_base_url(self, custom_profile):
         """Unknown custom endpoint — do not send the Ollama-only flag."""
@@ -108,7 +118,7 @@ class TestCustomReasoningWireShape:
             base_url=base_url,
         )
         assert "think" not in eb
-        assert tl == {"reasoning_effort": "none"}
+        assert tl == {}
 
     def test_disabled_sends_think_false_on_ollama_cloud_host(self, custom_profile):
         eb, tl = custom_profile.build_api_kwargs_extras(
