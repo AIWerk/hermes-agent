@@ -67,7 +67,7 @@ jobs:
             --repo . \
             --base "$BASE_SHA" \
             --head "$HEAD_SHA" \
-            --upstream cbd8de8ad64530be01efea23b7764d5c37c634ed \
+            --upstream "$(jq -r '.accepted_upstream_commit' .ci/content-loss/baseline.json)" \
             --pr-number "$PR_NUMBER" \
             --json-out content-loss-report.json \
             --markdown-out content-loss-report.md
@@ -86,7 +86,7 @@ jobs:
             --repo . \
             --active "$BASE_SHA" \
             --target "$BASE_SHA" \
-            --upstream cbd8de8ad64530be01efea23b7764d5c37c634ed \
+            --upstream "$(jq -r '.accepted_upstream_commit' .ci/content-loss/baseline.json)" \
             --json-out content-loss-report.json \
             --markdown-out content-loss-report.md
           rc=$?

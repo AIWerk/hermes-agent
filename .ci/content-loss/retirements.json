@@ -99,6 +99,56 @@
       "not_before": "2026-09-05T11:12:05Z",
       "expires_at": "2026-09-12T11:12:05Z",
       "reason": "Authorize the exact fork-loss class and approved merge-range regression coverage."
+    },
+    {
+      "id": "UPSTREAM-29112BEF-BASELINE-TRANSITION",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
+      "allowed_target_state": "blob:a38ffab3a8ec7ac6c29c51b91e350215258dd92c",
+      "valid_for_pr": 115,
+      "not_before": "2026-09-06T20:58:06Z",
+      "expires_at": "2026-09-13T20:58:06Z",
+      "reason": "Authorize the exact upstream-pin transition to v2026.8.31 by changing only accepted_upstream_commit in a separate control PR; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired."
+    },
+    {
+      "id": "UPSTREAM-29112BEF-WORKFLOW-DERIVATION",
+      "subject_path": ".github/workflows/aiwerk-content-loss-guard.yml",
+      "expected_old_blob": "ef484275048c83dc0a72b16ceb5910c81db91fb0",
+      "allowed_target_state": "blob:089ebddf11237483c6afdc2e8b120e08584c0153",
+      "valid_for_pr": 115,
+      "not_before": "2026-09-06T20:58:06Z",
+      "expires_at": "2026-09-13T20:58:06Z",
+      "reason": "Authorize only the exact workflow transition that derives the upstream pin from the protected base baseline for both guard modes; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired."
+    },
+    {
+      "allowed_target_state": "blob:fe39f21252a94bbd2b00553d63ac09f80e48aeca",
+      "expected_old_blob": "9054171a6157b88013d151160be540ecbe8e8255",
+      "expires_at": "2026-09-13T23:34:54Z",
+      "id": "GUARD-V7-IMPLEMENTATION",
+      "not_before": "2026-09-06T23:34:54Z",
+      "reason": "Authorize only the exact backward-compatible guard-v7 implementation that reports unchanged previous-upstream removals as upstream-retired while preserving protected, fork-owned, and fork-modified blockers; no product capability, path, marker, selector, or recovery obligation is retired.",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "valid_for_pr": 117
+    },
+    {
+      "allowed_target_state": "blob:ad3d5fb4e36435357e77a45c1304d9e137f80e7b",
+      "expected_old_blob": "7381ec1d6d55869309831b27bae3a895df2ca556",
+      "expires_at": "2026-09-13T23:34:54Z",
+      "id": "GUARD-V7-TESTS",
+      "not_before": "2026-09-06T23:34:54Z",
+      "reason": "Authorize only the exact guard-v7 positive and negative control tests; no product capability, path, marker, selector, or recovery obligation is retired.",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "valid_for_pr": 117
+    },
+    {
+      "allowed_target_state": "blob:f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "expected_old_blob": "a38ffab3a8ec7ac6c29c51b91e350215258dd92c",
+      "expires_at": "2026-09-13T23:34:54Z",
+      "id": "GUARD-V7-BASELINE-V2",
+      "not_before": "2026-09-06T23:34:54Z",
+      "reason": "Authorize only schema-v2 baseline metadata adding previous_accepted_upstream_commit=cbd8de8ad64530be01efea23b7764d5c37c634ed while keeping accepted_upstream_commit=29112bef099274229cadff79cdff7bf7b99c4b77; no product capability, path, marker, selector, or recovery obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 118
     }
   ],
   "schema_version": 1
