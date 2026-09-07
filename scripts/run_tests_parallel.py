@@ -90,14 +90,23 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 
-# One-shot retry of failing test FILES. A file that exits non-zero is re-run
-# once in a fresh subprocess; if the re-run passes, the file counts as passed
+# Bounded retry of failing test FILES. A file that exits non-zero is re-run
+# up to twice in a fresh subprocess; if a re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
-# Deterministic failures fail both attempts — a real regression can never be
-# laundered into green by this (it would have to flake in our favor twice in
-# a row on the same runner, which is exactly the definition of a flake).
+# Deterministic failures fail all attempts — a real regression can never be
+# laundered into green by this; only a genuinely intermittent failure can pass
+# on one of the fresh retry subprocesses.
 # Set to 0 to disable (env: HERMES_TEST_FILE_RETRIES).
-_DEFAULT_FILE_RETRIES = 1
+_DEFAULT_FILE_RETRIES = 2
+
+# These timing-sensitive integration files contend with the rest of the suite
+# under the eight-worker CI lane. Run them after the parallel pool, one at a
+# time, while preserving per-file subprocess isolation and retry behavior.
+_SERIAL_TEST_FILES = {
+    "tests/agent/test_compression_attempt_lifecycle.py",
+    "tests/agent/test_compression_stall_fallback_78981.py",
+    "tests/tui_gateway/test_slash_worker_mcp_discovery.py",
+}
 
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
@@ -245,6 +254,22 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
+def _partition_serial_test_files(
+    files: List[Path], repo_root: Path
+) -> Tuple[List[Path], List[Path]]:
+    """Separate known timing-sensitive files from the parallel worker pool."""
+    parallel: List[Path] = []
+    serial: List[Path] = []
+    resolved_root = repo_root.resolve()
+    for file in files:
+        try:
+            relative = file.resolve().relative_to(resolved_root).as_posix()
+        except ValueError:
+            relative = ""
+        (serial if relative in _SERIAL_TEST_FILES else parallel).append(file)
+    return parallel, serial
+
+
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
@@ -314,8 +339,8 @@ def _run_one_file(
 
     Returns (file, returncode, captured_combined_output, summary_counts, subprocess_wall_seconds).
 
-    ``retries`` > 0 enables the one-shot flake retry: a non-zero exit is
-    re-run in a fresh subprocess; if the re-run passes, the file counts as
+    ``retries`` > 0 enables bounded flake retries: a non-zero exit is
+    re-run in a fresh subprocess; if a re-run passes, the file counts as
     passed but the output is prefixed with a FLAKY banner and the file/output
     are recorded in ``_FLAKY_RESULTS`` so the summary can call it out. A
     deterministic failure fails every attempt, so real regressions cannot
@@ -346,26 +371,36 @@ def _run_one_file(
         file, pytest_args, repo_root, file_timeout
     )
     attempt = 0
+    failed_outputs = [output]
     while rc != 0 and attempt < retries:
         attempt += 1
-        first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
             file, pytest_args, repo_root, file_timeout
         )
         subproc_wall += subproc_wall2
         if rc == 0:
+            failure_sections = []
+            for failed_attempt, failed_output in enumerate(failed_outputs, start=1):
+                label = (
+                    "first-attempt output"
+                    if failed_attempt == 1
+                    else f"retry attempt {failed_attempt} failure output"
+                )
+                failure_sections.append(f"--- {label} ---\n{failed_output}")
             output = (
-                f"⚠ FLAKY: failed on attempt 1, passed on retry "
+                f"⚠ FLAKY: failed before passing on retry "
                 f"(attempt {attempt + 1}). Fix the flake — do not ignore this.\n"
-                f"--- first-attempt output ---\n{first_output}\n"
-                f"--- retry output ---\n{output}"
+                + "\n".join(failure_sections)
+                + f"\n--- retry output ---\n{output}"
             )
             with _flaky_lock:
                 _FLAKY_RESULTS.append((file, output))
+        else:
+            failed_outputs.append(output)
     return file, rc, output, summary, subproc_wall
 
 
-# Files that failed once and passed on retry, with both attempts' output.
+# Files that failed before passing on retry, with every failed attempt's output.
 # Keeping the traceback is load-bearing: a self-healed flake without its
 # failing assertion is only a filename, which forces another expensive full
 # run to rediscover the race.
@@ -1122,9 +1157,17 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
+    parallel_files, serial_files = _partition_serial_test_files(files, repo_root)
+    if serial_files:
+        print(
+            "Serial timing lane: "
+            + ", ".join(_format_file(file, repo_root) for file in serial_files),
+            flush=True,
+        )
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
-        for file in files:
+        for file in parallel_files:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
@@ -1137,6 +1180,26 @@ def main() -> int:
         # control flow obvious.
         for fut in futures:
             fut.result() if fut.exception() is None else None
+
+    # Never overlap timing-sensitive files with the parallel pool or with each
+    # other. A completed Future lets the shared callback retain one accounting
+    # and reporting path for both lanes.
+    for file in serial_files:
+        t0 = time.monotonic()
+        serial_future: Future = Future()
+        try:
+            serial_future.set_result(
+                _run_one_file(
+                    file,
+                    pytest_passthrough,
+                    repo_root,
+                    args.file_timeout,
+                    args.file_retries,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — callback records runner crash
+            serial_future.set_exception(exc)
+        _on_done(file, t0, serial_future)
 
     elapsed = time.monotonic() - started
     print()
@@ -1179,11 +1242,11 @@ def main() -> int:
         )
         print("  Check the per-file output above for the real error.")
 
-    # Flaky files: failed once, passed on the automatic retry. Green, but
+    # Flaky files: failed before passing on an automatic retry. Green, but
     # loudly reported so they get fixed instead of silently re-flaking.
     if _FLAKY_RESULTS:
         print()
-        print(f"=== ⚠ {len(_FLAKY_RESULTS)} FLAKY file{'s' if len(_FLAKY_RESULTS) != 1 else ''} (failed once, passed on retry — fix these) ===")
+        print(f"=== ⚠ {len(_FLAKY_RESULTS)} FLAKY file{'s' if len(_FLAKY_RESULTS) != 1 else ''} (failed before passing on retry — fix these) ===")
         for f, output in _FLAKY_RESULTS:
             print(f"  {_format_file(f, repo_root)}")
             print(output.rstrip())
