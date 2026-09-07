@@ -62,8 +62,8 @@ def _commit(repo: Path, message: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def _baseline(upstream: str) -> dict:
-    return {
+def _baseline(upstream: str, *, previous_upstream: str | None = None) -> dict:
+    baseline = {
         "schema_version": 1,
         "baseline_id": "r7a-test",
         "bootstrap": {
@@ -123,6 +123,10 @@ def _baseline(upstream: str) -> dict:
             "tests/ci/test_content_loss_guard.py",
         ],
     }
+    if previous_upstream is not None:
+        baseline["schema_version"] = 2
+        baseline["previous_accepted_upstream_commit"] = previous_upstream
+    return baseline
 
 
 def _contract(*, preserve: bool = True) -> str:
@@ -223,6 +227,85 @@ def test_upstream_origin_deletion_is_reported_but_not_mislabeled_as_fork_loss(
     assert report["verdict"] == "PASS"
     assert "FORK_OWNED_PATH_REMOVED" not in _codes(report)
     assert report["measurements"]["missing_paths"][0]["classification"] == "upstream-origin"
+
+
+def _three_way_repo(tmp_path: Path) -> tuple[Path, str, str, str]:
+    root = tmp_path / "three-way-repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "R7A Test")
+    _git(root, "config", "user.email", "r7a@example.invalid")
+
+    _write(root, "upstream-retired.txt", "unchanged upstream bytes\n")
+    _write(root, "shared-modified.txt", "upstream bytes\n")
+    previous_upstream = _commit(root, "previous accepted upstream")
+
+    (root / "upstream-retired.txt").unlink()
+    current_upstream = _commit(root, "current upstream retires one path")
+
+    _git(root, "checkout", "-q", "-b", "fork", previous_upstream)
+    _write(root, "shared-modified.txt", "fork override\n")
+    _write(root, "fork-only.txt", "AIWerk private capability\n")
+    _write(root, "immutable-release-build.json", _contract())
+    _write(
+        root,
+        ".ci/content-loss/baseline.json",
+        json.dumps(
+            _baseline(current_upstream, previous_upstream=previous_upstream),
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    _write(root, ".ci/content-loss/retirements.json", '{"approvals":[],"schema_version":1}\n')
+    active = _commit(root, "active fork from previous upstream")
+    return root, previous_upstream, current_upstream, active
+
+
+def test_previous_upstream_retirement_is_reported_not_blocked(tmp_path: Path) -> None:
+    root, previous_upstream, current_upstream, active = _three_way_repo(tmp_path)
+    (root / "upstream-retired.txt").unlink()
+    target = _commit(root, "apply current upstream retirement")
+
+    report = evaluate_range(
+        root, active, target, current_upstream, pr_number=17, now=_NOW
+    )
+
+    assert report["verdict"] == "PASS"
+    assert report["previous_upstream_sha"] == previous_upstream
+    assert report["measurements"]["missing_paths"] == [
+        {
+            "classification": "upstream-retired",
+            "mode": "100644",
+            "oid": _git(root, "rev-parse", f"{active}:upstream-retired.txt"),
+            "path": "upstream-retired.txt",
+            "type": "blob",
+            "verdict": "reported",
+        }
+    ]
+
+
+def test_previous_upstream_does_not_exempt_fork_owned_or_modified_deletions(
+    tmp_path: Path,
+) -> None:
+    root, _previous_upstream, current_upstream, active = _three_way_repo(tmp_path)
+    (root / "fork-only.txt").unlink()
+    (root / "shared-modified.txt").unlink()
+    target = _commit(root, "delete fork-owned and fork-modified paths")
+
+    report = evaluate_range(
+        root, active, target, current_upstream, pr_number=17, now=_NOW
+    )
+
+    assert report["verdict"] == "FAIL"
+    assert "FORK_OWNED_PATH_REMOVED" in _codes(report)
+    classifications = {
+        item["path"]: item["classification"]
+        for item in report["measurements"]["missing_paths"]
+    }
+    assert classifications == {
+        "fork-only.txt": "fork-owned",
+        "shared-modified.txt": "fork-modified",
+    }
 
 
 def test_upstream_existing_but_fork_modified_file_deletion_is_blocked(
@@ -1020,7 +1103,7 @@ def test_success_report_binds_all_authority_objects_and_completeness(
 
     report = evaluate_range(root, base, base, upstream, pr_number=17, now=_NOW)
 
-    assert report["guard_version"] == "r7a-v1"
+    assert report["guard_version"] == "r7a-v2"
     assert report["program_status"] == {
         "canonical_recovery_complete": False,
         "phase": "incomplete-bootstrap",
@@ -1110,7 +1193,7 @@ def test_cli_error_still_writes_canonical_error_envelope(
 
     assert rc == 3
     assert report["verdict"] == "ERROR"
-    assert report["guard_version"] == "r7a-v1"
+    assert report["guard_version"] == "r7a-v2"
     assert report["reason_codes"] == ["EVIDENCE_ERROR"]
     assert report["completeness"] == {
         "all_selectors_evaluated": False,

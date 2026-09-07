@@ -34,7 +34,7 @@ _HISTORICAL_RANGE_TARGET = _HISTORICAL_CLASS_TARGET
 _HISTORICAL_RANGE_UPSTREAM = "cbd8de8ad64530be01efea23b7764d5c37c634ed"
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 _REGULAR_MODES = {"100644", "100755"}
-_GUARD_VERSION = "r7a-v1"
+_GUARD_VERSION = "r7a-v2"
 _RECOVERY_PACKET_SHA256 = "8262d0e5fac12fc0b6f856f0e7e7091fe9e089e78310aec7f16dc2d120a089ec"
 _RECOVERY_LEDGER_SHA256 = "b99ea555b9ee0eeac3e60ce702502b217f5aa130e89ec2c8cecb0d24b8dba894"
 
@@ -199,22 +199,28 @@ def _require_exact_keys(value: Any, keys: set[str], label: str) -> dict[str, Any
 
 
 def _validate_baseline(value: Any) -> dict[str, Any]:
-    baseline = _require_exact_keys(
-        value,
-        {
-            "schema_version",
-            "baseline_id",
-            "bootstrap",
-            "accepted_upstream_commit",
-            "recovery_ledger",
-            "markers",
-            "protected_paths",
-            "selectors",
-            "protected_controls",
-        },
-        "baseline",
-    )
-    if baseline["schema_version"] != 1 or not isinstance(baseline["baseline_id"], str):
+    common_keys = {
+        "schema_version",
+        "baseline_id",
+        "bootstrap",
+        "accepted_upstream_commit",
+        "recovery_ledger",
+        "markers",
+        "protected_paths",
+        "selectors",
+        "protected_controls",
+    }
+    if not isinstance(value, dict):
+        raise ContentLossError("baseline must be an object")
+    schema_version = value.get("schema_version")
+    if schema_version == 1:
+        required_keys = common_keys
+    elif schema_version == 2:
+        required_keys = common_keys | {"previous_accepted_upstream_commit"}
+    else:
+        raise ContentLossError("unsupported baseline schema")
+    baseline = _require_exact_keys(value, required_keys, "baseline")
+    if not isinstance(baseline["baseline_id"], str):
         raise ContentLossError("unsupported baseline schema")
     bootstrap = _require_exact_keys(
         baseline["bootstrap"], {"source_commit", "source_tree", "path_count"}, "baseline.bootstrap"
@@ -227,6 +233,10 @@ def _validate_baseline(value: Any) -> dict[str, Any]:
         raise ContentLossError("baseline bootstrap path_count must be a non-negative integer")
     if not _OID_RE.fullmatch(str(baseline["accepted_upstream_commit"])):
         raise ContentLossError("accepted_upstream_commit is not a full object id")
+    if schema_version == 2 and not _OID_RE.fullmatch(
+        str(baseline["previous_accepted_upstream_commit"])
+    ):
+        raise ContentLossError("previous_accepted_upstream_commit is not a full object id")
     ledger = _require_exact_keys(
         baseline["recovery_ledger"],
         {
@@ -1403,6 +1413,20 @@ def evaluate_range(
         raise ContentLossError(
             f"upstream authority mismatch: baseline={accepted_upstream} argument={upstream_sha}"
         )
+    previous_upstream_sha: str | None = None
+    previous_upstream_entries: dict[str, dict[str, str]] = {}
+    if baseline["schema_version"] == 2:
+        previous_upstream_sha = _resolve(
+            root, baseline["previous_accepted_upstream_commit"], "commit"
+        )
+        _run_git(
+            root,
+            "merge-base",
+            "--is-ancestor",
+            previous_upstream_sha,
+            accepted_upstream,
+        )
+        previous_upstream_entries = _tree_entries(root, previous_upstream_sha)
 
     reasons: list[str] = []
     applied: list[str] = []
@@ -1435,8 +1459,14 @@ def evaluate_range(
             now=now,
         )
         upstream_entry = upstream_entries.get(path)
+        previous_upstream_entry = previous_upstream_entries.get(path)
         if upstream_entry is None:
-            classification = "fork-owned"
+            if previous_upstream_entry is None:
+                classification = "fork-owned"
+            elif old == previous_upstream_entry:
+                classification = "upstream-retired"
+            else:
+                classification = "fork-modified"
         elif old != upstream_entry:
             classification = "fork-modified"
         else:
@@ -1448,7 +1478,7 @@ def evaluate_range(
         elif path in protected:
             verdict = "blocked-protected-loss"
             reasons.append("PROTECTED_PATH_REMOVED")
-        elif classification != "upstream-origin":
+        elif classification not in {"upstream-origin", "upstream-retired"}:
             verdict = "blocked-fork-loss"
             reasons.append("FORK_OWNED_PATH_REMOVED")
         missing_items.append(
@@ -1594,6 +1624,7 @@ def evaluate_range(
         },
         "mode": "range",
         "pr_number": pr_number,
+        "previous_upstream_sha": previous_upstream_sha,
         "reason_codes": reason_codes,
         "retirements_applied": sorted(applied),
         "schema_version": 1,
