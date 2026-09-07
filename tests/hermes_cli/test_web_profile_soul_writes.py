@@ -42,39 +42,37 @@ def _extract_single_body(text: str, opening: str, closing: str) -> str:
 
 
 def test_default_soul_concise_guidance_is_synchronized():
-    canonical = (
-        "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-        "You are helpful, knowledgeable, direct, and concise. You assist users with a "
-        "wide range of tasks including answering questions, writing and editing code, "
-        "analyzing information, creative work, and executing actions via your tools. "
-        "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-        "being genuinely useful over being verbose unless otherwise directed below. "
-        "Optimize for useful signal over verbosity: keep answers tight, summarize tool "
-        "outputs instead of pasting long raw logs, and avoid unnecessary explanation. "
-        "Be targeted and token-efficient in your exploration and investigations. When "
-        "the conversation context is close to the limit, warn the user briefly."
-    )
+    # AIW-AGENT-004 must_keep: behavior clauses, not the retired trait-list
+    # snapshot. Upstream sizing/honesty/earned depth and AIWerk efficiency
+    # coexist; efficiency must never become permission to under-explore.
     required_phrases = (
-        "You communicate clearly",
-        "admit uncertainty when appropriate",
-        "prioritize being genuinely useful over being verbose unless otherwise directed below",
-        "direct, and concise",
+        "Be direct: match the length of your reply to the weight of the ask",
+        "a one-line question gets a one-line answer",
+        "what changed, what's verified, and what's left",
+        "No filler",
+        "no restating the request back",
+        "no re-summarizing what you already said",
+        "no narrating tool calls the user can see",
+        "Plain claims over adjectives; when unsure, say so plainly",
+        "Agree because it's right, not because the user said it",
+        "Depth is earned",
+        "user asks for detail, teaches, or the stakes demand it",
         "Optimize for useful signal over verbosity",
         "summarize tool outputs instead of pasting long raw logs",
         "avoid unnecessary explanation",
         "targeted and token-efficient",
-        "conversation context is close to the limit",
+        "without limiting task completeness or skipping necessary exploration",
+        "conversation context is close to the limit, warn the user briefly",
+        "Explicit later user direction overrides these default preferences",
     )
     for identity in (DEFAULT_SOUL_MD, DEFAULT_AGENT_IDENTITY):
-        assert all(fragment in identity for fragment in required_phrases)
-    assert DEFAULT_SOUL_MD == DEFAULT_AGENT_IDENTITY == canonical
+        for fragment in required_phrases:
+            assert fragment in identity, fragment
+    canonical = DEFAULT_SOUL_MD
+    assert DEFAULT_AGENT_IDENTITY == canonical
 
     docker_soul = (REPO_ROOT / "docker" / "SOUL.md").read_text(encoding="utf-8")
-    assert docker_soul.startswith("# Hermes Agent Persona\n")
-    assert "Default guidance: keep replies concise" in docker_soul
-    assert "summarize long tool output" in docker_soul
-    assert "context is close to the limit" in docker_soul
-    assert docker_soul.rstrip().endswith("-->")
+    assert docker_soul.strip() == canonical
 
     install_sh = (REPO_ROOT / "scripts/install.sh").read_text(encoding="utf-8")
     assert (
@@ -87,7 +85,8 @@ def test_default_soul_concise_guidance_is_synchronized():
     )
 
     install_ps1 = (REPO_ROOT / "scripts/install.ps1").read_text(encoding="utf-8")
-    assert _extract_single_body(install_ps1, '$soulContent = @"\n', '\n"@') == canonical
+    # PowerShell is deliberately ASCII-only; only the em-dash differs.
+    assert _extract_single_body(install_ps1, '$soulContent = @"\n', '\n"@') == canonical.replace("—", "--")
 
     english_docs = (REPO_ROOT / "website/docs/developer-guide/prompt-assembly.md").read_text(
         encoding="utf-8"

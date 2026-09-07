@@ -63,6 +63,10 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
             "log_success() { :; }",
+            # setup_path warns when the sandbox HOME has no shell config to
+            # extend PATH in — reached whenever $SHELL is bash. Without the
+            # stub, set -e aborts the harness with rc 127.
+            "log_warn() { :; }",
             _setup_path_function(),
             "setup_path",
         ]

@@ -959,8 +959,9 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
         "suppressed_sources": {"anthropic": ["hermes_pkce"]},
     }))
 
-    # Stub the readers so only hermes_pkce is "available"; claude_code returns None
-    import agent.anthropic_adapter as aa
+    # Patch the current reader owner: never consult host Claude credentials.
+    # Only hermes_pkce is "available"; claude_code returns None.
+    import agent.anthropic_credentials as aa
     monkeypatch.setattr(aa, "read_hermes_oauth_credentials", lambda: {
         "accessToken": "tok", "refreshToken": "r", "expiresAt": 9999999999000,
     })

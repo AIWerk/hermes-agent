@@ -1,7 +1,31 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.agent_init import _merge_custom_provider_extra_body
 from providers import get_provider_profile
+
+
+@pytest.mark.parametrize("effort", ["none", "high", "ultra", None])
+@pytest.mark.parametrize("capable", [False, True])
+def test_custom_remote_reasoning_respects_model_capability(monkeypatch, tmp_path, effort, capable):
+    from agent import models_dev
+
+    monkeypatch.setattr(models_dev, "_get_provider_models", lambda *a, **k: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "model_overrides:\n  custom:\n    glm-5.2:\n"
+        f"      supports_reasoning: {str(capable).lower()}\n"
+    )
+    profile = get_provider_profile("custom")
+    assert profile is not None
+    extra, top = profile.build_api_kwargs_extras(
+        model="glm-5.2", base_url="https://ark.cn-beijing.volces.com/api/v3",
+        reasoning_config={"enabled": effort != "none", "effort": effort},
+    )
+    assert extra == {}
+    expected = "max" if effort == "ultra" else effort
+    assert top == ({"reasoning_effort": expected} if capable and effort else {})
 
 
 def test_custom_profile_omits_ollama_reasoning_fields_for_remote_endpoint():
