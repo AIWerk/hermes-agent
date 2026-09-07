@@ -7,6 +7,7 @@ resolving. Those re-exports must not import the modules eagerly: every
 dependency chain (jwt, click, ...) even when no subcommand runs.
 """
 
+import inspect
 import subprocess
 import sys
 import textwrap
@@ -38,6 +39,11 @@ def test_importing_main_does_not_import_command_modules():
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_startup_fleet_warning_uses_lazy_module_lookup():
+    source = inspect.getsource(hermes_cli.main)
+    assert "_self()._warn_pending_fleet_restart_on_startup()" in source
 
 
 def test_lazy_reexports_resolve_to_real_objects():

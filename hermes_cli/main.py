@@ -13245,7 +13245,7 @@ def main():
     # update`` catch-up work. Skip when the user is already running update.
     try:
         if "update" not in sys.argv[1:]:
-            _warn_pending_fleet_restart_on_startup()
+            _self()._warn_pending_fleet_restart_on_startup()
     except Exception:
         pass
 
