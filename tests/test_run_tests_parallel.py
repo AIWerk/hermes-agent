@@ -20,11 +20,13 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -270,6 +272,135 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+
+
+def _load_runner_module():
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("run_tests_parallel", runner)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_default_file_retries_allows_two_retries(tmp_path: Path) -> None:
+    """The default runner survives a file that passes on its third attempt."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    marker = tmp_path / "attempt-count"
+    probe = tmp_path / "test_flaky_twice_probe.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_flaky_twice():
+                marker = Path({str(marker)!r})
+                attempt = int(marker.read_text() if marker.exists() else "0") + 1
+                marker.write_text(str(attempt))
+                assert attempt >= 3, f"simulated attempt {{attempt}} failure"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--files",
+            str(probe),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert marker.read_text(encoding="utf-8") == "3"
+    assert "attempt 3" in proc.stdout
+    assert "simulated attempt 1 failure" in proc.stdout
+    assert "simulated attempt 2 failure" in proc.stdout
+
+
+def test_known_timing_files_are_partitioned_into_serial_lane() -> None:
+    runner = _load_runner_module()
+    repo_root = Path(__file__).resolve().parent.parent
+    expected_serial = [
+        repo_root / "tests/agent/test_compression_attempt_lifecycle.py",
+        repo_root / "tests/tui_gateway/test_slash_worker_mcp_discovery.py",
+        repo_root / "tests/agent/test_compression_stall_fallback_78981.py",
+    ]
+    ordinary = repo_root / "tests/test_run_tests_parallel.py"
+
+    parallel, serial = runner._partition_serial_test_files(
+        [ordinary, *expected_serial], repo_root
+    )
+
+    assert parallel == [ordinary]
+    assert serial == expected_serial
+
+
+def test_serial_lane_never_overlaps_parallel_or_other_serial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _load_runner_module()
+    parallel = tmp_path / "test_parallel_probe.py"
+    serial_a = tmp_path / "test_serial_a.py"
+    serial_b = tmp_path / "test_serial_b.py"
+    for probe in (parallel, serial_a, serial_b):
+        probe.write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    start_order: list[str] = []
+
+    def fake_run_one_file(file, _pytest_args, _repo_root, _timeout, _retries):
+        nonlocal active, peak_active
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            start_order.append(file.name)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+        return file, 0, "1 passed", {"passed": 1}, 0.05
+
+    monkeypatch.setattr(runner, "_run_one_file", fake_run_one_file)
+    monkeypatch.setattr(
+        runner,
+        "_partition_serial_test_files",
+        lambda _files, _root: ([parallel], [serial_a, serial_b]),
+        raising=False,
+    )
+    monkeypatch.setattr(runner, "_save_durations", lambda *_args: None)
+    monkeypatch.setattr(runner, "_off_host_marker_files", lambda _files: {})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_tests_parallel.py",
+            "--files",
+            os.pathsep.join(str(path) for path in (parallel, serial_a, serial_b)),
+            "-j",
+            "8",
+            "--file-retries",
+            "0",
+        ],
+    )
+
+    assert runner.main() == 0
+    assert peak_active == 1
+    assert start_order == [parallel.name, serial_a.name, serial_b.name]
 
 
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
