@@ -112,7 +112,7 @@
       ],
       "root_project": {
         "name": "hermes-agent",
-        "version": "0.20.5",
+        "version": "0.21.0",
         "source": ".",
         "source_kind": "exact-candidate-tree",
         "required_evidence": [
