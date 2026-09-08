@@ -4,6 +4,7 @@ import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent,
 import { Markdown } from "@/components/Markdown";
 import { buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, type CuiGreetingContext } from "@/lib/cui-greeting";
 import { buildApprovalResponseParams } from "@/lib/cui-approval";
+import { runSideSessionBackWithParentRestore, type SideSessionBackResult } from "@/lib/cui-side-session";
 
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
@@ -1036,6 +1037,7 @@ export default function AiwerkAssistantPage() {
   const sessionIdRef = useRef<string | null>(null);
   const [activeSessionKey, setActiveSessionKey] = useState<string | null>(null);
   const activeSessionKeyRef = useRef<string | null>(null);
+  const sideParentSessionIdRef = useRef<string | null>(null);
   const [input, setInput] = useState("");
   const [sideInput, setSideInput] = useState("");
   const [slashCommands, setSlashCommands] = useState<SlashCommandItem[]>([]);
@@ -2595,6 +2597,7 @@ export default function AiwerkAssistantPage() {
     setSideInput("");
     showToast("Nebenunterhaltung starten");
     if (!gateway || !sessionId) return;
+    sideParentSessionIdRef.current = activeSessionKeyRef.current || sessionId;
     try {
       const result = await gateway.request<{ side_session_id?: string }>("session.side.start", { session_id: sessionId });
       if (result.side_session_id) {
@@ -2610,24 +2613,34 @@ export default function AiwerkAssistantPage() {
       activeToolAnchorRef.current = undefined;
       activeSideToolAnchorRef.current = undefined;
       setActiveTurnMode("main");
+      sideParentSessionIdRef.current = null;
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
   const returnFromSideSession = async () => {
     const gateway = gatewayRef.current;
+    const rememberedParentSessionId = sideParentSessionIdRef.current;
+    const restoreParentSessionId = (parentSessionId: string) => {
+      setActiveSessionKey(parentSessionId);
+      storeActiveSessionId(parentSessionId);
+      sideParentSessionIdRef.current = null;
+    };
     setConversationMode("main");
     conversationModeRef.current = "main";
     activeTurnModeRef.current = "main";
     setActiveTurnMode("main");
     showToast("Zurück zur Hauptsitzung");
-    if (!gateway || !sessionId) return;
+    if (!gateway || !sessionId) {
+      if (rememberedParentSessionId) restoreParentSessionId(rememberedParentSessionId);
+      return;
+    }
     try {
-      const result = await gateway.request<{ parent_session_id?: string }>("session.side.back", { session_id: sessionId });
-      if (result.parent_session_id) {
-        setActiveSessionKey(result.parent_session_id);
-        storeActiveSessionId(result.parent_session_id);
-      }
+      await runSideSessionBackWithParentRestore(
+        rememberedParentSessionId,
+        () => gateway.request<SideSessionBackResult>("session.side.back", { session_id: sessionId }),
+        restoreParentSessionId,
+      );
       void refreshSessionMeta(gateway, sessionId);
       void refreshRuntimeStatus(gateway, sessionId);
     } catch (e) {
