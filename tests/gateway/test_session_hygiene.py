@@ -22,7 +22,8 @@ import pytest
 
 from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 
 
@@ -1656,6 +1657,7 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
 
     worker_started = threading.Event()
     release_worker = threading.Event()
+    worker_finished = threading.Event()
     cleanup_done = threading.Event()
     session_id = "sess-fence-wait"
 
@@ -1681,16 +1683,16 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             if commit_fence is not None:
                 commit_fence.try_cancel_before_commit()
             worker_started.set()
-            # Keep the worker alive (and keep reporting "progress") so a
-            # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                if commit_fence is not None:
-                    commit_fence.touch_progress()
-                if release_worker.is_set():
-                    break
-                time.sleep(0.02)
-            return (messages, None)
+            # Keep the worker alive until the host has proved it returned
+            # independently. A fixed two-second worker made this assertion
+            # scheduler-sensitive under the canonical -j 8 suite.
+            try:
+                while not release_worker.wait(0.02):
+                    if commit_fence is not None:
+                        commit_fence.touch_progress()
+                return (messages, None)
+            finally:
+                worker_finished.set()
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -1698,15 +1700,13 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         runner, adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id
         )
-        started = time.monotonic()
-        result = await runner._handle_message(event)
-        elapsed = time.monotonic() - started
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=20)
 
         assert result == "ok"
         assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
-            f"hygiene host waited {elapsed:.1f}s after fence cancel — "
-            "must not extend toward the 600s ceiling (#96953)"
+        assert not worker_finished.is_set(), (
+            "hygiene host waited for the fence-cancelled worker instead of "
+            "returning independently (#96953)"
         )
         assert runner._run_agent.await_count == 1
         state = db.get_compression_failure_cooldown(session_id)
@@ -1715,8 +1715,10 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             "Context compression timed out" in s["content"] for s in adapter.sent
         ), "fence-cancel is not a summary-model timeout; no timeout toast"
         release_worker.set()
+        assert worker_finished.wait(timeout=2)
         await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
     finally:
+        release_worker.set()
         db.close()
 
 

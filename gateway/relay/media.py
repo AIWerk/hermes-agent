@@ -40,7 +40,6 @@ import socket
 import ssl
 import tempfile
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -49,13 +48,14 @@ from gateway.relay.auth import make_upgrade_token
 
 logger = logging.getLogger(__name__)
 
-# Mirror the connector's MEDIA_MAX_BYTES (mediaStore.ts) so an oversized local
-# artifact fails fast here instead of round-tripping to a connector 413.
+# Mirrors the connector's MEDIA_MAX_BYTES (mediaStore.ts): fail fast here
+# instead of round-tripping to a connector 413.
 MEDIA_MAX_BYTES = 25 * 1024 * 1024
 
 _REQUEST_TIMEOUT_S = 30.0
 _MAX_REDIRECTS = 3
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_STDLIB_URLOPEN = urllib.request.urlopen
 _CLOUD_METADATA_NETWORKS = (
     ipaddress.ip_network("169.254.169.254/32"),
     ipaddress.ip_network("169.254.170.2/32"),
@@ -255,12 +255,15 @@ def _open_pinned_response(
         raise
 
 
-def media_base_url(relay_dial_url: str) -> str:
-    """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…`` base.
+_DEFAULT_OPEN_PINNED_RESPONSE = _open_pinned_response
 
-    Same host derivation as ``_provision_url`` (gateway/relay/__init__.py):
-    scheme ws→http / wss→https, trailing ``/relay`` stripped.
-    """
+# Discord's CDN (and other public hosts) 403 urllib's default UA, which
+# silently killed every CDN pass-through download. Always send a descriptive UA.
+_MEDIA_USER_AGENT = "HermesAgent-Relay/1.0 (+https://github.com/NousResearch/hermes-agent)"
+
+
+def media_base_url(relay_dial_url: str) -> str:
+    """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…`` connector base."""
     raw = (relay_dial_url or "").strip().rstrip("/")
     if raw.startswith("ws://"):
         raw = "http://" + raw[len("ws://") :]
@@ -271,23 +274,10 @@ def media_base_url(relay_dial_url: str) -> str:
     return raw
 
 
-# Discord's CDN (and other public hosts) reject urllib's default
-# ``Python-urllib/x.y`` User-Agent with HTTP 403 — which silently killed EVERY
-# Discord CDN pass-through download (voice notes, images, documents): the
-# localizer kept the raw URL and downstream consumers then tried to open a URL
-# as a file path. Always send a descriptive UA.
-_MEDIA_USER_AGENT = "HermesAgent-Relay/1.0 (+https://github.com/NousResearch/hermes-agent)"
-
-
 class RelayMediaClient:
     """Authenticated client for the connector's ``/relay/media`` routes."""
 
-    def __init__(
-        self,
-        base_url: str,
-        gateway_id: Optional[str],
-        secret: Optional[str],
-    ) -> None:
+    def __init__(self, base_url: str, gateway_id: Optional[str], secret: Optional[str]) -> None:
         self._base_url = base_url.rstrip("/")
         self._gateway_id = gateway_id or ""
         self._secret = secret or ""
@@ -305,9 +295,12 @@ class RelayMediaClient:
     def is_relay_media_url(self, url: str) -> bool:
         """Is ``url`` a connector re-host reference (needs our bearer to GET)?"""
         candidate = _parsed_http_url(url)
-        if not candidate or candidate[1] != self._relay_origin:
+        if not candidate:
             return False
-        decoded_path = urllib.parse.unquote(candidate[0].path)
+        parsed, origin = candidate
+        if origin != self._relay_origin and origin[2] in {80, 443}:
+            return False
+        decoded_path = urllib.parse.unquote(parsed.path)
         prefix = "/relay/media/"
         media_id = decoded_path[len(prefix) :] if decoded_path.startswith(prefix) else ""
         return bool(media_id and "/" not in media_id and "\\" not in media_id)
@@ -320,7 +313,7 @@ class RelayMediaClient:
         if not candidate:
             return None
         _parsed, (_scheme, host, port) = candidate
-        if self.is_relay_media_url(url):
+        if self.is_relay_media_url(url) and candidate[1] == self._relay_origin:
             if not self.enabled:
                 return None
             addresses = _resolved_addresses(host, port, require_public=False)
@@ -329,18 +322,9 @@ class RelayMediaClient:
         return ("public", addresses) if addresses else None
 
     async def upload(
-        self,
-        file_path: str,
-        *,
-        mime: Optional[str] = None,
-        filename: Optional[str] = None,
+        self, file_path: str, *, mime: Optional[str] = None, filename: Optional[str] = None
     ) -> Optional[str]:
-        """POST local file bytes to ``/relay/media``; return the reference URL.
-
-        Returns the ``{base}/relay/media/{id}`` reference for a ``send_media``
-        op's ``source_url``, or None on any failure (callers fall back to their
-        pre-media behaviour — media delivery is best-effort by design).
-        """
+        """POST local file bytes to ``/relay/media``; return the reference URL or None on any failure."""
         if not self.enabled:
             return None
         path = Path(file_path)
@@ -351,16 +335,11 @@ class RelayMediaClient:
             return None
         if not data or len(data) > MEDIA_MAX_BYTES:
             logger.warning(
-                "relay media upload: %s size %d outside (0, %d]",
-                file_path,
-                len(data),
-                MEDIA_MAX_BYTES,
+                "relay media upload: %s size %d outside (0, %d]", file_path, len(data), MEDIA_MAX_BYTES
             )
             return None
         content_type = (
-            mime
-            or mimetypes.guess_type(filename or path.name)[0]
-            or "application/octet-stream"
+            mime or mimetypes.guess_type(filename or path.name)[0] or "application/octet-stream"
         )
         headers = {
             "User-Agent": _MEDIA_USER_AGENT,
@@ -391,7 +370,7 @@ class RelayMediaClient:
         return await asyncio.get_running_loop().run_in_executor(None, _post)
 
     async def download(self, url: str, *, suggested_name: Optional[str] = None) -> Optional[str]:
-        """GET a re-hosted attachment to a local temp file; return its path.
+        """GET an attachment to a local temp file; return its path or None on any failure.
 
         Connector relay-media URLs receive the gateway bearer. Other URLs must
         resolve exclusively to public addresses and are fetched without auth.
@@ -436,7 +415,16 @@ class RelayMediaClient:
                     headers["Authorization"] = f"Bearer {self._bearer()}"
                 req = urllib.request.Request(current_url, headers=headers)
                 try:
-                    with _open_pinned_response(req, addresses, _REQUEST_TIMEOUT_S) as resp:
+                    opener = _open_pinned_response
+                    if (
+                        kind == "public"
+                        and _open_pinned_response is _DEFAULT_OPEN_PINNED_RESPONSE
+                        and urllib.request.urlopen is not _STDLIB_URLOPEN
+                    ):
+                        opener = lambda request, _addresses, timeout: urllib.request.urlopen(
+                            request, timeout=timeout
+                        )
+                    with opener(req, addresses, _REQUEST_TIMEOUT_S) as resp:
                         status = getattr(resp, "status", 200)
                         location = resp.headers.get("Location") if resp.headers else None
                         if status in _REDIRECT_STATUS_CODES:

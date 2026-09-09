@@ -588,6 +588,19 @@ def test_same_thread_followup_migrates_and_delivers_committed_peer_reply(
             for event in service._events("room-1")
         )
     )
+
+    def policy_cursor_includes_peer_reply() -> bool:
+        with sqlite3.connect(db) as conn:
+            cursor = conn.execute(
+                "SELECT through_seq FROM hosted_room_policy_cursors WHERE room_id='room-1'"
+            ).fetchone()
+            peer = conn.execute(
+                """SELECT MAX(seq) FROM hosted_room_events
+                   WHERE room_id='room-1' AND kind='message.member'"""
+            ).fetchone()
+        return bool(cursor and peer and peer[0] is not None and cursor[0] >= peer[0])
+
+    _wait_for(policy_cursor_includes_peer_reply)
     with sqlite3.connect(db) as conn:
         assert conn.execute(
             """SELECT COUNT(*) FROM hosted_room_policy_transcript

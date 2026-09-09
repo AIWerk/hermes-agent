@@ -320,6 +320,7 @@ class TestChromeDebugLaunch:
         monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
 
         with patch("hermes_cli.cli_commands_mixin.load_local_browser_launcher_config", return_value=cfg), \
+             patch("hermes_cli.cli_commands_mixin.discover_local_cdp_url", side_effect=[None, cfg.cdp_url]), \
              patch("hermes_cli.cli_commands_mixin.call_local_browser_launcher", return_value=(True, "{}")) as launcher, \
              patch("hermes_cli.cli_commands_mixin.wait_for_browser_debug_ready", return_value=True), \
              patch("tools.browser_tool.cleanup_all_browsers"), \

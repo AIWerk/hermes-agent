@@ -50,6 +50,27 @@ class TestWave1RestoredTestWebServerEndpoints:
         assert "cwd" not in rows[0]
         assert "model_config" not in rows[0]
 
+    def test_exhaustive_session_paging_disables_per_page_pinned_backfill(self):
+        import hermes_cli.web_server as ws
+
+        base_rows = [{"id": f"session-{index}"} for index in range(1001)]
+
+        class DB:
+            def __init__(self):
+                self.calls = []
+
+            def list_sessions_rich(self, *, limit, offset, include_pinned, **_kwargs):
+                self.calls.append((limit, offset, include_pinned))
+                return base_rows[offset : offset + limit]
+
+        db = DB()
+        rows = ws._list_sessions_rich_all(
+            db, limit=2, offset=77, include_pinned=True
+        )
+
+        assert rows == base_rows
+        assert db.calls == [(1000, 0, False), (1000, 1000, False)]
+
     @pytest.fixture(autouse=True)
     def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
         """Create a TestClient and isolate the state DB under the test HERMES_HOME."""
@@ -136,7 +157,7 @@ class TestWave1RestoredTestWebServerEndpoints:
         for section in (profile_list, sidebar):
             assert "request: Request" in section
             assert '_cui_actor_context_from_request' in section
-            assert '_session_visible_to_cui_actor' in section
+            assert '_session_list_row_visible' in section
             assert '_project_session_list_rows_public' in section
             assert '_list_sessions_rich_all' in section
             assert 'compact_rows": False if actor else' in section
@@ -1454,3 +1475,57 @@ class TestWave1RestoredTestAdminApiPermissionEnforcement:
         import hermes_cli.web_server as web_server
 
         assert web_server._admin_api_action_for(method, path) is not None
+
+    def test_session_owner_backfill_and_prune_are_admin_actions(self):
+        import hermes_cli.web_server as web_server
+
+        assert web_server._admin_api_action_for("POST", "/api/sessions/owner-backfill") is not None
+        assert web_server._admin_api_action_for("POST", "/api/sessions/prune") is not None
+
+    def test_admin_permission_helper_denies_user_and_allows_admin(self):
+        from types import SimpleNamespace
+
+        import hermes_cli.web_server as web_server
+
+        def _request(role):
+            return SimpleNamespace(
+                method="POST",
+                url=SimpleNamespace(path="/api/sessions/owner-backfill"),
+                state=SimpleNamespace(session=SimpleNamespace(role=role)),
+            )
+
+        denied = web_server._enforce_admin_api_permission(_request("user"))  # type: ignore[arg-type]
+        assert denied is not None and denied.status_code == 403
+        assert web_server._enforce_admin_api_permission(_request("admin")) is None  # type: ignore[arg-type]
+
+    def test_admin_permission_middleware_is_registered(self):
+        import hermes_cli.web_server as web_server
+
+        dispatchers = [
+            middleware.kwargs.get("dispatch")
+            for middleware in web_server.app.user_middleware
+        ]
+        assert web_server._admin_permission_middleware in dispatchers
+
+    def test_non_admin_owner_backfill_is_denied_before_db_write(self, monkeypatch):
+        from starlette.testclient import TestClient
+
+        import hermes_cli.dashboard_auth.middleware as auth_middleware
+        import hermes_cli.web_server as web_server
+        import hermes_cli.web_routers.sessions as session_routes
+
+        async def _authenticate_user(request, call_next):
+            request.state.session = SimpleNamespace(role="user")
+            return await call_next(request)
+
+        def _unexpected_db_write(*_args, **_kwargs):
+            raise AssertionError("non-admin request reached owner-backfill DB write")
+
+        monkeypatch.setattr(auth_middleware, "gated_auth_middleware", _authenticate_user)
+        monkeypatch.setattr(session_routes, "_with_db", _unexpected_db_write)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        with TestClient(web_server.app) as client:
+            response = client.post("/api/sessions/owner-backfill", json={"profile": "other"})
+
+        assert response.status_code == 403

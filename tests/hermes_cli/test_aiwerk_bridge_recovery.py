@@ -245,10 +245,39 @@ def test_bridge_session_and_resource_cache_keys_are_actor_scoped_and_secret_free
     finally:
         web_server._current_http_cui_actor.reset(token)
 
+    rotated_config = {
+        "mcp_servers": {
+            "aiwerk_bridge": {
+                "url": "https://bridge.example.test/mcp",
+                "headers": {"Authorization": "Bearer rotated-secret-value"},
+            }
+        }
+    }
+    token = web_server._current_http_cui_actor.set(
+        {"tenant_id": "tenant-a", "actor_id": "user-1", "role": "user"}
+    )
+    try:
+        session_rotated = web_server._mcp_bridge_session_key(rotated_config)
+        cache_rotated = web_server._assistant_resource_config_signature(
+            rotated_config, None
+        )
+    finally:
+        web_server._current_http_cui_actor.reset(token)
+
     assert session_a != session_b
     assert cache_a != cache_b
-    for value in (session_a, session_b, cache_a, cache_b):
+    assert session_a != session_rotated
+    assert cache_a != cache_rotated
+    for value in (
+        session_a,
+        session_b,
+        session_rotated,
+        cache_a,
+        cache_b,
+        cache_rotated,
+    ):
         assert "secret-test-value" not in value
+        assert "rotated-secret-value" not in value
         assert "Authorization" not in value
 
 

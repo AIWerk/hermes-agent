@@ -318,6 +318,11 @@ def test_default_file_retries_allows_two_retries(tmp_path: Path) -> None:
             "-q",
         ],
         cwd=repo_root,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key != "HERMES_TEST_FILE_RETRIES"
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

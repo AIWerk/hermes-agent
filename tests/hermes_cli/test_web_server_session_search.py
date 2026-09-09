@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from hermes_cli import web_server
+import hermes_cli.web_routers.sessions as _rt_sessions
 
 
 class _FakeSessionDB:

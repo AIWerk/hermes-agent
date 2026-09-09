@@ -10,7 +10,6 @@ import acp_adapter.edit_approval as edit_approval_module
 from acp_adapter.edit_approval import (
     EditProposal,
     build_acp_edit_tool_call,
-    clear_edit_approval_requester,
     set_edit_approval_requester,
     should_auto_approve_edit,
 )
@@ -18,7 +17,7 @@ from model_tools import handle_function_call
 
 
 def teardown_function() -> None:
-    clear_edit_approval_requester()
+    set_edit_approval_requester(None)
 
 
 def test_edit_proposal_display_projection_redacts_copy_without_mutating_internal():

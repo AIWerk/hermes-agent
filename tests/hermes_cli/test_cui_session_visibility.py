@@ -146,6 +146,62 @@ def test_persisted_session_iterator_pages_past_foreign_rows_without_leaking_meta
     assert "model_config" not in visible[0]
 
 
+def test_projected_compression_tip_is_reauthorized_in_scoped_db_and_iterator():
+    from hermes_cli import web_server
+    from tui_gateway import server
+
+    projected = {
+        **_row("foreign-tip", ACTOR_A),
+        "_lineage_root_id": "owned-root",
+        "title": "Foreign title",
+        "preview": "foreign preview",
+    }
+    foreign_tip = _row("foreign-tip", ACTOR_B)
+
+    class DB:
+        def list_sessions_rich(self, *, limit, offset=0, **_kwargs):
+            return [projected][offset : offset + limit]
+
+        def get_session(self, session_id):
+            return foreign_tip if session_id == "foreign-tip" else None
+
+    raw = DB()
+    scoped = web_server._CuiActorScopedSessionDB(raw, ACTOR_A)
+
+    assert scoped.list_sessions_rich(limit=20, offset=0) == []
+    assert scoped.session_count() == 0
+    assert list(server._iter_visible_persisted_session_rows(raw, ACTOR_A)) == []
+
+
+def test_session_list_title_lookup_rejects_foreign_compression_tip(monkeypatch):
+    from contextlib import contextmanager
+    from tui_gateway import server
+
+    root = {**_row("owned-root", ACTOR_A), "title": "Owned title", "archived": 0}
+    foreign_tip = {**_row("foreign-tip", ACTOR_B), "preview": "foreign preview"}
+
+    class DB:
+        def get_session_by_title(self, _title):
+            return root
+
+        def get_compression_tip(self, _session_id):
+            return "foreign-tip"
+
+        def get_session(self, session_id):
+            return foreign_tip if session_id == "foreign-tip" else root
+
+    @contextmanager
+    def profile_db(_params):
+        yield DB()
+
+    monkeypatch.setattr(server, "_profile_db", profile_db)
+    monkeypatch.setattr(server, "current_cui_actor_context", lambda: ACTOR_A)
+
+    response = server._methods["session.list"]("request-1", {"title": "Owned title"})
+
+    assert response["result"]["sessions"] == []
+
+
 def test_replay_rpc_honors_bound_actor_session_ownership(monkeypatch):
     from tui_gateway import event_replay, server
 

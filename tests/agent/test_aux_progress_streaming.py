@@ -24,12 +24,12 @@ from agent.auxiliary_client import (
     _aggregate_chat_stream_async,
     _anthropic_event_has_content,
     _aux_stream_total_ceiling,
-    _codex_event_has_content,
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
     aux_progress_hook,
 )
+from agent.codex_runtime import _codex_event_has_content
 from agent.conversation_compression import CompressionCommitFence
 
 
@@ -582,7 +582,7 @@ class TestContentBearingProgress:
         any kind (transport liveness), not only on the first token."""
         from agent.auxiliary_client import (
             _aux_provider_response,
-            _aux_timing_hook,
+            _aux_thread_local_hook,
             _notify_aux_timing_response,
         )
 
@@ -595,7 +595,7 @@ class TestContentBearingProgress:
         accumulator = _ChatStreamAccumulator()
 
         with (
-            _aux_timing_hook(_aux_provider_response, _timed_response),
+            _aux_thread_local_hook(_aux_provider_response, _timed_response),
             aux_progress_hook(lambda: None),
         ):
             accumulator.feed(keepalive)

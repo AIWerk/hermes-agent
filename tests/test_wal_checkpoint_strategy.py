@@ -89,6 +89,17 @@ class TestTryWalCheckpointPassive:
         """Successful PASSIVE checkpoint does not raise."""
         db._try_wal_checkpoint()
 
+    def test_checkpoint_skips_replaced_handle(self, db, monkeypatch):
+        mock_conn = MagicMock()
+        db._conn = mock_conn
+        monkeypatch.setattr(
+            db, "_raise_if_db_replaced", MagicMock(side_effect=RuntimeError("replaced"))
+        )
+
+        db._try_wal_checkpoint()
+
+        mock_conn.execute.assert_not_called()
+
 
 class TestCloseUsesPassive:
     """close() must use PASSIVE. Transient per-cron-run SessionDB connections
@@ -131,6 +142,22 @@ class TestCloseUsesPassive:
         assert any("WAL checkpoint (PASSIVE) at close failed" in r.message for r in caplog.records), (
             f"Expected debug log about PASSIVE failure at close, got: {caplog.text}"
         )
+
+    def test_close_skips_checkpoint_on_replaced_handle(self, db, monkeypatch):
+        real_conn = db._conn
+        mock_conn = MagicMock(wraps=real_conn)
+        db._conn = mock_conn
+        monkeypatch.setattr(
+            db, "_raise_if_db_replaced", MagicMock(side_effect=RuntimeError("replaced"))
+        )
+
+        db.close()
+
+        checkpoint_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "wal_checkpoint" in str(call.args[0]).lower()
+        ]
+        assert checkpoint_calls == []
 
 
 class TestVacuumUsesPassive:

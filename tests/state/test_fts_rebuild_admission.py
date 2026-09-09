@@ -17,15 +17,18 @@ prove nothing.
 """
 
 import contextlib
+import errno
 import subprocess
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 import hermes_state_common
-from hermes_state import FTS_STALE_KEY, SessionDB, _FTS_TRIGGERS
+from hermes_state import SessionDB
+from hermes_state_common import FTS_STALE_KEY, _FTS_TRIGGERS
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX flock child-process harness"

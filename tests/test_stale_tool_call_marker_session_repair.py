@@ -13,6 +13,10 @@ fix, so resuming a polluted session doesn't re-teach the model to keep
 emitting the marker. Unaffected sessions pass through unchanged.
 """
 
+from unittest.mock import MagicMock
+
+import pytest
+
 from hermes_state import (
     _is_stale_tool_call_marker_message,
     _strip_stale_tool_call_markers,
@@ -206,6 +210,25 @@ class TestPurgeStaleToolCallMarkers:
                 assert second["backup_path"] is None  # nothing to change, nothing to back up
             finally:
                 db.close()
+
+    def test_backup_refuses_replaced_handle(self, tmp_path, monkeypatch):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "t.db")
+        try:
+            self._seed_polluted_db(db)
+            monkeypatch.setattr(
+                db,
+                "_raise_if_db_replaced",
+                MagicMock(side_effect=RuntimeError("replaced")),
+            )
+
+            with pytest.raises(RuntimeError, match="replaced"):
+                db.purge_stale_tool_call_markers(dry_run=False, backup=True)
+
+            assert list(tmp_path.glob("t.db.*backup*")) == []
+        finally:
+            db.close()
 
     def test_no_backup_when_flag_false(self):
         import tempfile
