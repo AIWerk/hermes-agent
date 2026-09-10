@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from starlette.testclient import TestClient
 
 
 _RESTORED_ENV_KEYS = (
@@ -186,7 +187,7 @@ class TestRestorationRoundWebServer:
         monkeypatch.setattr(ws, "_call_aiwerk_bridge_tool", lambda *args, **kwargs: {})
 
         children = ws._aiwerk_bridge_subservers(config)
-        by_id = {child["id"]: child for child in children}
+        by_id = {child["name"]: child for child in children}
 
         assert by_id["google-workspace-aiwerk"]["label"] == "Google Workspace AIWerk"
         assert by_id["google-workspace-aiwerk"]["description"] == "Gmail, Kalender und Drive"
@@ -863,6 +864,273 @@ class TestRestorationRoundWebServer:
         monkeypatch.setenv("MAILDIR", str(maildir))
         assert ws._email_summary({})["unread_count"] == 2
 
+    def test_email_reader_get_fetches_sanitizes_and_items_expose_open_url(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        config = {
+            "assistant": {
+                "email": {
+                    "accounts": [
+                        {
+                            "backend": "google_workspace",
+                            "address": "owner@example.test",
+                            "mcp_server": "google-workspace-aiwerk",
+                            "user_google_email": "owner@example.test",
+                        }
+                    ]
+                }
+            }
+        }
+        monkeypatch.setattr(ws, "load_config", lambda: config)
+        monkeypatch.setattr(
+            ws,
+            "_assistant_resources_payload",
+            lambda *args, **kwargs: {
+                "email": {
+                    "accounts": [
+                        {
+                            "address": "owner@example.test",
+                            "items": [
+                                {
+                                    "id": "msg-1",
+                                    "message_id": "msg-1",
+                                    "sender": "Sender <sender@example.test>",
+                                    "subject": "Rendered subject",
+                                    "received_at": "2026-09-10T12:00:00Z",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+        reads = []
+
+        def read_message(_config, account, message_id):
+            reads.append((account["address"], message_id))
+            return (
+                "From: Sender <sender@example.test>\n"
+                "Subject: Rendered subject\n"
+                "\n"
+                "<b>Hello</b><script>alert('x')</script> "
+                "https://secret.example/path?token=abc /home/customer/private.txt"
+            )
+
+        monkeypatch.setattr(ws, "_run_google_workspace_message_read", read_message)
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        response = client.get(
+            "/api/assistant/email/view?account=owner%40example.test&id=msg-1",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert reads == [("owner@example.test", "msg-1")]
+        body = response.text
+        assert "Rendered subject" in body
+        assert "Hello" in body
+        assert "[LINK]" in body
+        assert "<script" not in body
+        assert "secret.example" not in body
+
+        if hasattr(ws, "_attach_email_open_urls"):
+            account = {"address": "owner@example.test"}
+            ws._attach_email_open_urls(account, [{"id": "msg-1"}, {"message_id": "msg-2"}])
+            assert account["items"][0]["open_url"] == "/api/assistant/email/view?account=owner%40example.test&id=msg-1"
+            assert account["items"][1]["open_url"] == "/api/assistant/email/view?account=owner%40example.test&id=msg-2"
+
+    def test_email_reader_himalaya_missing_binary_surfaces_backend_unavailable(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        config = {
+            "assistant": {
+                "email": {
+                    "accounts": [
+                        {
+                            "backend": "himalaya",
+                            "address": "office@example.test",
+                            "account": "office",
+                            "folder": "INBOX",
+                        }
+                    ]
+                }
+            }
+        }
+        monkeypatch.setattr(ws, "load_config", lambda: config)
+        monkeypatch.setattr(
+            ws,
+            "_assistant_resources_payload",
+            lambda *args, **kwargs: {
+                "email": {
+                    "accounts": [
+                        {
+                            "address": "office@example.test",
+                            "items": [{"id": "h1", "message_id": "h1", "subject": "Himalaya subject"}],
+                        }
+                    ]
+                }
+            },
+        )
+        monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        response = client.get(
+            "/api/assistant/email/view?account=office%40example.test&id=h1",
+            headers=headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Himalaya is not installed"
+
+    def test_resource_attachment_shared_file_copies_real_image_artifact(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+
+        shared_root = tmp_path / "shared"
+        source_dir = shared_root / "images"
+        source_dir.mkdir(parents=True)
+        source = source_dir / "photo.png"
+        source.write_bytes(b"\x89PNG\r\n\x1a\nreal image bytes")
+        monkeypatch.setenv("AIWERK_SHARED_FOLDER", str(shared_root))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        response = client.post(
+            "/api/assistant/attachments/resource",
+            headers=headers,
+            json={
+                "kind": "shared_file",
+                "session_id": "session/with unsafe chars",
+                "item": {
+                    "name": "photo.png",
+                    "open_url": "/api/assistant/shared-folder/open?path=images/photo.png",
+                    "mime": "image/png",
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        attachment = response.json()["attachments"][0]
+        copied = Path(attachment["path"])
+        assert copied.read_bytes() == source.read_bytes()
+        assert copied != source
+        assert {"session_with_unsafe_chars", "session-with-unsafe-chars"} & set(copied.parts)
+        assert attachment["name"] == "photo.png"
+        assert attachment["type"] == "image/png"
+        assert attachment["size"] == source.stat().st_size
+        assert attachment["is_image"] is True
+        assert attachment["extraction"] == "image"
+        assert not attachment.get("extracted_text")
+
+    def test_assistant_mode_allows_artifact_open_safe_methods_and_denies_unlisted_route(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_DASHBOARD_MODE", "assistant")
+        ws.app.state.auth_required = False
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        artifact = ws._assistant_upload_root() / "artifact.txt"
+        artifact.write_text("safe artifact", encoding="utf-8")
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        path = "/api/assistant/artifacts/open"
+        params = {"path": str(artifact)}
+        assert client.get(path, params=params, headers=headers).status_code == 200
+        route_methods = {
+            method
+            for route in ws.app.routes
+            if getattr(route, "path", "") == path
+            for method in getattr(route, "methods", set())
+        }
+        if "HEAD" in route_methods:
+            assert client.head(path, params=params, headers=headers).status_code == 200
+        if "OPTIONS" in route_methods:
+            assert client.options(path, params=params, headers=headers).status_code != 404
+        assert client.get("/api/config", headers=headers).status_code == 404
+
+    def test_assistant_transcribe_multipart_uses_bounded_read_and_real_transcription(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        calls = []
+
+        def transcribe(path):
+            calls.append(Path(path))
+            return {"success": True, "transcript": "real words", "provider": "test-stt"}
+
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", transcribe)
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        response = client.post(
+            "/api/assistant/transcribe",
+            headers=headers,
+            data={"session_id": "voice-session"},
+            files={"file": ("voice.webm", b"audio bytes", "audio/webm")},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"text": "real words", "provider": "test-stt"}
+        assert len(calls) == 1
+        assert calls[0].read_bytes() == b"audio bytes"
+        assert "voice-session" in str(calls[0])
+
+    def test_read_upload_reads_only_limit_plus_one_and_callers_reject_before_retaining(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+
+        class BoundedUpload:
+            filename = "large.txt"
+            content_type = "text/plain"
+
+            def __init__(self):
+                self.requested = []
+
+            async def read(self, size=-1):
+                self.requested.append(size)
+                return b"x" * size
+
+        if hasattr(ws, "_read_upload"):
+            upload = BoundedUpload()
+            data = _run_async(ws._read_upload(upload, ws._ASSISTANT_UPLOAD_MAX_FILE_BYTES))
+
+            assert upload.requested == [ws._ASSISTANT_UPLOAD_MAX_FILE_BYTES + 1]
+            assert len(data) == ws._ASSISTANT_UPLOAD_MAX_FILE_BYTES + 1
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+        response = client.post(
+            "/api/assistant/attachments",
+            headers=headers,
+            files={"files": ("large.txt", b"x" * (ws._ASSISTANT_UPLOAD_MAX_FILE_BYTES + 1), "text/plain")},
+        )
+
+        assert response.status_code == 413
+        assert not any(ws._assistant_upload_root().rglob("large.txt"))
+
+    def test_bridge_subserver_missing_status_defaults_connected_and_projects_consumer_fields(self):
+        import hermes_cli.web_server as ws
+
+        item = ws._aiwerk_bridge_subserver_item({"id": "google-workspace-demo"})
+        if item.get("id") == "aiwerk-bridge-id-:-google-workspace-demo":
+            item = ws._aiwerk_bridge_subserver_item("google-workspace-demo", {})
+
+        assert item["id"] == "aiwerk-bridge-google-workspace-demo"
+        assert item["label"] == "Google Workspace Demo"
+        assert item["description"] == "Gmail, Kalender und Drive"
+        assert item["status"] == "connected"
+        assert item["status_label"] == "Verbunden"
+        assert item["capabilities"] == ["Bridge-Subserver"]
+        assert item["open_url"] == "https://aiwerkmcp.com/#/catalog/google-workspace"
+        if "catalog_slug" in item:
+            assert item["catalog_slug"] == "google-workspace"
+
     def test_contact_env_overrides_drive_bridge_himalaya_and_interaction_sources(self, monkeypatch):
         import hermes_cli.web_server as ws
 
@@ -1090,3 +1358,9 @@ def _minimal_docx_bytes(text: str) -> bytes:
             ),
         )
     return buf.getvalue()
+
+
+def _run_async(coro):
+    import asyncio
+
+    return asyncio.run(coro)

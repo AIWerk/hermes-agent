@@ -38,10 +38,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__
-from hermes_cli.config import load_config, load_env
+from hermes_cli.config import get_hermes_home, load_config, load_env
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, JSONResponse, Response
     from starlette.concurrency import run_in_threadpool
@@ -52,7 +52,7 @@ except ImportError:
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
-        from fastapi import FastAPI, HTTPException, Request
+        from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, JSONResponse, Response
         from starlette.concurrency import run_in_threadpool
@@ -1045,6 +1045,7 @@ _ASSISTANT_ALLOWED_HTTP = {
     "/api/status": {"GET"},
     "/api/auth/me": {"GET"},
     "/api/assistant/resources": {"GET"},
+    "/api/assistant/artifacts/open": {"GET", "HEAD", "OPTIONS"},
     "/api/assistant/shared-folder/open": {"GET", "POST"},
     "/api/assistant/calendar/view": {"GET", "POST"},
     "/api/model/info": {"GET"},
@@ -1067,7 +1068,7 @@ _ASSISTANT_ALLOWED_HTTP = {
     "/api/assistant/todos/edit": {"POST"},
     "/api/cui/contacts": {"POST"},
     "/api/cui/contacts/hide": {"POST"},
-    "/api/assistant/email/view": {"POST"},
+    "/api/assistant/email/view": {"GET", "HEAD", "OPTIONS", "POST"},
     "/api/assistant/shared-folder/open-folder": {"POST"},
     "/api/sessions": {"GET"},
 }
@@ -1906,20 +1907,56 @@ def _aiwerk_bridge_catalog_slug(name: str, details: Dict[str, Any] | None = None
     return _AIWERK_BRIDGE_CATALOG_SLUGS.get(clean, clean)
 
 
+def _safe_resource_id(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip()).strip("-").lower()
+
+
+def _resource_status_label(status: str) -> str:
+    return {
+        "connected": "Verbunden",
+        "auth_required": "Anmeldung nötig",
+        "limited": "Eingeschränkt",
+        "disabled": "Deaktiviert",
+        "error": "Fehler",
+    }.get(status, "Eingeschränkt")
+
+
 def _normalize_aiwerk_bridge_subserver_status(value: Any) -> str:
+    if isinstance(value, dict):
+        if value.get("enabled", True) is False:
+            return "disabled"
+        value = value.get("status") or value.get("state") or "connected"
+    elif value in (None, ""):
+        return "connected"
     text = str(value or "").strip().lower()
-    return text if text in {"connected", "auth_required", "error", "disabled"} else "unknown"
+    if text in {"connected", "running", "ready", "ok", "healthy"}:
+        return "connected"
+    if text in {"auth_required"}:
+        return "auth_required"
+    if text in {"disabled", "off"}:
+        return "disabled"
+    if text in {"error", "failed", "unhealthy"}:
+        return "error"
+    if text in {"disconnected", "stopped", "starting", "pending", "idle", "lazy"}:
+        return "limited"
+    return "limited" if text else "connected"
 
 
 def _aiwerk_bridge_subserver_item(item: Dict[str, Any]) -> Dict[str, Any]:
     name = str(item.get("name") or item.get("id") or "")
+    status = _normalize_aiwerk_bridge_subserver_status(item)
+    catalog_slug = _aiwerk_bridge_catalog_slug(name, item)
     return {
-        "id": name,
+        "id": f"aiwerk-bridge-{_safe_resource_id(name)}",
         "name": name,
         "label": _aiwerk_bridge_subserver_label(name, item),
         "description": _aiwerk_bridge_subserver_description(name, item),
-        "catalog_slug": _aiwerk_bridge_catalog_slug(name, item),
-        "status": _normalize_aiwerk_bridge_subserver_status(item.get("status")),
+        "catalog_slug": catalog_slug,
+        "status": status,
+        "status_label": _resource_status_label(status),
+        "capabilities": ["Bridge-Subserver"],
+        "open_url": f"https://aiwerkmcp.com/#/catalog/{urllib.parse.quote(catalog_slug, safe='-_.~')}"
+        if catalog_slug else "",
     }
 
 
@@ -2401,28 +2438,48 @@ def get_assistant_resources(request: Request, refresh: str | None = None, resour
     return _assistant_resources_payload(request, force_refresh=bool(refresh), refresh_resource=resource)
 
 
-async def _read_upload(upload: Any) -> bytes:
-    data = await upload.read() if hasattr(upload, "read") else b""
+async def _read_upload(upload: Any, limit: int) -> bytes:
+    data = await upload.read(limit + 1) if hasattr(upload, "read") else b""
     if isinstance(data, str):
         data = data.encode("utf-8")
     return data
 
 
 @app.post("/api/assistant/audio/transcribe")
-async def transcribe_assistant_audio(request: Request, upload: Any) -> Dict[str, Any]:
+@app.post("/api/assistant/transcribe")
+async def transcribe_assistant_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: str = Form(""),
+) -> Dict[str, Any]:
     _require_token(request)
-    suffix = Path(getattr(upload, "filename", "") or "").suffix.lower()
+    filename = Path(str(file.filename or "voice.webm")).name
+    suffix = Path(filename).suffix.lower()
     if suffix not in _ASSISTANT_AUDIO_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported audio type")
-    data = await _read_upload(upload)
+    data = await _read_upload(file, _ASSISTANT_AUDIO_MAX_BYTES)
     if len(data) > _ASSISTANT_AUDIO_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Audio upload is too large")
-    return {"text": ""}
-
-
-@app.post("/api/assistant/transcribe")
-async def transcribe_assistant_audio_alias(request: Request, file: Any = None, upload: Any = None) -> Dict[str, Any]:
-    return await transcribe_assistant_audio(request, upload or file)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+    session_part = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(session_id or "session")).strip("._-") or "session"
+    target_dir = _assistant_upload_root() / session_part / f"voice-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+    target.write_bytes(data)
+    try:
+        target.chmod(0o600)
+    except Exception:
+        pass
+    try:
+        from tools.transcription_tools import transcribe_audio
+        result = await asyncio.to_thread(transcribe_audio, str(target))
+    except Exception as exc:
+        _log.exception("Assistant audio transcription failed")
+        raise HTTPException(status_code=500, detail="Transcription failed") from exc
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error") or "Transcription failed")
+    return {"text": str(result.get("transcript") or "").strip(), "provider": result.get("provider")}
 
 
 @app.post("/api/assistant/audio/tts")
@@ -2733,6 +2790,8 @@ def _create_shared_file_attachment(config: Dict[str, Any], item: Dict[str, Any],
     return payload
 
 
+@app.options("/api/assistant/artifacts/open")
+@app.head("/api/assistant/artifacts/open")
 @app.get("/api/assistant/artifacts/open")
 async def open_assistant_artifact(request: Request):
     _require_token(request)
@@ -2774,7 +2833,11 @@ async def upload_assistant_attachments_route(request: Request) -> Dict[str, Any]
         suffix = Path(filename).suffix.lower()
         if suffix not in _ASSISTANT_UPLOAD_EXTS:
             raise HTTPException(status_code=415, detail="Unsupported attachment type")
-        data = await _read_upload(upload)
+        remaining = _ASSISTANT_UPLOAD_MAX_TOTAL_BYTES - total
+        if remaining <= 0:
+            raise HTTPException(status_code=413, detail="Attachment batch too large")
+        read_limit = min(_ASSISTANT_UPLOAD_MAX_FILE_BYTES, remaining)
+        data = await _read_upload(upload, read_limit)
         if len(data) > _ASSISTANT_UPLOAD_MAX_FILE_BYTES:
             raise HTTPException(status_code=413, detail=f"File too large: {filename}")
         total += len(data)
@@ -3857,12 +3920,6 @@ def _iter_nested_display_candidates(value: Any):
             yield from _iter_nested_display_candidates(item)
 
 
-@app.post("/api/assistant/email/view")
-def view_assistant_email(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_token(request)
-    return {"html": _plain_email_reader_html(payload)}
-
-
 def _format_swiss_datetime(value: Any) -> str:
     text = str(value or "")
     if not text:
@@ -3879,11 +3936,13 @@ def _format_swiss_datetime(value: Any) -> str:
 
 def _sanitize_reader_text(value: Any) -> str:
     text = _html_fragment_to_plain_text(str(value or ""))
-    return re.sub(r"https?://\S+", "[LINK]", text)
+    text = re.sub(r"https?://\S+", "[LINK]", text)
+    return re.sub(r"(?:/[^\s<>'\"]+){2,}", "[PATH]", text)
 
 
 def _sanitize_reader_literal(value: Any) -> str:
-    return re.sub(r"https?://\S+", "[LINK]", str(value or ""))
+    text = re.sub(r"https?://\S+", "[LINK]", str(value or ""))
+    return re.sub(r"(?:/[^\s<>'\"]+){2,}", "[PATH]", text)
 
 
 def _reader_response(title: str, rows: list[tuple[str, Any]]) -> Response:
@@ -3905,12 +3964,117 @@ def _reader_response(title: str, rows: list[tuple[str, Any]]) -> Response:
     )
 
 
+def _find_email_account_config(config: Dict[str, Any], account_ref: str) -> Dict[str, Any] | None:
+    wanted = str(account_ref or "").strip().lower()
+    for account in _email_account_configs(config):
+        candidates = {
+            _email_account_address(account),
+            _email_account_label(account),
+            str(account.get("account") or ""),
+            str(account.get("user_google_email") or ""),
+        }
+        if wanted in {candidate.strip().lower() for candidate in candidates if candidate}:
+            return account
+    if os.environ.get("AIWERK_CUI_EMAIL_BACKEND") or os.environ.get("AIWERK_CUI_GOOGLE_EMAIL") or os.environ.get("AIWERK_CUI_EMAIL_ACCOUNT"):
+        for account in _email_account_configs(config):
+            if account:
+                return account
+    return None
+
+
+def _is_google_email_backend(backend: str) -> bool:
+    return str(backend or "").strip().lower() in {"google_workspace", "google", "gmail"}
+
+
+def _email_open_url(account: Dict[str, Any], item: Dict[str, Any]) -> str:
+    account_ref = str(account.get("address") or account.get("label") or account.get("account") or "")
+    message_id = str(item.get("message_id") or item.get("id") or "")
+    return (
+        "/api/assistant/email/view?"
+        f"account={urllib.parse.quote(account_ref)}&id={urllib.parse.quote(message_id)}"
+    )
+
+
+def _attach_email_open_urls(account: Dict[str, Any], items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    account["items"] = items
+    for item in items:
+        if isinstance(item, dict) and (item.get("message_id") or item.get("id")):
+            item["open_url"] = _email_open_url(account, item)
+    return items
+
+
+@app.get("/api/assistant/email/view")
+def view_assistant_email_get(request: Request, account: str, id: str) -> Response:
+    _require_token(request)
+    account_ref = str(account or "").strip()
+    message_id = str(id or "").strip()
+    if not account_ref or not message_id:
+        raise HTTPException(status_code=400, detail="Missing email account or message id")
+    config = load_config()
+    account_cfg = _find_email_account_config(config, account_ref)
+    if not account_cfg:
+        raise HTTPException(status_code=404, detail="Email account not configured")
+    account_label = _email_account_address(account_cfg) or _email_account_label(account_cfg) or account_ref
+    sender = ""
+    subject = "Ohne Betreff"
+    received_at = ""
+    try:
+        resources = _assistant_resources_payload(request, force_refresh=False)
+        accounts = ((resources.get("email") or {}).get("accounts") or []) if isinstance(resources, dict) else []
+        for account_entry in accounts:
+            if str(account_entry.get("address") or account_entry.get("label") or "").strip().lower() != account_ref.lower():
+                continue
+            for item in account_entry.get("items") or []:
+                if message_id in {str(item.get("message_id") or ""), str(item.get("id") or "")}:
+                    sender = str(item.get("sender") or "")
+                    subject = str(item.get("subject") or subject)
+                    received_at = str(item.get("received_at") or "")
+                    break
+    except Exception:
+        _log.debug("Could not hydrate email metadata for reader", exc_info=True)
+    try:
+        backend = _email_backend_name(account_cfg)
+        if _is_google_email_backend(backend):
+            body = _run_google_workspace_message_read(config, account_cfg, message_id)
+        else:
+            body = _run_himalaya_message_read(
+                message_id,
+                account=str(account_cfg.get("account") or account_cfg.get("name") or "") or None,
+                folder=str(account_cfg.get("folder") or account_cfg.get("mailbox") or "") or None,
+            )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message id")
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="Himalaya is not installed")
+    except Exception as exc:
+        _log.debug("CUI email reader failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Email could not be loaded")
+    return _reader_response(
+        subject,
+        [
+            ("Konto:", _sanitize_reader_literal(account_label)),
+            ("Von:", _sanitize_reader_literal(sender)),
+            ("Empfangen:", _format_swiss_datetime(received_at)),
+            ("Inhalt:", _sanitize_reader_text(body)),
+        ],
+    )
+
+
+@app.post("/api/assistant/email/view")
+def view_assistant_email_post(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
+    _require_token(request)
+    return {"html": _plain_email_reader_html(payload)}
+
+
 @app.post("/api/assistant/attachments/resource")
 def attach_assistant_resource(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
     _require_token(request)
     from hermes_constants import get_hermes_home
     item = dict(payload.get("item") or {})
     session_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(payload.get("session_id") or "session"))
+    kind = str(payload.get("kind") or item.get("kind") or "").strip().lower()
+    if kind == "shared_file":
+        return {"attachments": [_create_shared_file_attachment(load_config(), item, session_id)]}
     root = get_hermes_home() / "dashboard_uploads"
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{secrets.token_hex(8)}-{session_id}-resource.txt"
@@ -4063,7 +4227,10 @@ def _google_workspace_email_summary(
         "backend": "google_workspace",
         "status": "connected",
         "summary": f"{len(unread_ids)} ungelesene E-Mails",
-        "items": latest_items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
+        "items": _attach_email_open_urls(
+            {"address": user_google_email, "label": _email_account_label(account_cfg) or user_google_email},
+            latest_items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
+        ),
         "unread_count": len(unread_ids),
     }
 
@@ -4112,7 +4279,7 @@ def _run_himalaya_envelope_list(
 def _run_himalaya_message_read(message_id: str, account: str | None = None, folder: str | None = None) -> str:
     binary = shutil.which("himalaya")
     if not binary:
-        return ""
+        raise FileNotFoundError("himalaya not installed")
     resolved_account = account or os.environ.get("AIWERK_CUI_EMAIL_ACCOUNT") or os.environ.get("HIMALAYA_ACCOUNT")
     resolved_folder = folder or os.environ.get("AIWERK_CUI_EMAIL_FOLDER") or os.environ.get("HIMALAYA_FOLDER") or "INBOX"
     cmd = [binary, "message", "read", "--preview", "--output", "plain"]
@@ -4156,7 +4323,7 @@ def _himalaya_email_summary(
     account = _himalaya_account_value(account_cfg)
     folder = _himalaya_folder_value(account_cfg)
     items = _run_himalaya_envelope_list(page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS, account=account or None, folder=folder)
-    return {
+    account_payload = {
         "label": _email_account_label(account_cfg) or account or folder,
         "address": _email_account_address(account_cfg) or account,
         "backend": "himalaya",
@@ -4166,6 +4333,8 @@ def _himalaya_email_summary(
         "items": items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
         "unread_count": len(items),
     }
+    _attach_email_open_urls(account_payload, account_payload["items"])
+    return account_payload
 
 
 def _maildir_email_summary(maildir: str | None) -> Dict[str, Any] | None:
@@ -4194,7 +4363,9 @@ def _merge_email_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
     items: list[Dict[str, Any]] = []
     unread_count = 0
     for account in accounts:
-        items.extend(dict(item) for item in account.get("items", []) if isinstance(item, dict))
+        account_items = [dict(item) for item in account.get("items", []) if isinstance(item, dict)]
+        _attach_email_open_urls(account, account_items)
+        items.extend(account_items)
         unread_count += int(account.get("unread_count") or 0)
     status = _status_from_summaries(accounts)
     if status == "auth_required":
