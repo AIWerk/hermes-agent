@@ -2618,6 +2618,19 @@ def _assistant_upload_root() -> Path:
     return root
 
 
+def _safe_upload_component(value: str, fallback: str = "upload") -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "").strip(".-_")
+    return (safe or fallback)[:80]
+
+
+def _assistant_attachment_target_dir(session_id: str, prefix: str = "resource") -> Path:
+    session_part = _safe_upload_component(session_id or "session", "session")
+    batch_part = f"{prefix}-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    target_dir = _assistant_upload_root() / session_part / batch_part
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir
+
+
 def _assistant_artifact_roots() -> tuple[Path, ...]:
     return (_assistant_upload_root().resolve(),)
 
@@ -2788,9 +2801,9 @@ def _create_shared_file_attachment(config: Dict[str, Any], item: Dict[str, Any],
             raise HTTPException(status_code=415, detail=f"Unsupported file type: {filename}")
     if len(data) > _ASSISTANT_UPLOAD_MAX_BYTES:
         raise HTTPException(status_code=413, detail=f"File too large: {filename}")
-    target_dir = _assistant_upload_root() / str(session_id or "session") / "shared"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{secrets.token_hex(8)}-{filename}"
+    target_dir = _assistant_attachment_target_dir(session_id, "shared")
+    safe_name = _safe_upload_component(filename, "shared-file")
+    target = target_dir / safe_name
     target.write_bytes(data)
     payload: Dict[str, Any] = {
         "name": filename,
@@ -4019,7 +4032,7 @@ def _attach_email_open_urls(account: Dict[str, Any], items: list[Dict[str, Any]]
 
 
 @app.get("/api/assistant/email/view")
-def view_assistant_email_get(request: Request, account: str, id: str) -> Response:
+def view_assistant_email(request: Request, account: str, id: str) -> Response:
     _require_token(request)
     account_ref = str(account or "").strip()
     message_id = str(id or "").strip()
@@ -4279,7 +4292,15 @@ def _run_himalaya_envelope_list(
     cmd.extend(["--page-size", str(page_size), "--output", "json"])
     if query:
         cmd.append(str(query))
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS, check=False)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS,
+        check=False,
+    )
     if proc.returncode != 0:
         return []
     try:
@@ -4303,7 +4324,15 @@ def _run_himalaya_message_read(message_id: str, account: str | None = None, fold
     if resolved_folder:
         cmd.extend(["--folder", str(resolved_folder)])
     cmd.append(str(message_id))
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS, check=False)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_ASSISTANT_EMAIL_TIMEOUT_SECONDS,
+        check=False,
+    )
     return proc.stdout if proc.returncode == 0 else ""
 
 

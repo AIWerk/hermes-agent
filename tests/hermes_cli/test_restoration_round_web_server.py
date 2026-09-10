@@ -1287,6 +1287,92 @@ class TestRestorationRoundWebServer:
         assert attachment["extraction"] == "image"
         assert not attachment.get("extracted_text")
 
+    @pytest.mark.parametrize("session_id", [".", ".."])
+    def test_resource_attachment_shared_file_dot_only_session_stays_in_upload_root(
+        self, monkeypatch, tmp_path, session_id
+    ):
+        import hermes_cli.web_server as ws
+
+        shared_root = tmp_path / "shared"
+        shared_root.mkdir()
+        source = shared_root / "note.txt"
+        source.write_text("local shared note", encoding="utf-8")
+        upload_root = tmp_path / "home" / "dashboard_uploads"
+        monkeypatch.setenv("AIWERK_SHARED_FOLDER", str(shared_root))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        response = client.post(
+            "/api/assistant/attachments/resource",
+            headers=headers,
+            json={
+                "kind": "shared_file",
+                "session_id": session_id,
+                "item": {"open_url": "/api/assistant/shared-folder/open?path=note.txt"},
+            },
+        )
+
+        assert response.status_code == 200
+        copied = Path(response.json()["attachments"][0]["path"]).resolve()
+        relative = copied.relative_to(upload_root.resolve())
+        assert relative.parts[0] == "session"
+        assert copied.read_text(encoding="utf-8") == "local shared note"
+
+        valid_response = client.post(
+            "/api/assistant/attachments/resource",
+            headers=headers,
+            json={
+                "kind": "shared_file",
+                "session_id": "normal-session",
+                "item": {"open_url": "/api/assistant/shared-folder/open?path=note.txt"},
+            },
+        )
+
+        assert valid_response.status_code == 200
+        valid_path = Path(valid_response.json()["attachments"][0]["path"]).resolve()
+        valid_relative = valid_path.relative_to(upload_root.resolve())
+        assert valid_relative.parts[0] == "normal-session"
+        assert valid_path.read_text(encoding="utf-8") == "local shared note"
+
+    @pytest.mark.parametrize("session_id", [".", ".."])
+    def test_resource_attachment_cloud_shared_file_dot_only_session_stays_in_upload_root(
+        self, monkeypatch, tmp_path, session_id
+    ):
+        import hermes_cli.web_server as ws
+
+        upload_root = tmp_path / "home" / "dashboard_uploads"
+        monkeypatch.delenv("AIWERK_CUI_SHARED_FOLDER", raising=False)
+        monkeypatch.delenv("AIWERK_SHARED_FOLDER", raising=False)
+        monkeypatch.delenv("HERMES_SHARED_FOLDER", raising=False)
+        monkeypatch.delenv("HERMES_SHARED_DIR", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(ws, "load_config", lambda: self._cloud_config())
+        monkeypatch.setattr(ws, "_discover_dav_shared_folder_root", lambda config: None)
+        monkeypatch.setattr(
+            ws,
+            "_download_sftpgo_pubshare_file",
+            lambda config, rel_path: (b"cloud shared note", "text/plain", "note.txt"),
+        )
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        response = client.post(
+            "/api/assistant/attachments/resource",
+            headers=headers,
+            json={
+                "kind": "shared_file",
+                "session_id": session_id,
+                "item": {"open_url": "/api/assistant/shared-folder/open?path=note.txt"},
+            },
+        )
+
+        assert response.status_code == 200
+        copied = Path(response.json()["attachments"][0]["path"]).resolve()
+        relative = copied.relative_to(upload_root.resolve())
+        assert relative.parts[0] == "session"
+        assert copied.read_text(encoding="utf-8") == "cloud shared note"
+
     def test_assistant_mode_allows_artifact_open_safe_methods_and_denies_unlisted_route(
         self, monkeypatch, tmp_path
     ):
