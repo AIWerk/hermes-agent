@@ -2,6 +2,7 @@ import io
 import json
 import threading
 import time
+import urllib.parse
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,267 @@ _RESTORED_ENV_KEYS = (
 
 
 class TestRestorationRoundWebServer:
+    def _cloud_response_xml(self, *hrefs: tuple[str, str, bool, int]) -> bytes:
+        responses = []
+        for href, name, is_folder, size in hrefs:
+            collection = "<D:collection/>" if is_folder else ""
+            responses.append(
+                f"<D:response><D:href>{href}</D:href><D:propstat><D:prop>"
+                f"<D:displayname>{name}</D:displayname>"
+                f"<D:getcontentlength>{size}</D:getcontentlength>"
+                f"<D:getlastmodified>Thu, 10 Sep 2026 12:00:00 GMT</D:getlastmodified>"
+                f"<D:resourcetype>{collection}</D:resourcetype>"
+                f"</D:prop></D:propstat></D:response>"
+            )
+        return (
+            "<?xml version='1.0'?><D:multistatus xmlns:D='DAV:'>"
+            + "".join(responses)
+            + "</D:multistatus>"
+        ).encode()
+
+    def _cloud_config(self, **overrides):
+        cloud = {
+            "base_url": "https://cloud.example.test",
+            "share_id": "share-123",
+            "path": "/Customer Shared",
+            "password_pass_entry": "customers/shared",
+            "max_depth": 2,
+        }
+        cloud.update(overrides)
+        return {"dashboard": {"shared_cloud": cloud}}
+
+    def test_cloud_only_sftpgo_pubshare_summary_open_and_attachment(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("AIWERK_CUI_SHARED_FOLDER", raising=False)
+        monkeypatch.delenv("AIWERK_SHARED_FOLDER", raising=False)
+        monkeypatch.delenv("HERMES_SHARED_FOLDER", raising=False)
+        monkeypatch.delenv("HERMES_SHARED_DIR", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(ws, "load_config", lambda: self._cloud_config())
+        monkeypatch.setattr(ws, "_pass_first_line", lambda entry: "share-password")
+        monkeypatch.setattr(ws, "_discover_dav_shared_folder_root", lambda config: None)
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, body, content_type="application/json"):
+                self._body = body if isinstance(body, bytes) else body.encode()
+                self.headers = {"content-type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return self._body
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                assert timeout in {20, 30}
+                url = request.full_url
+                if "/login?" in url and request.data is None:
+                    return FakeResponse('<input name="_form_token" value="token-1">', "text/html")
+                if "/login?" in url and request.data is not None:
+                    return FakeResponse("'X-CSRF-TOKEN': 'csrf-1'", "text/html")
+                if "/dirs?" in url:
+                    path = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["path"][0]
+                    if path == "/Customer Shared":
+                        return FakeResponse(json.dumps([
+                            {"name": "docs", "type": "dir", "modified_time": "2026-09-10T12:00:00Z"},
+                            {"name": "overview.txt", "type": "file", "size": 5},
+                            {"name": ".env", "type": "file", "size": 10},
+                        ]))
+                    if path == "/Customer Shared/docs":
+                        return FakeResponse(json.dumps([
+                            {"name": "manual.html", "type": "file", "size": 17},
+                            {"name": "plan.pdf", "type": "file", "size": 7},
+                        ]))
+                if "/browse?" in url:
+                    path = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["path"][0]
+                    if path == "/Customer Shared/overview.txt":
+                        return FakeResponse(b"hello", "text/plain")
+                    if path == "/Customer Shared/docs/manual.html":
+                        return FakeResponse(b"<script>bad()</script>", "text/html")
+                raise AssertionError(url)
+
+        monkeypatch.setattr(ws.urllib.request, "build_opener", lambda *_args: FakeOpener())
+        monkeypatch.setattr(ws.urllib.request, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("urlopen should not be used")))
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        resources = client.get("/api/assistant/resources?refresh=1&resource=shared_folder", headers=headers)
+        assert resources.status_code == 200
+        shared = resources.json()["shared_folder"]
+        assert shared["status"] == "connected"
+        assert shared["source"] == "cloud"
+        assert shared["can_open_folder"] is False
+        assert shared["cloud_url"] == "https://cloud.example.test/web/client/pubshares/share-123/browse?path=%2FCustomer%20Shared"
+        assert [item["name"] for item in shared["items"]] == ["docs", "overview.txt"]
+        assert shared["items"][0]["cloud_url"].endswith("path=%2FCustomer%20Shared%2Fdocs")
+        manual = shared["items"][0]["children"][0]
+        assert manual["open_url"] == "/api/assistant/shared-folder/open?path=docs%2Fmanual.html"
+        assert manual["reference_uri"] == "shared://docs/manual.html"
+
+        file_open = client.get("/api/assistant/shared-folder/open?path=overview.txt", headers=headers)
+        assert file_open.status_code == 200
+        assert file_open.content == b"hello"
+        assert file_open.headers["content-type"].startswith("text/plain")
+
+        attachment = client.post(
+            "/api/assistant/attachments/resource",
+            headers=headers,
+            json={
+                "kind": "shared_file",
+                "session_id": "session/with unsafe chars",
+                "item": {"open_url": "/api/assistant/shared-folder/open?path=overview.txt"},
+            },
+        )
+        assert attachment.status_code == 200
+        uploaded = attachment.json()["attachments"][0]
+        copied = Path(uploaded["path"])
+        assert copied.read_bytes() == b"hello"
+        assert copied.name.endswith("overview.txt")
+        assert {"session_with_unsafe_chars", "session-with-unsafe-chars"} & set(copied.parts)
+        assert str(copied).startswith(str(tmp_path / "home" / "dashboard_uploads"))
+
+    def test_cloud_only_webdav_summary_open_and_attachment(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(ws, "load_config", lambda: self._cloud_config(
+            type="webdav",
+            webdav_url="https://dav.example.test/dav/files/customer",
+            username="customer",
+        ))
+        monkeypatch.setattr(ws, "_pass_first_line", lambda entry: "secret")
+        monkeypatch.setattr(ws, "_discover_dav_shared_folder_root", lambda config: None)
+
+        class FakeResponse:
+            status = 207
+
+            def __init__(self, body, content_type="application/xml", status=207):
+                self._body = body if isinstance(body, bytes) else body.encode()
+                self.headers = {"content-type": content_type}
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return self._body
+
+        def fake_urlopen(request, timeout=None):
+            assert "Authorization" in request.headers
+            assert "secret" not in repr(request.headers)
+            url_path = urllib.parse.unquote(urllib.parse.urlparse(request.full_url).path).rstrip("/")
+            if request.get_method() == "PROPFIND" and url_path.endswith("/Customer Shared"):
+                return FakeResponse(self._cloud_response_xml(
+                    ("/Customer%20Shared/", "Customer Shared", True, 0),
+                    ("/Customer%20Shared/docs/", "docs", True, 0),
+                    ("/Customer%20Shared/readme.txt", "readme.txt", False, 6),
+                    ("/Customer%20Shared/team-token.txt", "team-token.txt", False, 6),
+                ))
+            if request.get_method() == "PROPFIND" and url_path.endswith("/Customer Shared/docs"):
+                return FakeResponse(self._cloud_response_xml(
+                    ("/Customer%20Shared/docs/", "docs", True, 0),
+                    ("/Customer%20Shared/docs/guide.pdf", "guide.pdf", False, 7),
+                ))
+            if request.get_method() == "GET" and url_path.endswith("/Customer Shared/docs/guide.pdf"):
+                return FakeResponse(b"%PDF-1\n", "application/pdf", status=200)
+            raise AssertionError(f"{request.get_method()} {request.full_url}")
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", fake_urlopen)
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        resources = client.get("/api/assistant/resources?refresh=1&resource=shared_folder", headers=headers)
+        assert resources.status_code == 200
+        shared = resources.json()["shared_folder"]
+        assert shared["status"] == "connected"
+        assert shared["source"] == "cloud"
+        assert [item["name"] for item in shared["items"]] == ["docs", "readme.txt"]
+        guide = shared["items"][0]["children"][0]
+        assert guide["open_url"] == "/api/assistant/shared-folder/open?path=docs%2Fguide.pdf"
+
+        opened = client.get(guide["open_url"], headers=headers)
+        assert opened.status_code == 200
+        assert opened.content == b"%PDF-1\n"
+        assert opened.headers["content-type"].startswith("application/pdf")
+
+        attached = client.post(
+            "/api/assistant/attachments/resource",
+            headers=headers,
+            json={"kind": "shared_file", "session_id": "s1", "item": {"open_url": guide["open_url"]}},
+        )
+        assert attached.status_code == 200
+        assert Path(attached.json()["attachments"][0]["path"]).read_bytes() == b"%PDF-1\n"
+
+    def test_shared_folder_local_mount_precedes_cloud(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "local.txt").write_text("local", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_SHARED_FOLDER", str(shared))
+        monkeypatch.setattr(ws, "load_config", lambda: self._cloud_config())
+
+        def fail_cloud(*_args, **_kwargs):
+            raise AssertionError("cloud must not be queried when local mount is present")
+
+        monkeypatch.setattr(ws, "_webdav_cloud_items", fail_cloud, raising=False)
+        monkeypatch.setattr(ws, "_sftpgo_pubshare_items", fail_cloud, raising=False)
+        monkeypatch.setattr(ws, "_download_webdav_cloud_file", fail_cloud, raising=False)
+        monkeypatch.setattr(ws, "_download_sftpgo_pubshare_file", fail_cloud, raising=False)
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        resources = client.get("/api/assistant/resources?refresh=1&resource=shared_folder", headers=headers)
+        assert resources.status_code == 200
+        shared_folder = resources.json()["shared_folder"]
+        assert shared_folder["source"] == "local"
+        assert [item["name"] for item in shared_folder["items"]] == ["local.txt"]
+        assert client.get("/api/assistant/shared-folder/open?path=local.txt", headers=headers).text == "local"
+
+    def test_cloud_shared_folder_open_rejects_unsafe_and_oversized_files(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(ws, "load_config", lambda: self._cloud_config(
+            type="webdav",
+            webdav_url="https://dav.example.test/dav/files/customer",
+            username="customer",
+        ))
+        monkeypatch.setattr(ws, "_pass_first_line", lambda entry: "secret")
+        monkeypatch.setattr(ws, "_discover_dav_shared_folder_root", lambda config: None)
+        too_large = b"x" * (ws._ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES + 1)
+
+        class FakeResponse:
+            status = 200
+            headers = {"content-type": "text/plain"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, limit=-1):
+                return too_large[:limit]
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+        client = TestClient(ws.app)
+        headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
+
+        assert client.get("/api/assistant/shared-folder/open?path=../secret.txt", headers=headers).status_code == 404
+        assert client.get("/api/assistant/shared-folder/open?path=team-token.txt", headers=headers).status_code == 404
+        assert client.get("/api/assistant/shared-folder/open?path=big.txt", headers=headers).status_code == 404
+
     def test_hidden_shared_names_are_rejected_by_shared_folder_listing(self, monkeypatch, tmp_path):
         import hermes_cli.web_server as ws
 

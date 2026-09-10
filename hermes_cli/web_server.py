@@ -2758,25 +2758,40 @@ def _create_shared_file_attachment(config: Dict[str, Any], item: Dict[str, Any],
     rel_path = _shared_attachment_rel_path(item)
     if not rel_path:
         raise HTTPException(status_code=400, detail="Shared file path missing")
-    shared_root = _resolve_shared_folder_root(config)
-    if not shared_root:
-        raise HTTPException(status_code=404, detail="Shared file not found")
-    source = (shared_root / rel_path).resolve()
-    root = shared_root.resolve()
-    if not source.is_file() or (source != root and root not in source.parents):
-        raise HTTPException(status_code=404, detail="Shared file not found")
     filename = Path(rel_path).name
     suffix = Path(filename).suffix.lower()
     if suffix not in _ASSISTANT_UPLOAD_EXTS:
         raise HTTPException(status_code=415, detail=f"Unsupported file type: {filename}")
-    data = source.read_bytes()
+    shared_root = _resolve_shared_folder_root(config)
+    source: Path | None = None
+    if shared_root:
+        source = _safe_shared_path(shared_root.resolve(), rel_path)
+        if not source.is_file():
+            raise HTTPException(status_code=404, detail="Shared file not found")
+        data = source.read_bytes()
+        media_type = mimetypes.guess_type(filename)[0] or str(item.get("mime") or "application/octet-stream")
+    else:
+        cloud = _shared_cloud_config(config)
+        downloaded = None
+        if isinstance(cloud, dict):
+            downloaded = (
+                _download_webdav_cloud_file(cloud, rel_path)
+                if _shared_cloud_uses_webdav(cloud)
+                else _download_sftpgo_pubshare_file(cloud, rel_path)
+            )
+        if not downloaded:
+            raise HTTPException(status_code=404, detail="Shared file not found")
+        data, media_type, downloaded_name = downloaded
+        filename = downloaded_name or filename
+        suffix = Path(filename).suffix.lower()
+        if suffix not in _ASSISTANT_UPLOAD_EXTS:
+            raise HTTPException(status_code=415, detail=f"Unsupported file type: {filename}")
     if len(data) > _ASSISTANT_UPLOAD_MAX_BYTES:
         raise HTTPException(status_code=413, detail=f"File too large: {filename}")
     target_dir = _assistant_upload_root() / str(session_id or "session") / "shared"
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{secrets.token_hex(8)}-{filename}"
     target.write_bytes(data)
-    media_type = mimetypes.guess_type(filename)[0] or str(item.get("mime") or "application/octet-stream")
     payload: Dict[str, Any] = {
         "name": filename,
         "path": str(target),
@@ -4788,42 +4803,377 @@ def _pass_first_line(entry: str) -> str:
         return ""
 
 
-def _webdav_cloud_items(config: Dict[str, Any]) -> list[Dict[str, Any]]:
-    import base64
-    import xml.etree.ElementTree as ET
-    base_url = str(config.get("base_url") or "").rstrip("/")
-    root_path = str(config.get("path") or "/").strip() or "/"
-    max_depth = int(config.get("max_depth") or 2)
-    password = str(config.get("password") or _pass_first_line(str(config.get("password_pass_entry") or "")))
-    auth = base64.b64encode(f"{config.get('username', '')}:{password}".encode()).decode()
+def _clean_shared_relative_path(value: str) -> str | None:
+    parts = [part for part in str(value or "").replace("\\", "/").split("/") if part]
+    clean_parts: list[str] = []
+    for part in parts:
+        if part in {".", ".."} or "/" in part or _is_hidden_shared_item(Path(part)):
+            return None
+        clean_parts.append(part)
+    return "/".join(clean_parts) if clean_parts else None
 
-    def list_dir(path: str, depth: int, root_prefix: str) -> list[Dict[str, Any]]:
-        url = base_url + urllib.parse.quote(path, safe="/")
-        req = urllib.request.Request(url, data=b"", method="PROPFIND", headers={"Depth": "1", "Authorization": f"Basic {auth}"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read()
-        tree = ET.fromstring(data)
-        ns = {"D": "DAV:"}
+
+def _clean_shared_cloud_path(value: str) -> str | None:
+    clean = _clean_shared_relative_path(value)
+    return f"/{clean}" if clean else "/"
+
+
+def _shared_reference_uri(rel_path: str) -> str | None:
+    clean = _clean_shared_relative_path(rel_path)
+    return f"shared://{urllib.parse.quote(clean, safe='/')}" if clean else None
+
+
+def _shared_cloud_uses_webdav(cloud: Dict[str, Any] | None) -> bool:
+    if not isinstance(cloud, dict):
+        return False
+    kind = str(cloud.get("type") or cloud.get("kind") or "").strip().lower().replace("-", "_")
+    return kind in {"webdav", "sftpgo_webdav", "webdav_sftpgo"} or bool(cloud.get("webdav_url") or cloud.get("dav_url"))
+
+
+def _shared_cloud_browse_url(cloud: Dict[str, Any] | None, rel_path: str | None = None) -> str | None:
+    if not isinstance(cloud, dict):
+        return None
+    base_url = str(cloud.get("base_url") or "").rstrip("/")
+    share_id = str(cloud.get("share_id") or "").strip().strip("/")
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not share_id:
+        return None
+    root_path = _clean_shared_cloud_path(str(cloud.get("path") or "/")) or "/"
+    if rel_path:
+        clean_rel = _clean_shared_relative_path(rel_path)
+        if not clean_rel:
+            return None
+        browse_path = _clean_shared_cloud_path(root_path.rstrip("/") + "/" + clean_rel)
+    else:
+        browse_path = root_path
+    if not browse_path:
+        return None
+    return (
+        f"{base_url}/web/client/pubshares/{urllib.parse.quote(share_id, safe='')}"
+        f"/browse?path={urllib.parse.quote(browse_path, safe='')}"
+    )
+
+
+def _urlopen_text(opener: urllib.request.OpenerDirector, request: urllib.request.Request, timeout: int = 20) -> tuple[int, str]:
+    with opener.open(request, timeout=timeout) as response:
+        data = response.read(512_000)
+        return response.status, data.decode("utf-8", errors="replace")
+
+
+def _urlopen_json(opener: urllib.request.OpenerDirector, request: urllib.request.Request, timeout: int = 20) -> Any:
+    with opener.open(request, timeout=timeout) as response:
+        data = response.read(512_000)
+        return json.loads(data.decode("utf-8", errors="replace"))
+
+
+def _sftpgo_item_kind(raw: Dict[str, Any]) -> str:
+    raw_type = raw.get("type")
+    if raw_type in (1, "1", "dir", "directory", "folder"):
+        return "folder"
+    return "file"
+
+
+def _sftpgo_modified_at(raw: Dict[str, Any]) -> str | None:
+    for key in ("modified_time", "mtime", "last_modified"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, (int, float)) and value > 0:
+            seconds = value / 1000 if value > 10_000_000_000 else value
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+    return None
+
+
+def _sftpgo_pubshare_items(cloud: Dict[str, Any]) -> list[Dict[str, Any]]:
+    import http.cookiejar
+
+    base_url = str(cloud.get("base_url") or "").rstrip("/")
+    share_id = str(cloud.get("share_id") or "").strip().strip("/")
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    root_path = _clean_shared_cloud_path(str(cloud.get("path") or "/")) or "/"
+    max_depth = int(cloud.get("max_depth") or _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
+    password = _pass_first_line(pass_entry)
+    if not base_url or not share_id or not pass_entry or not password:
+        return []
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    quoted_share_id = urllib.parse.quote(share_id, safe="")
+    login_next = urllib.parse.quote(f"/web/client/pubshares/{share_id}/browse", safe="")
+    login_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/login?next={login_next}"
+    try:
+        status, login_html = _urlopen_text(opener, urllib.request.Request(login_url, headers={"User-Agent": "Hermes-CUI/1.0"}))
+        if status >= 400:
+            return []
+        match = re.search(r'name="_form_token"\s+value="([^"]+)"', login_html)
+        if not match:
+            return []
+        body = urllib.parse.urlencode({"share_password": password, "_form_token": _html.unescape(match.group(1))}).encode()
+        status, browse_html = _urlopen_text(
+            opener,
+            urllib.request.Request(
+                login_url,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Hermes-CUI/1.0"},
+                method="POST",
+            ),
+        )
+        if status >= 400 or 'name="share_password"' in browse_html:
+            return []
+    except Exception:
+        return []
+    csrf_match = re.search(r"'X-CSRF-TOKEN':\s*'([^']+)'", browse_html)
+    headers = {"User-Agent": "Hermes-CUI/1.0"}
+    if csrf_match:
+        headers["X-CSRF-TOKEN"] = csrf_match.group(1)
+
+    def child_path(parent: str, name: str) -> str:
+        return _clean_shared_cloud_path(parent.rstrip("/") + "/" + name) or "/"
+
+    def list_path(path: str, depth: int) -> list[Dict[str, Any]]:
+        dirs_url = (
+            f"{base_url}/web/client/pubshares/{quoted_share_id}/dirs"
+            f"?path={urllib.parse.quote(path, safe='')}"
+        )
+        try:
+            raw_items = _urlopen_json(opener, urllib.request.Request(dirs_url, headers=headers))
+        except Exception:
+            return []
+        if not isinstance(raw_items, list):
+            return []
         items: list[Dict[str, Any]] = []
-        for response in tree.findall("D:response", ns):
-            href = urllib.parse.unquote((response.findtext("D:href", namespaces=ns) or "").rstrip("/"))
-            if href.rstrip("/") == path.rstrip("/"):
+        for raw in raw_items:
+            if not isinstance(raw, dict):
                 continue
-            name = response.findtext(".//D:displayname", namespaces=ns) or Path(href).name
-            is_folder = response.find(".//D:collection", ns) is not None
-            rel = href[len(root_prefix.rstrip("/") + "/"):] if href.startswith(root_prefix.rstrip("/") + "/") else name
-            item = {
+            name = str(raw.get("name") or "").strip()
+            if not name or "/" in name or name in {".", ".."} or _is_hidden_shared_item(Path(name)):
+                continue
+            kind = _sftpgo_item_kind(raw)
+            item_path = child_path(path, name)
+            rel_path = _clean_shared_relative_path(item_path[len(root_path.rstrip("/") + "/"):] if item_path.startswith(root_path.rstrip("/") + "/") else name)
+            if not rel_path:
+                continue
+            size = raw.get("size")
+            size_bytes = int(size) if kind == "file" and isinstance(size, (int, float, str)) and str(size).isdigit() else None
+            item: Dict[str, Any] = {
+                "id": _safe_resource_id(rel_path),
                 "name": name,
-                "kind": "folder" if is_folder else "file",
-                "reference_uri": "shared://" + rel,
-                "open_url": "/api/assistant/shared-folder/open?path=" + urllib.parse.quote(rel),
+                "kind": kind,
+                "mime": (mimetypes.guess_type(name)[0] or "application/octet-stream") if kind == "file" else None,
+                "size_bytes": size_bytes,
+                "modified_at": _sftpgo_modified_at(raw),
             }
-            if is_folder and depth < max_depth:
-                item["children"] = list_dir(href, depth + 1, root_prefix)
+            if kind == "file":
+                item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel_path, safe='')}"
+                reference_uri = _shared_reference_uri(rel_path)
+                if reference_uri:
+                    item["reference_uri"] = reference_uri
+            elif kind == "folder":
+                cloud_url = _shared_cloud_browse_url(cloud, rel_path)
+                if cloud_url:
+                    item["cloud_url"] = cloud_url
+                if depth > 0:
+                    item["children"] = list_path(item_path, depth - 1)
+                    item["child_count"] = len(item["children"])
             items.append(item)
+            if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
+                break
         return items
 
-    return list_dir(root_path, 1, root_path)
+    return list_path(root_path, max(0, min(max_depth, _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)))
+
+
+def _webdav_cloud_url(cloud: Dict[str, Any]) -> str | None:
+    raw_url = str(cloud.get("webdav_url") or cloud.get("dav_url") or cloud.get("base_url") or "").strip()
+    parsed = urllib.parse.urlparse(raw_url.rstrip("/"))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+
+
+def _webdav_cloud_root_path(cloud: Dict[str, Any]) -> str:
+    return _clean_shared_cloud_path(str(cloud.get("path") or cloud.get("root_path") or "/")) or "/"
+
+
+def _webdav_auth_header(cloud: Dict[str, Any]) -> str | None:
+    import base64
+
+    username = str(cloud.get("username") or cloud.get("user") or "").strip()
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    password = _pass_first_line(pass_entry)
+    if not username or not pass_entry or not password:
+        return None
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def _webdav_request_url(base_url: str, path: str, *, directory: bool = True) -> str:
+    clean_path = _clean_shared_cloud_path(path) or "/"
+    suffix = "/" if directory and not clean_path.endswith("/") else ""
+    return f"{base_url}{urllib.parse.quote(clean_path, safe='/')}{suffix}"
+
+
+def _webdav_response_prop(response: Any, name: str) -> str | None:
+    value = response.findtext(f".//{{DAV:}}{name}")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _webdav_child_rel_path(root_path: str, href: str) -> str | None:
+    clean_href = _clean_shared_cloud_path(urllib.parse.unquote(urllib.parse.urlparse(href).path))
+    clean_root = _clean_shared_cloud_path(root_path) or "/"
+    if not clean_href or clean_href.rstrip("/") == clean_root.rstrip("/"):
+        return None
+    prefix = clean_root.rstrip("/") + "/"
+    if not clean_href.startswith(prefix):
+        return None
+    return _clean_shared_relative_path(clean_href[len(prefix):])
+
+
+def _webdav_cloud_items(cloud: Dict[str, Any]) -> list[Dict[str, Any]]:
+    import xml.etree.ElementTree as ET
+
+    base_url = _webdav_cloud_url(cloud)
+    auth_header = _webdav_auth_header(cloud)
+    root_path = _webdav_cloud_root_path(cloud)
+    max_depth = int(cloud.get("max_depth") or _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
+    if not base_url or not auth_header:
+        return []
+    propfind_body = (
+        '<?xml version="1.0" encoding="utf-8" ?>'
+        '<D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:getcontentlength/>'
+        '<D:getlastmodified/><D:resourcetype/></D:prop></D:propfind>'
+    ).encode("utf-8")
+
+    def list_path(path: str, depth: int) -> list[Dict[str, Any]]:
+        request = urllib.request.Request(
+            _webdav_request_url(base_url, path),
+            data=propfind_body,
+            method="PROPFIND",
+            headers={"Authorization": auth_header, "Depth": "1", "Content-Type": "application/xml", "User-Agent": "Hermes-CUI/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw_xml = response.read(512_000)
+            tree = ET.fromstring(raw_xml)
+        except Exception:
+            return []
+        items: list[Dict[str, Any]] = []
+        for raw_response in tree.findall("{DAV:}response"):
+            href = raw_response.findtext("{DAV:}href") or ""
+            current_rel = _webdav_child_rel_path(path, href)
+            rel_path = _webdav_child_rel_path(root_path, href)
+            if not current_rel or not rel_path:
+                continue
+            name = _webdav_response_prop(raw_response, "displayname") or Path(rel_path).name
+            if not name or "/" in name or name in {".", ".."} or _is_hidden_shared_item(Path(name)):
+                continue
+            is_folder = raw_response.find(".//{DAV:}resourcetype/{DAV:}collection") is not None
+            size_raw = _webdav_response_prop(raw_response, "getcontentlength")
+            item: Dict[str, Any] = {
+                "id": _safe_resource_id(rel_path),
+                "name": name,
+                "kind": "folder" if is_folder else "file",
+                "mime": None if is_folder else (mimetypes.guess_type(name)[0] or "application/octet-stream"),
+                "size_bytes": None if is_folder or not size_raw or not size_raw.isdigit() else int(size_raw),
+                "modified_at": _webdav_response_prop(raw_response, "getlastmodified"),
+            }
+            if is_folder:
+                cloud_url = _shared_cloud_browse_url(cloud, rel_path)
+                if cloud_url:
+                    item["cloud_url"] = cloud_url
+                if depth > 0:
+                    item["children"] = list_path(root_path.rstrip("/") + "/" + rel_path, depth - 1)
+                    item["child_count"] = len(item["children"])
+            else:
+                item["open_url"] = f"/api/assistant/shared-folder/open?path={urllib.parse.quote(rel_path, safe='')}"
+                reference_uri = _shared_reference_uri(rel_path)
+                if reference_uri:
+                    item["reference_uri"] = reference_uri
+            items.append(item)
+            if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
+                break
+        return items
+
+    return list_path(root_path, max(0, min(max_depth, _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)))
+
+
+def _download_webdav_cloud_file(cloud: Dict[str, Any], rel_path: str) -> tuple[bytes, str, str] | None:
+    clean = _clean_shared_relative_path(rel_path)
+    base_url = _webdav_cloud_url(cloud)
+    auth_header = _webdav_auth_header(cloud)
+    if not clean or not base_url or not auth_header:
+        return None
+    target_path = _clean_shared_cloud_path(_webdav_cloud_root_path(cloud).rstrip("/") + "/" + clean)
+    if not target_path:
+        return None
+    filename = Path(clean).name
+    request = urllib.request.Request(
+        _webdav_request_url(base_url, target_path, directory=False),
+        headers={"Authorization": auth_header, "User-Agent": "Hermes-CUI/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = response.headers.get("content-type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+            data = response.read(_ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES + 1)
+            if response.status >= 400 or len(data) > _ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES:
+                return None
+            return data, content_type, filename
+    except Exception:
+        return None
+
+
+def _download_sftpgo_pubshare_file(cloud: Dict[str, Any], rel_path: str) -> tuple[bytes, str, str] | None:
+    import http.cookiejar
+
+    clean = _clean_shared_relative_path(rel_path)
+    if not clean:
+        return None
+    base_url = str(cloud.get("base_url") or "").rstrip("/")
+    share_id = str(cloud.get("share_id") or "").strip().strip("/")
+    pass_entry = str(cloud.get("password_pass_entry") or cloud.get("pass_entry") or "").strip()
+    password = _pass_first_line(pass_entry)
+    if not base_url or not share_id or not pass_entry or not password:
+        return None
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    quoted_share_id = urllib.parse.quote(share_id, safe="")
+    login_next = urllib.parse.quote(f"/web/client/pubshares/{share_id}/browse", safe="")
+    login_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/login?next={login_next}"
+    try:
+        status, login_html = _urlopen_text(opener, urllib.request.Request(login_url, headers={"User-Agent": "Hermes-CUI/1.0"}))
+        if status >= 400:
+            return None
+        match = re.search(r'name="_form_token"\s+value="([^"]+)"', login_html)
+        if not match:
+            return None
+        body = urllib.parse.urlencode({"share_password": password, "_form_token": _html.unescape(match.group(1))}).encode()
+        status, browse_html = _urlopen_text(
+            opener,
+            urllib.request.Request(
+                login_url,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Hermes-CUI/1.0"},
+                method="POST",
+            ),
+        )
+        if status >= 400 or 'name="share_password"' in browse_html:
+            return None
+        csrf_match = re.search(r"'X-CSRF-TOKEN':\s*'([^']+)'", browse_html)
+        headers = {"User-Agent": "Hermes-CUI/1.0"}
+        if csrf_match:
+            headers["X-CSRF-TOKEN"] = csrf_match.group(1)
+        root_path = _clean_shared_cloud_path(str(cloud.get("path") or "/")) or "/"
+        target_path = _clean_shared_cloud_path(root_path.rstrip("/") + "/" + clean)
+        if not target_path:
+            return None
+        file_url = f"{base_url}/web/client/pubshares/{quoted_share_id}/browse?path={urllib.parse.quote(target_path, safe='')}"
+        with opener.open(urllib.request.Request(file_url, headers=headers), timeout=30) as response:
+            filename = Path(clean).name
+            content_type = response.headers.get("content-type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+            data = response.read(_ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES + 1)
+            if response.status >= 400 or len(data) > _ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES or "text/html" in content_type.lower():
+                return None
+            return data, content_type, filename
+    except Exception:
+        return None
 
 
 def _shared_folder_root() -> Path | None:
@@ -4857,17 +5207,14 @@ def _open_system_folder(path: Path, **_kwargs: Any) -> bool:
 
 
 def _shared_cloud_url(config: Dict[str, Any], relative_path: str = "") -> str | None:
-    cloud = _assistant_config_section(config, "dashboard", "shared_cloud")
-    base = str(cloud.get("base_url") or "").rstrip("/")
-    share_id = str(cloud.get("share_id") or "").strip()
-    if not base or not share_id:
-        return None
-    path = "/" + relative_path.strip("/")
-    return f"{base}/web/client/pubshares/{urllib.parse.quote(share_id)}/browse?path={urllib.parse.quote(path, safe='')}"
+    return _shared_cloud_browse_url(_shared_cloud_config(config), relative_path or None)
 
 
 def _safe_shared_path(root: Path, relative: str) -> Path:
     rel = urllib.parse.unquote(relative or "").lstrip("/")
+    clean = _clean_shared_relative_path(rel)
+    if not clean:
+        raise HTTPException(status_code=404, detail="Not found")
     target = (root / rel).resolve()
     if root not in target.parents and target != root:
         raise HTTPException(status_code=404, detail="Not found")
@@ -4906,24 +5253,55 @@ def _shared_item(path: Path, root: Path, config: Dict[str, Any], depth: int = 0,
 
 
 def _shared_folder_summary(config: Dict[str, Any], request: Request | None = None) -> Dict[str, Any]:
+    cloud = _shared_cloud_config(config)
     root = _resolve_shared_folder_root(config)
-    if root is None:
-        return {"status": "not_configured", "items": [], "can_open_folder": False}
-    paths = [
-        path
-        for path in sorted(root.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-        if not _is_hidden_shared_item(path)
-    ][: _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS]
-    items = [
-        _shared_item(path, root, config, max_depth=_ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
-        for path in paths
-    ]
-    can_open = bool(_can_open_system_folder() and _remote_open_allowed(request))
+    if root is not None:
+        paths = [
+            path
+            for path in sorted(root.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            if not _is_hidden_shared_item(path)
+        ][: _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS]
+        items = [
+            _shared_item(path, root, config, max_depth=_ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
+            for path in paths
+        ]
+        can_open = bool(_can_open_system_folder() and _remote_open_allowed(request))
+        payload = {
+            "status": "connected",
+            "summary": f"{len(items)} Dateien",
+            "items": items,
+            "source": "local",
+            "can_open_folder": can_open,
+            "visible_items": _ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS,
+            "max_depth": _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH,
+        }
+        cloud_url = _shared_cloud_url(config)
+        if cloud_url:
+            payload["cloud_url"] = cloud_url
+        return payload
+
+    if isinstance(cloud, dict):
+        items = _webdav_cloud_items(cloud) if _shared_cloud_uses_webdav(cloud) else _sftpgo_pubshare_items(cloud)
+        payload = {
+            "status": "connected" if items else "error",
+            "summary": f"{len(items)} Dateien" if items else "Cloud-Ordner konnte nicht geprüft werden",
+            "items": items,
+            "source": "cloud",
+            "can_open_folder": False,
+            "visible_items": _ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS,
+            "max_depth": _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH,
+        }
+        cloud_url = _shared_cloud_url(config)
+        if cloud_url:
+            payload["cloud_url"] = cloud_url
+        return payload
+
     payload = {
-        "status": "connected",
-        "summary": f"{len(items)} Dateien",
-        "items": items,
-        "can_open_folder": can_open,
+        "status": "not_configured",
+        "summary": "Nicht eingerichtet",
+        "items": [],
+        "source": "none",
+        "can_open_folder": False,
         "visible_items": _ASSISTANT_RESOURCE_DEFAULT_VISIBLE_ITEMS,
         "max_depth": _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH,
     }
@@ -4969,10 +5347,31 @@ def open_assistant_shared_folder_file(request: Request, payload: Dict[str, Any])
 @app.get("/api/assistant/shared-folder/open")
 def get_assistant_shared_folder_file(request: Request, path: str) -> Response:
     _require_token(request)
-    root = _shared_folder_root()
+    config = load_config()
+    root = _resolve_shared_folder_root(config)
     if root is None:
-        raise HTTPException(status_code=404, detail="Not found")
-    target = _safe_shared_path(root, path)
+        clean = _clean_shared_relative_path(path)
+        cloud = _shared_cloud_config(config)
+        downloaded = None
+        if clean and isinstance(cloud, dict):
+            downloaded = (
+                _download_webdav_cloud_file(cloud, clean)
+                if _shared_cloud_uses_webdav(cloud)
+                else _download_sftpgo_pubshare_file(cloud, clean)
+            )
+        if not downloaded:
+            raise HTTPException(status_code=404, detail="Not found")
+        data, ctype, filename = downloaded
+        ctype, disposition = _safe_shared_open_disposition(filename, ctype)
+        return Response(
+            data,
+            media_type=ctype,
+            headers={
+                "Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(filename)}",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    target = _safe_shared_path(root.resolve(), path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     if target.stat().st_size > _ASSISTANT_SHARED_FILE_OPEN_MAX_BYTES:
