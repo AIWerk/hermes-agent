@@ -1158,6 +1158,10 @@ class CuiContactCreateRequest(BaseModel):
 
 class CuiContactHideRequest(BaseModel):
     key: str = ""
+    id: str = ""
+    email: str = ""
+    phone: str = ""
+    display_name: str = ""
 
 
 class _CalendarHtmlToTextParser:
@@ -2032,24 +2036,64 @@ def _is_dashboard_spam_email_item(item: dict[str, Any]) -> bool:
             return True
     return False
 
+def _email_sort_key(item: dict[str, Any]) -> str:
+    value = item.get("received_at")
+    return value if isinstance(value, str) else ""
+
+
+def _parse_himalaya_email_date(value: Any) -> str | None:
+    """Normalize envelope dates once for mail and contact consumers."""
+    from datetime import datetime, timezone
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        return raw
+
+
+def _himalaya_envelope_to_resource_item(envelope: Any) -> dict[str, Any] | None:
+    if not isinstance(envelope, dict):
+        return None
+    item = dict(envelope)  # Keep structured sender and headers for spam checks.
+    ref = str(envelope.get("message_id") or envelope.get("id") or "").strip()
+    subject = str(envelope.get("subject") or "").strip()
+    sender = envelope.get("sender") or envelope.get("from") or ""
+    if isinstance(sender, dict):
+        address = str(sender.get("addr") or sender.get("address") or sender.get("email") or "")
+        sender = email.utils.formataddr((str(sender.get("name") or ""), address))
+    display_id = ref if re.fullmatch(r"[A-Za-z0-9_.-]+", ref) else _safe_resource_id(ref or f"mail-{subject}-{sender}")
+    item.update(id=display_id,
+                subject=subject, sender=sender,
+                received_at=_parse_himalaya_email_date(envelope.get("date") or envelope.get("received_at")))
+    if ref:
+        item["message_id"] = ref
+    return item
+
+
 def _unread_first_email_items(
     unread_items: list[dict[str, Any]],
     latest_items: list[dict[str, Any]] | None = None,
     *,
     min_items: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Keep backend order within unread and latest groups, hiding spam first."""
+    """Sort unread newest-first, retain latest top-up order, hide spam first."""
     if min_items is None:
         min_items = _ASSISTANT_EMAIL_PREVIEW_ITEMS
     combined: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for unread, items in ((True, unread_items), (False, latest_items or [])):
+    ordered_unread = sorted((item for item in unread_items if isinstance(item, dict)), key=_email_sort_key, reverse=True)
+    for unread, items in ((True, ordered_unread), (False, latest_items or [])):
         for item in items:
             if not unread and len(combined) >= min_items:
                 break
             if not isinstance(item, dict) or _is_dashboard_spam_email_item(item):
                 continue
-            ref = str(item.get("message_id") or item.get("id") or "")
+            ref = str(item.get("message_id") or item.get("id") or "").strip()
             if ref and ref in seen:
                 continue
             if ref:
@@ -2060,7 +2104,7 @@ def _unread_first_email_items(
                 address = str(sender.get("addr") or sender.get("address") or sender.get("email") or "")
                 sender = email.utils.formataddr((str(sender.get("name") or ""), address))
             normalized["sender"] = sender
-            normalized["received_at"] = item.get("received_at") or item.get("date") or ""
+            normalized["received_at"] = item.get("received_at") if "received_at" in item else item.get("date") or ""
             combined.append(normalized)
     return combined
 
@@ -2547,15 +2591,83 @@ def _assistant_config_section(config: Dict[str, Any], *path: str) -> Dict[str, A
 
 
 def _assistant_email_accounts(config: Dict[str, Any]) -> list[Dict[str, Any]]:
-    for section in (
-        _assistant_config_section(config, "assistant", "email"),
-        _assistant_config_section(config, "dashboard", "email"),
-        config.get("email") if isinstance(config.get("email"), dict) else {},
-    ):
-        accounts = section.get("accounts") if isinstance(section, dict) else None
-        if isinstance(accounts, list):
-            return [dict(item) for item in accounts if isinstance(item, dict)]
-    return []
+    section = _resource_account_section(config, "email", "mailbox")
+    return _resource_accounts(section, (("accounts", None), ("google_workspace", "google_workspace"), ("gmail", "gmail"), ("imap", "imap"), ("himalaya", "himalaya")))
+
+
+def _resource_account_section(config, singular, alias):
+    if not isinstance(config, dict):
+        return {}
+    for name in ("assistant", "dashboard", singular, alias):
+        section = config.get(name)
+        if not isinstance(section, dict):
+            continue
+        if name in (singular, alias):
+            return section
+        nested = section.get(singular) or section.get(alias)
+        if isinstance(nested, dict):
+            return nested
+    return {}
+
+
+def _email_account_dicts(raw, *, backend=None):
+    defaults = {}
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        if isinstance(raw.get("accounts"), list):
+            defaults = {k: v for k, v in raw.items() if k != "accounts"}
+            items = raw["accounts"]
+        else:
+            items = [raw]
+    else:
+        items = []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        account = {**defaults, **item}
+        if account.get("enabled") is False:
+            continue
+        if backend and not _email_backend_name(account):
+            account["backend"] = backend
+        result.append(account)
+    return result
+
+
+def _resource_accounts(section, groups):
+    if section.get("enabled") is False:
+        return []
+    accounts = []
+    for key, backend in groups:
+        accounts.extend(_email_account_dicts(section.get(key), backend=backend))
+    if not accounts and not any(key in section for key, _ in groups):
+        if _email_backend_name(section) or section.get("enabled") is True:
+            return [dict(section)]
+    return accounts
+
+
+def _is_microsoft_calendar_backend(backend):
+    return backend in {"microsoft_calendar", "microsoft-calendar", "microsoft", "outlook", "outlook_calendar", "outlook-calendar"}
+
+
+def _microsoft_calendar_account_label(account):
+    explicit = account.get("label") or account.get("name")
+    if explicit:
+        return str(explicit).strip()
+    for key in ("address", "email", "user_google_email", "google_email", "account"):
+        value = str(account.get(key) or "").strip()
+        if value and value != "me":
+            return value
+    return "Microsoft Kalender"
+
+
+def _microsoft_calendar_account_address(account, fallback):
+    for key in ("address", "email", "microsoft_email", "outlook_email", "user_principal_name"):
+        value = str(account.get(key) or "").strip()
+        if value and value != "me":
+            return value
+    return fallback
 
 
 def _email_backend_name(account: Dict[str, Any] | None) -> str:
@@ -2579,7 +2691,7 @@ def _email_account_address(account: Dict[str, Any]) -> str:
 
 def _email_account_configs(config: Dict[str, Any]) -> list[Dict[str, Any]]:
     accounts = _assistant_email_accounts(config)
-    if accounts:
+    if accounts or _resource_account_section(config, "email", "mailbox"):
         return accounts
     backend = str(os.environ.get("AIWERK_CUI_EMAIL_BACKEND") or "").strip()
     account = os.environ.get("AIWERK_CUI_EMAIL_ACCOUNT") or os.environ.get("HIMALAYA_ACCOUNT")
@@ -2611,17 +2723,11 @@ def _google_workspace_user_email(account: Dict[str, Any] | None = None, *, env_f
 
 
 def _calendar_accounts(config: Dict[str, Any]) -> list[Dict[str, Any]]:
-    accounts = _assistant_config_section(config, "calendar").get("accounts")
-    if isinstance(accounts, list):
-        return [dict(item) for item in accounts if isinstance(item, dict)]
-    accounts = _assistant_config_section(config, "dashboard", "calendar").get("accounts")
-    if isinstance(accounts, list):
-        return [dict(item) for item in accounts if isinstance(item, dict)]
-    return [
-        dict(account)
-        for account in _assistant_email_accounts(config)
-        if str(account.get("backend") or "").lower() in {"google_workspace", "google_calendar"}
-    ]
+    section = _resource_account_section(config, "calendar", "calendars")
+    accounts = _resource_accounts(section, (("accounts", "google_workspace"), ("google_workspace", "google_workspace"), ("google", "google_workspace"), ("microsoft_calendar", "microsoft_calendar"), ("microsoft", "microsoft_calendar"), ("outlook", "microsoft_calendar")))
+    if accounts or section:
+        return accounts
+    return [dict(account) for account in _email_account_configs(config) if _is_google_email_backend(_email_backend_name(account)) or _email_backend_name(account) == "google_calendar"]
 
 
 def _extract_bridge_text(payload: Dict[str, Any]) -> str:
@@ -2685,6 +2791,19 @@ def _resource_payload(name: str, config: Dict[str, Any] | None = None, request: 
     return payload
 
 
+def _assistant_initial_resource_payload(name: str, config: Dict[str, Any]) -> Dict[str, Any] | None:
+    payloads = {
+        "email": {"summary": "E-Mail wird aktualisiert…", "unread_count": 0, "items": [], "accounts": []},
+        "calendar": {"summary": "Kalender wird aktualisiert…", "items": [], "accounts": []},
+        "shared_folder": {"summary": "Shared Ordner wird aktualisiert…", "root_label": "Shared", "items": [], "total_count": 0},
+        "vault": {"summary": "Passwort-Tresor wird aktualisiert…", "vault_url": _vault_url_from_config(config), "item_count": 0, "weak_count": 0, "reused_count": 0, "compromised_count": None},
+        "contacts": {"summary": "Kontakte werden aktualisiert…", "source_label": "Relevante Kontakte", "items": [], "relevant": [], "frequent": [], "manual": [], "total_count": 0, "manual_count": 0, "connected_count": 0, "interaction_count": 0, "saved_count": 0, "saved_top_up_target": 0, "relevance_window_days": 10},
+    }
+    if name not in payloads:
+        return None
+    return {"status": "loading", "refreshing": True, **payloads[name]}
+
+
 def _assistant_resources_payload(request: Request | None = None, *, force_refresh: bool = False, refresh_resource: str | None = None) -> Dict[str, Any]:
     config = load_config()
     if force_refresh and refresh_resource in {"email", "calendar", "contacts", "connectors"}:
@@ -2700,6 +2819,7 @@ def _assistant_resources_payload(request: Request | None = None, *, force_refres
             lambda name=name: _resource_payload(name, config, request),
             force_refresh=force_refresh and refresh_resource in {None, name},
             stale_while_revalidate=bool((not force_refresh) and (refresh_resource == name or refresh_resource is None)),
+            initial_payload=_assistant_initial_resource_payload(name, config) if refresh_resource is None and not force_refresh else None,
         )
         if name == "contacts" and isinstance(payload, dict):
             payload = _filter_contacts_payload(
@@ -3511,7 +3631,7 @@ def submit_assistant_support(request: Request, payload: AssistantSupportRequest)
 
 
 def _contacts_store_path() -> Path:
-    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "cui_contacts.json"
+    return get_hermes_home() / "cui_contacts.json"
 
 
 def _read_contacts_store_payload() -> Dict[str, Any]:
@@ -3522,17 +3642,23 @@ def _read_contacts_store_payload() -> Dict[str, Any]:
 
 
 def _read_manual_contacts() -> list[Dict[str, Any]]:
-    payload = os.getenv("AIWERK_CUI_CONTACTS_JSON")
+    contacts = list(_read_contacts_store_payload().get("contacts", []))
+    payload = os.getenv("AIWERK_CUI_CONTACTS_JSON", "").strip()
     if payload:
         try:
+            if not payload.startswith(("{", "[")):
+                with Path(payload).expanduser().open("rb") as stream:
+                    raw = stream.read(256001)
+                if len(raw) > 256000:
+                    raise ValueError("Contact file exceeds size limit")
+                payload = raw.decode("utf-8")
             data = _json.loads(payload)
-            if isinstance(data, list):
-                return [_normalize_contact_item(item) for item in data if isinstance(item, dict)]
-            if isinstance(data, dict):
-                return [_normalize_contact_item(item) for item in data.get("contacts", []) if isinstance(item, dict)]
-        except Exception:
-            return []
-    return [_normalize_contact_item(item) for item in _read_contacts_store_payload().get("contacts", []) if isinstance(item, dict)]
+            rows = data if isinstance(data, list) else data.get("items", data.get("contacts", [])) if isinstance(data, dict) else []
+            if isinstance(rows, list):
+                contacts.extend(rows)
+        except (OSError, ValueError, UnicodeError):
+            pass
+    return [_normalize_contact_item({"source": "Manuell", "relevance": "frequent", **item}) for item in contacts if isinstance(item, dict)]
 
 
 def _write_contacts_store_payload(payload: Dict[str, Any]) -> None:
@@ -3589,11 +3715,12 @@ def _dedupe_contact_badges(values: Iterable[Any], *, limit: int = 4) -> list[str
 
 
 def _normalize_contact(value: Any) -> str:
-    return _unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii").lower()
+    text = _unicodedata.normalize("NFKD", _safe_contact_text(value, 500).casefold())
+    return "".join(char for char in text if not _unicodedata.combining(char))
 
 
 def _contact_search_haystack(contact: Dict[str, Any]) -> str:
-    return _normalize_contact(" ".join(str(contact.get(key) or "") for key in ("name", "email", "phone")))
+    return _normalize_contact(" ".join(str(contact.get(key) or "") for key in ("display_name", "name", "email", "phone", "organization", "role", "note")))
 
 
 def _contact_matches_query(contact: Dict[str, Any], query: str) -> bool:
@@ -3614,6 +3741,13 @@ def _contact_hide_keys(contact: Dict[str, Any]) -> set[str]:
         if value:
             keys.add(value)
             keys.add(f"{key}:{value}")
+            if key == 'id':
+                # Generated IDs can be 120 chars; supplied DTO IDs sanitize to 80.
+                # Match both representations without changing persisted identity.
+                keys.update((value[:80], f'id:{value[:80]}'))
+    phone = re.sub(r"[^0-9+]", "", _safe_contact_phone(contact.get("phone")))
+    if phone:
+        keys.add(f"phone:{phone}")
     name = _normalize_contact(contact.get("display_name") or contact.get("name"))
     if name:
         keys.add(f"name:{name}")
@@ -3672,10 +3806,20 @@ def _dedupe_contacts(contacts: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         if key in seen:
             existing = seen[key]
             existing["source_badges"] = _dedupe_contact_badges([*existing["source_badges"], *contact["source_badges"]])
+            for field in ("organization", "role", "email", "phone", "note", "last_interaction_at"):
+                if not existing.get(field) and contact.get(field):
+                    existing[field] = contact[field]
+            existing["interaction_count"] = int(existing.get("interaction_count") or 0) + int(contact.get("interaction_count") or 0)
+            existing["last_interaction_at"] = max(existing.get("last_interaction_at") or "", contact.get("last_interaction_at") or "")
+            existing["interaction_score"] = round(float(existing.get("interaction_score") or 0) + float(contact.get("interaction_score") or 0), 2)
             continue
         seen[key] = contact
         deduped.append(contact)
     return deduped
+
+
+def _rank_contacts(contacts: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    return sorted(contacts, key=lambda c: (float(c.get('interaction_score') or 0), int(c.get('interaction_count') or 0), str(c.get('last_interaction_at') or ''), str(c.get('display_name') or '').lower()), reverse=True)
 
 
 def _filter_contacts_payload(payload: Dict[str, Any], *, own_emails: set[str]) -> Dict[str, Any]:
@@ -3685,12 +3829,42 @@ def _filter_contacts_payload(payload: Dict[str, Any], *, own_emails: set[str]) -
     for key in ("items", "contacts", "frequent", "relevant"):
         value = filtered.get(key)
         if isinstance(value, list):
-            filtered[key] = _filter_human_contacts([_normalize_contact_item(item) for item in value if isinstance(item, dict)], own_emails=own_emails)
+            filtered[key] = _filter_hidden_contacts(_filter_human_contacts([_normalize_contact_item(item) for item in value if isinstance(item, dict)], own_emails=own_emails))
             for contact in filtered[key]:
                 contact["source_badges"] = [badge for badge in contact["source_badges"] if _safe_contact_email(badge) not in own_emails]
     if not filtered.get("items") and "items" in filtered:
         filtered["total_count"] = 0
     return filtered
+
+
+def _contact_message_participants(item: Dict[str, Any], *, sent: bool, source: str, date: str = "") -> list[Dict[str, Any]]:
+    """Project counterparties only; structured envelopes share this boundary."""
+    from email.utils import formataddr
+    contacts: list[Dict[str, Any]] = []
+    fields = ("to", "cc", "bcc") if sent else ("from",)
+    for field in fields:
+        value = (item.get("from") or item.get("sender")) if field == "from" else item.get(field)
+        for address in value if isinstance(value, list) else [value]:
+            if isinstance(address, dict):
+                address = formataddr((str(address.get("name") or ""), str(address.get("addr") or address.get("email") or "")))
+            if not isinstance(address, str):
+                continue
+            contacts.extend(_contacts_from_address_text(address, source=source, score=5.0 if sent else 4.0, last_interaction_at=date, relevance="relevant"))
+    return contacts
+
+
+def _gmail_contact_is_bulk(item: Dict[str, Any]) -> bool:
+    headers = {str(k).lower().replace("-", "_"): v for k, v in item.items()}
+    return (str(headers.get("precedence") or "").strip().lower() in {"bulk", "junk", "list"}
+            or bool(headers.get("list_unsubscribe"))
+            or str(headers.get("auto_submitted") or "").strip().lower() not in {"", "no"})
+
+
+def _gmail_contact_is_sent(item: Dict[str, Any], own_emails: set[str]) -> bool:
+    labels = item.get("label_ids") or item.get("labelIds") or item.get("labels") or []
+    if isinstance(labels, str):
+        labels = re.split(r"[\s,]+", labels)
+    return "SENT" in {str(label).upper() for label in labels} or _safe_contact_email(item.get("from") or item.get("sender")) in own_emails
 
 
 def _contacts_from_google_workspace_query_interactions(
@@ -3724,19 +3898,12 @@ def _contacts_from_google_workspace_query_interactions(
                 server=server,
                 user_google_email=user_google_email,
             ) if ids else []:
-                for value in (item.get("from"), item.get("sender"), item.get("to"), item.get("cc"), item.get("bcc")):
-                    contacts.extend(_contacts_from_address_text(value, source="Gmail"))
+                sent = _gmail_contact_is_sent(item, blocked_own | {_safe_contact_email(user_google_email)})
+                if sent or not _gmail_contact_is_bulk(item):
+                    contacts.extend(_contact_message_participants(item, sent=sent, source="Gesendet" if sent else "Aus E-Mail", date=item.get("received_at") or item.get("date") or ""))
         except Exception as exc:
             _log.debug("CUI Gmail contact query scan failed for %s/%s/%s: %s", server, user_google_email, query, exc)
-    filtered: list[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for contact in contacts:
-        email_key = str(contact.get("email") or "").strip().lower()
-        if not email_key or email_key in seen or not _contact_is_customer_safe(contact, blocked_own):
-            continue
-        seen.add(email_key)
-        filtered.append(contact)
-    return filtered
+    return _rank_contacts(_dedupe_contacts(_filter_contacts_payload({'items': contacts}, own_emails=blocked_own)['items']))
 
 
 def _contacts_from_gmail_query_blocks(config: Dict[str, Any], query: str) -> list[Dict[str, Any]]:
@@ -3757,10 +3924,26 @@ def _parse_google_contacts(text: str) -> list[Dict[str, Any]]:
         elif line.lower().startswith("name:"):
             current["display_name"] = line.split(":", 1)[1].strip()
         elif line.lower().startswith("email:"):
-            current["email"] = _safe_contact_email(line.split(":", 1)[1])
+            value = _safe_contact_email(line.split(":", 1)[1])
+            if value:
+                current.setdefault('email', value)
+                values = current.setdefault('emails', [])
+                if value not in values and len(values) < 5:
+                    values.append(value)
         elif line.lower().startswith("phone:"):
             value = line.split(":", 1)[1].strip()
-            current["phone"] = _safe_contact_phone(re.sub(r"\s*\([^)]*\)\s*$", "", value).strip() or value)
+            value = _safe_contact_phone(re.sub(r"\s*\([^)]*\)\s*$", "", value).strip() or value)
+            if value:
+                current.setdefault('phone', value)
+                values = current.setdefault('phones', [])
+                if value not in values and len(values) < 5:
+                    values.append(value)
+        elif line.lower().startswith('organization:'):
+            value = line.split(':', 1)[1].strip()
+            if ' at ' in value:
+                current['role'], current['organization'] = value.split(' at ', 1)
+            else:
+                current['organization'] = value
     if current:
         contacts.append(current)
     return contacts
@@ -3768,16 +3951,10 @@ def _parse_google_contacts(text: str) -> list[Dict[str, Any]]:
 
 def _contact_account_configs(config: Dict[str, Any]) -> list[Dict[str, Any]]:
     contacts_cfg = _assistant_config_section(config, "contacts")
-    accounts = contacts_cfg.get("accounts")
-    if isinstance(accounts, list) and accounts:
-        source = [dict(item) for item in accounts if isinstance(item, dict)]
-    else:
-        source = [
-            dict(account)
-            for account in _email_account_configs(config)
-            if _email_backend_name(account) in {"google_workspace", "google", "gmail"}
-        ]
-    if not source and (os.environ.get("AIWERK_CUI_GOOGLE_EMAIL") or os.environ.get("AIWERK_CUI_GOOGLE_WORKSPACE_SERVER")):
+    source = _resource_accounts(contacts_cfg, (("accounts", "google_workspace"), ("google_workspace", "google_workspace")))
+    if not source and not contacts_cfg:
+        source = [dict(account) for account in _email_account_configs(config) if _is_google_email_backend(_email_backend_name(account))]
+    if not source and not contacts_cfg and (os.environ.get("AIWERK_CUI_GOOGLE_EMAIL") or os.environ.get("AIWERK_CUI_GOOGLE_WORKSPACE_SERVER")):
         source = [{"backend": "google_workspace"}]
     normalized: list[Dict[str, Any]] = []
     for account in source:
@@ -3813,9 +3990,13 @@ def _contacts_from_google_workspace(config: Dict[str, Any], query: str = "", lim
             continue
         items = payload.get("contacts") or payload.get("items") if isinstance(payload, dict) else None
         if isinstance(items, list):
-            contacts.extend(dict(item) for item in items if isinstance(item, dict))
+            parsed = [dict(item) for item in items if isinstance(item, dict)]
         else:
-            contacts.extend(_parse_google_contacts(_extract_bridge_text(payload)))
+            parsed = _parse_google_contacts(_extract_bridge_text(payload))
+        for item in parsed:
+            item['source_badges'] = _dedupe_contact_badges(['Google Contacts', account.get('label') or user_google_email, *(item.get('source_badges') or []), 'Gespeichert'])
+            item.setdefault('relevance', 'frequent')
+            contacts.append(_normalize_contact_item(item))
     return contacts[:page_size]
 
 
@@ -3832,7 +4013,7 @@ def _contacts_from_google_workspace_interactions(config: Dict[str, Any], own_ema
     for account in _contact_account_configs(config):
         server = str(account.get("server") or "google-workspace-aiwerk")
         user_google_email = str(account.get("user_google_email") or "me")
-        for query in queries:
+        for sent, query in zip((True, False), queries):
             ids = _gmail_bridge_search_message_ids(
                 config,
                 query,
@@ -3846,18 +4027,19 @@ def _contacts_from_google_workspace_interactions(config: Dict[str, Any], own_ema
                 server=server,
                 user_google_email=user_google_email,
             ) if ids else []:
-                for value in (item.get("sender"), item.get("from"), item.get("to"), item.get("cc")):
-                    contacts.extend(_contacts_from_address_text(value, source="Gmail"))
-    return [contact for contact in contacts if _contact_is_customer_safe(contact, own_emails)]
+                if sent or not _gmail_contact_is_bulk(item):
+                    contacts.extend(_contact_message_participants(item, sent=sent, source="Gesendet" if sent else "Aus E-Mail", date=item.get("received_at") or item.get("date") or ""))
+    return _rank_contacts(_dedupe_contacts(_filter_contacts_payload({'items': contacts}, own_emails=own_emails)['items']))
 
 
-def _contacts_from_address_text(value: Any, *, source: str) -> list[Dict[str, Any]]:
+def _contacts_from_address_text(value: Any, *, source: str, score: float = 1.0, last_interaction_at: Any = None, relevance: str = "frequent") -> list[Dict[str, Any]]:
     text = str(value or "")
     contacts: list[Dict[str, Any]] = []
     for name, address in email.utils.getaddresses([text]):
         address = _safe_contact_email(address)
         if address and not any(contact.get("email") == address for contact in contacts):
-            contacts.append(_normalize_contact_item({"display_name": name or address, "email": address, "source_badges": [source]}))
+            display_name = name or address.split("@", 1)[0].replace(".", " ").replace("_", " ").title()
+            contacts.append(_normalize_contact_item({"display_name": display_name, "email": address, "source_badges": [source, "Relevant" if relevance == "relevant" else "Häufig"], "interaction_count": 1, "interaction_score": score, "last_interaction_at": last_interaction_at, "relevance": relevance}))
     return contacts
 
 
@@ -3899,9 +4081,18 @@ def _contacts_from_himalaya_interactions(config: Dict[str, Any], own_emails: set
         for sent in (True, False):
             folder = _himalaya_contact_folder(account, sent=sent)
             for item in _run_himalaya_envelope_list(page_size=limit, account=account_name or None, folder=folder):
-                for value in (item.get("from"), item.get("sender"), item.get("to"), item.get("cc")):
-                    contacts.extend(_contacts_from_address_text(value, source="E-Mail"))
-    return [contact for contact in contacts if _contact_is_customer_safe(contact, own_emails)]
+                if not isinstance(item, dict):
+                    continue
+                from datetime import datetime, timedelta, timezone
+                date = _parse_himalaya_email_date(item.get("date")) or ""
+                try:
+                    parsed = datetime.fromisoformat(date.replace("Z", "+00:00"))
+                    if parsed < datetime.now(timezone.utc) - timedelta(days=_contacts_relevance_window_days()):
+                        continue
+                except (ValueError, OverflowError):
+                    pass  # Historical unknown-date fallback admits the contact.
+                contacts.extend(_contact_message_participants(item, sent=sent, source="Gesendet" if sent else "Aus E-Mail", date=date))
+    return _rank_contacts(_dedupe_contacts(_filter_contacts_payload({'items': contacts}, own_emails=own_emails)['items']))
 
 
 def _normalize_contact_item(contact: Dict[str, Any]) -> Dict[str, Any]:
@@ -3909,17 +4100,35 @@ def _normalize_contact_item(contact: Dict[str, Any]) -> Dict[str, Any]:
     phones = contact.get("phones") if isinstance(contact.get("phones"), list) else []
     email = _safe_contact_email(contact.get("email") or (emails[0] if emails else ""))
     phone = _safe_contact_phone(contact.get("phone") or (phones[0] if phones else ""))
-    name = _safe_contact_text(contact.get("display_name") or contact.get("name") or email, 120)
+    name = _safe_contact_text(contact.get("display_name") or contact.get("name") or contact.get("label"), 120)
+    if not name and email:
+        name = email.split("@", 1)[0].replace(".", " ").title()
     badges = contact.get("source_badges")
     badges = badges if isinstance(badges, list) else [contact.get("source") or "Google"]
-    return {
+    normalized = {
         **contact,
+        "id": _safe_contact_text(contact.get("id"), 80),
         "display_name": name,
         "name": name,
         "email": email,
         "phone": phone,
         "source_badges": _dedupe_contact_badges(badges),
     }
+    if not normalized["id"]:
+        # Contact-local historical recipe; do not change other resource IDs.
+        seed = "|".join((email, phone, name))
+        normalized["id"] = (re.sub(r"[^A-Za-z0-9._:-]+", "-", seed).strip(".-_:") or "contact")[:120]
+    for key, fallback, limit in (("organization", "company", 120), ("role", "title", 120), ("note", "note", 240), ("relevance", "relevance", 40), ("last_interaction_at", "last_interaction_at", 80)):
+        normalized[key] = _safe_contact_text(contact.get(key) or contact.get(fallback), limit)
+    for key, cast in (("interaction_count", int), ("interaction_score", float)):
+        normalized.pop(key, None)
+        try:
+            value = cast(contact.get(key) or 0)
+            if value > 0:
+                normalized[key] = round(value, 2) if key == "interaction_score" else value
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return normalized
 
 
 _SYSTEM_CONTACT_LOCALPARTS = {
@@ -3963,12 +4172,16 @@ def _contacts_saved_top_up_target() -> int:
 def _contact_is_customer_safe(contact: Dict[str, Any], own_emails: set[str]) -> bool:
     email = _safe_contact_email(contact.get("email"))
     name = str(contact.get("display_name") or contact.get("name") or "").lower()
-    if not email or email in own_emails:
+    if (not email and not _safe_contact_phone(contact.get("phone"))) or (email and email in own_emails):
         return False
     local = email.split("@", 1)[0] if "@" in email else ""
     compact_local = re.sub(r"[^a-z0-9]", "", local)
     haystack = f"{name} {contact.get('organization') or ''} {email}".lower()
     if local in _SYSTEM_CONTACT_LOCALPARTS or compact_local in {"noreply", "donotreply"}:
+        return False
+    if local in {"ertesites", "értesítés"} and email.rsplit("@", 1)[-1] == "kozpontirendszer.gov.hu":
+        return False
+    if name.strip() in _SYSTEM_CONTACT_LOCALPARTS or re.sub(r"[^a-z0-9]", "", name) in {"root", "noreply", "donotreply"}:
         return False
     if any(local.startswith(f"{prefix}-") or local.startswith(f"{prefix}+") for prefix in _SYSTEM_CONTACT_LOCALPARTS):
         return False
@@ -4086,16 +4299,27 @@ def create_cui_contact(request: Request, payload: CuiContactCreateRequest) -> Di
 @app.post("/api/cui/contacts/hide")
 def hide_cui_contact(request: Request, payload: CuiContactHideRequest) -> Dict[str, Any]:
     _require_token(request)
+    keys = _contact_hide_keys(payload.model_dump())
+    if not keys:
+        raise HTTPException(status_code=400, detail="Contact identity required")
     store = _read_contacts_store_payload()
     hidden = set(store.get("hidden") or [])
-    hidden.add(payload.key)
+    hidden.update(keys)
     store["hidden"] = sorted(hidden)
     _write_contacts_store_payload(store)
-    return {"ok": True}
+    _assistant_invalidate_resource_cache("contacts")
+    return {"ok": True, "hidden": store["hidden"]}
 
 
-def _todo_path() -> Path:
-    return Path(os.getenv("AIWERK_CUI_TODO_PATH") or (Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "assistant_todos.md"))
+def _todo_path(config: Dict[str, Any] | None = None) -> Path:
+    config = load_config() if config is None else config
+    section = {}
+    for parent in (config.get("dashboard"), config.get("assistant"), config):
+        if isinstance(parent, dict) and isinstance(parent.get("todos"), dict):
+            section = parent["todos"]
+            break
+    raw = os.getenv("AIWERK_CUI_TODO_PATH") or section.get("path") or section.get("todo_path")
+    return Path(str(raw)).expanduser() if raw else hermes_constants.get_hermes_home() / "TODO.md"
 
 
 def _read_todo_lines(path: Path | None = None) -> list[str]:
@@ -4129,10 +4353,14 @@ def _todo_items(lines: list[str]) -> list[Dict[str, Any]]:
         id_match = re.search(r"\bid=([A-Za-z0-9_.:-]+)", meta)
         item_id = id_match.group(1) if id_match else f"line-{index + 1}"
         full_text = re.sub(r"\s*<!--\s*hermes:[^>]*-->\s*$", "", match.group("text")).strip()
+        full_text = re.sub(r"<!--\s*hermes:[^>]*-->", "", full_text)
+        full_text = re.sub(r"`([^`]+)`", r"\1", full_text)
+        full_text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", full_text)
+        full_text = re.sub(r"\s+", " ", full_text).strip()[:4000]
         items.append({
             "id": item_id,
             "line": index + 1,
-            "text": full_text,
+            "text": full_text[:180],
             "full_text": full_text,
             "done": match.group("done").lower() == "x",
             "metadata": meta.strip(),
@@ -4189,7 +4417,7 @@ def _todo_response() -> Dict[str, Any]:
 
 
 def _todo_summary(_config: Dict[str, Any]) -> Dict[str, Any]:
-    items = _todo_items(_read_todo_lines())
+    items = _todo_items(_read_todo_lines(_todo_path(_config)))
     open_items = [item for item in items if not item["done"]]
     done_count = len(items) - len(open_items)
     return {
@@ -4241,9 +4469,16 @@ def _assistant_support_section(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
 
 def _calendar_account_config_for_ref(config: Dict[str, Any], ref: str) -> Dict[str, Any]:
     ref_l = str(ref or "").strip().lower()
+    if not ref_l:
+        return {}
     for account in _calendar_accounts(config):
         candidates = (
             account.get("id"),
+            _microsoft_calendar_account_label(account) if _is_microsoft_calendar_backend(_email_backend_name(account)) else _email_account_label(account),
+            _microsoft_calendar_account_address(account, _microsoft_calendar_account_label(account)) if _is_microsoft_calendar_backend(_email_backend_name(account)) else _email_account_address(account),
+            account.get("google_email"),
+            account.get("microsoft_email"),
+            account.get("outlook_email"),
             account.get("email"),
             account.get("address"),
             account.get("user_principal_name"),
@@ -4347,24 +4582,20 @@ def _reader_response(title: str, rows: list[tuple[str, Any]]) -> Response:
 
 def _find_email_account_config(config: Dict[str, Any], account_ref: str) -> Dict[str, Any] | None:
     wanted = str(account_ref or "").strip().lower()
+    if not wanted:
+        return None
     for account in _email_account_configs(config):
-        candidates = {
-            _email_account_address(account),
-            _email_account_label(account),
-            str(account.get("account") or ""),
-            str(account.get("user_google_email") or ""),
-        }
-        if wanted in {candidate.strip().lower() for candidate in candidates if candidate}:
+        backend = _email_backend_name(account)
+        if not (_is_google_email_backend(backend) or backend in {"himalaya", "imap"} or account.get("enabled") is True):
+            continue
+        candidates = (_email_account_address(account), _email_account_label(account), account.get("account"), account.get("user_google_email"), account.get("google_email"))
+        if wanted in {str(candidate).strip().lower() for candidate in candidates if candidate}:
             return account
-    if os.environ.get("AIWERK_CUI_EMAIL_BACKEND") or os.environ.get("AIWERK_CUI_GOOGLE_EMAIL") or os.environ.get("AIWERK_CUI_EMAIL_ACCOUNT"):
-        for account in _email_account_configs(config):
-            if account:
-                return account
     return None
 
 
 def _is_google_email_backend(backend: str) -> bool:
-    return str(backend or "").strip().lower() in {"google_workspace", "google", "gmail"}
+    return str(backend or "").strip().lower() in {"aiwerk_bridge", "aiwerk-bridge", "google_workspace", "google-workspace", "google", "gmail", "mcp"}
 
 
 def _email_open_url(account: Dict[str, Any], item: Dict[str, Any]) -> str:
@@ -4401,16 +4632,10 @@ def view_assistant_email(request: Request, account: str, id: str) -> Response:
     received_at = ""
     try:
         resources = _assistant_resources_payload(request, force_refresh=False)
-        accounts = ((resources.get("email") or {}).get("accounts") or []) if isinstance(resources, dict) else []
-        for account_entry in accounts:
-            if str(account_entry.get("address") or account_entry.get("label") or "").strip().lower() != account_ref.lower():
-                continue
-            for item in account_entry.get("items") or []:
-                if message_id in {str(item.get("message_id") or ""), str(item.get("id") or "")}:
-                    sender = str(item.get("sender") or "")
-                    subject = str(item.get("subject") or subject)
-                    received_at = str(item.get("received_at") or "")
-                    break
+        metadata = _find_resource_email_metadata(resources, account_ref, message_id)
+        sender = str(metadata.get("sender") or "")
+        subject = str(metadata.get("subject") or subject)
+        received_at = str(metadata.get("received_at") or "")
     except Exception:
         _log.debug("Could not hydrate email metadata for reader", exc_info=True)
     try:
@@ -4447,6 +4672,19 @@ def view_assistant_email_post(request: Request, payload: Dict[str, Any]) -> Dict
     return {"html": _plain_email_reader_html(payload)}
 
 
+def _find_resource_email_metadata(resources: Any, account_ref: str, message_id: str) -> Dict[str, Any]:
+    email = resources.get("email") if isinstance(resources, dict) else None
+    accounts = email.get("accounts") if isinstance(email, dict) else None
+    for account in accounts if isinstance(accounts, list) else []:
+        if not isinstance(account, dict) or str(account.get("address") or account.get("label") or "").strip().casefold() != account_ref.strip().casefold():
+            continue
+        items = account.get("items")
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and message_id in {str(item.get("message_id") or "").strip(), str(item.get("id") or "").strip()}:
+                return dict(item)
+    return {}
+
+
 @app.post("/api/assistant/attachments/resource")
 def attach_assistant_resource(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
     _require_token(request)
@@ -4456,16 +4694,47 @@ def attach_assistant_resource(request: Request, payload: Dict[str, Any]) -> Dict
     kind = str(payload.get("kind") or item.get("kind") or "").strip().lower()
     if kind == "shared_file":
         return {"attachments": [_create_shared_file_attachment(load_config(), item, session_id)]}
+    if kind == "email":
+        config = load_config()
+        account_ref = str(item.get("account_address") or item.get("account_label") or item.get("account") or "").strip()
+        message_id = str(item.get("message_id") or item.get("id") or "").strip()
+        if not account_ref or not message_id:
+            raise HTTPException(status_code=400, detail="Missing email account or message id")
+        account_cfg = _find_email_account_config(config, account_ref)
+        if not account_cfg:
+            raise HTTPException(status_code=404, detail="Email account not configured")
+        backend = _email_backend_name(account_cfg)
+        try:
+            item.update(_find_resource_email_metadata(_assistant_resources_payload(request, force_refresh=False), account_ref, message_id))
+        except Exception:
+            _log.debug("Could not hydrate email attachment metadata", exc_info=True)
+        try:
+            if _is_google_email_backend(backend):
+                body = _run_google_workspace_message_read(config, account_cfg, message_id)
+            else:
+                body = _run_himalaya_message_read(message_id, account=str(account_cfg.get("account") or account_cfg.get("name") or "").strip() or None, folder=str(account_cfg.get("folder") or account_cfg.get("mailbox") or "").strip() or None)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid message id")
+        except FileNotFoundError:
+            raise HTTPException(status_code=503, detail="Himalaya is not installed")
+        except Exception as exc:
+            _log.debug("CUI email attachment failed: %s", exc)
+            raise HTTPException(status_code=502, detail="Email could not be loaded") from exc
+        lines = ["Attached email context", f"Account: {account_ref}", f"From: {item.get('sender') or 'Unbekannt'}", f"Subject: {item.get('subject') or 'Ohne Betreff'}", f"Date: {item.get('received_at') or ''}", f"Source: {item.get('source') or backend}", _strip_email_reader_transport_metadata(body)]
+    elif kind == "calendar_event":
+        lines = ["Attached calendar event context", f"Title: {item.get('title') or 'Termin'}", f"Starts: {item.get('starts_at') or ''}", f"Ends: {item.get('ends_at') or ''}", f"Location: {item.get('location_hint') or ''}", f"Account: {item.get('account_address') or item.get('account_label') or ''}", f"Source: {item.get('source') or 'calendar'}"]
+        if item.get("html_link"):
+            lines.append("Link: [LINK]")
+    elif kind == "contact":
+        badges = item.get("source_badges")
+        source = ", ".join(str(b) for b in badges if str(b).strip()) if isinstance(badges, list) else ""
+        lines = ["Attached contact context", f"Name: {item.get('display_name') or item.get('name') or item.get('email') or item.get('phone') or 'Kontakt'}", f"Organization: {item.get('organization') or ''}", f"Role: {item.get('role') or ''}", f"Email: {item.get('email') or ''}", f"Phone: {item.get('phone') or ''}", f"Source: {source or item.get('source') or 'contacts'}"]
+    else:
+        lines = [str(item.get("title") or item.get("name") or "Resource"), str(item.get("account_address") or ""), str(item.get("location_hint") or item.get("description") or item.get("html_link") or ""), str(item.get("html_link") or "")]
     root = hermes_constants.get_hermes_home() / "dashboard_uploads"
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{secrets.token_hex(8)}-{session_id}-resource.txt"
-    lines = [
-        str(item.get("title") or item.get("name") or "Resource"),
-        str(item.get("account_address") or ""),
-        _sanitize_reader_text(item.get("location_hint") or item.get("description") or item.get("html_link") or ""),
-        _sanitize_reader_text(item.get("html_link") or ""),
-    ]
-    path.write_text("\n".join(line for line in lines if line), encoding="utf-8")
+    path.write_text("\n".join(_sanitize_reader_text(line) for line in lines if line), encoding="utf-8")
     return {"attachments": [{"name": path.name, "path": str(path), "extraction": "text", "is_image": False}]}
 
 
@@ -4478,7 +4747,7 @@ def view_assistant_calendar_event(request: Request, account: str, id: str) -> Re
         if str(acct.get("address") or "").lower() != account.lower():
             continue
         for item in acct.get("items", []):
-            if str(item.get("id") or item.get("event_id") or "") == id:
+            if str(item.get("event_id") or item.get("id") or "").strip() == id:
                 found = dict(item)
                 break
     if found is None:
@@ -4486,15 +4755,15 @@ def view_assistant_calendar_event(request: Request, account: str, id: str) -> Re
     config = load_config()
     account_cfg = _calendar_account_config_for_ref(config, account)
     source = str(found.get("source") or account_cfg.get("backend") or "").lower()
-    if (not found.get("description") and not found.get("location_hint")) or source in {"microsoft_calendar", "outlook"}:
+    if (not found.get("description") and not found.get("location_hint")) or _is_microsoft_calendar_backend(source):
         try:
             detail_payload = (
                 _fetch_microsoft_calendar_event_detail(config, account_cfg, id)
-                if source in {"microsoft_calendar", "outlook"}
+                if _is_microsoft_calendar_backend(source)
                 else _fetch_google_workspace_calendar_event_detail(config, account_cfg, id)
             )
             detail_text = _extract_bridge_text(detail_payload)
-            if source in {"microsoft_calendar", "outlook"}:
+            if _is_microsoft_calendar_backend(source):
                 try:
                     detail = _json.loads(detail_text)
                 except Exception:
@@ -4505,6 +4774,7 @@ def view_assistant_calendar_event(request: Request, account: str, id: str) -> Re
                     "location_hint": (detail.get("location") or {}).get("displayName") if isinstance(detail.get("location"), dict) else found.get("location_hint"),
                     "starts_at": _microsoft_graph_datetime(detail.get("start")) or found.get("starts_at"),
                     "ends_at": _microsoft_graph_datetime(detail.get("end")) or found.get("ends_at"),
+                    "organizer": _microsoft_graph_email(detail.get("organizer")) or found.get("organizer"),
                     "html_link": detail.get("webLink") or found.get("html_link"),
                 })
             else:
@@ -4525,6 +4795,7 @@ def view_assistant_calendar_event(request: Request, account: str, id: str) -> Re
             ("Start:", _format_swiss_datetime(found.get("starts_at"))),
             ("Ende:", _format_swiss_datetime(found.get("ends_at"))),
             ("Ort:", _sanitize_reader_literal(found.get("location_hint"))),
+            ("Organisator:", _sanitize_reader_literal(found.get("organizer"))),
             ("Beschreibung:", _sanitize_reader_text(found.get("description") or found.get("summary") or found.get("html_link"))),
             ("Link:", _sanitize_reader_text(found.get("html_link") or "[LINK]")),
         ],
@@ -4557,7 +4828,7 @@ def _google_workspace_email_summary(
     if not account_cfg:
         accounts = [
             account for account in _email_account_configs(config)
-            if _email_backend_name(account) in {"google_workspace", "google", "gmail"}
+            if _is_google_email_backend(_email_backend_name(account))
         ]
         if accounts:
             account_cfg = accounts[0]
@@ -4571,7 +4842,7 @@ def _google_workspace_email_summary(
             account_cfg = {"backend": os.environ.get("AIWERK_CUI_EMAIL_BACKEND")}
     backend = os.environ.get("AIWERK_CUI_EMAIL_BACKEND") if not account_cfg else ""
     backend = (backend or _email_backend_name(account_cfg) or "google_workspace").lower()
-    if backend not in {"google_workspace", "google", "gmail"}:
+    if not _is_google_email_backend(backend):
         return None
     server = _google_workspace_server(account_cfg, env_first=True)
     user_google_email = _google_workspace_user_email(account_cfg, env_first=True)
@@ -4729,6 +5000,7 @@ def _himalaya_email_summary(
         query="not flag Seen", page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
         account=account or None, folder=folder,
     )
+    unread_items = [item for raw in unread_items if (item := _himalaya_envelope_to_resource_item(raw)) is not None]
     items = _unread_first_email_items(unread_items, min_items=_ASSISTANT_EMAIL_PREVIEW_ITEMS)
     visible_unread = len(items)
     latest_items: list[Dict[str, Any]] = []
@@ -4737,6 +5009,7 @@ def _himalaya_email_summary(
             page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS + len(unread_items),
             account=account or None, folder=folder,
         )
+        latest_items = [item for raw in latest_items if (item := _himalaya_envelope_to_resource_item(raw)) is not None]
         items = _unread_first_email_items(unread_items, latest_items, min_items=_ASSISTANT_EMAIL_PREVIEW_ITEMS)
     account_payload = {
         "label": _email_account_label(account_cfg) or account or folder,
@@ -4793,7 +5066,7 @@ def _merge_email_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
         items.extend(account_items)
         unread_count += account["unread_count"]
     # Partition only after real per-backend unread fetch and read top-up.
-    items = [item for item in items if item.get("unread") is True] + [item for item in items if item.get("unread") is not True]
+    items = sorted((item for item in items if item.get("unread") is True), key=_email_sort_key, reverse=True) + sorted((item for item in items if item.get("unread") is not True), key=_email_sort_key, reverse=True)
     status = _status_from_summaries(accounts)
     if status == "auth_required":
         summary_text = "E-Mail neu verbinden"
@@ -4823,7 +5096,7 @@ def _email_summary(_config: Dict[str, Any]) -> Dict[str, Any]:
     if accounts:
         for account in accounts:
             backend = _email_backend_name(account)
-            if backend in {"google_workspace", "google", "gmail"}:
+            if _is_google_email_backend(backend):
                 summary = _google_workspace_email_summary(config, account)
             elif backend in {"himalaya", "imap"} or account.get("account") or account.get("folder"):
                 summary = _himalaya_email_summary(config, account)
@@ -4831,7 +5104,7 @@ def _email_summary(_config: Dict[str, Any]) -> Dict[str, Any]:
                 summary = None
             if summary:
                 summaries.append(summary)
-    else:
+    elif not _resource_account_section(config, "email", "mailbox"):
         for summary in (_google_workspace_email_summary(config), _himalaya_email_summary(config)):
             if summary and summary.get("status") != "not_configured":
                 summaries.append(summary)
@@ -4897,10 +5170,11 @@ def _connector_summary(
 
 
 def _merge_calendar_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
-    accounts = [summary for summary in summaries if summary]
+    accounts = [dict(summary) for summary in summaries if summary]
     items: list[Dict[str, Any]] = []
     for account in accounts:
-        items.extend(dict(item) for item in account.get("items", []) if isinstance(item, dict))
+        account["items"] = [_calendar_item_with_open_url(item, account=account) for item in account.get("items", []) if isinstance(item, dict)]
+        items.extend(account["items"])
     items.sort(key=lambda item: str(item.get("starts_at") or ""))
     status = _status_from_summaries(accounts)
     if status == "auth_required":
@@ -4913,9 +5187,30 @@ def _merge_calendar_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]
 
 
 def _calendar_open_url(account: Dict[str, Any], item: Dict[str, Any]) -> str:
-    address = str(account.get("address") or account.get("user_google_email") or account.get("user_principal_name") or "")
-    event_id = str(item.get("id") or item.get("event_id") or "")
-    return f"/api/assistant/calendar/view?account={urllib.parse.quote(address)}&id={urllib.parse.quote(event_id)}"
+    address = str(item.get("account_address") or account.get("address") or account.get("user_google_email") or account.get("user_principal_name") or item.get("account_label") or account.get("label") or "Kalender").strip()
+    event_id = str(item.get("event_id") or item.get("id") or "").strip()
+    if not event_id or not address:
+        return ""
+    return "/api/assistant/calendar/view?" + urllib.parse.urlencode({"account": address, "id": event_id})
+
+
+def _calendar_item_with_open_url(item: Dict[str, Any], *, account: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    normalized = dict(item)
+    if not str(normalized.get("open_url") or "").strip():
+        url = _calendar_open_url(account or {}, normalized)
+        if url:
+            normalized["open_url"] = url
+    return normalized
+
+
+def _microsoft_graph_email(value: Any) -> str:
+    if not isinstance(value, dict) or not isinstance(value.get("emailAddress"), dict):
+        return ""
+    from email.utils import formataddr
+    address = value["emailAddress"]
+    name = str(address.get("name") or "").strip()
+    email_address = str(address.get("address") or "").strip()
+    return formataddr((name, email_address)) if name and email_address else (email_address or name)
 
 
 def _google_workspace_calendar_summary(config: Dict[str, Any] | None, account_cfg: Dict[str, Any], *, now: _datetime | None = None) -> Dict[str, Any] | None:
@@ -4997,7 +5292,8 @@ def _microsoft_graph_datetime(value: Any) -> str:
 def _microsoft_calendar_summary(config: Dict[str, Any] | None, account_cfg: Dict[str, Any], *, now: _datetime | None = None) -> Dict[str, Any] | None:
     config = config or {}
     server = str(account_cfg.get("mcp_server") or "microsoft-calendar")
-    address = str(account_cfg.get("address") or account_cfg.get("user_principal_name") or "")
+    label = _microsoft_calendar_account_label(account_cfg)
+    address = _microsoft_calendar_account_address(account_cfg, label)
     now = now or _datetime.now(_timezone.utc)
     start = now.astimezone(_timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
@@ -5023,9 +5319,9 @@ def _microsoft_calendar_summary(config: Dict[str, Any] | None, account_cfg: Dict
             },
         )
     except Exception as exc:
-        return {"label": account_cfg.get("label") or address, "address": address, "source": "microsoft_calendar", "status": _bridge_error_status(exc), "summary": "Outlook Kalender neu verbinden", "items": []}
+        return {"label": label, "address": address, "source": "microsoft_calendar", "status": _bridge_error_status(exc), "summary": "Outlook Kalender neu verbinden", "items": []}
     if _bridge_payload_is_auth_error(payload):
-        return {"label": account_cfg.get("label") or address, "address": address, "source": "microsoft_calendar", "status": "auth_required", "summary": "Outlook Kalender neu verbinden", "items": []}
+        return {"label": label, "address": address, "source": "microsoft_calendar", "status": "auth_required", "summary": "Outlook Kalender neu verbinden", "items": []}
     text = _extract_bridge_text(payload)
     try:
         data = _json.loads(text)
@@ -5042,8 +5338,9 @@ def _microsoft_calendar_summary(config: Dict[str, Any] | None, account_cfg: Dict
             "title": str(event.get("subject") or event.get("title") or ""),
             "starts_at": _microsoft_graph_datetime(event.get("start")),
             "ends_at": _microsoft_graph_datetime(event.get("end")),
+            "organizer": _microsoft_graph_email(event.get("organizer")),
             "location_hint": (event.get("location") or {}).get("displayName") if isinstance(event.get("location"), dict) else "",
-            "account_label": account_cfg.get("label") or address,
+            "account_label": label,
             "account_address": address,
             "source": "microsoft_calendar",
         }
@@ -5052,7 +5349,7 @@ def _microsoft_calendar_summary(config: Dict[str, Any] | None, account_cfg: Dict
     items.sort(key=lambda item: item.get("starts_at") or "")
     items = items[:max_results]
     return {
-        "label": account_cfg.get("label") or address,
+        "label": label,
         "address": address,
         "source": "microsoft_calendar",
         "status": "connected",
@@ -5064,21 +5361,21 @@ def _microsoft_calendar_summary(config: Dict[str, Any] | None, account_cfg: Dict
 def _calendar_summary(config: Dict[str, Any]) -> Dict[str, Any]:
     payload = _json_file_payload("AIWERK_CUI_CALENDAR_SUMMARY_JSON")
     if payload is not None:
+        payload = dict(payload)
         payload.setdefault("status", "connected")
-        payload.setdefault("accounts", [])
+        payload["accounts"] = _merge_calendar_summaries([account for account in payload.get("accounts", []) if isinstance(account, dict)])["accounts"]
+        payload["items"] = [_calendar_item_with_open_url(item) for item in payload.get("items", []) if isinstance(item, dict)]
         return payload
     summaries: list[Dict[str, Any]] = []
     for account in _calendar_accounts(config):
-        backend = str(account.get("backend") or "").lower()
-        if backend in {"google_workspace", "google_calendar"}:
+        backend = _email_backend_name(account)
+        if (_is_google_email_backend(backend) or backend in {"google", "google_calendar"}):
             summary = _google_workspace_calendar_summary(config, account)
-        elif backend in {"microsoft_calendar", "outlook"}:
+        elif _is_microsoft_calendar_backend(backend):
             summary = _microsoft_calendar_summary(config, account)
         else:
             summary = None
         if summary:
-            for item in summary.get("items", []):
-                item.setdefault("open_url", _calendar_open_url(summary, item))
             summaries.append(summary)
     return _merge_calendar_summaries(summaries)
 
@@ -5086,31 +5383,77 @@ def _calendar_summary(config: Dict[str, Any]) -> Dict[str, Any]:
 def _contacts_summary(_config: Dict[str, Any], email: Dict[str, Any], calendar: Dict[str, Any]) -> Dict[str, Any]:
     config = _config or {}
     own = _contacts_own_email_set(config, email, calendar)
-    contacts = [_normalize_contact_item(item) for item in _read_manual_contacts()]
-    contacts.extend(_normalize_contact_item(item) for item in _contacts_from_google_workspace(config, limit=_contacts_saved_top_up_target()))
-    contacts.extend(_normalize_contact_item(item) for item in _contacts_from_google_workspace_interactions(config, own))
-    contacts.extend(_normalize_contact_item(item) for item in _contacts_from_himalaya_interactions(config, own))
-    for account in email.get("accounts", []):
-        for item in account.get("items", []):
-            contacts.extend(_contacts_from_address_text(item.get("sender") or item.get("from"), source="E-Mail"))
-    filtered: list[Dict[str, Any]] = []
-    hidden = set(_read_contacts_store_payload().get("hidden") or [])
+    def visible(rows):
+        # Normalize identities before hide checks; filter BEFORE badge union/budget.
+        return _filter_contacts_payload({'items': rows}, own_emails=own)['items']
+
+    contacts = visible(_read_manual_contacts())
+    contacts.extend(visible(_contacts_from_google_workspace_interactions(config, own)))
+    contacts.extend(visible(_contacts_from_himalaya_interactions(config, own)))
+    signals: set[str] = set()
+    from email.utils import formataddr
+    for resource, is_calendar in ((email, False), (calendar, True)):
+        if not isinstance(resource, dict):
+            continue
+        accounts = resource.get('accounts')
+        for account in accounts if isinstance(accounts, list) else []:
+            if not isinstance(account, dict):
+                continue
+            items = account.get('items')
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                for key in ('sender', 'organizer', 'creator', 'email', 'account_address'):
+                    address = _safe_contact_email(item.get(key))
+                    if address:
+                        signals.add(address)
+                values = [item.get(k) for k in ('organizer', 'creator', 'email')] if is_calendar else [item.get('sender') or item.get('from')]
+                if is_calendar and isinstance(item.get('attendees'), list):
+                    values.extend(item['attendees'])
+                for value in values:
+                    if isinstance(value, dict):
+                        value = formataddr((str(value.get('display_name') or value.get('name') or ''), str(value.get('email') or value.get('address') or '')))
+                    if isinstance(value, str):
+                        contacts.extend(visible(_contacts_from_address_text(value, source='Aus Kalender' if is_calendar else 'Aus E-Mail', score=2 if is_calendar else 4, last_interaction_at=item.get('received_at'), relevance='related' if is_calendar else 'relevant')))
+    target = _contacts_saved_top_up_target()
+    saved = _dedupe_contacts(visible(_contacts_from_google_workspace(config, limit=target)))
+    contacts = _dedupe_contacts(contacts)
+    identities = {c['email'] for c in contacts if c['email']}
+    enrichment = [c for c in saved if c['email'] in identities]
+    contacts = _dedupe_contacts([*contacts, *enrichment])
+    topup = []
+    for contact in saved:
+        if len(contacts) + len(topup) >= target:
+            break
+        if contact['email'] not in identities:
+            topup.append(contact)
+            identities.add(contact['email'])
+    contacts = _rank_contacts([*contacts, *topup])
+    relevant, frequent = [], []
     for contact in contacts:
-        email_key = str(contact.get("email") or "").strip().lower()
-        key = str(contact.get("key") or contact.get("email") or contact.get("display_name") or "")
-        if not email_key or key in hidden:
-            continue
-        if not _contact_is_customer_safe(contact, own):
-            continue
-        filtered.append(contact)
-    filtered = _dedupe_contacts(filtered)
-    return {
-        "status": "connected" if filtered else "not_configured",
-        "source_label": "Relevante Kontakte",
-        "relevant": filtered[:_contacts_page_size(config)],
-        "frequent": filtered[:_ASSISTANT_CONTACT_PREVIEW_ITEMS],
-        "total_count": len(filtered),
-    }
+        if contact.get('relevance') in {'relevant', 'related'} or contact.get('interaction_count') or ('Manuell' in contact['source_badges'] and contact.get('note')):
+            relevant.append(dict(contact, relevance='relevant'))
+        elif contact['email'] in signals:
+            relevant.append(dict(contact, relevance='related'))
+        else:
+            frequent.append(contact)
+    manual_count = sum('Manuell' in c['source_badges'] for c in contacts)
+    google_count = sum('Google Contacts' in c['source_badges'] for c in contacts)
+    interaction_count = sum(bool(c.get('interaction_count')) for c in contacts)
+    return _filter_contacts_payload({
+        'status': 'connected' if contacts else 'not_configured',
+        'source_label': 'Relevante Kontakte' if contacts else 'Keine relevanten Kontakte',
+        'summary': f'{len(contacts)} relevante Kontakte' if contacts else 'Keine relevanten Kontakte',
+        'items': (relevant + frequent)[:_ASSISTANT_CONTACT_PREVIEW_ITEMS],
+        'relevant': relevant[:_contacts_page_size(config)],
+        'frequent': frequent[:_ASSISTANT_CONTACT_PREVIEW_ITEMS],
+        'total_count': len(contacts), 'manual_count': manual_count,
+        'google_count': google_count, 'saved_count': sum('Google Contacts' in c['source_badges'] for c in topup),
+        'interaction_count': interaction_count,
+        'connected_count': max(interaction_count, google_count, len(contacts)-manual_count),
+        'relevance_window_days': _contacts_relevance_window_days(),
+        'saved_top_up_target': target, 'checked_at': _datetime.now(_timezone.utc).isoformat().replace('+00:00', 'Z'),
+    }, own_emails=own)
 
 
 _EMAIL_READER_META_HEADER_RE = re.compile(
@@ -5607,29 +5950,66 @@ def _shared_folder_root() -> Path | None:
 
 
 def _can_open_system_folder() -> bool:
-    return True
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    if sys.platform.startswith("linux"):
+        return shutil.which("xdg-open") is not None
+    if sys.platform == "darwin":
+        return shutil.which("open") is not None
+    return os.name == "nt"
 
 
 def _request_looks_local(request: Request | None) -> bool:
-    if request is None:
+    if request is None or request.client is None:
         return False
-    host = (request.headers.get("host") or "").split(":", 1)[0]
-    return host in {"127.0.0.1", "localhost", "::1"}
+    if any(header in request.headers for header in ("x-forwarded-for", "x-real-ip", "forwarded")):
+        return False
+    import ipaddress
+    try:
+        if not ipaddress.ip_address(request.client.host).is_loopback:
+            return False
+    except ValueError:
+        return False
+    raw_host = request.headers.get("host", "").strip().lower()
+    host = raw_host[1:raw_host.index("]")] if raw_host.startswith("[") and "]" in raw_host else raw_host.split(":", 1)[0]
+    if host in {"", "localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
-def _remote_open_allowed(request: Request | None) -> bool:
-    return os.getenv("HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN", "").lower() in {"1", "true", "yes"} or _request_looks_local(request)
+def _shared_folder_remote_open_allowed(config: Dict[str, Any]) -> bool:
+    if _env_truthy("HERMES_CUI_ALLOW_REMOTE_FILE_MANAGER_OPEN"):
+        return True
+    for section_name in ("assistant", "dashboard", "shared_folder", "shared"):
+        section = config.get(section_name)
+        if isinstance(section, dict):
+            for key in ("allow_remote_file_manager_open", "allow_remote_open_folder", "remote_file_manager_open"):
+                if str(section.get(key) or "").strip().lower() in {"1", "true", "yes", "on"}:
+                    return True
+    return False
 
 
-def _open_system_folder(path: Path, **_kwargs: Any) -> bool:
-    if sys.platform == "darwin":
-        args = ["open", str(path)]
-    elif os.name == "nt":
-        args = ["explorer", str(path)]
-    else:
-        args = ["xdg-open", str(path)]
-    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return True
+def _remote_open_allowed(request: Request | None, config: Dict[str, Any] | None = None) -> bool:
+    return _can_open_system_folder() and (_shared_folder_remote_open_allowed(config if config is not None else load_config()) or _request_looks_local(request))
+
+
+def _open_system_folder(path: Path, *, request: Request | None = None, config: Dict[str, Any] | None = None) -> bool:
+    try:
+        if not path.is_dir() or not _remote_open_allowed(request, config):
+            return False
+        if sys.platform == "darwin":
+            args = ["open", str(path)]
+        elif os.name == "nt":
+            args = ["explorer", str(path)]
+        else:
+            args = ["xdg-open", str(path)]
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        return False
 
 
 def _shared_cloud_url(config: Dict[str, Any], relative_path: str = "") -> str | None:
@@ -5644,7 +6024,7 @@ def _safe_shared_path(root: Path, relative: str) -> Path:
     target = (root / rel).resolve()
     if root not in target.parents and target != root:
         raise HTTPException(status_code=404, detail="Not found")
-    if any(part.startswith(".") for part in target.relative_to(root).parts):
+    if any(_is_hidden_shared_item(Path(part)) for part in target.relative_to(root).parts):
         raise HTTPException(status_code=404, detail="Not found")
     return target
 
@@ -5659,39 +6039,61 @@ def _is_hidden_shared_item(path: Path) -> bool:
 
 
 def _shared_item(path: Path, root: Path, config: Dict[str, Any], depth: int = 0, max_depth: int = 4) -> Dict[str, Any]:
+    path = _safe_shared_path(root, path.relative_to(root).as_posix())
     rel = path.relative_to(root).as_posix()
-    item = {"name": path.name, "kind": "folder" if path.is_dir() else "file"}
+    stat_result = path.stat()
+    is_dir = path.is_dir()
+    item = {
+        "id": _safe_resource_id(rel),
+        "name": path.name,
+        "kind": "folder" if is_dir else "file",
+        "mime": None if is_dir else (mimetypes.guess_type(path.name)[0] or "application/octet-stream"),
+        "size_bytes": None if is_dir else stat_result.st_size,
+        "modified_at": datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
     cloud_url = _shared_cloud_url(config, rel)
     if cloud_url:
         item["cloud_url"] = cloud_url
-    if path.is_dir():
+    if is_dir:
         if depth < max_depth:
-            children = [
-                p
-                for p in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-                if not _is_hidden_shared_item(p)
-            ][: _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS]
-            item["children"] = [_shared_item(child, root, config, depth + 1, max_depth) for child in children]
+            item["children"] = _shared_local_items(path, root, config, depth + 1, max_depth)
+            item["child_count"] = len(item["children"])
     else:
         item["open_url"] = "/api/assistant/shared-folder/open?path=" + urllib.parse.quote(rel)
         item["reference_uri"] = "shared://" + rel
     return item
 
 
+def _shared_local_items(directory: Path, root: Path, config: Dict[str, Any], depth: int, max_depth: int) -> list[Dict[str, Any]]:
+    # Validate each resolved target before sorting, statting or descending.
+    paths = []
+    for child in directory.iterdir():
+        try:
+            target = _safe_shared_path(root, child.relative_to(root).as_posix())
+            paths.append((not target.is_dir(), target.name.lower(), target))
+        except (OSError, RuntimeError, ValueError, HTTPException):
+            continue
+    items = []
+    for _, _, path in sorted(paths, key=lambda entry: entry[:2]):
+        if len(items) >= _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS:
+            break
+        try:
+            items.append(_shared_item(path, root, config, depth, max_depth))
+        except (OSError, RuntimeError, ValueError, HTTPException):
+            continue
+    return items
+
+
 def _shared_folder_summary(config: Dict[str, Any], request: Request | None = None) -> Dict[str, Any]:
     cloud = _shared_cloud_config(config)
     root = _resolve_shared_folder_root(config)
     if root is not None:
-        paths = [
-            path
-            for path in sorted(root.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-            if not _is_hidden_shared_item(path)
-        ][: _ASSISTANT_RESOURCE_MAX_SHARED_ITEMS]
-        items = [
-            _shared_item(path, root, config, max_depth=_ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
-            for path in paths
-        ]
-        can_open = bool(_can_open_system_folder() and _remote_open_allowed(request))
+        root = root.resolve()
+        try:
+            items = _shared_local_items(root, root, config, 0, _ASSISTANT_RESOURCE_MAX_SHARED_DEPTH)
+        except (OSError, RuntimeError, ValueError):
+            items = []
+        can_open = _remote_open_allowed(request, config)
         payload = {
             "status": "connected",
             "summary": f"{len(items)} Dateien",
@@ -5754,10 +6156,11 @@ def _content_type_for_shared_file(path: Path) -> tuple[str, str, Dict[str, str]]
 
 def open_assistant_shared_folder_root(request: Request) -> Dict[str, Any]:
     _require_token(request)
+    config = load_config()
     root = _shared_folder_root()
-    if root is None or not _remote_open_allowed(request):
+    if root is None or not _remote_open_allowed(request, config):
         raise HTTPException(status_code=409, detail="File manager open is not available")
-    return {"ok": bool(_open_system_folder(root))}
+    return {"ok": bool(_open_system_folder(root, request=request, config=config))}
 
 
 @app.post("/api/assistant/shared-folder/open-folder")

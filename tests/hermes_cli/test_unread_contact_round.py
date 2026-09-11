@@ -141,7 +141,8 @@ def test_gmail_numbered_search_produces_summary_and_query_contacts(ws, monkeypat
     assert [i['id'] for i in result['items']] == ['18abc', '18def', '18fed']
     assert [i['unread'] for i in result['items']] == [True, True, False]
     assert result['unread_count'] == 2
-    assert [i['email'] for i in contacts] == ['ada@example.org', 'bea@example.org']
+    # 6b60f218: _sort_interaction_contacts uses reverse=True, including name ties.
+    assert [i['email'] for i in contacts] == ['bea@example.org', 'ada@example.org']
     assert [p['message_ids'] for tool, p in calls if tool == 'get_gmail_messages_content_batch'] == [
         ['18abc', '18def'], ['18fed'], ['18abc', '18def'],
     ]
@@ -216,8 +217,12 @@ def test_contacts_summary_unions_badges_after_visibility_filtering(ws, monkeypat
     monkeypatch.setattr(ws, '_contacts_from_google_workspace_interactions', lambda *a: [])
     monkeypatch.setattr(ws, '_contacts_from_himalaya_interactions', lambda *a: [])
     result = ws._contacts_summary({}, {'accounts': []}, {})
-    for field in ('relevant', 'frequent'):
-        assert [i['email'] for i in result[field]] == ['ada@example.org', 'bea@example.org', 'cy@example.org']
-        assert result[field][0]['name'] == 'Ada'
-        assert result[field][0]['source_badges'] == ['CRM', 'Google']
+    # 6b60f218: _contacts_summary sets frequent = contacts not in relevant.
+    # These unannotated CRM/Google contacts belong only to frequent.
+    assert result['relevant'] == []
+    for field in ('frequent',):
+        assert [i['email'] for i in result[field]] == ['cy@example.org', 'bea@example.org', 'ada@example.org']
+        ada = next(i for i in result[field] if i['email'] == 'ada@example.org')
+        assert ada['name'] == 'Ada'
+        assert ada['source_badges'] == ['CRM', 'Google']
     assert result['total_count'] == 3
