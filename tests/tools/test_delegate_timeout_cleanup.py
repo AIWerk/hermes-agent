@@ -31,11 +31,13 @@ class _SlowUnwindingChild:
 
     def run_conversation(self, **_kwargs):
         self.started.set()
-        assert self.interrupted.wait(timeout=1)
+        self.interrupted.wait()
         # Model the real child turn's finally path: it still performs session
         # activity/SQLite cleanup after the parent requests interruption.
         self.unwinding.set()
-        assert self.allow_finish.wait(timeout=2)
+        # Only the test releases teardown. A wall-clock expiry here would end
+        # the worker before a slow parent checks the deferred-close contract.
+        self.allow_finish.wait()
         self.finished.set()
         return {
             "final_response": "",
@@ -68,20 +70,21 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
 
-    result = delegate_tool._run_single_child(
-        task_index=0,
-        goal="exercise timeout teardown",
-        child=child,
-        parent_agent=parent,
-    )
-
-    assert result["status"] == "timeout"
-    assert child.unwinding.wait(timeout=1)
     try:
+        result = delegate_tool._run_single_child(
+            task_index=0,
+            goal="exercise timeout teardown",
+            child=child,
+            parent_agent=parent,
+        )
+
+        assert result["status"] == "timeout"
+        assert child.unwinding.wait(timeout=1)
         assert not child.closed.is_set(), (
             "timed-out child.close() ran before its conversation thread unwound"
         )
     finally:
+        child.interrupted.set()
         child.allow_finish.set()
     assert child.finished.wait(timeout=1)
     assert child.closed.wait(timeout=1)

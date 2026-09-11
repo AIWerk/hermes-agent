@@ -87,6 +87,13 @@ jobs:
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
+      - name: Install diagnostic sandbox dependency
+        # Command-construction tests authenticate this root-owned executable;
+        # do not replace it with PATH discovery or bypass the trust checks.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+
       - name: Run tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess

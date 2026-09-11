@@ -335,7 +335,8 @@ class TestTranscribeLocalCommand:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr("tools.transcription_local.tempfile.TemporaryDirectory", fake_tempdir)
-        monkeypatch.setattr("tools.transcription_audio._find_ffmpeg_binary", lambda: "/opt/homebrew/bin/ffmpeg")
+        # These facade functions still resolve their bound discovery alias here.
+        monkeypatch.setattr("tools.transcription_tools._find_ffmpeg_binary", lambda: "/opt/homebrew/bin/ffmpeg")
         monkeypatch.setattr("tools.transcription_audio.subprocess.run", fake_run)
 
         from tools.transcription_tools import _transcribe_local_command
@@ -1132,7 +1133,7 @@ class TestCafConversion:
             return MagicMock(returncode=0)
 
         monkeypatch.setattr(
-            "tools.transcription_audio._find_ffmpeg_binary",
+            "tools.transcription_tools._find_ffmpeg_binary",
             lambda: "/usr/bin/ffmpeg",
         )
         monkeypatch.setattr(subprocess, "run", fake_run)
