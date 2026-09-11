@@ -173,7 +173,8 @@ def _report_database_journal_modes(
     version_info: tuple[int, ...] | None = None,
 ) -> None:
     """List each database's journal mode; warn on WAL under a vulnerable SQLite."""
-    from hermes_state import _wal_reset_repair_hint, is_sqlite_wal_reset_vulnerable
+    from hermes_state import _wal_reset_repair_hint
+    from hermes_state_wal import is_sqlite_wal_reset_vulnerable
 
     vulnerable = is_sqlite_wal_reset_vulnerable(version_info)
     home = hermes_home if hermes_home is not None else HERMES_HOME

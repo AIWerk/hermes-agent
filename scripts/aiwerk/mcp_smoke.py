@@ -195,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     plan = load_plan(args.plan)
 
-    from tools.mcp_tool import discover_mcp_tools, get_mcp_status, shutdown_mcp_servers
+    from tools.mcp_tool_discovery import discover_mcp_tools, get_mcp_status
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
     from tools.registry import registry
 
     try:

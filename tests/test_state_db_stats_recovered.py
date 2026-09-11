@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionDB, collect_state_db_stats, count_db_holders
+from hermes_state import SessionDB
+from hermes_state_dbfile import collect_state_db_stats, count_db_holders
 
 
 @pytest.fixture()
@@ -180,7 +181,7 @@ def test_render_healthy_stats_no_warnings():
 
 
 def test_render_warns_on_large_db():
-    from hermes_cli.doctor import (
+    from hermes_cli.doctor_state import (
         STATE_DB_SIZE_WARN_BYTES,
         _render_state_db_stats,
     )
@@ -199,7 +200,7 @@ def test_render_warns_on_large_db():
 
 
 def test_render_large_db_with_pending_rebuild_suggests_optimize():
-    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
 
     big = STATE_DB_SIZE_WARN_BYTES + 1
     lines = _render_state_db_stats(
@@ -211,7 +212,7 @@ def test_render_large_db_with_pending_rebuild_suggests_optimize():
 
 
 def test_render_large_db_legacy_trigram_suggests_optimize():
-    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
 
     big = STATE_DB_SIZE_WARN_BYTES + 1
     lines = _render_state_db_stats(

@@ -89,7 +89,8 @@ def _fetch_picker_live_models(
     headers: dict[str, str] | None = None, timeout: float = 5.0,
     api_mode: str | None = None) -> list[str] | None:
     """Fetch picker models with native Ollama and cached generic discovery."""
-    from hermes_cli.models import _get_ollama_native_headers, cached_fetch_api_models, fetch_ollama_local_models
+    from hermes_cli.models import _get_ollama_native_headers, cached_fetch_api_models
+    from hermes_cli.models_local import fetch_ollama_local_models
     from hermes_cli.models_local import (
         _normalize_openai_base_url,
         should_use_ollama_native_catalog,

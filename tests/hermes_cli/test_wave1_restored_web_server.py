@@ -1,4 +1,6 @@
 """Restored historical Wave 1 web-server behavior tests."""
+from hermes_cli import config as config_owner
+from hermes_cli.web_routers import config_env
 
 import asyncio
 import os
@@ -1409,10 +1411,10 @@ class TestWave1RestoredTestWebServerEndpoints:
         from hermes_cli.config import custom_endpoint_key_env, load_env
 
         env_var = custom_endpoint_key_env("conflict-proxy")
-        ws.save_env_value(env_var, "dotenv-old")
+        config_owner.save_env_value(env_var, "dotenv-old")
         assert load_env().get(env_var) == "dotenv-old"
         monkeypatch.setenv(env_var, "inherited-old")
-        monkeypatch.setattr(ws, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
+        monkeypatch.setattr(config_env, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
 
         resp = self.client.post(
             "/api/providers/custom-endpoints",
@@ -1436,7 +1438,7 @@ class TestWave1RestoredTestWebServerEndpoints:
         env_var = custom_endpoint_key_env("inherited-proxy")
         monkeypatch.setenv(env_var, "inherited-only")
         assert env_var not in load_env()
-        monkeypatch.setattr(ws, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
+        monkeypatch.setattr(config_env, "save_config", lambda cfg: (_ for _ in ()).throw(OSError("disk full")))
 
         resp = self.client.post(
             "/api/providers/custom-endpoints",

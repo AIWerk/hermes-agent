@@ -1,3 +1,4 @@
+from agent import process_bootstrap, retry_utils
 import sys
 import types
 from types import SimpleNamespace
@@ -2797,7 +2798,7 @@ def test_try_refresh_codex_client_credentials_rebuilds_client(monkeypatch):
         "hermes_cli.auth.resolve_codex_runtime_credentials",
         _fake_resolve,
     )
-    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
+    monkeypatch.setattr(process_bootstrap, "OpenAI", _fake_openai)
 
     existing = _ExistingClient()
     agent.client = existing
@@ -3937,7 +3938,7 @@ def test_run_conversation_codex_invalid_encrypted_content_without_replay_state_d
     agent = _build_agent(monkeypatch)
     agent.provider = "custom"
     agent.base_url = "https://api.example.com/v1"
-    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *args, **kwargs: 0)
 
     request_payloads = []
 

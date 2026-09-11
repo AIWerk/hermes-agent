@@ -1,6 +1,7 @@
 """Regression tests for the restored hosted AIWerk MCP bridge backend."""
 
 from __future__ import annotations
+from hermes_cli import config as config_owner
 
 import json
 import threading
@@ -195,7 +196,7 @@ def test_aiwerk_bridge_reuses_session_across_cui_tool_calls(monkeypatch):
 def test_aiwerk_bridge_config_expands_header_env_refs(monkeypatch):
     monkeypatch.delenv("AIWERK_BRIDGE_MCP_TOKEN", raising=False)
     monkeypatch.setattr(
-        web_server,
+        config_owner,
         "load_env",
         lambda: {"AIWERK_BRIDGE_MCP_TOKEN": "test-token"},
     )

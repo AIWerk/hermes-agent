@@ -1,4 +1,5 @@
 """Tests for hermes_cli.web_server and related config utilities."""
+from hermes_cli.web_routers import chat_ws
 
 import asyncio
 import os
@@ -192,7 +193,7 @@ async def test_gateway_ws_preserves_ticket_actor_allowlist_into_handle_ws(monkey
     monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
     monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
 
-    await web_server.gateway_ws(socket)
+    await chat_ws.gateway_ws(socket)
 
     assert socket.closed == []
     assert captured["auth_identity"] == {
@@ -229,7 +230,7 @@ async def test_gateway_ws_internal_credential_preserves_only_issuer_asserted_ide
     monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
     monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
 
-    await web_server.gateway_ws(socket)
+    await chat_ws.gateway_ws(socket)
 
     assert socket.closed == []
     assert captured["auth_identity"] == {
@@ -270,7 +271,7 @@ async def test_gateway_ws_drops_arbitrary_consumed_ticket_fields(monkeypatch):
 
     monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
 
-    await web_server.gateway_ws(socket)
+    await chat_ws.gateway_ws(socket)
 
     assert captured["auth_identity"] == {
         "tenant_id": "tenant-2",

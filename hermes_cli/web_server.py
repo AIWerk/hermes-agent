@@ -23,6 +23,9 @@ import sys
 import sysconfig
 import threading
 import time
+import email.utils
+import hermes_constants
+from hermes_cli import config as config_owner
 import urllib.parse
 import urllib.request
 import zipfile
@@ -1610,7 +1613,7 @@ def _expand_env_refs(value: Any, env: Dict[str, str]) -> Any:
 
 def _mcp_bridge_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
     raw = (config or load_config()).get("mcp_servers", {}).get("aiwerk_bridge", {})
-    bridge = _expand_env_refs(raw, load_env())
+    bridge = _expand_env_refs(raw, config_owner.load_env())
     return bridge if isinstance(bridge, dict) else {}
 
 
@@ -1987,8 +1990,267 @@ def _aiwerk_bridge_subservers(config: Dict[str, Any]) -> list[Dict[str, Any]]:
         return [{"id": "aiwerk-bridge", "name": "aiwerk_bridge", "label": "AIWerk Bridge", "status": _bridge_error_status(exc)}]
 
 
-def _vault_bridge_summary(_config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    return {"status": "unknown", "summary": "Vault status unavailable", "items": [], "weak_count": 0, "reused_count": 0, "compromised_count": 0}
+def _email_sender_domain(sender: Any) -> str:
+    _name, address = email.utils.parseaddr(str(sender or ""))
+    if "@" not in address:
+        return ""
+    return address.rsplit("@", 1)[-1].strip().lower().rstrip(".")
+
+def _email_sender_display(sender: Any) -> str:
+    name, address = email.utils.parseaddr(str(sender or ""))
+    return (name or address or str(sender or "")).strip().lower()
+
+def _domain_matches(domain: str, allowed_domains: set[str]) -> bool:
+    return any(domain == allowed or domain.endswith(f".{allowed}") for allowed in allowed_domains)
+
+def _email_unread_count(items: list[dict[str, Any]], fallback: int = 0) -> int:
+    if any("unread" in item for item in items):
+        return sum(1 for item in items if item.get("unread") is True)
+    return min(fallback, len(items)) if fallback else 0
+
+def _is_dashboard_spam_email_item(item: dict[str, Any]) -> bool:
+    """Hide obvious spam from the CUI resource rail without touching the mailbox."""
+    sender = item.get("sender")
+    sender_domain = _email_sender_domain(sender)
+    if sender_domain in _ASSISTANT_EMAIL_BLOCKED_SENDER_DOMAINS:
+        return True
+    sender_display = _email_sender_display(sender)
+    subject = str(item.get("subject") or "").lower()
+    for brand, allowed_domains in _ASSISTANT_EMAIL_BRAND_DOMAINS.items():
+        if brand in sender_display and sender_domain and not _domain_matches(sender_domain, allowed_domains):
+            return True
+        if brand in subject and sender_domain and not _domain_matches(sender_domain, allowed_domains):
+            return True
+    return False
+
+def _visible_email_items(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    visible: list[dict[str, Any]] = []
+    hidden = 0
+    for item in items:
+        if _is_dashboard_spam_email_item(item):
+            hidden += 1
+            continue
+        visible.append(item)
+    return visible, hidden
+
+def _bridge_result_text(result: dict[str, Any]) -> str:
+    nested = result.get("result") if isinstance(result, dict) else None
+    if isinstance(nested, dict):
+        structured = nested.get("structuredContent")
+        if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+            return structured["result"]
+        content = nested.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            if parts:
+                return "\n".join(parts)
+    structured = result.get("structuredContent") if isinstance(result, dict) else None
+    if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+        return structured["result"]
+    return ""
+
+def _parse_bridge_json_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    text = _bridge_result_text(value)
+    if text:
+        try:
+            parsed = _json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    nested = value.get("result")
+    if isinstance(nested, dict):
+        content = nested.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    try:
+                        parsed = _json.loads(item["text"])
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        continue
+    return value
+
+def _vault_web_url(value: Any, fallback: str = "https://pass.aiwerk.ch") -> str:
+    raw = str(value or fallback).strip()
+    if not raw.startswith(("https://", "http://")):
+        return fallback
+    parsed = urllib.parse.urlparse(raw)
+    path = re.sub(r"/api/?$", "", parsed.path or "")
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path or "", "", "", "")) or fallback
+
+def _vault_base_summary(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "not_configured",
+        "vault_url": _vault_url_from_config(config),
+        "url": _vault_url_from_config(config),
+        "items": [],
+        "summary": "Tresor noch nicht eingerichtet",
+        "item_count": None,
+        "weak_count": None,
+        "reused_count": None,
+        "compromised_count": None,
+        "compromised_supported": False,
+        "two_factor_status": "unknown",
+        "checked_at": _datetime.now(_timezone.utc).isoformat(),
+        "source": "none",
+    }
+
+def _password_looks_weak(password: str) -> bool:
+    if len(password) < 12:
+        return True
+    classes = 0
+    classes += any(ch.islower() for ch in password)
+    classes += any(ch.isupper() for ch in password)
+    classes += any(ch.isdigit() for ch in password)
+    classes += any(not ch.isalnum() for ch in password)
+    return classes < 3
+
+def _run_json_command(command: list[str], *, timeout: int = 8) -> Any:
+    # This local helper intentionally preserves the caller's credentials and
+    # HOME semantics; use the canonical subprocess environment builder so new
+    # process-launch sites remain centrally auditable.
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+    env["BW_NOINTERACTION"] = "true"
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("command failed")
+    return _json.loads(completed.stdout or "null")
+
+def _vault_local_bw_summary(config: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    vault_url = str(base.get("vault_url") or _vault_url_from_config(config))
+    bw = shutil.which("bw")
+    if not bw:
+        return {**base, "status": "limited", "summary": "Tresor-Link verfügbar", "source": "link"}
+
+    try:
+        status = _run_json_command([bw, "status"], timeout=5)
+    except Exception:
+        return {**base, "status": "error", "summary": "Tresor konnte nicht geprüft werden", "source": "bw"}
+
+    if isinstance(status, dict):
+        server_url = status.get("serverUrl")
+        if isinstance(server_url, str) and server_url.startswith(("https://", "http://")):
+            vault_url = _vault_web_url(server_url, vault_url)
+        bw_status = str(status.get("status") or "").lower()
+    else:
+        bw_status = ""
+
+    if bw_status != "unlocked":
+        label = "Tresor gesperrt" if bw_status == "locked" else "Anmeldung im Tresor nötig"
+        return {**base, "status": "auth_required", "vault_url": vault_url, "summary": label, "source": "bw"}
+
+    try:
+        items = _run_json_command([bw, "list", "items"], timeout=20)
+    except Exception:
+        return {**base, "status": "limited", "vault_url": vault_url, "summary": "Tresor verbunden · Statistik nicht verfügbar", "source": "bw"}
+    if not isinstance(items, list):
+        items = []
+
+    passwords: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        login = item.get("login")
+        if isinstance(login, dict):
+            password = login.get("password")
+            if isinstance(password, str) and password:
+                passwords.append(password)
+    weak_count = sum(1 for password in passwords if _password_looks_weak(password))
+    password_counts: dict[str, int] = {}
+    for password in passwords:
+        password_counts[password] = password_counts.get(password, 0) + 1
+    reused_count = sum(count for count in password_counts.values() if count > 1)
+    hint_count = weak_count + reused_count
+    summary = f"{len(items)} Zugangsdaten"
+    summary += f" · {hint_count} Hinweise" if hint_count else " · Alles in Ordnung"
+    return {
+        **base,
+        "status": "limited" if hint_count else "connected",
+        "vault_url": vault_url,
+        "summary": summary,
+        "item_count": len(items),
+        "weak_count": weak_count,
+        "reused_count": reused_count,
+        "source": "bw",
+    }
+
+def _vault_bridge_summary(config: dict[str, Any], base: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    base = base or _vault_base_summary(config)
+    if not _mcp_bridge_config(config):
+        return None
+    try:
+        raw_health = _call_aiwerk_bridge_tool(config, server="vault", tool="health_check", params={})
+    except Exception:
+        return None
+    health = _parse_bridge_json_payload(raw_health)
+    if not isinstance(health, dict) or not health:
+        return None
+
+    vault_url = _vault_web_url(health.get("vault_url"), str(base.get("vault_url") or "https://pass.aiwerk.ch"))
+    authenticated = bool(health.get("authenticated"))
+    status_text = str(health.get("status") or "").lower()
+    exposed_visible = bool(health.get("exposed_collection_visible"))
+    agent_visible = bool(health.get("agent_created_collection_visible"))
+    exposed_count = int(health.get("items_in_exposed") or 0)
+    agent_count = int(health.get("items_in_agent_created") or 0)
+    item_count = exposed_count + agent_count
+
+    if status_text != "ok" or not authenticated:
+        return {**base, "status": "auth_required", "vault_url": vault_url, "summary": "Tresor-Anmeldung über Bridge nötig", "source": "aiwerk_bridge"}
+    if not exposed_visible or not agent_visible:
+        missing = []
+        if not exposed_visible:
+            missing.append("mcp-exposed")
+        if not agent_visible:
+            missing.append("mcp-agent-created")
+        return {
+            **base,
+            "status": "limited",
+            "vault_url": vault_url,
+            "summary": f"Tresor verbunden · Collection fehlt: {', '.join(missing)}",
+            "item_count": item_count,
+            "agent_created_count": agent_count,
+            "source": "aiwerk_bridge",
+        }
+
+    summary = f"{exposed_count} freigegebene Zugangsdaten"
+    if agent_count:
+        summary += f" · {agent_count} von Agent erstellt"
+    elif exposed_count == 0:
+        summary = "Tresor verbunden · keine freigegebenen Einträge"
+    return {
+        **base,
+        "status": "connected",
+        "vault_url": vault_url,
+        "summary": summary,
+        "item_count": item_count,
+        "exposed_count": exposed_count,
+        "agent_created_count": agent_count,
+        "weak_count": None,
+        "reused_count": None,
+        "compromised_count": None,
+        "compromised_supported": False,
+        "source": "aiwerk_bridge",
+    }
 
 
 _ASSISTANT_RESOURCE_CACHE_TTLS = {
@@ -2613,7 +2875,7 @@ def _assistant_preview_kind(name: str, media_type: str) -> str:
 
 
 def _assistant_upload_root() -> Path:
-    root = get_hermes_home() / "dashboard_uploads"
+    root = hermes_constants.get_hermes_home() / "dashboard_uploads"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -2852,7 +3114,7 @@ async def upload_assistant_attachments_route(request: Request) -> Dict[str, Any]
         raise HTTPException(status_code=413, detail="Too many files")
     from hermes_constants import get_hermes_home
 
-    upload_root = get_hermes_home() / "dashboard_uploads"
+    upload_root = hermes_constants.get_hermes_home() / "dashboard_uploads"
     upload_root.mkdir(parents=True, exist_ok=True)
     attachments: list[Dict[str, Any]] = []
     total = 0
@@ -3108,7 +3370,7 @@ def _extract_uploaded_text(path: Path, content_type: str = "") -> tuple[str, str
 def _support_log_path() -> Path:
     from hermes_constants import get_hermes_home
     raw = os.environ.get("AIWERK_CUI_SUPPORT_LOG")
-    return Path(raw).expanduser() if raw else get_hermes_home() / "aiwerk-support" / "inbox.jsonl"
+    return Path(raw).expanduser() if raw else hermes_constants.get_hermes_home() / "aiwerk-support" / "inbox.jsonl"
 
 
 def _safe_support_text(value: Any) -> str:
@@ -4103,7 +4365,7 @@ def attach_assistant_resource(request: Request, payload: Dict[str, Any]) -> Dict
     kind = str(payload.get("kind") or item.get("kind") or "").strip().lower()
     if kind == "shared_file":
         return {"attachments": [_create_shared_file_attachment(load_config(), item, session_id)]}
-    root = get_hermes_home() / "dashboard_uploads"
+    root = hermes_constants.get_hermes_home() / "dashboard_uploads"
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{secrets.token_hex(8)}-{session_id}-resource.txt"
     lines = [
@@ -4403,14 +4665,23 @@ def _maildir_email_summary(maildir: str | None) -> Dict[str, Any] | None:
 
 
 def _merge_email_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
-    accounts = [summary for summary in summaries if summary]
+    accounts = [dict(summary) for summary in summaries if summary]
     items: list[Dict[str, Any]] = []
     unread_count = 0
+    filtered_count = 0
     for account in accounts:
         account_items = [dict(item) for item in account.get("items", []) if isinstance(item, dict)]
+        account_items, hidden = _visible_email_items(account_items)
         _attach_email_open_urls(account, account_items)
+        account["items"] = account_items
+        account["filtered_count"] = hidden
+        account["unread_count"] = (
+            _email_unread_count(account_items, int(account.get("unread_count") or 0))
+            if hidden else int(account.get("unread_count") or 0)
+        )
+        filtered_count += hidden
         items.extend(account_items)
-        unread_count += int(account.get("unread_count") or 0)
+        unread_count += account["unread_count"]
     status = _status_from_summaries(accounts)
     if status == "auth_required":
         summary_text = "E-Mail neu verbinden"
@@ -4422,6 +4693,7 @@ def _merge_email_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
         "status": status,
         "summary": summary_text,
         "accounts": accounts,
+        "filtered_count": filtered_count,
         "items": items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
         "unread_count": unread_count,
     }
@@ -4461,8 +4733,15 @@ def _vaultwarden_summary(_config: Dict[str, Any]) -> Dict[str, Any]:
     payload = _json_file_payload("AIWERK_CUI_VAULT_SUMMARY_JSON")
     if payload is not None:
         return payload
-    url = _vault_url_from_config(_config)
-    return {"status": "not_configured", "summary": "Kein Tresor verbunden", "url": url, "items": [], "weak_count": 0, "reused_count": 0, "compromised_count": 0}
+    base = _vault_base_summary(_config)
+    bridge = _vault_bridge_summary(_config, base)
+    if bridge is not None:
+        return bridge
+    # Do not probe a local credential store when no vault was configured.
+    vault = _assistant_config_section(_config or {}, "vault")
+    if vault or (_config or {}).get("vault_url") or os.environ.get("AIWERK_CUI_VAULT_URL"):
+        return _vault_local_bw_summary(_config, base)
+    return base
 
 
 def _vault_url_from_config(config: Dict[str, Any]) -> str:

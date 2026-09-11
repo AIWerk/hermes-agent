@@ -1,3 +1,4 @@
+from hermes_cli.web_routers import sessions
 import asyncio
 from types import SimpleNamespace
 
@@ -113,7 +114,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
 
     request = SimpleNamespace(state=SimpleNamespace(session=None))
-    response = asyncio.run(web_server.search_sessions(request, q="20260603", limit=2))
+    response = asyncio.run(sessions.search_sessions(request, q="20260603", limit=2))
 
     assert _FakeSessionDB.requested_fields is not None
     assert "context" not in _FakeSessionDB.requested_fields

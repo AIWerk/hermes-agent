@@ -86,7 +86,8 @@ def _write_output(output, text, summary) -> None:
 
 
 def _cmd_repair_search(args):
-    from hermes_state import DEFAULT_DB_PATH, SessionDB, count_db_holders
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+    from hermes_state_dbfile import count_db_holders
 
     db_path = DEFAULT_DB_PATH
     if not db_path.exists():

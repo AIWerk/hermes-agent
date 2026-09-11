@@ -1,3 +1,5 @@
+from hermes_cli.web_routers import sessions
+from hermes_cli import web_models
 import ast
 import asyncio
 import threading
@@ -117,9 +119,9 @@ def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
     monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", _open_db)
 
     result = asyncio.run(
-        web_server.bulk_delete_sessions_endpoint(
-            web_server.BulkDeleteSessions(ids=["one", "two"]),
-            SimpleNamespace(state=SimpleNamespace(session=None)),
+        sessions.bulk_delete_sessions_endpoint(
+            body=web_models.BulkDeleteSessions(ids=["one", "two"]),
+            request=SimpleNamespace(state=SimpleNamespace(session=None)),
         )
     )
 

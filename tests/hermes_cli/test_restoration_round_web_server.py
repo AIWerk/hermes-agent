@@ -1,3 +1,4 @@
+import shutil
 import io
 import json
 import threading
@@ -1090,7 +1091,7 @@ class TestRestorationRoundWebServer:
                 stdout = "Message ID: h1\nSubject: Hello\n\nBody"
             return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
-        monkeypatch.setattr(ws.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(ws.subprocess, "run", run_himalaya)
         monkeypatch.setenv("AIWERK_CUI_EMAIL_ACCOUNT", "env-account")
         monkeypatch.setenv("HIMALAYA_ACCOUNT", "fallback-account")
@@ -1235,7 +1236,7 @@ class TestRestorationRoundWebServer:
                 }
             },
         )
-        monkeypatch.setattr(ws.shutil, "which", lambda name: None)
+        monkeypatch.setattr(shutil, "which", lambda name: None)
         client = TestClient(ws.app)
         headers = {ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}
 
