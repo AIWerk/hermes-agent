@@ -1,6 +1,8 @@
 """Batch 1 contracts: map rows 1/6/8/9/12/38/52, authority paste_25.
 External adapters and desktop launches are intercepted; storage is synthetic.
 """
+import shutil
+
 import pytest
 
 @pytest.mark.parametrize('mode',['default','config','env'])
@@ -349,7 +351,7 @@ def test_shared_folder_open_requires_real_local_peer_or_optin(ws, monkeypatch, t
     monkeypatch.setattr(ws, '_shared_folder_root', lambda: tmp_path)
     monkeypatch.setattr(ws, '_resolve_shared_folder_root', lambda c: tmp_path)
     monkeypatch.setenv('DISPLAY', ':synthetic')
-    monkeypatch.setattr(ws.shutil, 'which', lambda cmd: '/synthetic/'+cmd)
+    monkeypatch.setattr(shutil, 'which', lambda cmd: '/synthetic/'+cmd)
     calls=[]
     monkeypatch.setattr(ws.subprocess, 'Popen', lambda *a, **k: calls.append(a))
     req=request(ws, peer, headers)
@@ -370,7 +372,7 @@ def test_shared_remote_open_optin_alias_matrix(ws, monkeypatch, tmp_path, sectio
     monkeypatch.setattr(ws, '_shared_folder_root', lambda: tmp_path)
     monkeypatch.setattr(ws, '_resolve_shared_folder_root', lambda c: tmp_path)
     monkeypatch.setenv('DISPLAY', ':synthetic')
-    monkeypatch.setattr(ws.shutil, 'which', lambda c: '/synthetic/'+c)
+    monkeypatch.setattr(shutil, 'which', lambda c: '/synthetic/'+c)
     monkeypatch.setattr(ws.subprocess, 'Popen', lambda *a, **k: None)
     req=request(ws,'203.0.113.9', {'host':'remote.example'})
     assert ws._shared_folder_summary(config,req)['can_open_folder']
@@ -380,7 +382,7 @@ def test_shared_remote_open_optin_alias_matrix(ws, monkeypatch, tmp_path, sectio
 def test_local_open_fails_closed(ws, monkeypatch, tmp_path, failure):
     monkeypatch.setenv('DISPLAY', ':synthetic')
     monkeypatch.delenv('WAYLAND_DISPLAY', raising=False)
-    monkeypatch.setattr(ws.shutil,'which',lambda c: '/synthetic/'+c)
+    monkeypatch.setattr(shutil,'which',lambda c: '/synthetic/'+c)
     calls=[]
     def spawn(*a, **k):
         calls.append(a)
@@ -389,7 +391,7 @@ def test_local_open_fails_closed(ws, monkeypatch, tmp_path, failure):
     monkeypatch.setattr(ws.subprocess,'Popen',spawn)
     path=tmp_path
     if failure == 'display': monkeypatch.delenv('DISPLAY')
-    if failure == 'opener': monkeypatch.setattr(ws.shutil,'which',lambda c: None)
+    if failure == 'opener': monkeypatch.setattr(shutil,'which',lambda c: None)
     if failure == 'directory': path=tmp_path/'missing'
     assert ws._open_system_folder(path,request=request(ws),config={}) is False
     assert len(calls) == (1 if failure == 'spawn' else 0)
@@ -537,7 +539,7 @@ def test_email_rows_himalaya_real_envelope_projection(ws, monkeypatch):
     from urllib.parse import urlsplit,parse_qs
     raw={'id':' /42? ', 'subject':'  Hello  ', 'date':'2026-09-01 12:30+02:00', 'from':{'name':'Ada','addr':'ada@example.org'},'flags':['Seen'],'has_attachment':True}
     original=copy.deepcopy(raw); calls=[]
-    monkeypatch.setattr(ws.shutil,'which',lambda *a:'/fake/himalaya')
+    monkeypatch.setattr(shutil,'which',lambda *a:'/fake/himalaya')
     def run(cmd,**kw):
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd,0,json.dumps([raw]),'')
