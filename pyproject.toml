@@ -633,6 +633,7 @@ select = ["PLW1514", "F821", "F822", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC2
 "gateway/platforms/__init__.py" = ["F822"]
 "gateway/platforms/whatsapp_common.py" = ["F821"]
 "gateway/run.py" = ["F821", "ASYNC220"]
+"gateway/run_shutdown.py" = ["ASYNC220"]
 "hermes_cli/cli_agent_setup_mixin.py" = ["F821"]
 "hermes_cli/web_server.py" = ["F821"]
 "plugins/context_engine/__init__.py" = ["F821"]

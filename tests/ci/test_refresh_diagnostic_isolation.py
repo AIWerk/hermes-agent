@@ -6,12 +6,45 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts" / "ci" / "run_refresh_diagnostic.py"
 RUNBOOK = ROOT / "docs" / "aiwerk-upstream-refresh-runbook.md"
 
 
+def _bubblewrap_sandbox_available() -> bool:
+    """Probe namespaces, not just installation or the diagnostic runner."""
+    from scripts.ci.run_refresh_diagnostic import _authenticate_bubblewrap
+
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        bwrap = _authenticate_bubblewrap()
+        result = subprocess.run(
+            [
+                bwrap, "--die-with-parent", "--clearenv", "--unshare-all",
+                "--new-session", "--ro-bind", "/", "/", "--", "/usr/bin/true",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+requires_bubblewrap_sandbox = pytest.mark.skipif(
+    not _bubblewrap_sandbox_available(),
+    reason="trusted bubblewrap sandbox is unavailable (namespace probe failed)",
+)
+
+
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_runner_isolates_sessiondb_from_caller_home(tmp_path: Path) -> None:
     caller_home = tmp_path / "caller-home"
     live_hermes_home = caller_home / ".hermes"
@@ -55,6 +88,7 @@ def test_refresh_diagnostic_runner_isolates_sessiondb_from_caller_home(tmp_path:
     assert not (live_hermes_home / "state.db").exists()
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_tmpdir_supports_af_unix_socket_paths(tmp_path: Path) -> None:
     child = (
         "import json, os, socket; "
@@ -80,6 +114,7 @@ def test_refresh_diagnostic_tmpdir_supports_af_unix_socket_paths(tmp_path: Path)
     assert len(payload["socket_path"].encode()) <= payload["limit"]
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_scrubs_secret_env_and_hides_live_home(tmp_path: Path) -> None:
     live_home = tmp_path / "caller-home"
     live_hermes = live_home / ".hermes"
@@ -116,6 +151,7 @@ def test_refresh_diagnostic_scrubs_secret_env_and_hides_live_home(tmp_path: Path
     assert secret_file.read_text(encoding="utf-8") == "live secret"
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_repo_is_read_only(tmp_path: Path) -> None:
     marker = ROOT / "refresh-diagnostic-must-not-write"
     child = (
@@ -146,6 +182,7 @@ def test_refresh_diagnostic_repo_is_read_only(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_denies_network_egress(tmp_path: Path) -> None:
     child = (
         "import json, socket\n"
@@ -175,6 +212,7 @@ def test_refresh_diagnostic_denies_network_egress(tmp_path: Path) -> None:
     assert payload["connected"] is False
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_can_write_isolated_home_tmp_and_run_pytest(tmp_path: Path) -> None:
     child = (
         "import os, pathlib, subprocess, sys; "
@@ -279,6 +317,7 @@ def test_refresh_diagnostic_does_not_bind_broad_etc_or_shared_uv_parent(monkeypa
     assert ("--ro-bind", os.fspath(prefix)) in pairs
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_hides_etc_sibling_host_files(tmp_path: Path) -> None:
     child = (
         "import json, pathlib; "
@@ -304,6 +343,7 @@ def test_refresh_diagnostic_hides_etc_sibling_host_files(tmp_path: Path) -> None
     assert payload == {"hosts": False, "passwd": True, "group": True, "nsswitch": True}
 
 
+@requires_bubblewrap_sandbox
 def test_refresh_diagnostic_hides_sibling_uv_runtimes(tmp_path: Path) -> None:
     import scripts.ci.run_refresh_diagnostic as runner
 
