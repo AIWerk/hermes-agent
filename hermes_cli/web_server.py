@@ -4738,15 +4738,26 @@ def _vaultwarden_summary(_config: Dict[str, Any]) -> Dict[str, Any]:
     if bridge is not None:
         return bridge
     # Do not probe a local credential store when no vault was configured.
-    vault = _assistant_config_section(_config or {}, "vault")
+    vault = _vault_config_section(_config or {})
     if vault or (_config or {}).get("vault_url") or os.environ.get("AIWERK_CUI_VAULT_URL"):
         return _vault_local_bw_summary(_config, base)
     return base
 
 
+def _vault_config_section(config: Dict[str, Any]) -> Dict[str, Any]:
+    # Preserve the historical dashboard -> assistant -> top-level precedence.
+    for parent in ("dashboard", "assistant"):
+        section = config.get(parent)
+        if isinstance(section, dict) and isinstance(section.get("vault"), dict):
+            return section["vault"]
+    vault = config.get("vault")
+    return vault if isinstance(vault, dict) else {}
+
+
 def _vault_url_from_config(config: Dict[str, Any]) -> str:
-    vault = _assistant_config_section(config or {}, "vault")
-    return str(os.environ.get("AIWERK_CUI_VAULT_URL") or vault.get("url") or (config or {}).get("vault_url") or "https://pass.aiwerk.ch")
+    vault = _vault_config_section(config or {})
+    url = str(os.environ.get("AIWERK_CUI_VAULT_URL") or vault.get("url") or vault.get("vault_url") or (config or {}).get("vault_url") or "https://pass.aiwerk.ch").strip()
+    return url if url.startswith(("https://", "http://")) else "https://pass.aiwerk.ch"
 
 
 def _connector_summary(

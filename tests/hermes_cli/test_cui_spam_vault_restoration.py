@@ -81,7 +81,13 @@ def test_upload_root_resolves_defining_owner(monkeypatch, tmp_path):
     assert ws._assistant_upload_root().is_relative_to(target)
 
 
-def test_vault_local_fallback_uses_only_fake_process(monkeypatch):
+@pytest.mark.parametrize("config", [
+    {"vault_url": "https://vault.example.test"},
+    {"vault": {"url": "https://vault.example.test"}},
+    {"dashboard": {"vault": {"url": "https://vault.example.test"}}},
+    {"assistant": {"vault": {"vault_url": "https://vault.example.test"}}},
+])
+def test_vault_local_fallback_uses_only_fake_process(monkeypatch, config):
     from types import SimpleNamespace
     import shutil
     monkeypatch.setattr(shutil, "which", lambda name: "/fake/bw")
@@ -91,7 +97,8 @@ def test_vault_local_fallback_uses_only_fake_process(monkeypatch):
         payload = {"status": "unlocked"} if command[1] == "status" else [{"login": {"password": "private-password"}}]
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
     monkeypatch.setattr(ws.subprocess, "run", run)
-    result = ws._vaultwarden_summary({"vault_url": "https://vault.example.test"})
+    result = ws._vaultwarden_summary(config)
     assert result["item_count"] == 1
+    assert result["vault_url"] == "https://vault.example.test"
     assert calls == [["/fake/bw", "status"], ["/fake/bw", "list", "items"]]
     assert "private-password" not in json.dumps(result)
