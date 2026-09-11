@@ -1805,7 +1805,11 @@ def _gmail_bridge_search_message_ids(
         tool="search_gmail_messages",
         params=params,
     )
-    return [str(item.get("id")) for item in _gmail_bridge_metadata_to_items(payload) if item.get("id")]
+    ids = [str(item.get("id")) for item in _gmail_bridge_metadata_to_items(payload) if item.get("id")]
+    if ids:
+        return ids
+    # Gmail search emits indented, numbered Message ID lines, unlike metadata.
+    return re.findall(r"Message ID:\s*([A-Za-z0-9_-]+)", _extract_bridge_text(payload))
 
 
 def _gmail_bridge_metadata_items_for_ids(
@@ -2014,7 +2018,8 @@ def _is_dashboard_spam_email_item(item: dict[str, Any]) -> bool:
     """Hide obvious spam from the CUI resource rail without touching the mailbox."""
     sender = item.get("sender") or item.get("from")
     if isinstance(sender, dict):
-        sender = sender.get("addr") or sender.get("address") or sender.get("email")
+        address = str(sender.get("addr") or sender.get("address") or sender.get("email") or "")
+        sender = email.utils.formataddr((str(sender.get("name") or ""), address))
     sender_domain = _email_sender_domain(sender)
     if sender_domain in _ASSISTANT_EMAIL_BLOCKED_SENDER_DOMAINS:
         return True
@@ -4071,7 +4076,7 @@ def search_cui_contacts_get(request: Request, q: str = "") -> Dict[str, Any]:
 @app.post("/api/cui/contacts")
 def create_cui_contact(request: Request, payload: CuiContactCreateRequest) -> Dict[str, Any]:
     _require_token(request)
-    contact = {"name": payload.name, "email": payload.email, "phone": payload.phone, "key": payload.email or payload.name}
+    contact = _normalize_contact_item({"name": payload.name, "email": payload.email, "phone": payload.phone, "key": payload.email or payload.name})
     store = _read_contacts_store_payload()
     store.setdefault("contacts", []).append(contact)
     _write_contacts_store_payload(store)
@@ -5089,17 +5094,16 @@ def _contacts_summary(_config: Dict[str, Any], email: Dict[str, Any], calendar: 
         for item in account.get("items", []):
             contacts.extend(_contacts_from_address_text(item.get("sender") or item.get("from"), source="E-Mail"))
     filtered: list[Dict[str, Any]] = []
-    seen: set[str] = set()
     hidden = set(_read_contacts_store_payload().get("hidden") or [])
     for contact in contacts:
         email_key = str(contact.get("email") or "").strip().lower()
         key = str(contact.get("key") or contact.get("email") or contact.get("display_name") or "")
-        if not email_key or email_key in seen or key in hidden:
+        if not email_key or key in hidden:
             continue
         if not _contact_is_customer_safe(contact, own):
             continue
-        seen.add(email_key)
         filtered.append(contact)
+    filtered = _dedupe_contacts(filtered)
     return {
         "status": "connected" if filtered else "not_configured",
         "source_label": "Relevante Kontakte",

@@ -100,3 +100,124 @@ def test_persisted_contacts_are_normalized_on_read_and_write(ws, tmp_path):
     assert saved['email'] == 'ada@example.org'
     assert saved['phone'] == '+41 79'
     assert saved['source_badges'] == ['CRM']
+
+
+def test_gmail_numbered_search_produces_summary_and_query_contacts(ws, monkeypatch):
+    # Wire format from google_workspace_mcp gmail_tools._format_gmail_results_plain.
+    numbered = """Found 2 messages matching 'in:inbox is:unread':
+
+📧 MESSAGES:
+  1. Message ID: 18abc
+     Web Link: https://mail.google.com/mail/u/0/#all/18abc
+     Thread ID: thread-a
+     Thread Link: https://mail.google.com/mail/u/0/#all/thread-a
+
+  2. Message ID: 18def
+     Web Link: https://mail.google.com/mail/u/0/#all/18def
+     Thread ID: thread-b
+     Thread Link: https://mail.google.com/mail/u/0/#all/thread-b
+
+💡 USAGE:
+  • Pass the Message IDs **as a list** to get_gmail_messages_content_batch()
+    e.g. get_gmail_messages_content_batch(message_ids=[...])
+  • Pass the Thread IDs to get_gmail_thread_content() (single) or get_gmail_threads_content_batch() (batch)"""
+    metadata = [mail('18abc'), mail('18def', 'Bea <bea@example.org>')]
+    calls = []
+
+    def bridge(config, *, server, tool, params):
+        calls.append((tool, params))
+        if tool == 'search_gmail_messages':
+            if params['query'] == 'in:inbox':
+                return {'messages': [{'id': '18fed'}]}
+            return {'result': {'content': [{'type': 'text', 'text': numbered}]}}
+        assert tool == 'get_gmail_messages_content_batch'
+        return {'messages': [item for item in metadata + [mail('18fed')] if item['id'] in params['message_ids']]}
+
+    monkeypatch.setattr(ws, '_call_aiwerk_bridge_tool', bridge)
+    monkeypatch.setattr(ws, '_ASSISTANT_EMAIL_PREVIEW_ITEMS', 3)
+    monkeypatch.setattr(ws, '_contact_account_configs', lambda c: [{'user_google_email': 'me@example.org'}])
+    result = ws._google_workspace_email_summary({}, {'backend': 'gmail', 'address': 'me@example.org'})
+    contacts = ws._contacts_from_google_workspace_query_interactions({}, 'Ada', own_emails={'me@example.org'})
+    assert [i['id'] for i in result['items']] == ['18abc', '18def', '18fed']
+    assert [i['unread'] for i in result['items']] == [True, True, False]
+    assert result['unread_count'] == 2
+    assert [i['email'] for i in contacts] == ['ada@example.org', 'bea@example.org']
+    assert [p['message_ids'] for tool, p in calls if tool == 'get_gmail_messages_content_batch'] == [
+        ['18abc', '18def'], ['18fed'], ['18abc', '18def'],
+    ]
+
+
+def test_himalaya_structured_impersonators_do_not_consume_topup(ws, monkeypatch):
+    monkeypatch.setattr(ws, '_ASSISTANT_EMAIL_PREVIEW_ITEMS', 5)
+    unread = [{'id': 'U', 'from': {'name': 'Ada', 'addr': 'ada@example.org'}}]
+    latest = [
+        {'id': f'S{i}', 'from': {'name': 'Migros', 'addr': f'offer{i}@unrelated.example'}, 'subject': 'Hello'}
+        for i in range(4)
+    ] + [
+        {'id': 'R1', 'from': {'name': 'Bea', 'addr': 'bea@example.org'}, 'flags': ['Seen']},
+        {'id': 'R2', 'from': {'name': 'Cy', 'addr': 'cy@example.org'}, 'flags': ['Seen']},
+    ]
+    calls = []
+
+    def envelopes(query=None, **kwargs):
+        calls.append((query, kwargs))
+        return unread if query else latest
+
+    monkeypatch.setattr(ws, '_run_himalaya_envelope_list', envelopes)
+    result = ws._merge_email_summaries([
+        ws._himalaya_email_summary({}, {'backend': 'himalaya', 'account': 'main', 'folder': 'INBOX'}),
+    ])
+    assert [i['id'] for i in result['items']] == ['U', 'R1', 'R2']
+    assert [i['unread'] for i in result['items']] == [True, False, False]
+    assert result['unread_count'] == 1
+    assert result['filtered_count'] == 4
+    assert result['items'][1]['from'] == latest[4]['from']
+    assert calls[0][0] == 'not flag Seen'
+    assert calls[1] == (None, {'page_size': 6, 'account': 'main', 'folder': 'INBOX'})
+    assert 'sender' not in latest[0]
+
+
+def test_manual_contact_create_persists_and_returns_normalized_fields(ws):
+    from starlette.testclient import TestClient
+
+    ws._contacts_store_path().write_text(json.dumps({'contacts': [], 'hidden': ['keep-hidden']}))
+    client = TestClient(ws.app)
+    response = client.post('/api/cui/contacts', headers={ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}, json={
+        'name': 'Ada', 'email': 'Ada <ADA@example.org>', 'phone': '+41\n79',
+    })
+    assert response.status_code == 200
+    returned = response.json()['contact']
+    saved = json.loads(ws._contacts_store_path().read_text())
+    assert returned['email'] == 'ada@example.org'
+    assert returned['phone'] == '+41 79'
+    assert saved['contacts'] == [returned]
+    assert saved['hidden'] == ['keep-hidden']
+
+
+def test_contacts_summary_unions_badges_after_visibility_filtering(ws, monkeypatch):
+    manual = [
+        {'name': 'Ada', 'email': 'ada@example.org', 'source_badges': ['CRM']},
+        {'name': 'Bea', 'email': 'bea@example.org', 'source_badges': ['CRM']},
+        {'name': 'Hidden', 'email': 'hidden@example.org', 'key': 'hidden-key'},
+        {'name': 'Me', 'email': 'me@example.org'},
+    ]
+    ws._contacts_store_path().write_text(json.dumps({'contacts': manual, 'hidden': ['hidden-key', 'hidden-copy']}))
+    google = [
+        {'name': 'Ada Google', 'email': 'ADA@example.org', 'source_badges': ['Google', 'crm']},
+        {'name': 'Hidden Ada', 'email': 'ada@example.org', 'key': 'hidden-copy', 'source_badges': ['Private']},
+        {'name': 'Newsletter', 'email': 'ada@example.org', 'source_badges': ['Unsafe']},
+        {'name': 'Cy', 'email': 'cy@example.org', 'source_badges': ['Google']},
+        {'name': 'Robot', 'email': 'noreply@example.org'},
+    ]
+    monkeypatch.setattr(ws, '_email_account_configs', lambda c: [{'address': 'me@example.org'}])
+    monkeypatch.setattr(ws, '_calendar_accounts', lambda c: [])
+    monkeypatch.setattr(ws, '_contact_account_configs', lambda c: [])
+    monkeypatch.setattr(ws, '_contacts_from_google_workspace', lambda c, **kw: google)
+    monkeypatch.setattr(ws, '_contacts_from_google_workspace_interactions', lambda *a: [])
+    monkeypatch.setattr(ws, '_contacts_from_himalaya_interactions', lambda *a: [])
+    result = ws._contacts_summary({}, {'accounts': []}, {})
+    for field in ('relevant', 'frequent'):
+        assert [i['email'] for i in result[field]] == ['ada@example.org', 'bea@example.org', 'cy@example.org']
+        assert result[field][0]['name'] == 'Ada'
+        assert result[field][0]['source_badges'] == ['CRM', 'Google']
+    assert result['total_count'] == 3
