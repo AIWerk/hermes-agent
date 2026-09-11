@@ -1354,31 +1354,43 @@ def _live_system_guard(request, monkeypatch):
         _psutil = None
         _initial_children = set()
 
-    def _is_own_subtree(pid: int) -> bool:
-        # PID 0 means "our own process group"; -1 means "every process we
-        # can signal". Both are dangerous when paired with SIGTERM/SIGKILL,
-        # but pid 0 is technically scoped to our group so allow it; pid -1
-        # is treated as foreign (refuse).
+    def _classify_subtree(pid: int) -> str:
+        # Preserve the existing own-group and fixture-start child policy.
         if pid == 0:
-            return True
+            return "verified-own"
         if pid < 0:
-            return False
+            return "verified-foreign"
         if pid == test_pid or pid in _initial_children:
-            return True
+            return "verified-own"
         if _psutil is None:
-            return False
+            return "unresolved-error"
         try:
             walker = _psutil.Process(pid)
+        except _psutil.NoSuchProcess:
+            return "confirmed-gone"
         except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
+            return "unresolved-error"
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
-                    return True
+                    return "verified-own"
+        except _psutil.NoSuchProcess:
+            # An ancestor may have vanished while the target is still live.
+            # psutil's identity-aware check distinguishes that from target
+            # disappearance/PID reuse; neither outcome authorizes a signal.
+            try:
+                if not walker.is_running():
+                    return "confirmed-gone"
+            except Exception:
+                pass
+            return "unresolved-error"
         except Exception:
-            return False
-        return False
+            return "unresolved-error"
+        return "verified-foreign"
+
+    def _is_own_subtree(pid: int) -> bool:
+        # The killpg consumer still requires positive subtree verification.
+        return _classify_subtree(pid) == "verified-own"
 
     real_kill = _os.kill
 
@@ -1390,8 +1402,17 @@ def _live_system_guard(request, monkeypatch):
         # test_entire_tree_is_sigkilled_not_just_parent.
         if int(sig) == 0:
             return real_kill(pid, sig, *args, **kwargs)
-        if _is_own_subtree(int(pid)):
+        classification = _classify_subtree(int(pid))
+        if classification == "verified-own":
             return real_kill(pid, sig, *args, **kwargs)
+        if classification == "confirmed-gone":
+            import errno
+            raise ProcessLookupError(errno.ESRCH, "live-system guard: target is gone", pid)
+        if classification == "unresolved-error":
+            import errno
+            # Deny this signal without aborting production's per-target
+            # OSError-suppressed tree cleanup. Foreign targets stay hard errors.
+            raise PermissionError(errno.EPERM, "live-system guard: unresolved ancestry", pid)
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("
             f"{pid}, {sig}) — PID is outside the test process subtree. "
