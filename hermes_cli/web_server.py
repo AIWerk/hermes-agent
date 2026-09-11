@@ -24,6 +24,8 @@ import sysconfig
 import threading
 import time
 import email.utils
+import email.header
+from collections.abc import Iterable
 import hermes_constants
 from hermes_cli import config as config_owner
 import urllib.parse
@@ -2010,7 +2012,9 @@ def _email_unread_count(items: list[dict[str, Any]], fallback: int = 0) -> int:
 
 def _is_dashboard_spam_email_item(item: dict[str, Any]) -> bool:
     """Hide obvious spam from the CUI resource rail without touching the mailbox."""
-    sender = item.get("sender")
+    sender = item.get("sender") or item.get("from")
+    if isinstance(sender, dict):
+        sender = sender.get("addr") or sender.get("address") or sender.get("email")
     sender_domain = _email_sender_domain(sender)
     if sender_domain in _ASSISTANT_EMAIL_BLOCKED_SENDER_DOMAINS:
         return True
@@ -2022,6 +2026,39 @@ def _is_dashboard_spam_email_item(item: dict[str, Any]) -> bool:
         if brand in subject and sender_domain and not _domain_matches(sender_domain, allowed_domains):
             return True
     return False
+
+def _unread_first_email_items(
+    unread_items: list[dict[str, Any]],
+    latest_items: list[dict[str, Any]] | None = None,
+    *,
+    min_items: int | None = None,
+) -> list[dict[str, Any]]:
+    """Keep backend order within unread and latest groups, hiding spam first."""
+    if min_items is None:
+        min_items = _ASSISTANT_EMAIL_PREVIEW_ITEMS
+    combined: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for unread, items in ((True, unread_items), (False, latest_items or [])):
+        for item in items:
+            if not unread and len(combined) >= min_items:
+                break
+            if not isinstance(item, dict) or _is_dashboard_spam_email_item(item):
+                continue
+            ref = str(item.get("message_id") or item.get("id") or "")
+            if ref and ref in seen:
+                continue
+            if ref:
+                seen.add(ref)
+            normalized = dict(item, unread=unread)
+            sender = item.get("sender") or item.get("from") or ""
+            if isinstance(sender, dict):
+                address = str(sender.get("addr") or sender.get("address") or sender.get("email") or "")
+                sender = email.utils.formataddr((str(sender.get("name") or ""), address))
+            normalized["sender"] = sender
+            normalized["received_at"] = item.get("received_at") or item.get("date") or ""
+            combined.append(normalized)
+    return combined
+
 
 def _visible_email_items(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     visible: list[dict[str, Any]] = []
@@ -3485,12 +3522,12 @@ def _read_manual_contacts() -> list[Dict[str, Any]]:
         try:
             data = _json.loads(payload)
             if isinstance(data, list):
-                return [dict(item) for item in data if isinstance(item, dict)]
+                return [_normalize_contact_item(item) for item in data if isinstance(item, dict)]
             if isinstance(data, dict):
-                return [dict(item) for item in data.get("contacts", []) if isinstance(item, dict)]
+                return [_normalize_contact_item(item) for item in data.get("contacts", []) if isinstance(item, dict)]
         except Exception:
             return []
-    return [dict(item) for item in _read_contacts_store_payload().get("contacts", []) if isinstance(item, dict)]
+    return [_normalize_contact_item(item) for item in _read_contacts_store_payload().get("contacts", []) if isinstance(item, dict)]
 
 
 def _write_contacts_store_payload(payload: Dict[str, Any]) -> None:
@@ -3501,7 +3538,7 @@ def _write_contacts_store_payload(payload: Dict[str, Any]) -> None:
 
 def _write_manual_contacts(contacts: list[Dict[str, Any]]) -> None:
     payload = _read_contacts_store_payload()
-    payload["contacts"] = contacts
+    payload["contacts"] = [_normalize_contact_item(item) for item in contacts if isinstance(item, dict)]
     _write_contacts_store_payload(payload)
 
 
@@ -3509,6 +3546,41 @@ def _write_hidden_contact_keys(keys: list[str]) -> None:
     payload = _read_contacts_store_payload()
     payload["hidden"] = keys
     _write_contacts_store_payload(payload)
+
+
+def _safe_contact_text(value: Any, limit: int = 160) -> str:
+    text = str(value or "").strip()
+    if "=?" in text and "?=" in text:
+        try:
+            text = str(email.header.make_header(email.header.decode_header(text))).strip()
+        except Exception:
+            pass
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _safe_contact_email(value: Any) -> str:
+    match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", _safe_contact_text(value, 254), re.I)
+    return match.group(0).lower() if match else ""
+
+
+def _safe_contact_phone(value: Any) -> str:
+    text = _safe_contact_text(value, 80)
+    return text if re.search(r"\d", text) else ""
+
+
+def _dedupe_contact_badges(values: Iterable[Any], *, limit: int = 4) -> list[str]:
+    badges: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        badge = _safe_contact_text(value, 40)
+        if not badge or badge.casefold() in seen:
+            continue
+        if len(badges) >= limit:
+            break
+        seen.add(badge.casefold())
+        badges.append(badge)
+    return badges
 
 
 def _normalize_contact(value: Any) -> str:
@@ -3533,7 +3605,7 @@ def _contact_matches_query(contact: Dict[str, Any], query: str) -> bool:
 def _contact_hide_keys(contact: Dict[str, Any]) -> set[str]:
     keys: set[str] = set()
     for key in ("key", "id", "email"):
-        value = str(contact.get(key) or "").strip().lower()
+        value = _safe_contact_email(contact.get(key)) if key == "email" else str(contact.get(key) or "").strip().lower()
         if value:
             keys.add(value)
             keys.add(f"{key}:{value}")
@@ -3563,7 +3635,7 @@ def _contacts_own_email_set(config: Dict[str, Any] | None, email_resource: Dict[
         if not isinstance(account, dict):
             continue
         for key in ("address", "email", "user_google_email", "google_email"):
-            email_addr = str(account.get(key) or "").strip().lower()
+            email_addr = _safe_contact_email(account.get(key))
             if email_addr and email_addr != "me":
                 own.add(email_addr)
     for resource in (email_resource, calendar_resource):
@@ -3573,7 +3645,7 @@ def _contacts_own_email_set(config: Dict[str, Any] | None, email_resource: Dict[
             if not isinstance(account, dict):
                 continue
             for key in ("address", "email", "account_address"):
-                email_addr = str(account.get(key) or "").strip().lower()
+                email_addr = _safe_contact_email(account.get(key))
                 if email_addr:
                     own.add(email_addr)
     return {item for item in own if item}
@@ -3585,13 +3657,18 @@ def _filter_human_contacts(contacts: list[Dict[str, Any]], *, own_emails: set[st
 
 def _dedupe_contacts(contacts: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
     deduped: list[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for contact in contacts:
-        email_key = str(contact.get("email") or "").strip().lower()
+    seen: dict[str, Dict[str, Any]] = {}
+    for raw in contacts:
+        contact = _normalize_contact_item(raw)
+        email_key = contact["email"]
         key = email_key or str(contact.get("key") or contact.get("id") or contact.get("display_name") or contact.get("name") or "").strip().lower()
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
+        if key in seen:
+            existing = seen[key]
+            existing["source_badges"] = _dedupe_contact_badges([*existing["source_badges"], *contact["source_badges"]])
+            continue
+        seen[key] = contact
         deduped.append(contact)
     return deduped
 
@@ -3603,7 +3680,9 @@ def _filter_contacts_payload(payload: Dict[str, Any], *, own_emails: set[str]) -
     for key in ("items", "contacts", "frequent", "relevant"):
         value = filtered.get(key)
         if isinstance(value, list):
-            filtered[key] = _filter_human_contacts([item for item in value if isinstance(item, dict)], own_emails=own_emails)
+            filtered[key] = _filter_human_contacts([_normalize_contact_item(item) for item in value if isinstance(item, dict)], own_emails=own_emails)
+            for contact in filtered[key]:
+                contact["source_badges"] = [badge for badge in contact["source_badges"] if _safe_contact_email(badge) not in own_emails]
     if not filtered.get("items") and "items" in filtered:
         filtered["total_count"] = 0
     return filtered
@@ -3673,8 +3752,10 @@ def _parse_google_contacts(text: str) -> list[Dict[str, Any]]:
         elif line.lower().startswith("name:"):
             current["display_name"] = line.split(":", 1)[1].strip()
         elif line.lower().startswith("email:"):
-            email = line.split(":", 1)[1].strip().split(" ", 1)[0]
-            current["email"] = email
+            current["email"] = _safe_contact_email(line.split(":", 1)[1])
+        elif line.lower().startswith("phone:"):
+            value = line.split(":", 1)[1].strip()
+            current["phone"] = _safe_contact_phone(re.sub(r"\s*\([^)]*\)\s*$", "", value).strip() or value)
     if current:
         contacts.append(current)
     return contacts
@@ -3768,11 +3849,10 @@ def _contacts_from_google_workspace_interactions(config: Dict[str, Any], own_ema
 def _contacts_from_address_text(value: Any, *, source: str) -> list[Dict[str, Any]]:
     text = str(value or "")
     contacts: list[Dict[str, Any]] = []
-    for name, email in re.findall(r"([^<,;]+)<([^>]+)>", text):
-        contacts.append({"display_name": name.strip(), "email": email.strip(), "source_badges": [source]})
-    for email in re.findall(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text):
-        if not any(contact.get("email") == email for contact in contacts):
-            contacts.append({"display_name": email, "email": email, "source_badges": [source]})
+    for name, address in email.utils.getaddresses([text]):
+        address = _safe_contact_email(address)
+        if address and not any(contact.get("email") == address for contact in contacts):
+            contacts.append(_normalize_contact_item({"display_name": name or address, "email": address, "source_badges": [source]}))
     return contacts
 
 
@@ -3820,14 +3900,20 @@ def _contacts_from_himalaya_interactions(config: Dict[str, Any], own_emails: set
 
 
 def _normalize_contact_item(contact: Dict[str, Any]) -> Dict[str, Any]:
-    email = str(contact.get("email") or "").strip()
-    name = str(contact.get("display_name") or contact.get("name") or email).strip()
+    emails = contact.get("emails") if isinstance(contact.get("emails"), list) else []
+    phones = contact.get("phones") if isinstance(contact.get("phones"), list) else []
+    email = _safe_contact_email(contact.get("email") or (emails[0] if emails else ""))
+    phone = _safe_contact_phone(contact.get("phone") or (phones[0] if phones else ""))
+    name = _safe_contact_text(contact.get("display_name") or contact.get("name") or email, 120)
+    badges = contact.get("source_badges")
+    badges = badges if isinstance(badges, list) else [contact.get("source") or "Google"]
     return {
         **contact,
         "display_name": name,
         "name": name,
         "email": email,
-        "source_badges": list(contact.get("source_badges") or ["Google"]),
+        "phone": phone,
+        "source_badges": _dedupe_contact_badges(badges),
     }
 
 
@@ -3870,7 +3956,7 @@ def _contacts_saved_top_up_target() -> int:
 
 
 def _contact_is_customer_safe(contact: Dict[str, Any], own_emails: set[str]) -> bool:
-    email = str(contact.get("email") or "").strip().lower()
+    email = _safe_contact_email(contact.get("email"))
     name = str(contact.get("display_name") or contact.get("name") or "").lower()
     if not email or email in own_emails:
         return False
@@ -4494,13 +4580,18 @@ def _google_workspace_email_summary(
             user_google_email=user_google_email,
             page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
         )
-        latest_items = _gmail_bridge_message_items(
-            config,
-            latest_query,
-            server=server,
-            user_google_email=user_google_email,
-            page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS,
-        )
+        unread_items = _gmail_bridge_metadata_items_for_ids(
+            config, unread_ids, server=server, user_google_email=user_google_email,
+        ) if unread_ids else []
+        preview_items = _unread_first_email_items(unread_items, min_items=_ASSISTANT_EMAIL_PREVIEW_ITEMS)
+        visible_unread = len(preview_items)
+        latest_items: list[Dict[str, Any]] = []
+        if visible_unread < _ASSISTANT_EMAIL_PREVIEW_ITEMS and latest_query != unread_query:
+            latest_items = _gmail_bridge_message_items(
+                config, latest_query, server=server, user_google_email=user_google_email,
+                page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS + len(unread_items),
+            )
+            preview_items = _unread_first_email_items(unread_items, latest_items, min_items=_ASSISTANT_EMAIL_PREVIEW_ITEMS)
     except Exception as exc:
         return {
             "label": _email_account_label(account_cfg) or user_google_email,
@@ -4516,12 +4607,13 @@ def _google_workspace_email_summary(
         "address": user_google_email,
         "backend": "google_workspace",
         "status": "connected",
-        "summary": f"{len(unread_ids)} ungelesene E-Mails",
+        "summary": f"{visible_unread} ungelesene E-Mails",
         "items": _attach_email_open_urls(
             {"address": user_google_email, "label": _email_account_label(account_cfg) or user_google_email},
-            latest_items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
+            preview_items,
         ),
-        "unread_count": len(unread_ids),
+        "unread_count": visible_unread,
+        "filtered_count": len({str(item.get("message_id") or item.get("id") or repr(item)) for item in [*unread_items, *latest_items] if _is_dashboard_spam_email_item(item)}),
     }
 
 
@@ -4628,16 +4720,29 @@ def _himalaya_email_summary(
         return None
     account = _himalaya_account_value(account_cfg)
     folder = _himalaya_folder_value(account_cfg)
-    items = _run_himalaya_envelope_list(page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS, account=account or None, folder=folder)
+    unread_items = _run_himalaya_envelope_list(
+        query="not flag Seen", page_size=_ASSISTANT_EMAIL_UNREAD_SCAN_LIMIT,
+        account=account or None, folder=folder,
+    )
+    items = _unread_first_email_items(unread_items, min_items=_ASSISTANT_EMAIL_PREVIEW_ITEMS)
+    visible_unread = len(items)
+    latest_items: list[Dict[str, Any]] = []
+    if visible_unread < _ASSISTANT_EMAIL_PREVIEW_ITEMS:
+        latest_items = _run_himalaya_envelope_list(
+            page_size=_ASSISTANT_EMAIL_PREVIEW_ITEMS + len(unread_items),
+            account=account or None, folder=folder,
+        )
+        items = _unread_first_email_items(unread_items, latest_items, min_items=_ASSISTANT_EMAIL_PREVIEW_ITEMS)
     account_payload = {
         "label": _email_account_label(account_cfg) or account or folder,
         "address": _email_account_address(account_cfg) or account,
         "backend": "himalaya",
         "folder": folder,
         "status": "connected" if items or account or folder else "not_configured",
-        "summary": f"{len(items)} E-Mails" if items else "Himalaya verbunden",
-        "items": items[:_ASSISTANT_EMAIL_PREVIEW_ITEMS],
-        "unread_count": len(items),
+        "summary": f"{visible_unread} ungelesene E-Mails",
+        "items": items,
+        "unread_count": visible_unread,
+        "filtered_count": len({str(item.get("message_id") or item.get("id") or repr(item)) for item in [*unread_items, *latest_items] if _is_dashboard_spam_email_item(item)}),
     }
     _attach_email_open_urls(account_payload, account_payload["items"])
     return account_payload
@@ -4674,14 +4779,16 @@ def _merge_email_summaries(summaries: list[Dict[str, Any]]) -> Dict[str, Any]:
         account_items, hidden = _visible_email_items(account_items)
         _attach_email_open_urls(account, account_items)
         account["items"] = account_items
-        account["filtered_count"] = hidden
+        account["filtered_count"] = hidden + int(account.get("filtered_count") or 0)
         account["unread_count"] = (
             _email_unread_count(account_items, int(account.get("unread_count") or 0))
             if hidden else int(account.get("unread_count") or 0)
         )
-        filtered_count += hidden
+        filtered_count += account["filtered_count"]
         items.extend(account_items)
         unread_count += account["unread_count"]
+    # Partition only after real per-backend unread fetch and read top-up.
+    items = [item for item in items if item.get("unread") is True] + [item for item in items if item.get("unread") is not True]
     status = _status_from_summaries(accounts)
     if status == "auth_required":
         summary_text = "E-Mail neu verbinden"
@@ -4973,18 +5080,14 @@ def _calendar_summary(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def _contacts_summary(_config: Dict[str, Any], email: Dict[str, Any], calendar: Dict[str, Any]) -> Dict[str, Any]:
     config = _config or {}
-    own = {str(account.get("address") or "").lower() for account in email.get("accounts", [])}
-    own.update(str(account.get("address") or "").lower() for account in calendar.get("accounts", []))
+    own = _contacts_own_email_set(config, email, calendar)
     contacts = [_normalize_contact_item(item) for item in _read_manual_contacts()]
     contacts.extend(_normalize_contact_item(item) for item in _contacts_from_google_workspace(config, limit=_contacts_saved_top_up_target()))
     contacts.extend(_normalize_contact_item(item) for item in _contacts_from_google_workspace_interactions(config, own))
     contacts.extend(_normalize_contact_item(item) for item in _contacts_from_himalaya_interactions(config, own))
     for account in email.get("accounts", []):
         for item in account.get("items", []):
-            sender = str(item.get("sender") or "")
-            match = re.search(r"([^<]+)<([^>]+)>", sender)
-            if match:
-                contacts.append({"display_name": match.group(1).strip(), "email": match.group(2).strip(), "source_badges": ["E-Mail"]})
+            contacts.extend(_contacts_from_address_text(item.get("sender") or item.get("from"), source="E-Mail"))
     filtered: list[Dict[str, Any]] = []
     seen: set[str] = set()
     hidden = set(_read_contacts_store_payload().get("hidden") or [])
