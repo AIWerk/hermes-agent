@@ -149,6 +149,36 @@
       "reason": "Authorize only schema-v2 baseline metadata adding previous_accepted_upstream_commit=cbd8de8ad64530be01efea23b7764d5c37c634ed while keeping accepted_upstream_commit=29112bef099274229cadff79cdff7bf7b99c4b77; no product capability, path, marker, selector, or recovery obligation is retired.",
       "subject_path": ".ci/content-loss/baseline.json",
       "valid_for_pr": 118
+    },
+    {
+      "id": "UPSTREAM-2237BE35-SPA-ANCHOR-SLOT-1",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
+      "valid_for_pr": 124,
+      "not_before": "2026-09-10T23:49:28Z",
+      "expires_at": "2026-09-17T23:49:28Z",
+      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
+    },
+    {
+      "id": "UPSTREAM-2237BE35-SPA-ANCHOR-SLOT-2",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
+      "valid_for_pr": 125,
+      "not_before": "2026-09-10T23:49:28Z",
+      "expires_at": "2026-09-17T23:49:28Z",
+      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
+    },
+    {
+      "id": "UPSTREAM-2237BE35-SPA-ANCHOR-SLOT-3",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
+      "valid_for_pr": 126,
+      "not_before": "2026-09-10T23:49:28Z",
+      "expires_at": "2026-09-17T23:49:28Z",
+      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
     }
   ],
   "schema_version": 1
