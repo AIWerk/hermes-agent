@@ -1424,10 +1424,205 @@ def _bootstrap_selector() -> dict:
         "id": "assistant-spa-bootstrap-global-floor",
         "type": "python_scoped_window_globals_superset",
         "path": "hermes_cli/web_server.py",
-        "root_function": "mount_spa",
+        "root_function": "_assistant_ui_bootstrap_js",
+        "legacy_root_function": "mount_spa",
         "helper_functions": ["_dashboard_mode_bootstrap_js"],
         "globals": sorted(_BOOTSTRAP_GLOBALS),
     }
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("new", True),
+        ("legacy-direct", True),
+        ("legacy-route", True),
+        ("legacy-called-local", True),
+        ("missing-both", False),
+        ("legacy-unused-local", False),
+        ("legacy-broken-route", False),
+        ("new-missing-global-with-legacy", False),
+        ("new-broken-helper-with-legacy", False),
+        ("new-duplicate-with-legacy", False),
+        ("new-nonfunction-with-legacy", False),
+        ("new-unused-local-with-legacy", False),
+        ("new-overwritten-with-legacy", False),
+        ("new-shadowed-helper-with-legacy", False),
+        ("new-assigned-helper", False),
+        ("new-argument-helper", False),
+        ("new-imported-helper", False),
+        ("legacy-rebound-local", False),
+        ("legacy-dead-route", False),
+        ("legacy-dead-call", False),
+        ("legacy-tail-call", False),
+        ("legacy-live-constant-route", True),
+    ],
+)
+def test_bootstrap_root_precedence_and_legacy_wiring(case: str, expected: bool) -> None:
+    globals_js = ";".join(f"{name}=1" for name in sorted(_BOOTSTRAP_GLOBALS))
+    legacy = f"def mount_spa(application):\n    return {globals_js!r}\n"
+    partial = globals_js.replace("window.__HERMES_DASHBOARD_MODE__=1", "")
+    helper = "def _dashboard_mode_bootstrap_js():\n    return 'window.__HERMES_DASHBOARD_MODE__=1'\n"
+    new = f"def _assistant_ui_bootstrap_js():\n    return _dashboard_mode_bootstrap_js() + {partial!r}\n"
+    sources = {
+        "new": helper + new,
+        "legacy-direct": legacy,
+        "legacy-route": "def mount_spa(application):\n"
+        f"    def _serve_index():\n        return {globals_js!r}\n"
+        "    @application.get('/{full_path:path}')\n"
+        "    async def serve_spa():\n        return _serve_index()\n",
+        "legacy-called-local": "def mount_spa(application):\n"
+        f"    def _serve_index():\n        return {globals_js!r}\n"
+        "    return _serve_index()\n",
+        "missing-both": "def unrelated():\n    return ''\n",
+        "legacy-unused-local": "def mount_spa(application):\n"
+        f"    def unused():\n        return {globals_js!r}\n"
+        "    return ''\n",
+        "legacy-broken-route": "def mount_spa(application):\n"
+        f"    def _serve_index():\n        return {globals_js!r}\n"
+        "    @application.get('/{full_path:path}')\n"
+        "    async def serve_spa():\n        return ''\n",
+        "new-missing-global-with-legacy": legacy
+        + f"def _assistant_ui_bootstrap_js():\n    return {partial!r}\n",
+        "new-broken-helper-with-legacy": legacy + helper
+        + f"def _assistant_ui_bootstrap_js():\n    return {partial!r}\n",
+        "new-duplicate-with-legacy": legacy + helper + new + new,
+        "new-nonfunction-with-legacy": legacy + "_assistant_ui_bootstrap_js = None\n",
+        "new-overwritten-with-legacy": legacy + helper + new
+        + "_assistant_ui_bootstrap_js = None\n",
+        "new-shadowed-helper-with-legacy": legacy + helper
+        + "def _assistant_ui_bootstrap_js():\n"
+        + "    def _dashboard_mode_bootstrap_js():\n        return ''\n"
+        + f"    return _dashboard_mode_bootstrap_js() + {partial!r}\n",
+        "new-unused-local-with-legacy": legacy
+        + "def _assistant_ui_bootstrap_js():\n"
+        + f"    def unused():\n        return {globals_js!r}\n"
+        + "    return ''\n",
+    }
+    sources.update({
+        "new-assigned-helper": helper + new.replace(
+            "    return", "    _dashboard_mode_bootstrap_js = lambda: ''\n    return"),
+        "new-argument-helper": helper + new.replace(
+            "_assistant_ui_bootstrap_js()", "_assistant_ui_bootstrap_js(_dashboard_mode_bootstrap_js)"),
+        "new-imported-helper": helper + new.replace(
+            "    return", "    from decoy import _dashboard_mode_bootstrap_js\n    return"),
+        "legacy-rebound-local": sources["legacy-route"].replace(
+            "    @application", "    _serve_index = lambda: ''\n    @application"),
+        "legacy-dead-route": "def mount_spa(application):\n    if False:\n"
+        "        @application.get('/{full_path:path}')\n"
+        f"        async def serve_spa():\n            return {globals_js!r}\n",
+        "legacy-dead-call": sources["legacy-called-local"].replace(
+            "    return _serve_index()", "    if False:\n        return _serve_index()"),
+        "legacy-tail-call": sources["legacy-called-local"].replace(
+            "    return _serve_index()", "    return ''\n    return _serve_index()"),
+    })
+    sources["legacy-live-constant-route"] = sources["legacy-dead-route"].replace(
+        "if False:", "if True:")
+    assert _guard._python_scoped_window_globals_selector(
+        sources[case], _bootstrap_selector()
+    ) is expected
+
+
+@pytest.mark.parametrize("binding", [
+    "_dashboard_mode_bootstrap_js = 1",
+    "(_dashboard_mode_bootstrap_js := 1)",
+    "for _dashboard_mode_bootstrap_js in [1]:\n    pass",
+    "with context() as _dashboard_mode_bootstrap_js:\n    pass",
+    "try:\n    pass\nexcept Exception as _dashboard_mode_bootstrap_js:\n    pass",
+    "from decoy import _dashboard_mode_bootstrap_js",
+    "match 1:\n    case _dashboard_mode_bootstrap_js:\n        pass",
+])
+def test_bootstrap_helper_binding_negative_controls(binding: str) -> None:
+    globals_js = ";".join(f"{name}=1" for name in sorted(_BOOTSTRAP_GLOBALS))
+    partial = globals_js.replace("window.__HERMES_DASHBOARD_MODE__=1", "")
+    helper = "def _dashboard_mode_bootstrap_js():\n    return 'window.__HERMES_DASHBOARD_MODE__=1'\n"
+    root = "def _assistant_ui_bootstrap_js():\n"
+    call = f"    return _dashboard_mode_bootstrap_js() + {partial!r}\n"
+    selector = _bootstrap_selector()
+    assert _guard._python_scoped_window_globals_selector(helper + root + call, selector)
+    bound = "".join(f"    {line}\n" for line in binding.splitlines())
+    assert not _guard._python_scoped_window_globals_selector(helper + root + bound + call, selector)
+
+
+@pytest.mark.parametrize("pattern", ["capture", "[*capture]", "{**capture}"])
+@pytest.mark.parametrize("target", ["helper", "root"])
+def test_bootstrap_pattern_bindings_fail_closed(pattern: str, target: str) -> None:
+    globals_js = ";".join(f"{name}=1" for name in sorted(_BOOTSTRAP_GLOBALS))
+    if target == "root":
+        name = "_assistant_ui_bootstrap_js"
+        source = f"def mount_spa(application):\n    return {globals_js!r}\n"
+        source += f"match None:\n    case {pattern.replace('capture', name)}:\n        pass\n"
+    else:
+        name = "_dashboard_mode_bootstrap_js"
+        partial = globals_js.replace("window.__HERMES_DASHBOARD_MODE__=1", "")
+        source = f"def {name}():\n    return 'window.__HERMES_DASHBOARD_MODE__=1'\n"
+        source += "def _assistant_ui_bootstrap_js():\n"
+        source += f"    match 1:\n        case {pattern.replace('capture', name)}:\n            pass\n"
+        source += f"    return {name}() + {partial!r}\n"
+    assert not _guard._python_scoped_window_globals_selector(source, _bootstrap_selector())
+
+
+@pytest.mark.parametrize("legacy", [None, "", [], "_assistant_ui_bootstrap_js"])
+def test_bootstrap_legacy_config_rejects_invalid_root(legacy) -> None:
+    selector = {**_bootstrap_selector(), "legacy_root_function": legacy}
+    with pytest.raises(ContentLossError, match="legacy"):
+        _guard._python_scoped_window_globals_selector("pass\n", selector)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [("none", "passed"), ("missing-global", "failed"),
+     ("broken-helper", "failed"), ("misleading-legacy", "failed"),
+     ("assigned-helper", "failed")],
+)
+def test_exact_refreshed_bootstrap_selector_controls(mutation: str, expected: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    positive = "8d605c21ebfbcb0b790b7bfe61e2c5f277e403ed"
+    if subprocess.run(
+        ["git", "cat-file", "-e", f"{positive}^{{commit}}"],
+        cwd=repo_root, capture_output=True,
+    ).returncode:
+        pytest.skip("exact refreshed positive-control commit unavailable")
+    selector = _bootstrap_selector()
+    entries = _guard._tree_entries(repo_root, positive)
+    if mutation != "none":
+        source = _git(repo_root, "show", f"{positive}:{selector['path']}")
+        if mutation == "assigned-helper":
+            import ast
+
+            root = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)
+                        and n.name == "_assistant_ui_bootstrap_js")
+            lines = source.splitlines(keepends=True)
+            lines.insert(root.body[0].lineno - 1, "    _dashboard_mode_bootstrap_js = lambda: ''\n")
+            source = "".join(lines)
+        elif mutation in {"missing-global", "misleading-legacy"}:
+            assert source.count("window.__HERMES_USER_DISPLAY_NAME__=") == 1
+            source = source.replace("window.__HERMES_USER_DISPLAY_NAME__=", "window.__REMOVED__=")
+        else:
+            import ast
+
+            module = ast.parse(source)
+            root = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                        and n.name == "_assistant_ui_bootstrap_js")
+            original = ast.get_source_segment(source, root)
+            assert original is not None
+            assert original.count("_dashboard_mode_bootstrap_js()") == 1
+            source = source.replace(original, original.replace("_dashboard_mode_bootstrap_js()", "''"))
+        if mutation == "misleading-legacy":
+            # A complete unused old root must never rescue a present broken new root.
+            import ast
+
+            root = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)
+                        and n.name == "mount_spa")
+            old = ast.get_source_segment(source, root)
+            assert old is not None
+            globals_js = ";".join(f"{name}=1" for name in sorted(_BOOTSTRAP_GLOBALS))
+            source = source.replace(old, f"def mount_spa(application):\n    return {globals_js!r}")
+        blob = _git(repo_root, "hash-object", "-w", "--stdin", input_bytes=source.encode())
+        entries[selector["path"]] = {**entries[selector["path"]], "oid": blob}
+    statuses, reasons = _guard._evaluate_selectors(repo_root, entries, [selector])
+    assert statuses == {selector["id"]: expected}
+    assert reasons == ([] if expected == "passed" else ["CAPABILITY_SELECTOR_FAILED"])
 
 
 def _core_dependencies_selector() -> dict:
@@ -1553,7 +1748,8 @@ def test_committed_class_floors_bind_exact_product_sets() -> None:
     bootstrap = selectors["assistant-spa-bootstrap-global-floor"]
     dependencies = selectors["core-project-dependency-floor"]
     assert set(bootstrap["globals"]) == _BOOTSTRAP_GLOBALS
-    assert bootstrap["root_function"] == "mount_spa"
+    assert bootstrap["root_function"] == "_assistant_ui_bootstrap_js"
+    assert bootstrap["legacy_root_function"] == "mount_spa"
     assert bootstrap["helper_functions"] == ["_dashboard_mode_bootstrap_js"]
     assert set(dependencies["dependencies"]) == _CORE_DEPENDENCIES
     assert "defusedxml" in dependencies["dependencies"]

@@ -1,5 +1,5 @@
 {
-  "accepted_upstream_commit": "29112bef099274229cadff79cdff7bf7b99c4b77",
+  "accepted_upstream_commit": "2237be355906fbe6065ce1815711eee52b2d646e",
   "baseline_id": "aiwerk-main-content-r7a-v2",
   "bootstrap": {
     "path_count": 10354,
@@ -15,7 +15,7 @@
       "zero_transition": "block"
     }
   ],
-  "previous_accepted_upstream_commit": "cbd8de8ad64530be01efea23b7764d5c37c634ed",
+  "previous_accepted_upstream_commit": "29112bef099274229cadff79cdff7bf7b99c4b77",
   "protected_controls": [
     ".github/workflows/aiwerk-content-loss-guard.yml",
     ".ci/content-loss/baseline.json",
@@ -667,7 +667,8 @@
       "type": "frontend_api_subset"
     },
     {
-      "root_function": "mount_spa",
+      "root_function": "_assistant_ui_bootstrap_js",
+      "legacy_root_function": "mount_spa",
       "helper_functions": [
         "_dashboard_mode_bootstrap_js"
       ],
