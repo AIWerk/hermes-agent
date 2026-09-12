@@ -92,3 +92,120 @@ def test_watcher_resolves_when_all_children_are_dead():
             )
 
     asyncio.run(_run())
+
+
+def test_watch_ok_probe_does_not_create_unawaited_coroutine():
+    """The fast-fail gate must inspect the watcher, not call it (#96044).
+
+    The old probe — inspect.isawaitable(_watch_children()) — created a
+    fresh coroutine per stdio tool call and never awaited it, emitting
+    'coroutine ... was never awaited' RuntimeWarnings under -W error and
+    churning the GC. Pin that the shipped source no longer calls the
+    watcher during the probe.
+    """
+    import inspect as _inspect
+
+    import tools.mcp_tool_handlers as handlers_mod
+
+    src = _inspect.getsource(handlers_mod)
+    assert "isawaitable(_watch_children())" not in src
+    assert "iscoroutinefunction(_watch_children)" in src
+
+
+def test_watch_ok_semantics_mock_vs_real():
+    """MagicMock watchers stay on the plain-await path; real async defs
+    (and AsyncMock) qualify for the fast-fail race — same split the old
+    isawaitable(call) probe produced, without the coroutine leak."""
+    import inspect as _inspect
+    from unittest.mock import AsyncMock, MagicMock
+
+    async def _real_watcher():  # what the real method looks like
+        pass
+
+    assert _inspect.iscoroutinefunction(_real_watcher) is True
+    assert _inspect.iscoroutinefunction(AsyncMock()) is True
+    assert _inspect.iscoroutinefunction(MagicMock()) is False
+
+
+def test_concurrent_stdio_spawns_claim_only_their_own_child(monkeypatch):
+    """The process-wide PID snapshot window must not overlap across servers."""
+    from tools import mcp_tool
+    from tools import mcp_tool_lifecycle as lifecycle
+    from tools import mcp_tool_transport as transport
+
+    active_pids: set[int] = set()
+    claims: dict[str, set[int]] = {}
+    next_pid = {"a": 101, "b": 202}
+
+    class Params:
+        def __init__(self, command, **_kwargs):
+            self.command = command
+
+    class StdioCM:
+        def __init__(self, pid):
+            self.pid = pid
+
+        async def __aenter__(self):
+            assert mcp_tool._stdio_spawn_lock.locked()
+            active_pids.add(self.pid)
+            await asyncio.sleep(0)
+            return object(), object()
+
+        async def __aexit__(self, *_exc):
+            active_pids.discard(self.pid)
+
+    class SessionCM:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc):
+            return None
+
+    async def preflight(_name, command, args):
+        return command, args
+
+    monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: True)
+    monkeypatch.setattr(mcp_tool, "StdioServerParameters", Params)
+    monkeypatch.setattr(mcp_tool, "_preflight_stdio_command", preflight)
+    monkeypatch.setattr(
+        mcp_tool,
+        "stdio_client",
+        lambda params, **_kwargs: StdioCM(next_pid[params.command]),
+    )
+    monkeypatch.setattr(mcp_tool, "ClientSession", lambda *_args, **_kwargs: SessionCM())
+    monkeypatch.setattr(mcp_tool, "_cancel_death_supervisor_reservation", lambda *_args: None)
+    monkeypatch.setattr(mcp_tool, "_release_idle_death_supervisor", lambda: None)
+    monkeypatch.setattr(
+        transport._config, "_resolve_stdio_command", lambda command, env: (command, env)
+    )
+    monkeypatch.setattr(transport._config, "_build_safe_env", lambda env: env or {})
+    monkeypatch.setattr(transport._config, "_write_stderr_log_header", lambda _name: None)
+    monkeypatch.setattr(transport._config, "_get_mcp_stderr_log", lambda: None)
+    monkeypatch.setattr(lifecycle, "_kill_orphaned_mcp_children", lambda: None)
+    monkeypatch.setattr(lifecycle, "_snapshot_child_pids", lambda: set(active_pids))
+    monkeypatch.setattr(transport, "_filter_mcp_children", lambda pids: set(pids))
+
+    async def run():
+        servers = [MCPServerTask("a"), MCPServerTask("b")]
+        for server in servers:
+            monkeypatch.setattr(server, "_supervised_stdio_params", (
+                lambda command, args, env: (command, args, env)
+            ))
+            monkeypatch.setattr(server, "_track_spawned_children", (
+                lambda pids, name=server.name: claims.__setitem__(name, set(pids))
+            ))
+            monkeypatch.setattr(server, "_release_spawned_children", lambda _pids: None)
+
+            async def serve(_session, _timeout, mark_lifecycle=False):
+                while len(claims) < 2:
+                    await asyncio.sleep(0)
+                return "done"
+
+            monkeypatch.setattr(server, "_serve_session", serve)
+        await asyncio.gather(*(
+            server._run_stdio({"command": server.name}) for server in servers
+        ))
+
+    asyncio.run(run())
+
+    assert claims == {"a": {101}, "b": {202}}

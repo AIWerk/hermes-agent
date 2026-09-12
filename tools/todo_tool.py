@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Todo Tool Module - Planning & Task Management
 
@@ -9,7 +8,7 @@ the conversation after context compression events, and every write bumps a
 monotonic revision so UI clients can reject stale updates.
 
 Design:
-- Single `todo` tool: provide `todos` param to write, omit to read
+- Single `todo_list` tool: provide `todos` param to write, omit to read
 - Every call returns the full current list
 - No system prompt mutation, no tool response modification
 - Behavioral guidance lives entirely in the tool schema description
@@ -608,12 +607,12 @@ def check_todo_requirements() -> bool:
 # static tool schema (cached, never changes mid-conversation).
 
 TODO_SCHEMA = {
-    "name": "todo",
+    "name": "todo_list",
     # Dieted (#95681): the item shape and merge semantics live ONLY in the
     # parameter schema below — the description teaches behavior, not
     # structure the params already define.
     "description": (
-        "Manage your task list for the current session. Use for complex tasks "
+        "Track a task list for multi-step work (3+ steps). Use for complex tasks "
         "with 3+ steps or when the user provides multiple tasks. "
         "For 'all N items' tasks, enumerate every instance as its own checklist "
         "item so none are silently dropped. "
@@ -670,7 +669,7 @@ TODO_SCHEMA = {
 from tools.registry import registry, tool_error
 
 registry.register(
-    name="todo",
+    name="todo_list",
     toolset="todo",
     schema=TODO_SCHEMA,
     handler=lambda args, **kw: todo_tool(

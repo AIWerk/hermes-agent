@@ -144,6 +144,7 @@ def test_linked_gateway_row_is_visible_only_to_its_configured_actor(monkeypatch)
         "actor_id": "actor-a",
         "user_id": "alice",
         "role": "user",
+        "provider": "portal",
     }
     monkeypatch.setattr(
         server,
@@ -155,6 +156,8 @@ def test_linked_gateway_row_is_visible_only_to_its_configured_actor(monkeypatch)
                         {
                             "username": "alice",
                             "actor_id": "actor-a",
+                            "tenant_id": "tenant-a",
+                            "provider": "portal",
                             "telegram_user_ids": ["123"],
                         }
                     ]
@@ -172,6 +175,72 @@ def test_linked_gateway_row_is_visible_only_to_its_configured_actor(monkeypatch)
         )
         is False
     )
+
+
+def test_gateway_row_display_name_collision_does_not_authorize(monkeypatch):
+    actor = {
+        "tenant_id": "tenant-a",
+        "actor_id": "actor-b",
+        "user_id": "bob",
+        "display_name": "Alice",
+        "role": "user",
+        "provider": "portal",
+    }
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_user_config",
+        lambda: {
+            "dashboard": {
+                "basic_auth": {
+                    "users": [
+                        {
+                            "username": "alice",
+                            "actor_id": "actor-a",
+                            "tenant_id": "tenant-a",
+                            "provider": "portal",
+                            "display_name": "Alice",
+                            "telegram_user_ids": ["123"],
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    assert server._cui_actor_owns_gateway_row({"source": "telegram", "user_id": "123"}, actor) is False
+
+
+def test_gateway_row_canonical_actor_identity_authorizes(monkeypatch):
+    actor = {
+        "tenant_id": "tenant-a",
+        "actor_id": "actor-a",
+        "user_id": "different-namespace-id",
+        "display_name": "Shared Name",
+        "role": "user",
+        "provider": "portal",
+    }
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_user_config",
+        lambda: {
+            "dashboard": {
+                "basic_auth": {
+                    "users": [
+                        {
+                            "username": "not-the-actor-id",
+                            "actor_id": "actor-a",
+                            "tenant_id": "tenant-a",
+                            "provider": "portal",
+                            "display_name": "Someone Else",
+                            "telegram_user_ids": ["123"],
+                        }
+                    ]
+                }
+            }
+        },
+    )
+
+    assert server._cui_actor_owns_gateway_row({"source": "telegram", "user_id": "123"}, actor) is True
 
 
 def test_live_session_compatibility_lookup_preserves_visibility(monkeypatch):

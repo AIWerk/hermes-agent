@@ -1,34 +1,12 @@
-#!/usr/bin/env python3
 """Propagate agent-turn context into worker threads that dispatch Hermes tools.
 
-A bare ``threading.Thread`` / ``ThreadPoolExecutor`` worker starts with an
-empty ``contextvars.Context`` and no thread-local approval/sudo callbacks.
-Tool dispatch inside such a thread therefore silently loses:
-
-  * the approval *session/platform* ContextVars (``tools.approval`` /
-    ``gateway.session_context``) — so gateway sessions fall into
-    ``check_dangerous_command``'s non-interactive auto-approve branch and
-    dangerous commands run without prompting (#33057, #30882);
-  * the thread-local CLI approval/sudo callbacks (``tools.terminal_tool``) —
-    so ``prompt_dangerous_approval`` cannot reach the user
-    (GHSA-qg5c-hvr5-hjgr, #15216).
-
-This helper factors out that capture/install/clear lifecycle so the several
-places that fan tool dispatch onto worker threads (``agent.tool_executor`` and
-the ``execute_code`` RPC threads) share one audited implementation instead of
-divergent copies.
-
-Usage — call :func:`propagate_context_to_thread` **on the parent thread**
-(it snapshots the parent's ContextVars and callbacks at call time) and use the
-returned callable as the worker's target::
-
-    t = threading.Thread(target=propagate_context_to_thread(loop_fn), args=(...))
-    # or
-    executor.submit(propagate_context_to_thread(worker_fn), *args)
-
-Approval/sudo callbacks are installed for the worker's lifetime and **always
-cleared on exit**, so a recycled thread never holds a stale reference to a
-disposed CLI instance.
+A bare ``threading.Thread`` / ``ThreadPoolExecutor`` worker starts with an empty
+``contextvars.Context`` and no thread-local approval/sudo callbacks, so tool dispatch inside it
+silently loses the approval ContextVars (gateway sessions then auto-approve dangerous commands)
+and the CLI callbacks (``prompt_dangerous_approval`` cannot reach the user, GHSA-qg5c-hvr5-hjgr).
+Call :func:`propagate_context_to_thread` **on the parent thread** (it snapshots at call time) and
+use the result as the worker target; callbacks are installed for the worker's lifetime and
+always cleared on exit.
 """
 
 from __future__ import annotations
@@ -69,18 +47,10 @@ def _callback_api():
 
 
 def propagate_context_to_thread(target: Callable) -> Callable:
-    """Wrap *target* for execution on a worker thread with the *current*
-    thread's ContextVars and approval/sudo callbacks propagated.
+    """Wrap *target* to run with the *current* thread's ContextVars and approval/sudo callbacks.
 
-    Call this on the parent thread; pass the returned callable as the
-    thread/executor target.  The returned callable forwards its positional
-    and keyword arguments to *target* and returns its result.
-
-    Fail-closed: if callback installation raises, the callbacks are left
-    unset (``None``).  That is the safe outcome — ``prompt_dangerous_approval``
-    denies dangerous commands when no callback is registered in an interactive
-    context, and the gateway approval queue blocks when its notify callback is
-    absent.
+    Fail-closed: if callback installation raises they stay ``None`` — dangerous commands are then
+    denied by ``prompt_dangerous_approval`` and the gateway approval queue blocks.
     """
     ctx = contextvars.copy_context()
     parent_approval_cb = parent_sudo_cb = parent_operator_cb = parent_secret_cb = None

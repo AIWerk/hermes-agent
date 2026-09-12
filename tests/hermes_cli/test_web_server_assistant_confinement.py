@@ -415,7 +415,6 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         "lib/api.ts",
         "lib/cui-approval.ts",
         "lib/cui-greeting.ts",
-        "lib/cui-side-session.ts",
         "lib/cui-slash.ts",
         "lib/dashboard-auth-reload.ts",
         "lib/gatewayClient.ts",

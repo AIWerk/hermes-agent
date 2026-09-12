@@ -1,16 +1,18 @@
-"""The decomposed command modules stay lazy after `import hermes_cli.main`.
+"""The frozen updater surface on hermes_cli.main stays lazy and resolvable.
 
-The main.py decomposition re-exports the sessions/update/dashboard command
-surface from hermes_cli.main so argparse wiring and monkeypatches keep
-resolving. Those re-exports must not import the modules eagerly: every
-`hermes` invocation (including `hermes --version`) would pay for update_cmd's
-dependency chain (jwt, click, ...) even when no subcommand runs.
+``hermes_cli/update_cmd*.py`` (frozen: old installed versions call into it) reads
+helpers off ``hermes_cli.main`` via ``_m().<name>``. main.py resolves the ones that
+live in the lazily-imported command modules through PEP 562 ``__getattr__`` so
+every ``hermes`` invocation (including ``hermes --version``) does not pay for
+update_cmd's dependency chain (jwt, click, ...) when no subcommand runs.
 """
 
 import inspect
 import subprocess
 import sys
 import textwrap
+
+import pytest
 
 import hermes_cli.main
 
@@ -51,22 +53,20 @@ def test_lazy_reexports_resolve_to_real_objects():
     import hermes_cli.sessions_cmd
     import hermes_cli.update_cmd
 
-    assert hermes_cli.main.cmd_sessions is hermes_cli.sessions_cmd.cmd_sessions
-    assert (
-        hermes_cli.main._cmd_update_impl is hermes_cli.update_cmd._cmd_update_impl
-    )
-    assert (
-        hermes_cli.main._scan_dashboard_processes
-        is hermes_cli.dashboard_procs._scan_dashboard_processes
-    )
-    # Back-compat alias resolves to the kill helper.
-    assert (
-        hermes_cli.main._warn_stale_dashboard_processes
-        is hermes_cli.dashboard_procs._kill_stale_dashboard_processes
-    )
+
+def test_frozen_surface_covers_every_update_cmd_main_read():
+    """Every ``_m().<name>`` in the frozen update_cmd*.py files resolves on hermes_cli.main."""
+    import re
+    from pathlib import Path
+
+    pkg = Path(hermes_cli.main.__file__).parent
+    names = set()
+    for path in pkg.glob("update*.py"):
+        names.update(re.findall(r"_m\(\)\.(\w+)", path.read_text(encoding="utf-8")))
+    missing = [n for n in sorted(names) if not hasattr(hermes_cli.main, n)]
+    assert not missing, missing
 
 
-def test_lazy_reexports_accept_monkeypatch(monkeypatch):
-    sentinel = object()
-    monkeypatch.setattr("hermes_cli.main._cmd_update_impl", sentinel)
-    assert hermes_cli.main._cmd_update_impl is sentinel
+def test_removed_reexports_are_gone():
+    for name in ("_scan_dashboard_processes", "_warn_stale_dashboard_processes", "_self", "_PROVIDER_MODELS"):
+        assert not hasattr(hermes_cli.main, name), name

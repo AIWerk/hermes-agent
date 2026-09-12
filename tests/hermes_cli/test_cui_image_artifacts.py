@@ -1,3 +1,4 @@
+import hermes_constants
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
@@ -1057,7 +1058,7 @@ def test_outbound_attachment_payloads_rejects_hermes_home_config(monkeypatch, tm
 def test_assistant_artifact_endpoint_serves_upload_root_image(client_loopback, tmp_path, monkeypatch):
     from hermes_cli import web_server
 
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path / "hermes-home")
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / "hermes-home")
     image_path = web_server._assistant_upload_root() / "artifact.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
 
@@ -1076,7 +1077,7 @@ def test_assistant_artifact_endpoint_serves_upload_root_image(client_loopback, t
 def test_assistant_artifact_endpoint_serves_non_image_as_safe_attachment(client_loopback, tmp_path, monkeypatch):
     from hermes_cli import web_server
 
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path / "hermes-home")
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / "hermes-home")
     text_path = web_server._assistant_upload_root() / "artifact.txt"
     text_path.write_text("not an image", encoding="utf-8")
 
@@ -1096,7 +1097,7 @@ def test_assistant_artifact_endpoint_serves_non_image_as_safe_attachment(client_
 def test_assistant_artifact_endpoint_forces_json_download(client_loopback, tmp_path, monkeypatch):
     from hermes_cli import web_server
 
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path / "hermes-home")
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / "hermes-home")
     json_path = web_server._assistant_upload_root() / "artifact.json"
     json_path.write_text('{"not": "previewed"}', encoding="utf-8")
 
@@ -1137,7 +1138,7 @@ def test_outbound_attachment_payloads_extracts_active_content_as_non_preview_fil
 def test_assistant_artifact_endpoint_forces_active_content_download(client_loopback, tmp_path, monkeypatch):
     from hermes_cli import web_server
 
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path / "hermes-home")
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / "hermes-home")
     html_path = web_server._assistant_upload_root() / "artifact.html"
     html_path.write_text("<script>alert(1)</script>", encoding="utf-8")
 
@@ -1158,7 +1159,7 @@ def test_assistant_artifact_endpoint_rejects_non_upload_root_paths(client_loopba
 
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: hermes_home)
     config_path = hermes_home / "config.yaml"
     config_path.write_text("model: test\n", encoding="utf-8")
 

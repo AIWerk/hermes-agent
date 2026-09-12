@@ -1,13 +1,18 @@
 """Rank 19: persistent FTS repair-required state and verified offline repair."""
 
 import sqlite3
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from hermes_state import (
+    SessionDB,
+)
+from hermes_state_common import (
     FTS_CJK_STALE_KEY,
     FTS_STALE_KEY,
-    SessionDB,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
 )
@@ -169,6 +174,32 @@ def test_verified_offline_repair_clears_state_only_after_integrity_success(stale
             }
         assert cjk_triggers == set(_FTS_CJK_TRIGGERS)
     assert db.fts_health_state()["repair_required"] is False
+
+
+def test_present_but_unreadable_fts_index_fails_verification():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE messages_fts USING fts5(content);
+        INSERT INTO messages_fts(content) VALUES ('healthy');
+        CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content);
+        INSERT INTO messages_fts_trigram(content) VALUES ('present');
+        """
+    )
+
+    class CorruptIndexConnection:
+        def execute(self, sql, params=()):
+            if sql == "SELECT 1 FROM messages_fts_trigram LIMIT 0":
+                raise sqlite3.DatabaseError("injected unreadable present index")
+            return conn.execute(sql, params)
+
+    db = object.__new__(SessionDB)
+    try:
+        verified, detail = db._verify_fts_repair(CorruptIndexConnection())  # type: ignore[arg-type]
+        assert verified is False
+        assert "injected unreadable present index" in detail
+    finally:
+        conn.close()
 
 
 def test_mixed_legacy_base_uses_external_integrity_for_cjk():
@@ -334,3 +365,101 @@ def test_repeated_failure_injection_never_reports_healthy(stale_db, monkeypatch)
         assert rows and rows[0]["search_provenance"]["degraded"] is True
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("guard_name", ["_raise_if_db_corrupt", "_raise_if_db_replaced"])
+def test_optimize_fts_checks_quarantine_guards_before_writes(guard_name):
+    db = object.__new__(SessionDB)
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    setattr(db, "_raise_if_db_corrupt", MagicMock())
+    setattr(db, "_raise_if_db_replaced", MagicMock())
+    getattr(db, guard_name).side_effect = RuntimeError("quarantined")
+
+    with pytest.raises(RuntimeError, match="quarantined"):
+        db.optimize_fts()
+
+    db._conn.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("_ensure_cjk_schema_committed", ()),
+        ("_ensure_v23_fts_tables", ("schema failed",)),
+        ("_merge_fts_incrementally", ()),
+    ],
+)
+@pytest.mark.parametrize("guard_name", ["_raise_if_db_corrupt", "_raise_if_db_replaced"])
+def test_direct_fts_maintenance_helpers_check_quarantine_guards(
+    method_name, args, guard_name
+):
+    db = object.__new__(SessionDB)
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    db._fts_usermerge_floor_applied = False
+    setattr(db, "_raise_if_db_corrupt", MagicMock())
+    setattr(db, "_raise_if_db_replaced", MagicMock())
+    getattr(db, guard_name).side_effect = RuntimeError("quarantined")
+
+    kwargs = {"max_pages": 1} if method_name == "_merge_fts_incrementally" else {}
+    with pytest.raises(RuntimeError, match="quarantined"):
+        getattr(db, method_name)(*args, **kwargs)
+
+    db._conn.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("guard_name", ["_raise_if_db_corrupt", "_raise_if_db_replaced"])
+def test_optimize_storage_vacuum_checks_quarantine_guards(guard_name):
+    db = object.__new__(SessionDB)
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    setattr(db, "_raise_if_db_corrupt", MagicMock())
+    setattr(db, "_raise_if_db_replaced", MagicMock())
+    getattr(db, guard_name).side_effect = RuntimeError("quarantined")
+
+    with pytest.raises(RuntimeError, match="quarantined"):
+        db._optimize_vacuum()
+
+    db._conn.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("guard_name", ["_raise_if_db_corrupt", "_raise_if_db_replaced"])
+def test_rebuild_fts_rechecks_quarantine_after_admission(monkeypatch, guard_name):
+    import contextlib
+    import hermes_state_search
+
+    db = object.__new__(SessionDB)
+    db.db_path = Path("state.db")
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    setattr(db, "_raise_if_db_corrupt", MagicMock())
+    setattr(db, "_raise_if_db_replaced", MagicMock())
+    getattr(db, guard_name).side_effect = RuntimeError("quarantined")
+
+    @contextlib.contextmanager
+    def admitted(_path):
+        yield True
+
+    monkeypatch.setattr(hermes_state_search, "fts_rebuild_admission", admitted)
+
+    with pytest.raises(RuntimeError, match="quarantined"):
+        db.rebuild_fts()
+
+    db._conn.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("guard_name", ["_raise_if_db_corrupt", "_raise_if_db_replaced"])
+def test_vacuum_rechecks_quarantine_guards_before_checkpoint(guard_name):
+    db = object.__new__(SessionDB)
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    db.optimize_fts = MagicMock(return_value=0)
+    setattr(db, "_raise_if_db_corrupt", MagicMock())
+    setattr(db, "_raise_if_db_replaced", MagicMock())
+    getattr(db, guard_name).side_effect = RuntimeError("quarantined")
+
+    with pytest.raises(RuntimeError, match="quarantined"):
+        db.vacuum()
+
+    db._conn.execute.assert_not_called()

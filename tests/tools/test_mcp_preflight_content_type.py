@@ -29,7 +29,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from tools.mcp_tool import MCPServerTask, NonMcpEndpointError
+from tools.mcp_tool import MCPServerTask
+from tools.mcp_tool_errors import NonMcpEndpointError
 
 
 def _make_task(name: str = "probe_srv") -> MCPServerTask:
@@ -201,6 +202,7 @@ def test_run_skips_preflight_for_oauth(monkeypatch):
     (``.well-known/oauth-protected-resource``), not by a GET content-type check.
     """
     import tools.mcp_tool as _mcp
+    from tools import mcp_tool_errors as _mcp_errors
 
     preflight_calls: list[str] = []
 
@@ -215,7 +217,7 @@ def test_run_skips_preflight_for_oauth(monkeypatch):
             raise asyncio.CancelledError()
 
         # Bypass URL validation so the test doesn't need a live network.
-        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda n, u: None)
+        monkeypatch.setattr(_mcp_errors, "_validate_remote_mcp_url", lambda n, u: None)
         monkeypatch.setattr(_mcp.MCPServerTask, "_preflight_content_type", _fake_preflight)
         monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _fake_run_http)
 
@@ -239,6 +241,7 @@ def test_run_skips_preflight_when_skip_preflight_set(monkeypatch):
     non-OAuth auth schemes the probe headers don't satisfy).
     """
     import tools.mcp_tool as _mcp
+    from tools import mcp_tool_errors as _mcp_errors
 
     preflight_calls: list[str] = []
 
@@ -249,7 +252,7 @@ def test_run_skips_preflight_when_skip_preflight_set(monkeypatch):
         async def _fake_run_http(self, config):
             raise asyncio.CancelledError()
 
-        monkeypatch.setattr(_mcp, "_validate_remote_mcp_url", lambda n, u: None)
+        monkeypatch.setattr(_mcp_errors, "_validate_remote_mcp_url", lambda n, u: None)
         monkeypatch.setattr(_mcp.MCPServerTask, "_preflight_content_type", _fake_preflight)
         monkeypatch.setattr(_mcp.MCPServerTask, "_run_http", _fake_run_http)
 
@@ -284,3 +287,40 @@ def test_post_probe_not_attempted_for_valid_head():
         asyncio.run(task._preflight_content_type(f"{base}/mcp", timeout=5.0))
     assert record == ["HEAD"]
     assert "POST" not in record
+
+
+def test_strict_preflight_strips_configured_headers_on_cross_origin_redirect():
+    seen = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            seen.append(self.headers.get("X-API-Key"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+
+        def log_message(self, format, *args):  # noqa: A002
+            pass
+
+    task = _make_task()
+    with _serve(Target) as target:
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_response(302)
+                self.send_header("Location", f"{target}/mcp")
+                self.end_headers()
+
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+        with _serve(Redirect) as origin:
+            asyncio.run(
+                task._preflight_content_type(
+                    f"{origin}/mcp",
+                    headers={"X-API-Key": "secret"},
+                    strict_redirect_headers=True,
+                    timeout=5.0,
+                )
+            )
+
+    assert seen == [None]

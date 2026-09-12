@@ -1,3 +1,4 @@
+import hermes_state_dbfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,7 +40,7 @@ def test_repair_search_refuses_when_other_process_holds_database(monkeypatch, tm
     db_path = tmp_path / "state.db"
     db_path.touch()
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
-    monkeypatch.setattr(hermes_state, "count_db_holders", lambda path: 1)
+    monkeypatch.setattr(hermes_state_dbfile, "count_db_holders", lambda path: 1)
     monkeypatch.setattr(hermes_state, "SessionDB", _FakeDB)
     rc = cmd_sessions(_args())
     assert rc == 2
@@ -50,7 +51,7 @@ def test_repair_search_reports_verified_success(monkeypatch, tmp_path, capsys):
     db_path = tmp_path / "state.db"
     db_path.touch()
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
-    monkeypatch.setattr(hermes_state, "count_db_holders", lambda path: 0)
+    monkeypatch.setattr(hermes_state_dbfile, "count_db_holders", lambda path: 0)
     monkeypatch.setattr(hermes_state, "SessionDB", _FakeDB)
     rc = cmd_sessions(_args())
     assert rc in (None, 0)
@@ -65,7 +66,7 @@ def test_repair_search_treats_not_required_as_successful_noop(
     db_path = tmp_path / "state.db"
     db_path.touch()
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
-    monkeypatch.setattr(hermes_state, "count_db_holders", lambda path: 0)
+    monkeypatch.setattr(hermes_state_dbfile, "count_db_holders", lambda path: 0)
     monkeypatch.setattr(hermes_state, "SessionDB", _NoopDB)
     rc = cmd_sessions(_args())
     assert rc in (None, 0)
@@ -81,7 +82,7 @@ def test_repair_search_reports_repair_success_with_restore_warning(
     db_path = tmp_path / "state.db"
     db_path.touch()
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
-    monkeypatch.setattr(hermes_state, "count_db_holders", lambda path: 0)
+    monkeypatch.setattr(hermes_state_dbfile, "count_db_holders", lambda path: 0)
     monkeypatch.setattr(hermes_state, "SessionDB", _RestoreWarningDB)
     rc = cmd_sessions(_args())
     assert rc in (None, 0)

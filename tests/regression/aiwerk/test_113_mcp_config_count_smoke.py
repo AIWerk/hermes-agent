@@ -215,17 +215,19 @@ def test_main_writes_safe_failure_report_without_dynamic_exception_values(
     plan_path.chmod(0o600)
     report_path = tmp_path / "mcp-report.json"
 
-    mcp_tool = ModuleType("tools.mcp_tool")
+    mcp_tool = ModuleType("tools.mcp_tool_discovery")
+    mcp_lifecycle = ModuleType("tools.mcp_tool_lifecycle")
     setattr(mcp_tool, "discover_mcp_tools", lambda: [])
     setattr(mcp_tool, "get_mcp_status", lambda: _statuses(bridge_connected=False))
-    setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+    setattr(mcp_lifecycle, "shutdown_mcp_servers", lambda: None)
     registry = SimpleNamespace(
         get_tool_names_for_toolset=lambda _toolset: [],
         get_entry=lambda _name: None,
     )
     registry_module = ModuleType("tools.registry")
     setattr(registry_module, "registry", registry)
-    monkeypatch.setitem(sys.modules, "tools.mcp_tool", mcp_tool)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_discovery", mcp_tool)
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_lifecycle", mcp_lifecycle)
     monkeypatch.setitem(sys.modules, "tools.registry", registry_module)
 
     assert _smoke.main(["--plan", str(plan_path), "--json-out", str(report_path)]) == 1

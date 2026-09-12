@@ -33,6 +33,7 @@ def workspace_args(install_dir: Path) -> list[str]:
     )
     result = subprocess.run(
         ["bash", "-c", script],
+        cwd=install_dir,
         capture_output=True,
         text=True,
         check=True,
@@ -92,3 +93,13 @@ def test_bare_checkout_installs_the_root_only(tmp_path):
     args = workspace_args(make_checkout(tmp_path, ()))
 
     assert args == ["--workspaces=false"]
+
+
+def test_workspace_probe_never_mutates_the_source_checkout(tmp_path):
+    """Sourcing install.sh for the probe must keep relative writes in the fixture."""
+    desktop_package = REPO_ROOT / "apps" / "desktop" / "package.json"
+    before = desktop_package.read_bytes()
+
+    workspace_args(make_checkout(tmp_path, ("ui-tui", "web")))
+
+    assert desktop_package.read_bytes() == before

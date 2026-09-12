@@ -32,8 +32,10 @@ def _fake_elevenlabs_environment_module(captured: dict):
 
 
 def test_elevenlabs_no_base_url_uses_sdk_default_environment():
-    assert tts._elevenlabs_environment_kwargs({}) == {}
-    assert tts._elevenlabs_environment_kwargs({"base_url": ""}) == {}
+    from tools.tts_tool_providers import _elevenlabs_environment_kwargs
+
+    assert _elevenlabs_environment_kwargs({}) == {}
+    assert _elevenlabs_environment_kwargs({"base_url": ""}) == {}
 
 
 def test_elevenlabs_forwards_nonempty_configured_language(tmp_path):

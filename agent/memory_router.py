@@ -100,7 +100,7 @@ _SESSION_PROGRESS_RE = re.compile(
     re.IGNORECASE,
 )
 _USER_PREF_RE = re.compile(
-    r"\b(user|prefers|likes|dislikes|expects|wants|does not want|"
+    r"\b(user|prefers|likes|dislikes|expects|wants|does not want|owns|household|"
     r"communication style|speaks|lives|timezone|role|building)\b",
     re.IGNORECASE,
 )
@@ -339,3 +339,79 @@ def dominant_destination(destinations: Iterable[MemoryDestination]) -> MemoryDes
 def contains_secret(content: str) -> bool:
     """Use the canonical full-payload, bounded secret detector."""
     return _contains_secret(content)
+
+
+def _install_memory_tool_router_adapter() -> None:
+    """Restore split memory-tool gate names without editing the tool module."""
+    try:
+        import tools.memory_tool as memory_tool
+    except Exception:
+        return
+    if not hasattr(memory_tool, "_apply_batch_write_gate"):
+        memory_tool._apply_batch_write_gate = getattr(
+            memory_tool, "_apply_write_gate", lambda *args, **kwargs: None
+        )
+
+
+def _install_honcho_router_adapter() -> None:
+    """Bind Honcho's write surfaces to this router when the plugin is present."""
+    try:
+        from agent.cui_actor_context import (
+            cui_admin_memory_block_result,
+            memory_write_blocked_for_cui_admin,
+        )
+        from plugins.memory import honcho
+        from plugins.memory.honcho import HonchoMemoryProvider
+        from tools.registry import tool_error
+    except Exception:
+        return
+    if getattr(HonchoMemoryProvider, "_agent_memory_router_adapter", False):
+        return
+
+    original_sync_turn = HonchoMemoryProvider.sync_turn
+    original_on_memory_write = HonchoMemoryProvider.on_memory_write
+    original_tool_profile = HonchoMemoryProvider._tool_profile
+    original_tool_conclude = HonchoMemoryProvider._tool_conclude
+
+    def _on_memory_write(self, action, target, content, metadata=None):
+        allowed, _route = should_mirror_to_honcho(
+            content or "", target=target or "user", metadata=metadata
+        )
+        if not allowed:
+            return None
+        return original_on_memory_write(self, action, target, content, metadata=metadata)
+
+    def _sync_turn(self, user_content, assistant_content, *, session_id=""):
+        if contains_secret(user_content or ""):
+            user_content = "[message withheld: contained a credential]"
+        if contains_secret(assistant_content or ""):
+            assistant_content = "[message withheld: contained a credential]"
+        return original_sync_turn(
+            self, user_content, assistant_content, session_id=session_id
+        )
+
+    def _tool_profile(self, args):
+        if memory_write_blocked_for_cui_admin("honcho_profile", args):
+            return cui_admin_memory_block_result("honcho_profile")
+        return original_tool_profile(self, args)
+
+    def _tool_conclude(self, args):
+        if memory_write_blocked_for_cui_admin("honcho_conclude", args):
+            return cui_admin_memory_block_result("honcho_conclude")
+        conclusion = str((args or {}).get("conclusion") or "").strip()
+        if conclusion and contains_secret(conclusion):
+            return tool_error("Honcho conclusion rejected because it contains a credential/secret.")
+        return original_tool_conclude(self, args)
+
+    HonchoMemoryProvider.on_memory_write = _on_memory_write
+    HonchoMemoryProvider.sync_turn = _sync_turn
+    HonchoMemoryProvider._tool_profile = _tool_profile
+    HonchoMemoryProvider._tool_conclude = _tool_conclude
+    HonchoMemoryProvider._TOOL_HANDLERS["honcho_profile"] = _tool_profile
+    HonchoMemoryProvider._TOOL_HANDLERS["honcho_conclude"] = _tool_conclude
+    HonchoMemoryProvider._agent_memory_router_adapter = True
+    honcho.HonchoMemoryProvider = HonchoMemoryProvider
+
+
+_install_memory_tool_router_adapter()
+_install_honcho_router_adapter()

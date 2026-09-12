@@ -262,6 +262,39 @@ def test_probe_and_connect_do_not_race(tmp_path, clean_registry, monkeypatch):
     assert not failures, failures[0]
 
 
+def test_offline_file_access_blocks_cross_process_tracked_open(tmp_path, clean_registry):
+    from hermes_cli.sqlite_safe_read import offline_file_access
+
+    db = tmp_path / "state.db"
+    _make_db(db, "DELETE")
+    script = (
+        "from hermes_cli.sqlite_safe_read import connect_tracked; "
+        "import sys; "
+        "conn = connect_tracked(sys.argv[1]); "
+        "print('ACQUIRED', flush=True); "
+        "conn.close()"
+    )
+
+    with offline_file_access(db, what="test cross-process lease"):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(db)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            import time
+
+            time.sleep(0.3)
+            assert proc.poll() is None, proc.communicate(timeout=5)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise
+
+    stdout, stderr = proc.communicate(timeout=10)
+    assert proc.returncode == 0, stderr
+    assert stdout.strip() == "ACQUIRED"
 
 
 def test_session_db_read_only_is_tracked(tmp_path, clean_registry, monkeypatch):

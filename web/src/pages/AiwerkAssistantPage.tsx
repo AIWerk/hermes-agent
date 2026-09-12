@@ -4,7 +4,6 @@ import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent,
 import { Markdown } from "@/components/Markdown";
 import { buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, type CuiGreetingContext } from "@/lib/cui-greeting";
 import { buildApprovalResponseParams } from "@/lib/cui-approval";
-import { runSideSessionBackWithParentRestore, type SideSessionBackResult } from "@/lib/cui-side-session";
 
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
@@ -18,6 +17,25 @@ import { safeWindowOpen } from "@/lib/safe-open";
 // module scope so both the page component and the standalone attachment card can
 // consult it without prop-drilling.
 const localObjectUrls = new Set<string>();
+
+interface SideSessionBackResult {
+  parent_session_id?: string;
+}
+
+async function runSideSessionBackWithParentRestore(
+  rememberedParentSessionId: string | null,
+  requestBack: () => Promise<SideSessionBackResult>,
+  restoreParentSessionId: (sessionId: string) => void,
+): Promise<SideSessionBackResult> {
+  let result: SideSessionBackResult | undefined;
+  try {
+    result = await requestBack();
+    return result;
+  } finally {
+    const parentSessionId = rememberedParentSessionId?.trim() || result?.parent_session_id?.trim();
+    if (parentSessionId) restoreParentSessionId(parentSessionId);
+  }
+}
 
 function createLocalObjectUrl(blob: Blob): string {
   const url = URL.createObjectURL(blob);

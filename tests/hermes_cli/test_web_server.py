@@ -1,4 +1,5 @@
 """Tests for hermes_cli.web_server and related config utilities."""
+from hermes_cli.web_routers import chat_ws
 
 import asyncio
 import os
@@ -21,6 +22,19 @@ from hermes_cli.config import (
     OPTIONAL_ENV_VARS,
     DEFAULT_CONFIG,
 )
+import gateway.status as _gw_status
+import hermes_cli.config as _cfg_mod
+import hermes_cli.web_routers.chat_ws as _rt_chat_ws
+import hermes_cli.web_routers.status as _rt_status
+import hermes_cli.web_server_chat as _web_server_chat
+import hermes_cli.web_server_config as _web_server_config
+import hermes_cli.web_server_dashboard as _web_server_dashboard
+import hermes_cli.web_server_files as _web_server_files
+import hermes_cli.web_server_gateway as _web_server_gateway
+import hermes_cli.web_server_lifecycle as _web_server_lifecycle
+import hermes_cli.web_server_memory as _web_server_memory
+import hermes_cli.web_server_messaging as _web_server_messaging
+import hermes_cli.web_server_sessions as _web_server_sessions
 
 
 class _ActorAdmissionWebSocket:
@@ -52,7 +66,7 @@ class TestAdminApiPermissionEnforcement:
         monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_admin)
         monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
         monkeypatch.setattr(
-            web_server, "_resolve_gateway_restart_target",
+            _web_server_gateway, "_resolve_gateway_restart_target",
             lambda profile: ("tenant-b-profile", "tenant-b"), raising=False,
         )
         monkeypatch.setattr(
@@ -82,7 +96,7 @@ class TestAdminApiPermissionEnforcement:
         monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_admin)
         monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
         monkeypatch.setattr(
-            web_server, "_resolve_gateway_restart_target",
+            _web_server_gateway, "_resolve_gateway_restart_target",
             lambda profile: ("canonical-a", "tenant-a"), raising=False,
         )
         monkeypatch.setattr(
@@ -179,7 +193,7 @@ async def test_gateway_ws_preserves_ticket_actor_allowlist_into_handle_ws(monkey
     monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
     monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
 
-    await web_server.gateway_ws(socket)
+    await chat_ws.gateway_ws(socket)
 
     assert socket.closed == []
     assert captured["auth_identity"] == {
@@ -216,7 +230,7 @@ async def test_gateway_ws_internal_credential_preserves_only_issuer_asserted_ide
     monkeypatch.setattr(web_server, "_ws_request_is_allowed", lambda _ws: True)
     monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
 
-    await web_server.gateway_ws(socket)
+    await chat_ws.gateway_ws(socket)
 
     assert socket.closed == []
     assert captured["auth_identity"] == {
@@ -257,7 +271,7 @@ async def test_gateway_ws_drops_arbitrary_consumed_ticket_fields(monkeypatch):
 
     monkeypatch.setattr(gateway_transport, "handle_ws", fake_handle_ws)
 
-    await web_server.gateway_ws(socket)
+    await chat_ws.gateway_ws(socket)
 
     assert captured["auth_identity"] == {
         "tenant_id": "tenant-2",
@@ -350,7 +364,7 @@ def _install_example_plugin(_isolate_hermes_home):
     # route reorder below.
     web_server._dashboard_plugins_cache = None
     web_server._get_dashboard_plugins(force_rescan=True)
-    web_server._mount_plugin_api_routes()
+    _web_server_dashboard._mount_plugin_api_routes()
 
     # ``include_router`` appends the new routes to the END of
     # ``app.router.routes``. That works fine at import time — the SPA
@@ -428,6 +442,14 @@ class TestRedactKey:
     def test_empty_key(self):
         result = redact_key("")
         assert "not set" in result.lower() or result == "***" or "\x1b" in result
+
+
+def test_public_path_redaction_covers_repeated_leading_slashes():
+    from hermes_cli.web_server import _redact_public_paths
+
+    assert _redact_public_paths("//private") == "[REDACTED_PATH]"
+    assert _redact_public_paths("///home/operator/private") == "[REDACTED_PATH]"
+    assert _redact_public_paths("https://example.test//private") == "https://example.test//private"
 
 
 class TestSessionTokenInjection:
@@ -513,7 +535,7 @@ class TestWebServerEndpoints:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
 
-        web_server._last_auto_archive_check.clear()
+        _web_server_sessions._last_auto_archive_check.clear()
         db_path = get_hermes_home() / "state.db"
         wal_path = Path(f"{db_path}-wal")
         writer = SessionDB(db_path=db_path)
@@ -564,6 +586,29 @@ class TestWebServerEndpoints:
                 monitor.close()
             writer.close()
 
+    def test_get_sessions_transient_ioerr_is_503(self, monkeypatch):
+        """Busy store, not a gone store: the desktop keeps the list it has."""
+        import sqlite3
+
+        from hermes_cli import web_server
+
+        def boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", boom)
+        assert self.client.get("/api/sessions?limit=1&offset=0").status_code == 503
+
+    def test_get_sessions_non_transient_operational_error_is_500(self, monkeypatch):
+        import sqlite3
+
+        from hermes_cli import web_server
+
+        def boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("no such table: sessions")
+
+        monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", boom)
+        assert self.client.get("/api/sessions?limit=1&offset=0").status_code == 500
+
     def test_get_status_loads_gateway_config_off_event_loop(self, monkeypatch):
         """Cold gateway config loading must not block the WebSocket loop.
 
@@ -590,7 +635,7 @@ class TestWebServerEndpoints:
 
         async def _run():
             event_loop_thread = threading.get_ident()
-            await web_server.get_status()
+            await _rt_status.get_status()
             return event_loop_thread
 
         event_loop_thread = asyncio.run(_run())
@@ -624,7 +669,7 @@ class TestWebServerEndpoints:
             }
         )
         save_config(config)
-        web_server._last_auto_archive_check.clear()
+        _web_server_sessions._last_auto_archive_check.clear()
 
         response = self.client.get("/api/sessions?limit=50&offset=0")
 
@@ -662,6 +707,9 @@ class TestWebServerEndpoints:
 
         legacy = sqlite3.connect(str(db_path))
         try:
+            # SQLite refuses DROP COLUMN while an index references the
+            # column; a pre-column legacy store has neither.
+            legacy.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
             legacy.execute(f"ALTER TABLE sessions DROP COLUMN {missing_column}")
             legacy.commit()
         finally:
@@ -708,6 +756,7 @@ class TestWebServerEndpoints:
 
         legacy = sqlite3.connect(str(db_path))
         try:
+            legacy.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
             legacy.execute("ALTER TABLE sessions DROP COLUMN last_activity_at")
             legacy.commit()
         finally:
@@ -752,7 +801,7 @@ class TestWebServerEndpoints:
         finally:
             legacy.close()
 
-        web_server._eager_reconcile_own_session_db()
+        _web_server_lifecycle._eager_reconcile_own_session_db()
 
         healed = sqlite3.connect(str(db_path))
         try:
@@ -784,7 +833,7 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(hermes_state, "SessionDB", boom)
         # Must swallow — reads fall back to the per-poll probe heal.
-        web_server._eager_reconcile_own_session_db()
+        _web_server_lifecycle._eager_reconcile_own_session_db()
 
     def test_heal_gives_up_when_reconcile_cannot_fix_the_store(self, monkeypatch):
         """A probe failure reconciliation can't cure must not retry forever.
@@ -809,12 +858,12 @@ class TestWebServerEndpoints:
         # A column no SCHEMA_SQL declares: the heal's writable reconcile
         # cannot add it, so the re-probe keeps failing.
         monkeypatch.setattr(
-            web_server,
+            _web_server_sessions,
             "_session_db_read_probe_statements",
             lambda: ('SELECT "sessions"."not_a_real_column" FROM "sessions" LIMIT 0',),
         )
-        monkeypatch.setattr(web_server, "_session_db_heal_exhausted", set())
-        monkeypatch.setattr(web_server, "_session_db_heal_warned", set())
+        monkeypatch.setattr(_web_server_sessions, "_session_db_heal_exhausted", set())
+        monkeypatch.setattr(_web_server_sessions, "_session_db_heal_warned", set())
 
         writable_opens = []
 
@@ -833,16 +882,16 @@ class TestWebServerEndpoints:
 
         # First open: probe fails -> one writable heal -> re-probe fails ->
         # exhausted. Still returns a usable read-only handle.
-        db = web_server._open_session_db_for_profile(None, read_only=True)
+        db = _web_server_sessions._open_session_db_for_profile(None, read_only=True)
         try:
             assert db.list_sessions_rich(limit=10, compact_rows=True)
         finally:
             db.close()
         assert len(writable_opens) == 1
-        assert str(db_path) in web_server._session_db_heal_exhausted
+        assert str(db_path) in _web_server_sessions._session_db_heal_exhausted
 
         # Second open: probe skipped, NO further writable opens.
-        db = web_server._open_session_db_for_profile(None, read_only=True)
+        db = _web_server_sessions._open_session_db_for_profile(None, read_only=True)
         try:
             assert db.list_sessions_rich(limit=10, compact_rows=True)
         finally:
@@ -869,7 +918,7 @@ class TestWebServerEndpoints:
         monkeypatch.setattr(hermes_state, "SessionDB", corrupt_open)
 
         with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
-            web_server._open_session_db_at_path(db_path, read_only=True)
+            _web_server_sessions._open_session_db_at_path(db_path, read_only=True)
 
         assert opens == [True]
 
@@ -898,7 +947,7 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(hermes_state, "SessionDB", scripted_open)
 
-        db = web_server._open_session_db_at_path(db_path, read_only=True)
+        db = _web_server_sessions._open_session_db_at_path(db_path, read_only=True)
 
         assert isinstance(db, _OkDB)
         assert opens == [True, False, True]
@@ -965,10 +1014,10 @@ class TestWebServerEndpoints:
             seen["expected_home"] = expected_home
             return None
 
-        monkeypatch.setattr(web_server, "get_running_pid_cached", _pid)
-        monkeypatch.setattr(web_server, "get_running_pid", _pid)
-        monkeypatch.setattr(web_server, "read_runtime_status", _runtime)
-        monkeypatch.setattr(web_server, "get_runtime_status_running_pid", _runtime_pid)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", _pid)
+        monkeypatch.setattr(_gw_status, "get_running_pid", _pid)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", _runtime)
+        monkeypatch.setattr(_gw_status, "get_runtime_status_running_pid", _runtime_pid)
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
 
         resp = self.client.get("/api/messaging/platforms?profile=worker")
@@ -1110,7 +1159,7 @@ class TestWebServerEndpoints:
         from tools import lazy_deps as ld
 
         # honcho declares pip_dependencies: [honcho-ai]; force it missing.
-        monkeypatch.setattr(web_server, "_dependency_importable", lambda dep: False)
+        monkeypatch.setattr(_web_server_memory, "_dependency_importable", lambda dep: False)
 
         installed = []
 
@@ -1422,6 +1471,748 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["session_id"] == "cyc-b"
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions/customer-owned",
+            "/api/sessions/customer-owned/messages",
+            "/api/sessions/customer-owned/export",
+            "/api/sessions/customer-owned/latest-descendant",
+        ],
+    )
+    def test_customer_session_get_routes_reject_foreign_actor(self, monkeypatch, path):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_foreign_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-b",
+                role="user",
+            )
+            return await call_next(request)
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="customer-owned",
+                source="web",
+                model_config={
+                    "_cui_visibility_scope": "customer",
+                    "_cui_actor_role": "user",
+                    "_cui_actor_id": "actor-a",
+                    "_cui_tenant_id": "tenant-a",
+                },
+            )
+            db.append_message("customer-owned", "user", "private")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_foreign_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        response = self.client.get(path)
+
+        assert response.status_code == 404
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions/customer-owned?profile=foreign",
+            "/api/sessions/customer-owned/messages?profile=foreign",
+            "/api/sessions/customer-owned/export?profile=foreign",
+            "/api/sessions/customer-owned/latest-descendant?profile=foreign",
+        ],
+    )
+    def test_customer_session_get_routes_reject_profile_idor_before_open(self, monkeypatch, path):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        def fail_open(profile, *, read_only):
+            if profile == "foreign":
+                raise AssertionError("foreign profile DB opened")
+            from hermes_state import SessionDB
+
+            return SessionDB(read_only=read_only)
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_open)
+        response = self.client.get(path)
+
+        assert response.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("method", "path", "body"),
+        [
+            ("get", "/api/profiles/sessions", None),
+            ("get", "/api/profiles/sessions/sidebar", None),
+            ("get", "/api/profiles/projects/tree", None),
+            ("post", "/api/profiles/sessions/pull-requests", {"ids": []}),
+        ],
+    )
+    def test_restricted_identity_cannot_fall_back_to_operator_profile_routes(
+        self, monkeypatch, method, path, body
+    ):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        async def incomplete_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="", actor_id="", role="user"
+            )
+            return await call_next(request)
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", incomplete_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        response = getattr(self.client, method)(path, json=body) if body is not None else getattr(self.client, method)(path)
+
+        assert response.status_code == 403
+
+    def test_inner_middleware_binds_authenticated_actor_for_resource_scopes(self):
+        import hermes_cli.web_server as web_server
+
+        request = SimpleNamespace(
+            method="GET",
+            url=SimpleNamespace(path="/api/cui/resources"),
+            state=SimpleNamespace(
+                session=SimpleNamespace(
+                    tenant_id="tenant-a", actor_id="actor-a", role="user"
+                )
+            ),
+        )
+        seen = []
+
+        async def call_next(_request):
+            seen.append(web_server._current_http_cui_actor.get())
+            return "ok"
+
+        result = asyncio.run(web_server._admin_permission_middleware(request, call_next))
+
+        assert result == "ok"
+        assert seen == [{"tenant_id": "tenant-a", "actor_id": "actor-a", "role": "user"}]
+        assert web_server._current_http_cui_actor.get() is None
+
+    def test_sidebar_cache_rejects_restricted_identity_before_wrapped_scan(self):
+        from fastapi import HTTPException
+        from hermes_cli.web_routers.profiles import _sidebar_singleflight_cache
+
+        called = []
+
+        @_sidebar_singleflight_cache
+        def scan(request):
+            called.append(request)
+            return {"errors": []}
+
+        class RequestStub:
+            pass
+
+        request = RequestStub()
+        request.state = SimpleNamespace(
+            session=SimpleNamespace(tenant_id="", actor_id="", role="user")
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            scan(request)
+
+        assert exc.value.status_code == 403
+        assert called == []
+
+    def test_customer_list_reauthorizes_projected_foreign_compression_tip(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        owned = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-a",
+            "_cui_tenant_id": "tenant-a",
+        }
+        foreign = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-b",
+            "_cui_tenant_id": "tenant-a",
+        }
+        db = SessionDB()
+        try:
+            db.create_session("owned-list-root", "web", model_config=owned)
+            db.append_message("owned-list-root", "user", "owned root")
+            db.end_session("owned-list-root", "compression")
+            db.create_session(
+                "foreign-list-tip",
+                "web",
+                model_config=foreign,
+                parent_session_id="owned-list-root",
+            )
+            db.append_message("foreign-list-tip", "user", "foreign tip")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        response = self.client.get("/api/sessions?limit=50")
+
+        assert response.status_code == 200
+        assert response.json()["sessions"] == []
+        assert response.json()["total"] == 0
+
+        profile_payload = self.client.get(
+            "/api/profiles/sessions?limit=50"
+        ).json()
+        assert profile_payload["sessions"] == []
+        assert profile_payload["total"] == 0
+
+        sidebar_payload = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=default"
+        ).json()
+        assert all(
+            row["id"] != "foreign-list-tip"
+            for section in ("recents", "cron", "messaging")
+            for row in sidebar_payload[section]["sessions"]
+        )
+
+    def test_customer_list_allows_projected_owned_compression_tip_and_counts_all_pages(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        owned = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-a",
+            "_cui_tenant_id": "tenant-a",
+        }
+        foreign = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-b",
+            "_cui_tenant_id": "tenant-a",
+        }
+        db = SessionDB()
+        try:
+            db.create_session("owned-list-parent", "web", model_config=owned)
+            db.append_message("owned-list-parent", "user", "owned parent")
+            db.end_session("owned-list-parent", "compression")
+            db.create_session(
+                "owned-list-tip",
+                "web",
+                model_config=owned,
+                parent_session_id="owned-list-parent",
+            )
+            db.append_message("owned-list-tip", "user", "owned tip")
+            for index in range(101):
+                sid = f"foreign-list-filler-{index:03d}"
+                db.create_session(sid, "web", model_config=foreign)
+                db.append_message(sid, "user", "foreign filler")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        response = self.client.get("/api/sessions?limit=1&offset=0")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [row["id"] for row in payload["sessions"]] == ["owned-list-tip"]
+        assert payload["total"] == 1
+
+        profile_payload = self.client.get(
+            "/api/profiles/sessions?limit=1"
+        ).json()
+        assert [row["id"] for row in profile_payload["sessions"]] == ["owned-list-tip"]
+        assert profile_payload["total"] == 1
+
+        sidebar_payload = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=default"
+        ).json()
+        assert "owned-list-tip" in {
+            row["id"] for row in sidebar_payload["recents"]["sessions"]
+        }
+
+    def test_customer_cannot_delete_foreign_session(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="actor-a", role="user"
+            )
+            return await call_next(request)
+
+        foreign = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-b",
+            "_cui_tenant_id": "tenant-a",
+        }
+        db = SessionDB()
+        try:
+            db.create_session("foreign-delete-session", "web", model_config=foreign)
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        response = self.client.delete("/api/sessions/foreign-delete-session")
+
+        assert response.status_code == 404
+        db = SessionDB()
+        try:
+            assert db.get_session("foreign-delete-session") is not None
+        finally:
+            db.close()
+
+    def test_customer_cannot_mutate_foreign_session(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="actor-a", role="user"
+            )
+            return await call_next(request)
+
+        foreign = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-b",
+            "_cui_tenant_id": "tenant-a",
+        }
+        db = SessionDB()
+        try:
+            db.create_session("foreign-mutate-session", "web", model_config=foreign)
+            db.set_session_title("foreign-mutate-session", "original")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        response = self.client.patch(
+            "/api/sessions/foreign-mutate-session", json={"title": "attacker"}
+        )
+
+        assert response.status_code == 404
+        db = SessionDB()
+        try:
+            assert db.get_session_title("foreign-mutate-session") == "original"
+        finally:
+            db.close()
+
+    def test_customer_bulk_delete_rejects_profile_override_before_db_open(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+        import hermes_cli.web_routers.sessions as sessions_router
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="actor-a", role="user"
+            )
+            return await call_next(request)
+
+        opened = []
+
+        def forbidden_open(*args, **kwargs):
+            opened.append((args, kwargs))
+            raise AssertionError("profile override reached a session database")
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(
+            sessions_router, "_open_session_db_for_profile", forbidden_open
+        )
+        monkeypatch.setattr(sessions_router, "_with_db", forbidden_open)
+
+        response = self.client.post(
+            "/api/sessions/bulk-delete",
+            json={"ids": ["owned-looking-id"], "profile": "foreign-profile"},
+        )
+
+        assert response.status_code == 404
+        assert opened == []
+
+    def test_non_admin_customer_cannot_prune_sessions_before_db_access(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+        import hermes_cli.web_routers.sessions as sessions_router
+        from hermes_cli.dashboard_auth import middleware
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="actor-a", role="user"
+            )
+            return await call_next(request)
+
+        called = []
+
+        def forbidden_prune(body):
+            called.append(body)
+            raise AssertionError("non-admin prune reached writable session DB")
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(sessions_router, "_prune_sessions", forbidden_prune)
+
+        response = self.client.post(
+            "/api/sessions/prune",
+            json={"profile": "foreign-profile", "older_than_days": 1},
+        )
+
+        assert response.status_code == 403
+        assert called == []
+
+    def test_customer_pr_scan_filters_foreign_session_ids_before_transcript_read(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a", actor_id="actor-a", role="user"
+            )
+            return await call_next(request)
+
+        owned = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-a",
+            "_cui_tenant_id": "tenant-a",
+        }
+        foreign = {**owned, "_cui_actor_id": "actor-b"}
+        db = SessionDB()
+        try:
+            db.create_session("owned-pr-session", "web", model_config=owned)
+            db.create_session("foreign-pr-session", "web", model_config=foreign)
+            db.append_message(
+                "owned-pr-session", "tool",
+                json.dumps({"output": "https://github.com/acme/repo/pull/11"}),
+            )
+            db.append_message(
+                "foreign-pr-session", "tool",
+                json.dumps({"output": "https://github.com/acme/repo/pull/99"}),
+            )
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        response = self.client.post(
+            "/api/profiles/sessions/pull-requests",
+            json={"ids": ["owned-pr-session", "foreign-pr-session"]},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["pull_requests"] == {
+            "owned-pr-session": {
+                "number": 11,
+                "url": "https://github.com/acme/repo/pull/11",
+            }
+        }
+
+    def test_customer_messages_and_export_use_public_recursive_projection(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        model_config = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-a",
+            "_cui_tenant_id": "tenant-a",
+            "private": "raw-model-config",
+        }
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="customer-owned",
+                source="web",
+                system_prompt="raw system prompt",
+                model_config=model_config,
+                cwd="/home/service/private-worktree",
+            )
+            db.append_message(
+                "customer-owned",
+                "user",
+                {
+                    "api_key": "plain-api-key-secret",
+                    "nested": [
+                        "Authorization: Bearer token-secret",
+                        {
+                            "path": "/home/service/private-worktree/file.txt",
+                            "root_path": "/root/.ssh/id_rsa",
+                            "etc_path": "/etc/ssh/sshd_config",
+                            "var_path": "/var/lib/private/data.db",
+                            "numeric_path": "/123/private/file",
+                            "unicode_path": "/ä/private/file",
+                            "windows_path": r"D:\secrets\private.txt",
+                            "unc_path": r"\\server\share\private.txt",
+                            "safe_url": "https://example.test/docs/report",
+                            "safe_shared_numeric": "shared://123/private/file",
+                            "safe_shared_unicode": "shared://ä/private/file",
+                            "password": "nested-password-secret",
+                            "items": [{"token": "nested-token-secret"}],
+                        },
+                    ],
+                    "headers": {"authorization": "Bearer token-secret"},
+                },
+            )
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        detail = self.client.get("/api/sessions/customer-owned")
+        assert detail.status_code == 200
+        rendered_detail = json.dumps(detail.json())
+        assert "raw system prompt" not in rendered_detail
+        assert "raw-model-config" not in rendered_detail
+        assert "private-worktree" not in rendered_detail
+
+        messages = self.client.get("/api/sessions/customer-owned/messages")
+        assert messages.status_code == 200
+        messages_payload = messages.json()
+        rendered_messages = json.dumps(messages_payload)
+        message_content = messages_payload["messages"][0]["content"]
+        assert "token-secret" not in rendered_messages
+        assert "plain-api-key-secret" not in rendered_messages
+        assert "nested-password-secret" not in rendered_messages
+        assert "nested-token-secret" not in rendered_messages
+        assert "/home/service" not in rendered_messages
+        assert "/root/.ssh" not in rendered_messages
+        assert "/etc/ssh" not in rendered_messages
+        assert "/var/lib" not in rendered_messages
+        assert message_content["nested"][1]["numeric_path"] == "[REDACTED_PATH]"
+        assert message_content["nested"][1]["unicode_path"] == "[REDACTED_PATH]"
+        assert r"D:\\secrets" not in rendered_messages
+        assert r"\\\\server\\share" not in rendered_messages
+        assert "https://example.test/docs/report" in rendered_messages
+        assert "shared://123/private/file" in rendered_messages
+        assert "shared://ä/private/file" in json.dumps(messages_payload, ensure_ascii=False)
+        assert "headers" not in rendered_messages
+
+        exported = self.client.get("/api/sessions/customer-owned/export")
+        assert exported.status_code == 200
+        export_payload = exported.json()
+        rendered_export = json.dumps(export_payload)
+        export_content = export_payload["messages"][0]["content"]
+        assert "raw system prompt" not in rendered_export
+        assert "raw-model-config" not in rendered_export
+        assert "private-worktree" not in rendered_export
+        assert "token-secret" not in rendered_export
+        assert "plain-api-key-secret" not in rendered_export
+        assert "nested-password-secret" not in rendered_export
+        assert "nested-token-secret" not in rendered_export
+        assert "/root/.ssh" not in rendered_export
+        assert "/etc/ssh" not in rendered_export
+        assert "/var/lib" not in rendered_export
+        assert export_content["nested"][1]["numeric_path"] == "[REDACTED_PATH]"
+        assert export_content["nested"][1]["unicode_path"] == "[REDACTED_PATH]"
+        assert r"D:\\secrets" not in rendered_export
+        assert r"\\\\server\\share" not in rendered_export
+        assert "https://example.test/docs/report" in rendered_export
+        assert "shared://123/private/file" in rendered_export
+        assert "shared://ä/private/file" in json.dumps(export_payload, ensure_ascii=False)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions?profile=foreign",
+            "/api/sessions/search?profile=foreign&q=customer-owned",
+        ],
+    )
+    def test_customer_session_list_search_reject_profile_idor_before_side_effects(
+        self, monkeypatch, path
+    ):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        side_effects = []
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        def fail_auto_archive(profile):
+            side_effects.append(("auto_archive", profile))
+            raise AssertionError("maintenance must not run")
+
+        def fail_open(profile, *, read_only):
+            side_effects.append(("open", profile, read_only))
+            raise AssertionError("DB must not open")
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(web_server, "_maybe_auto_archive_for_profile", fail_auto_archive)
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_open)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 404
+        assert side_effects == []
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/sessions?profile=foreign",
+            "/api/sessions/search?profile=foreign&q=customer-owned",
+        ],
+    )
+    def test_restricted_session_list_search_denied_before_side_effects(
+        self, monkeypatch, path
+    ):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+
+        side_effects = []
+
+        async def incomplete_authenticated_identity(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        def fail_auto_archive(profile):
+            side_effects.append(("auto_archive", profile))
+            raise AssertionError("maintenance must not run")
+
+        def fail_open(profile, *, read_only):
+            side_effects.append(("open", profile, read_only))
+            raise AssertionError("DB must not open")
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", incomplete_authenticated_identity)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        monkeypatch.setattr(web_server, "_maybe_auto_archive_for_profile", fail_auto_archive)
+        monkeypatch.setattr(web_server, "_open_session_db_for_profile", fail_open)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 403
+        assert side_effects == []
+
+    def test_customer_session_list_search_owned_default_profile_still_works(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def authenticated_customer(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="tenant-a",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        model_config = {
+            "_cui_visibility_scope": "customer",
+            "_cui_actor_role": "user",
+            "_cui_actor_id": "actor-a",
+            "_cui_tenant_id": "tenant-a",
+        }
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="customer-owned-default",
+                source="web",
+                model_config=model_config,
+            )
+            db.append_message("customer-owned-default", "user", "unique customer needle")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", authenticated_customer)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        listed = self.client.get("/api/sessions?limit=20")
+        assert listed.status_code == 200
+        assert "customer-owned-default" in {
+            row["id"] for row in listed.json()["sessions"]
+        }
+
+        searched = self.client.get("/api/sessions/search?q=needle")
+        assert searched.status_code == 200
+        assert "customer-owned-default" in {
+            row["id"] for row in searched.json()["results"]
+        }
+
+    @pytest.mark.parametrize("path", ["/api/sessions", "/api/sessions/stats"])
+    def test_restricted_authenticated_identity_denied_session_list_and_stats(self, monkeypatch, path):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.dashboard_auth import middleware
+        from hermes_state import SessionDB
+
+        async def incomplete_authenticated_identity(request, call_next):
+            request.state.session = SimpleNamespace(
+                tenant_id="",
+                actor_id="actor-a",
+                role="user",
+            )
+            return await call_next(request)
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="admin-row", source="cli")
+        finally:
+            db.close()
+
+        monkeypatch.setattr(middleware, "gated_auth_middleware", incomplete_authenticated_identity)
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+
+        response = self.client.get(path)
+
+        assert response.status_code == 403
+
 
 
 
@@ -1447,16 +2238,16 @@ class TestWebServerEndpoints:
             raise AssertionError("docker update guard should not spawn hermes update")
 
         # Bypass the managed-externally gate so we reach the docker install check.
-        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
         # The shared admission gate (#91277 Phase 3) resolves the install
         # method through hermes_cli.config directly.
         monkeypatch.setattr(
             "hermes_cli.config.detect_install_method", lambda *_a, **_k: "docker"
         )
-        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "docker")
-        monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
-        web_server._ACTION_PROCS.pop("hermes-update", None)
-        web_server._ACTION_RESULTS.pop("hermes-update", None)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "docker")
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fail_spawn)
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+        _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
 
         resp = self.client.post("/api/hermes/update")
 
@@ -1487,17 +2278,17 @@ class TestWebServerEndpoints:
             spawned = True
             raise AssertionError("APT-managed update guard should not spawn hermes update")
 
-        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
         # The shared admission gate (#91277 Phase 3) resolves the install
         # method through hermes_cli.config directly, so patch it there (the
         # web_server module alias only feeds the /update/check endpoint).
         monkeypatch.setattr(
             "hermes_cli.config.detect_install_method", lambda *_a, **_k: "apt"
         )
-        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "apt")
-        monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
-        web_server._ACTION_PROCS.pop("hermes-update", None)
-        web_server._ACTION_RESULTS.pop("hermes-update", None)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "apt")
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fail_spawn)
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+        _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
 
         resp = self.client.post("/api/hermes/update")
 
@@ -1532,11 +2323,11 @@ class TestWebServerEndpoints:
             f"=== hermes-update completed {action_id} ===\n",
             encoding="utf-8",
         )
-        monkeypatch.setattr(web_server, "_ACTION_LOG_DIR", tmp_path)
-        monkeypatch.setattr(web_server, "_ACTION_PROCS", {})
-        monkeypatch.setattr(web_server, "_ACTION_RESULTS", {})
-        monkeypatch.setattr(web_server, "_ACTION_COMMANDS", {})
-        monkeypatch.setattr(web_server, "_ACTION_IDS", {})
+        monkeypatch.setattr(_web_server_gateway, "_ACTION_LOG_DIR", tmp_path)
+        monkeypatch.setattr(_web_server_gateway, "_ACTION_PROCS", {})
+        monkeypatch.setattr(_web_server_gateway, "_ACTION_RESULTS", {})
+        monkeypatch.setattr(_web_server_gateway, "_ACTION_COMMANDS", {})
+        monkeypatch.setattr(_web_server_gateway, "_ACTION_IDS", {})
 
         status = self.client.get("/api/actions/hermes-update/status?lines=2000")
 
@@ -1559,12 +2350,12 @@ class TestWebServerEndpoints:
             calls.append((subcommand, name, env_overrides))
             return Proc()
 
-        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "a" * 32)
-        monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
-        web_server._ACTION_PROCS.pop("hermes-update", None)
-        web_server._ACTION_RESULTS.pop("hermes-update", None)
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fake_spawn)
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+        _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
 
         resp = self.client.post("/api/hermes/update")
 
@@ -1588,21 +2379,21 @@ class TestWebServerEndpoints:
             def poll(self):
                 return None
 
-        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(
-            web_server,
+            _web_server_gateway,
             "_spawn_hermes_action",
             lambda *_args, **_kwargs: pytest.fail("must not spawn a duplicate update"),
         )
-        web_server._ACTION_PROCS["hermes-update"] = Proc()
-        web_server._ACTION_IDS["hermes-update"] = "b" * 32
+        _web_server_gateway._ACTION_PROCS["hermes-update"] = Proc()
+        _web_server_gateway._ACTION_IDS["hermes-update"] = "b" * 32
 
         try:
             resp = self.client.post("/api/hermes/update")
         finally:
-            web_server._ACTION_PROCS.pop("hermes-update", None)
-            web_server._ACTION_IDS.pop("hermes-update", None)
+            _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+            _web_server_gateway._ACTION_IDS.pop("hermes-update", None)
 
         assert resp.status_code == 200
         assert resp.json() == {
@@ -1640,11 +2431,7 @@ class TestWebServerEndpoints:
         the setup cards and handed back to Keys — see
         tests/hermes_cli/test_setup_hidden_env.py.
         """
-        from hermes_cli.web_server import (
-            _MESSAGING_KEYS_PAGE_KEYS,
-            _build_catalog_entry,
-            _channel_managed_env_keys,
-        )
+        from hermes_cli.web_server_messaging import _MESSAGING_KEYS_PAGE_KEYS, _build_catalog_entry, _channel_managed_env_keys
 
         discord = _build_catalog_entry("discord")
         assert "DISCORD_BOT_TOKEN" in discord["env_vars"]
@@ -1798,8 +2585,8 @@ class TestWebServerEndpoints:
         import hermes_cli.web_server as ws
         from hermes_cli.config import load_config, load_env
 
-        with ws._telegram_onboarding_lock:
-            ws._telegram_onboarding_pairings.clear()
+        with _web_server_messaging._telegram_onboarding_lock:
+            _web_server_messaging._telegram_onboarding_pairings.clear()
 
         def fake_request(method, path, *, body=None, bearer_token=None):
             if method == "POST":
@@ -1821,15 +2608,15 @@ class TestWebServerEndpoints:
                 "token": "123456:SECRET",
             }
 
-        monkeypatch.setattr(ws, "_telegram_onboarding_request_sync", fake_request)
-        ws._ACTION_PROCS.pop("gateway-restart", None)
+        monkeypatch.setattr(_web_server_messaging, "_telegram_onboarding_request_sync", fake_request)
+        _web_server_gateway._ACTION_PROCS.pop("gateway-restart", None)
 
         def fail_spawn_action(subcommand, name):
             assert subcommand == ["gateway", "restart"]
             assert name == "gateway-restart"
             raise RuntimeError("supervisor unavailable")
 
-        monkeypatch.setattr(ws, "_spawn_hermes_action", fail_spawn_action)
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fail_spawn_action)
 
         start = self.client.post("/api/messaging/telegram/onboarding/start", json={})
         assert start.status_code == 200
@@ -1887,7 +2674,7 @@ class TestWebServerEndpoints:
     def test_parse_model_ids_handles_openai_and_bare_shapes(self):
         """Model discovery must tolerate the common /v1/models shapes and
         never raise (so a slightly non-standard local endpoint still works)."""
-        from hermes_cli.web_server import _parse_model_ids
+        from hermes_cli.web_server_profiles import _parse_model_ids
 
         class FakeResp:
             def __init__(self, payload, ok=True):
@@ -2626,7 +3413,7 @@ class TestBuildSchemaFromConfig:
 
 
     def test_overrides_applied(self):
-        from hermes_cli.web_server import CONFIG_SCHEMA
+        from hermes_cli.web_server_config import CONFIG_SCHEMA
         # terminal.backend should be a select with options
         if "terminal.backend" in CONFIG_SCHEMA:
             entry = CONFIG_SCHEMA["terminal.backend"]
@@ -2651,7 +3438,7 @@ class TestBuildSchemaFromConfig:
         blank entry server-side (the clear item is client-side via
         ``clearable``), and never empty even without tzdata (UTC fallback).
         """
-        from hermes_cli.web_server import CONFIG_SCHEMA, _timezone_options
+        from hermes_cli.web_server_config import CONFIG_SCHEMA, _timezone_options
 
         entry = CONFIG_SCHEMA["timezone"]
         assert entry["type"] == "select"
@@ -2674,19 +3461,19 @@ class TestBuildSchemaFromConfig:
         """
         from hermes_cli import web_server
 
-        monkeypatch.setattr(web_server, "load_config", lambda: {"memory": {"provider": "honcho"}})
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {"memory": {"provider": "honcho"}})
         monkeypatch.setattr(
-            web_server,
+            _web_server_config,
             "_memory_provider_options",
             lambda: ["", "honcho", "hindsight", "freshly_installed"],
         )
 
-        fields = web_server._schema_with_dynamic_provider_options()
+        fields = _web_server_config._schema_with_dynamic_provider_options()
 
         assert "freshly_installed" in fields["memory.provider"]["options"]
         # The entry is copied, not mutated in place, and keeps its select type.
         assert fields["memory.provider"]["type"] == "select"
-        assert web_server.CONFIG_SCHEMA["memory.provider"] is not fields["memory.provider"]
+        assert _web_server_config.CONFIG_SCHEMA["memory.provider"] is not fields["memory.provider"]
 
 
 
@@ -2696,7 +3483,7 @@ class TestBuildSchemaFromConfig:
 
     def test_no_single_field_categories(self):
         """After merging, no category should have just 1 field."""
-        from hermes_cli.web_server import CONFIG_SCHEMA
+        from hermes_cli.web_server_config import CONFIG_SCHEMA
         from collections import Counter
         cats = Counter(e["category"] for e in CONFIG_SCHEMA.values())
         for cat, count in cats.items():
@@ -3061,9 +3848,11 @@ class TestNewEndpoints:
             ),
         )
         # No xAI credentials → the Grok OAuth-backed row needs sign-in.
+        import hermes_cli.tools_config_post_setup as tools_config_post_setup
+
         monkeypatch.setattr(tools_config, "_xai_credentials_present", lambda: False)
         # Local TTS engines not installed → their rows need setup.
-        monkeypatch.setattr(tools_config, "_module_installed", lambda name: False)
+        monkeypatch.setattr(tools_config_post_setup, "_module_installed", lambda name: False)
         monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
 
         resp = self.client.get("/api/tools/toolsets/tts/config")
@@ -3180,7 +3969,7 @@ class TestNewEndpoints:
         import hermes_cli.web_server as web_server
         from hermes_cli.config import load_config, save_config
 
-        monkeypatch.setattr(web_server.shutil, "which", lambda name: None)
+        monkeypatch.setattr(shutil, "which", lambda name: None)
         config = load_config()
         config.setdefault("terminal", {})
         config["terminal"]["ssh_host"] = "devbox.example.com"
@@ -3362,7 +4151,7 @@ class TestModelContextLength:
 
     def test_normalize_extracts_context_length_from_dict(self):
         """normalize should surface context_length from model dict."""
-        from hermes_cli.web_server import _normalize_config_for_web
+        from hermes_cli.web_server_config import _normalize_config_for_web
 
         cfg = {
             "model": {
@@ -3377,7 +4166,7 @@ class TestModelContextLength:
 
     def test_normalize_bare_string_model_yields_zero(self):
         """normalize should set model_context_length=0 for bare string model."""
-        from hermes_cli.web_server import _normalize_config_for_web
+        from hermes_cli.web_server_config import _normalize_config_for_web
 
         result = _normalize_config_for_web({"model": "anthropic/claude-sonnet-4"})
         assert result["model"] == "anthropic/claude-sonnet-4"
@@ -3386,7 +4175,7 @@ class TestModelContextLength:
 
     def test_denormalize_writes_context_length_into_model_dict(self):
         """denormalize should write model_context_length back into model dict."""
-        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.web_server_config import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
         # Set up disk config with model as a dict
@@ -3406,7 +4195,7 @@ class TestModelContextLength:
         """The Settings autosave now sends a diff, not the full draft: editing
         only the Context Window control must not omit ``model`` and thereby
         drop the context_length edit on the floor (#89597 review)."""
-        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.web_server_config import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
         save_config({
@@ -3428,7 +4217,7 @@ class TestModelContextLength:
         to the diff-omission bug rather than the separate, pre-existing (and
         intentional, see ``_apply_main_model_assignment``) behavior where a
         real provider switch drops the context_length override."""
-        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.web_server_config import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
         save_config({
@@ -3448,7 +4237,7 @@ class TestDenormalizeProviderSwitch:
     def test_vendor_slug_switches_off_non_aggregator_provider(self):
         """ollama-local + a vendor/model slug → switch to openrouter and drop
         the stale local base_url (the issue's exact repro)."""
-        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.web_server_config import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
         save_config({
@@ -3471,7 +4260,7 @@ class TestDenormalizeProviderSwitch:
     def test_context_length_override_survives_provider_switch(self):
         """An explicit context-length override must persist alongside a
         provider switch."""
-        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.web_server_config import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
         save_config({"model": {"default": "llama3.2", "provider": "ollama-local"}})
@@ -3491,13 +4280,13 @@ class TestModelContextLengthSchema:
 
     def test_schema_model_context_length_after_model(self):
         """model_context_length should appear immediately after model in schema."""
-        from hermes_cli.web_server import CONFIG_SCHEMA
+        from hermes_cli.web_server_config import CONFIG_SCHEMA
         keys = list(CONFIG_SCHEMA.keys())
         model_idx = keys.index("model")
         assert keys[model_idx + 1] == "model_context_length"
 
     def test_schema_model_context_length_is_number(self):
-        from hermes_cli.web_server import CONFIG_SCHEMA
+        from hermes_cli.web_server_config import CONFIG_SCHEMA
         entry = CONFIG_SCHEMA["model_context_length"]
         assert entry["type"] == "number"
         assert "category" in entry
@@ -3519,7 +4308,7 @@ class TestModelInfoEndpoint:
     def test_model_info_with_dict_config(self, monkeypatch):
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "load_config", lambda: {
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
             "model": {
                 "default": "anthropic/claude-opus-4.6",
                 "provider": "openrouter",
@@ -3541,7 +4330,7 @@ class TestModelInfoEndpoint:
     def test_model_info_returns_dashboard_agent_name(self, monkeypatch):
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "load_config", lambda: {
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
             "model": "openai/gpt-5.6",
             "dashboard": {"agent_name": "Rocky"},
         })
@@ -3556,7 +4345,7 @@ class TestModelInfoEndpoint:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(
-            ws,
+            _cfg_mod,
             "load_config",
             lambda: {"dashboard": {"agent_name": "Theo"}},
         )
@@ -3569,7 +4358,7 @@ class TestModelInfoEndpoint:
     def test_model_info_empty_config_returns_agent_fallback(self, monkeypatch):
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "load_config", lambda: {})
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {})
 
         resp = self.client.get("/api/model/info")
 
@@ -3581,7 +4370,7 @@ class TestModelInfoEndpoint:
         """Endpoint should return zeros on import/resolution errors, not 500."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "load_config", lambda: {
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
             "model": "some/obscure-model"
         })
 
@@ -3616,7 +4405,7 @@ class TestProbeGatewayHealth:
 
         monkeypatch.setattr(ws.urllib.request, "urlopen", mock_urlopen)
 
-        alive, body = ws._probe_gateway_health()
+        alive, body = _web_server_gateway._probe_gateway_health()
 
         assert alive is False
         assert body is None
@@ -3645,7 +4434,7 @@ class TestProbeGatewayHealth:
             return mock_resp
 
         monkeypatch.setattr(ws.urllib.request, "urlopen", mock_urlopen)
-        alive, body = ws._probe_gateway_health()
+        alive, body = _web_server_gateway._probe_gateway_health()
         assert alive is True
         assert body["status"] == "ok"
         assert call_count[0] == 2
@@ -3669,10 +4458,10 @@ class TestStatusRemoteGateway:
         """When local PID check fails and remote probe succeeds, gateway shows running."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: None)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
-        monkeypatch.setattr(ws, "_probe_gateway_health", lambda: (True, {
+        monkeypatch.setattr(_web_server_gateway, "_probe_gateway_health", lambda: (True, {
             "status": "ok",
             "gateway_state": "running",
             "platforms": {"telegram": {"state": "connected"}},
@@ -3692,20 +4481,20 @@ class TestStatusRemoteGateway:
         """When local PID check succeeds, the remote probe is never called."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: {
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: {
             "gateway_state": "running",
             "platforms": {},
         })
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
         probe_called = [False]
-        original = ws._probe_gateway_health
+        original = _web_server_gateway._probe_gateway_health
 
         def track_probe():
             probe_called[0] = True
             return original()
 
-        monkeypatch.setattr(ws, "_probe_gateway_health", track_probe)
+        monkeypatch.setattr(_web_server_gateway, "_probe_gateway_health", track_probe)
 
         resp = self.client.get("/api/status")
         assert resp.status_code == 200
@@ -3716,10 +4505,10 @@ class TestStatusRemoteGateway:
         """Remote gateway running but PID not in response — pid should be None."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: None)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
-        monkeypatch.setattr(ws, "_probe_gateway_health", lambda: (True, {
+        monkeypatch.setattr(_web_server_gateway, "_probe_gateway_health", lambda: (True, {
             "status": "ok",
         }))
 
@@ -3761,8 +4550,8 @@ class TestStatusInstallId:
         import hermes_cli.web_server as ws
         from hermes_constants import get_default_hermes_root
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: None)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: None)
 
         first = self.client.get("/api/status")
         assert first.status_code == 200
@@ -3850,8 +4639,8 @@ class TestGatewayBusyReadout:
         gate dominates."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: {
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: {
             "gateway_state": "draining",
             "platforms": {},
             "active_agents": 3,
@@ -3867,8 +4656,8 @@ class TestGatewayBusyReadout:
         produce a spurious busy — it degrades to 0/not-busy."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: {
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: {
             "gateway_state": "running",
             "platforms": {},
             "active_agents": "garbage",
@@ -3973,8 +4762,8 @@ class TestGatewayUpdatedAtContract:
         import hermes_cli.web_server as ws
 
         epoch = 1750000000
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: {
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: {
             "gateway_state": "running",
             "platforms": {},
             "active_agents": 0,
@@ -3994,10 +4783,10 @@ class TestGatewayUpdatedAtContract:
         must still come out as string|null."""
         import hermes_cli.web_server as ws
 
-        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: None)
-        monkeypatch.setattr(ws, "read_runtime_status", lambda: None)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda: None)
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda: None)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://gw:8642")
-        monkeypatch.setattr(ws, "_probe_gateway_health", lambda: (True, {
+        monkeypatch.setattr(_web_server_gateway, "_probe_gateway_health", lambda: (True, {
             "status": "ok",
             "gateway_state": "running",
             "platforms": {},
@@ -4024,14 +4813,14 @@ class TestNormaliseThemeDefinition:
 
 
     def test_rejects_non_dict(self):
-        from hermes_cli.web_server import _normalise_theme_definition
+        from hermes_cli.web_server_dashboard import _normalise_theme_definition
         assert _normalise_theme_definition("string") is None
         assert _normalise_theme_definition(None) is None
         assert _normalise_theme_definition([1, 2, 3]) is None
 
     def test_loose_colors_shorthand(self):
         """Bare hex strings under `colors` parse as {hex, alpha=1.0}."""
-        from hermes_cli.web_server import _normalise_theme_definition
+        from hermes_cli.web_server_dashboard import _normalise_theme_definition
         result = _normalise_theme_definition({
             "name": "loose",
             "colors": {"background": "#000000", "midground": "#ffffff"},
@@ -4053,7 +4842,7 @@ class TestDiscoverUserThemes:
     def test_returns_empty_when_dir_missing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from hermes_cli import web_server
-        assert web_server._discover_user_themes() == []
+        assert _web_server_dashboard._discover_user_themes() == []
 
     def test_loads_and_normalises_yaml(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -4070,7 +4859,7 @@ class TestDiscoverUserThemes:
             "  density: spacious\n"
         )
         from hermes_cli import web_server
-        results = web_server._discover_user_themes()
+        results = _web_server_dashboard._discover_user_themes()
         assert len(results) == 1
         assert results[0]["name"] == "ocean"
         assert results[0]["label"] == "Ocean"
@@ -4097,7 +4886,7 @@ class TestDiscoverUserThemes:
 
         token = set_hermes_home_override(str(other))
         try:
-            results = web_server._discover_user_themes()
+            results = _web_server_dashboard._discover_user_themes()
         finally:
             reset_hermes_home_override(token)
 
@@ -4134,9 +4923,9 @@ class TestThemeBootstrapCSS:
         self._write_theme(tmp_path)
         from hermes_cli import web_server
         monkeypatch.setattr(
-            web_server, "load_config", lambda: {"dashboard": {"theme": "ocean"}}
+            _cfg_mod, "load_config", lambda: {"dashboard": {"theme": "ocean"}}
         )
-        css = web_server._render_active_theme_bootstrap_css()
+        css = _web_server_dashboard._render_active_theme_bootstrap_css()
         assert css.startswith('<style id="hermes-theme-bootstrap">')
         assert css.endswith("</style>")
         # Real bundle tokens (web/src/themes/context.tsx + index.css).
@@ -4175,7 +4964,7 @@ class TestThemeBootstrapCSS:
         )
         monkeypatch.setattr(ws, "WEB_DIST", dist)
         spa_app = FastAPI()
-        ws.mount_spa(spa_app)
+        _web_server_dashboard.mount_spa(spa_app)
         return TestClient(spa_app)
 
     def test_serve_index_injects_bootstrap_for_user_theme(self, tmp_path, monkeypatch):
@@ -4183,7 +4972,7 @@ class TestThemeBootstrapCSS:
         self._write_theme(tmp_path)
         import hermes_cli.web_server as ws
         monkeypatch.setattr(
-            ws, "load_config", lambda: {"dashboard": {"theme": "ocean"}}
+            _cfg_mod, "load_config", lambda: {"dashboard": {"theme": "ocean"}}
         )
         client = self._mount_spa_client(tmp_path, monkeypatch)
         resp = client.get("/chat")
@@ -4207,7 +4996,7 @@ class TestNormaliseThemeExtensions:
 
 
     def test_custom_css_passthrough_and_capped(self):
-        from hermes_cli.web_server import _normalise_theme_definition
+        from hermes_cli.web_server_dashboard import _normalise_theme_definition
         # Small CSS passes through verbatim.
         r = _normalise_theme_definition({
             "name": "t",
@@ -4222,7 +5011,7 @@ class TestNormaliseThemeExtensions:
 
 
     def test_component_styles_per_bucket(self):
-        from hermes_cli.web_server import _normalise_theme_definition
+        from hermes_cli.web_server_dashboard import _normalise_theme_definition
         r = _normalise_theme_definition({
             "name": "t",
             "componentStyles": {
@@ -4671,7 +5460,7 @@ class TestDashboardPluginManifestExtensions:
         from hermes_cli import web_server
         token = set_hermes_home_override(str(other))
         try:
-            plugins = web_server._discover_dashboard_plugins()
+            plugins = _web_server_dashboard._discover_dashboard_plugins()
         finally:
             reset_hermes_home_override(token)
         assert any(p["name"] == "skin-home" for p in plugins)
@@ -4692,7 +5481,7 @@ class TestDashboardPluginManifestExtensions:
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
         from hermes_cli import web_server
-        plugins = web_server._discover_dashboard_plugins()
+        plugins = _web_server_dashboard._discover_dashboard_plugins()
         assert any(p["name"] == "meeting-intelligence" for p in plugins)
 
     def test_profile_local_plugin_wins_over_root_plugin(self, tmp_path, monkeypatch):
@@ -4716,7 +5505,7 @@ class TestDashboardPluginManifestExtensions:
 
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
         from hermes_cli import web_server
-        plugins = web_server._discover_dashboard_plugins()
+        plugins = _web_server_dashboard._discover_dashboard_plugins()
         entries = [p for p in plugins if p["name"] == "dupe"]
         assert len(entries) == 1
         assert entries[0]["tab"]["path"] == "/from-profile"
@@ -4734,6 +5523,7 @@ class TestDashboardPluginManifestExtensions:
 # ---------------------------------------------------------------------------
 
 import sys
+from hermes_cli import main_tui_launch
 
 
 skip_on_windows = pytest.mark.skipif(
@@ -4750,7 +5540,7 @@ class TestPtyWebSocket:
         import hermes_cli.web_server as ws
 
         # Avoid exec'ing the actual TUI in tests: every test below installs
-        # its own fake argv via ``ws._resolve_chat_argv``.
+        # its own fake argv via ``web_server_chat._resolve_chat_argv``.
         self.ws_module = ws
         monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
         ws.app.state.pty_active_session_files = {}
@@ -4785,7 +5575,7 @@ class TestPtyWebSocket:
             "PATH": str(bin_dir),
         }
 
-        main_mod._apply_tui_python_env(env)
+        main_tui_launch._apply_tui_python_env(env)
 
         assert env["HERMES_PYTHON"] == command
 
@@ -4808,11 +5598,11 @@ class TestPtyWebSocket:
             captured["thread_kwargs"] = kwargs
             return fn(*args, **kwargs)
 
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", fake_resolve)
-        monkeypatch.setattr(self.ws_module.asyncio, "to_thread", fake_to_thread)
+        monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv", fake_resolve)
+        monkeypatch.setattr(_web_server_chat.asyncio, "to_thread", fake_to_thread)
 
         argv, cwd, env = asyncio.run(
-            self.ws_module._resolve_chat_argv_async(
+            _web_server_chat._resolve_chat_argv_async(
                 resume="sess-42",
                 sidecar_url="ws://127.0.0.1:9119/api/pub?channel=abc",
                 profile="worker",
@@ -4843,7 +5633,7 @@ class TestPtyWebSocket:
         from starlette.websockets import WebSocketDisconnect
 
         # Patch the REAL resolver so the whole wrapper/to_thread/lock chain runs.
-        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv", raising_resolver)
+        monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv", raising_resolver)
 
         url = self._url(profile=profile) if profile else self._url()
         with self.client.websocket_connect(url) as conn:
@@ -4867,14 +5657,12 @@ class TestPtyWebSocket:
             raise PtyUnavailableError("pty missing for tests")
 
         monkeypatch.setattr(
-            self.ws_module,
+            _web_server_chat,
             "_resolve_chat_argv",
             lambda resume=None, sidecar_url=None, profile=None: (["/bin/cat"], None, None),
         )
-        # Patch PtyBridge.spawn at the web_server module's binding.
-        import hermes_cli.web_server as ws_mod
-
-        monkeypatch.setattr(ws_mod.PtyBridge, "spawn", classmethod(lambda cls, *a, **k: _raise(*a, **k)))
+        # Patch PtyBridge.spawn at the web_server_chat module's binding.
+        monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", classmethod(lambda cls, *a, **k: _raise(*a, **k)))
 
         with self.client.websocket_connect(self._url()) as conn:
             # Expect a final text frame with the error message, then close.
@@ -4915,7 +5703,7 @@ class TestPtyWebSocket:
             sub_other = _FakeSub()
             frame = '{"type":"tool.start","payload":{"tool_id":"t1"}}'
 
-            event_channels, event_lock = ws_mod._get_event_state(app)
+            event_channels, event_lock = _rt_chat_ws._get_event_state(app)
             # Register two subscribers on the target channel and one on a
             # different channel, exactly as the /api/events handler does.
             async with event_lock:
@@ -4924,7 +5712,7 @@ class TestPtyWebSocket:
                 )
                 event_channels.setdefault("other-channel", set()).add(sub_other)
             try:
-                await ws_mod._broadcast_event(app, "broadcast-test", frame)
+                await _rt_chat_ws._broadcast_event(app, "broadcast-test", frame)
             finally:
                 async with event_lock:
                     event_channels.pop("broadcast-test", None)
@@ -4942,18 +5730,18 @@ class TestPtyWebSocket:
 
 
 def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
-    import hermes_cli.main as cli_main
+    import hermes_cli.main_tui_launch as tui_launch
     import hermes_cli.web_server as ws
 
     monkeypatch.setattr(
-        cli_main,
+        tui_launch,
         "_make_tui_argv",
         lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
     )
     monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
     monkeypatch.setattr(ws.app.state, "bound_port", 9119, raising=False)
 
-    _argv, _cwd, env = ws._resolve_chat_argv()
+    _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
     assert env is not None
     gateway_url = env.get("HERMES_TUI_GATEWAY_URL", "")
@@ -4964,17 +5752,15 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
 def test_resolve_chat_argv_never_exports_managed_autonomy_authority(
     monkeypatch,
 ):
-    import hermes_cli.main as cli_main
-    import hermes_cli.web_server as ws
+    import hermes_cli.main_tui_launch as tui_launch
 
     monkeypatch.setattr(
-        cli_main,
+        tui_launch,
         "_make_tui_argv",
         lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
     )
-    monkeypatch.setattr(ws, "_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED", True)
 
-    _argv, _cwd, env = ws._resolve_chat_argv(
+    _argv, _cwd, env = _web_server_chat._resolve_chat_argv(
         authenticated_actor={"actor_id": "operator-1", "role": "operator"}
     )
 
@@ -4987,17 +5773,15 @@ def test_resolve_chat_argv_never_exports_managed_autonomy_authority(
 def test_resolve_chat_argv_does_not_inject_managed_autonomy_in_admin_dashboard(
     monkeypatch,
 ):
-    import hermes_cli.main as cli_main
-    import hermes_cli.web_server as ws
+    import hermes_cli.main_tui_launch as tui_launch
 
     monkeypatch.setattr(
-        cli_main,
+        tui_launch,
         "_make_tui_argv",
         lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
     )
-    monkeypatch.setattr(ws, "_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED", True)
 
-    _argv, _cwd, env = ws._resolve_chat_argv(
+    _argv, _cwd, env = _web_server_chat._resolve_chat_argv(
         authenticated_actor={"actor_id": "dashboard-1", "role": "admin-dashboard"}
     )
 
@@ -5008,17 +5792,15 @@ def test_resolve_chat_argv_does_not_inject_managed_autonomy_in_admin_dashboard(
 
 
 def test_resolve_chat_argv_requires_actor_id_for_managed_autonomy(monkeypatch):
-    import hermes_cli.main as cli_main
-    import hermes_cli.web_server as ws
+    import hermes_cli.main_tui_launch as tui_launch
 
     monkeypatch.setattr(
-        cli_main,
+        tui_launch,
         "_make_tui_argv",
         lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
     )
-    monkeypatch.setattr(ws, "_CUI_MANAGED_AUTONOMY_FEATURE_ENABLED", True)
 
-    _argv, _cwd, env = ws._resolve_chat_argv(
+    _argv, _cwd, env = _web_server_chat._resolve_chat_argv(
         authenticated_actor={"role": "operator"}
     )
 
@@ -5029,11 +5811,10 @@ def test_resolve_chat_argv_requires_actor_id_for_managed_autonomy(monkeypatch):
 
 
 def test_resolve_chat_argv_strips_inherited_cui_trust_env(monkeypatch):
-    import hermes_cli.main as cli_main
-    import hermes_cli.web_server as ws
+    import hermes_cli.main_tui_launch as tui_launch
 
     monkeypatch.setattr(
-        cli_main,
+        tui_launch,
         "_make_tui_argv",
         lambda *_args, **_kwargs: (["node", "fake-tui.js"], Path("/tmp")),
     )
@@ -5041,7 +5822,7 @@ def test_resolve_chat_argv_strips_inherited_cui_trust_env(monkeypatch):
     monkeypatch.setenv("HERMES_CUI_MANAGED_ACTOR_ID", "spoofed-actor")
     monkeypatch.setenv("HERMES_CUI_MANAGED_ACTOR_ROLE", "admin")
 
-    _argv, _cwd, env = ws._resolve_chat_argv()
+    _argv, _cwd, env = _web_server_chat._resolve_chat_argv()
 
     assert env is not None
     assert "HERMES_CUI_MANAGED_AUTONOMY" not in env
@@ -5369,7 +6150,7 @@ class TestServeIndexMissingIndex:
         monkeypatch.setattr(ws, "WEB_DIST", dist)
         monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
         spa_app = FastAPI()
-        ws.mount_spa(spa_app)
+        _web_server_dashboard.mount_spa(spa_app)
         return TestClient(spa_app), dist
 
     def test_missing_index_inside_existing_dist_returns_json_404(
@@ -5400,6 +6181,22 @@ class TestServeIndexMissingIndex:
         assert resp.status_code == 200
         assert "SPA-rebuilt" in resp.text
 
+    def test_index_uses_ssh_token_applied_after_spa_mount(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_SESSION_TOKEN", "before-mount")
+        client, _dist = self._client_with_dist(
+            tmp_path, monkeypatch, write_index=True
+        )
+
+        ws._apply_ssh_session_token("after-mount")
+        resp = client.get("/chat")
+
+        assert resp.status_code == 200
+        assert 'window.__HERMES_SESSION_TOKEN__="after-mount"' in resp.text
+
 
 class TestHeadlessServeTokenPage:
     """Headless `hermes serve` must serve the Desktop token handshake page
@@ -5422,7 +6219,7 @@ class TestHeadlessServeTokenPage:
         monkeypatch.setenv("HERMES_SERVE_HEADLESS", "1")
         spa_app = FastAPI()
         spa_app.state.auth_required = gated
-        ws.mount_spa(spa_app)
+        _web_server_dashboard.mount_spa(spa_app)
         return TestClient(spa_app), ws
 
     def test_root_serves_token_page_when_not_gated(self, monkeypatch):
@@ -5444,6 +6241,25 @@ class TestHeadlessServeTokenPage:
 
         assert _json.loads(match.group(1)) == ws._SESSION_TOKEN
         assert "window.__HERMES_AUTH_REQUIRED__=false" in resp.text
+
+    def test_root_uses_ssh_token_applied_after_spa_mount(self, monkeypatch):
+        import json
+        import re
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_SESSION_TOKEN", "before-mount")
+        client, ws = self._headless_client(monkeypatch, gated=False)
+
+        ws._apply_ssh_session_token("after-mount")
+        resp = client.get("/")
+        match = re.search(
+            r'window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")',
+            resp.text,
+        )
+
+        assert match, resp.text
+        assert json.loads(match.group(1)) == "after-mount"
 
     def test_root_stays_404_json_when_auth_gated(self, monkeypatch):
         client, ws = self._headless_client(monkeypatch, gated=True)
@@ -5490,7 +6306,7 @@ class TestHashedAssetCacheHeaders:
         monkeypatch.setattr(ws, "WEB_DIST", dist)
         monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
         spa_app = FastAPI()
-        ws.mount_spa(spa_app)
+        _web_server_dashboard.mount_spa(spa_app)
         return TestClient(spa_app)
 
     def test_hashed_js_asset_is_immutable(self, tmp_path, monkeypatch):
@@ -5696,7 +6512,7 @@ def test_mount_spa_dynamic_web_dist_recheck(tmp_path, monkeypatch):
     dist = tmp_path / "web_dist"
     monkeypatch.setattr(web_server, "WEB_DIST", dist)
 
-    web_server.mount_spa(app)
+    _web_server_dashboard.mount_spa(app)
     client = TestClient(app)
 
     # 1. missing build -> 404

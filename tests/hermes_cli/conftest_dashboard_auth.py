@@ -130,6 +130,9 @@ class StubAuthProvider(DashboardAuthProvider):
                 "kind": "refresh",
                 "exp": now + 30 * 86400,
             }),
+            tenant_id="stub-org-1",
+            actor_id="stub-user-1",
+            role="user",
         )
 
     def verify_session(self, *, access_token: str):
@@ -148,6 +151,9 @@ class StubAuthProvider(DashboardAuthProvider):
             expires_at=payload["exp"],
             access_token=access_token,
             refresh_token="",  # not surfaced on verify
+            tenant_id=payload["org_id"],
+            actor_id=payload["sub"],
+            role="user",
         )
 
     def refresh_session(self, *, refresh_token: str) -> Session:
@@ -177,6 +183,9 @@ class StubAuthProvider(DashboardAuthProvider):
                 "kind": "refresh",
                 "exp": now + 30 * 86400,
             }),
+            tenant_id="stub-org-1",
+            actor_id=payload["sub"],
+            role="user",
         )
 
     def revoke_session(self, *, refresh_token: str) -> None:

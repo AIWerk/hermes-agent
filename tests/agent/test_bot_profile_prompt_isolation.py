@@ -82,6 +82,18 @@ def test_agent_home_resolves_from_session_db_path(tmp_path):
     assert system_prompt._agent_skills_dir(_Agent()) == bot_home / "skills"
 
 
+def test_agent_home_rejects_mock_database_path():
+    from unittest.mock import MagicMock
+
+    from agent import system_prompt
+
+    class _Agent:
+        _session_db = MagicMock()
+
+    assert system_prompt._agent_home(_Agent()) is None
+    assert system_prompt._agent_skills_dir(_Agent()) is None
+
+
 def test_agent_home_none_without_session_db():
     from agent import system_prompt
 
