@@ -556,7 +556,7 @@ async def gateway_ws(ws: WebSocket) -> None:
     request_gate = None
     if _server._assistant_mode_enabled():
         auth_identity = getattr(ws, "_hermes_auth_identity", None)
-        if _server._assistant_ws_request_gate({}, auth_identity) is not None:
+        if not _server._assistant_identity_complete(auth_identity):
             await ws.close(code=4403, reason="authenticated customer identity required")
             return
         request_gate = lambda request: _server._assistant_ws_request_gate(request, auth_identity)

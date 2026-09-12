@@ -44,6 +44,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from hermes_cli import __version__
 from hermes_cli.config import get_hermes_home, load_config, load_env
+from hermes_cli.dashboard_auth.identity import (
+    is_complete_authenticated_identity,
+    normalize_role,
+)
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -1114,9 +1118,6 @@ _ASSISTANT_ACTOR_PARAM_KEYS = frozenset({
     "_cui_tenant_id",
     "actor_role",
 })
-_ASSISTANT_ALLOWED_ROLES = frozenset({"user", "customer"})
-
-
 class AssistantTTSRequest(BaseModel):
     text: str = ""
     voice: str = "alloy"
@@ -1235,12 +1236,7 @@ async def _assistant_mode_http_gate(request: Request, call_next):
 
 
 def _assistant_identity_complete(identity: Any) -> bool:
-    if not isinstance(identity, dict):
-        return False
-    role = str(identity.get("role") or "").strip().lower()
-    actor_id = str(identity.get("actor_id") or identity.get("user_id") or "").strip()
-    tenant_id = str(identity.get("tenant_id") or "").strip()
-    return role in _ASSISTANT_ALLOWED_ROLES and bool(actor_id and tenant_id)
+    return is_complete_authenticated_identity(identity)
 
 
 def _inject_trusted_cui_actor(params: Dict[str, Any], identity: Dict[str, Any]) -> None:
@@ -1355,11 +1351,9 @@ def _cui_actor_context_from_request(request: Any) -> Dict[str, str]:
     role = str(getattr(session, "role", "") or "").strip().lower()
     actor_id = str(getattr(session, "actor_id", "") or getattr(session, "user_id", "") or "").strip()
     tenant_id = str(getattr(session, "tenant_id", "") or "").strip()
-    if role in _ASSISTANT_ALLOWED_ROLES and actor_id and tenant_id:
-        return {"tenant_id": tenant_id, "actor_id": actor_id, "role": role}
-    from hermes_cli.dashboard_auth.identity import normalize_role
-    if normalize_role(role) is not None and actor_id and tenant_id:
-        return {}
+    actor = {"tenant_id": tenant_id, "actor_id": actor_id, "role": role}
+    if is_complete_authenticated_identity(actor):
+        return actor
     return {"_restricted": "1"}
 
 
@@ -1373,7 +1367,7 @@ def _session_visible_to_cui_actor(row: Dict[str, Any], actor: Dict[str, Any] | N
     config = _session_model_config(row)
     return (
         config.get("_cui_visibility_scope") == "customer"
-        and config.get("_cui_actor_role") in _ASSISTANT_ALLOWED_ROLES
+        and normalize_role(config.get("_cui_actor_role")) is not None
         and config.get("_cui_actor_id") == actor.get("actor_id")
         and config.get("_cui_tenant_id") == actor.get("tenant_id")
     )
