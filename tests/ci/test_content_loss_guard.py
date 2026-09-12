@@ -1553,7 +1553,7 @@ def test_committed_class_floors_bind_exact_product_sets() -> None:
     bootstrap = selectors["assistant-spa-bootstrap-global-floor"]
     dependencies = selectors["core-project-dependency-floor"]
     assert set(bootstrap["globals"]) == _BOOTSTRAP_GLOBALS
-    assert bootstrap["root_function"] == "mount_spa"
+    assert bootstrap["root_function"] == "_assistant_ui_bootstrap_js"
     assert bootstrap["helper_functions"] == ["_dashboard_mode_bootstrap_js"]
     assert set(dependencies["dependencies"]) == _CORE_DEPENDENCIES
     assert "defusedxml" in dependencies["dependencies"]
