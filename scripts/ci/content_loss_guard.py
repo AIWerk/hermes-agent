@@ -759,6 +759,13 @@ def _python_scoped_window_globals_selector(
     root_name = selector.get("root_function")
     if not isinstance(root_name, str) or not root_name:
         raise ContentLossError("invalid Python root function")
+    legacy_name = selector.get("legacy_root_function")
+    if "legacy_root_function" in selector and (
+        not isinstance(legacy_name, str)
+        or not legacy_name.isidentifier()
+        or legacy_name == root_name
+    ):
+        raise ContentLossError("invalid Python legacy root function")
     helper_names = _validated_string_floor(
         selector, "helper_functions", "Python helper function"
     )
@@ -774,16 +781,136 @@ def _python_scoped_window_globals_selector(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             definitions.setdefault(node.name, []).append(node)
     roots = definitions.get(root_name, [])
+    if legacy_name is not None:
+        # A non-function binding is not an absent (or usable) new root.
+        if any(
+            (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+             and node.id == root_name)
+            or (isinstance(node, ast.ClassDef) and node.name == root_name)
+            or (isinstance(node, ast.alias)
+                and (node.asname or node.name.split(".")[0]) == root_name)
+            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == root_name)
+            or (isinstance(node, ast.MatchMapping) and node.rest == root_name)
+            for node in ast.walk(tree)
+        ):
+            return False
+        if not roots:
+            # Absence, not a failed floor, is the only legacy admission condition.
+            if any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == root_name for node in ast.walk(tree)
+            ):
+                return False
+            roots = definitions.get(legacy_name, [])
     if len(roots) != 1:
         return False
     root = roots[0]
+
+    def binds_name(node, name):
+        return (
+            isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id == name
+        ) or (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == name
+        ) or (isinstance(node, ast.arg) and node.arg == name) or (
+            isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == name
+        ) or (isinstance(node, ast.ExceptHandler) and node.name == name) or (
+            isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name
+        ) or (isinstance(node, ast.MatchMapping) and node.rest == name)
+
+    def live_children(node):
+        # Keep statement-list reachability: a dead branch/tail is not wiring.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fields = [("body", node.body)]
+        elif isinstance(node, ast.If) and isinstance(node.test, ast.Constant):
+            fields = [("branch", node.body if node.test.value else node.orelse)]
+        elif isinstance(node, ast.While) and isinstance(node.test, ast.Constant) and not node.test.value:
+            fields = [("branch", node.orelse)]
+        else:
+            fields = ast.iter_fields(node)
+        for _, value in fields:
+            if isinstance(value, list):
+                for child in value:
+                    if isinstance(child, ast.AST):
+                        yield child
+                    if isinstance(child, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                        break
+            elif isinstance(value, ast.AST):
+                yield value
+
+    def scoped_nodes(function):
+        if legacy_name is None:
+            # Preserve historical selectors that did not opt into root migration.
+            return list(ast.walk(function))
+        # A local definition is not wiring. Follow direct local calls and the
+        # legacy SPA route registered on the mount function's application arg.
+        nodes = []
+        pending = list(live_children(function))
+        local_functions = {}
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local_functions.setdefault(node.name, []).append(node)
+            elif not isinstance(node, (ast.ClassDef, ast.Lambda)):
+                nodes.append(node)
+                pending.extend(live_children(node))
+        application_arg = (
+            function.args.args[0].arg
+            if function.name == legacy_name and function.args.args else None
+        )
+        for functions in local_functions.values():
+            for local in functions:
+                if any(
+                    isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Attribute)
+                    and isinstance(dec.func.value, ast.Name)
+                    and dec.func.value.id == application_arg
+                    and dec.func.attr == "get"
+                    and len(dec.args) == 1
+                    and isinstance(dec.args[0], ast.Constant)
+                    and dec.args[0].value == "/{full_path:path}"
+                    for dec in local.decorator_list
+                ):
+                    pending.extend(live_children(local))
+        visited = set()
+        while True:
+            while pending:
+                node = pending.pop()
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.ClassDef, ast.Lambda)):
+                    nodes.append(node)
+                    pending.extend(live_children(node))
+            called = {
+                node.func.id for node in nodes
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            reachable = (called & local_functions.keys()) - visited
+            if not reachable:
+                return nodes
+            for name in reachable:
+                if len(local_functions[name]) != 1 or any(
+                    binds_name(node, name) and node is not local_functions[name][0]
+                    for node in ast.walk(function)
+                ):
+                    return []
+                visited.add(name)
+                pending.extend(live_children(local_functions[name][0]))
+
+    root_nodes = scoped_nodes(root)
     called_helpers = {
         node.func.id
-        for node in ast.walk(root)
+        for node in root_nodes
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in helper_names
     }
+    if legacy_name is not None and any(
+        binds_name(node, name) and node is not root
+        for node in ast.walk(root) for name in called_helpers
+    ):
+        # A same-named local callable is not the allowlisted module helper.
+        return False
     scoped = [root]
     for name in sorted(called_helpers):
         helpers = definitions.get(name, [])
@@ -792,7 +919,7 @@ def _python_scoped_window_globals_selector(
         scoped.append(helpers[0])
     actual: set[str] = set()
     for function in scoped:
-        for node in ast.walk(function):
+        for node in scoped_nodes(function):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 actual.update(_WINDOW_GLOBAL_ASSIGNMENT_RE.findall(node.value))
     return expected <= actual
