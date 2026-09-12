@@ -179,6 +179,36 @@
       "not_before": "2026-09-10T23:49:28Z",
       "expires_at": "2026-09-17T23:49:28Z",
       "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
+    },
+    {
+      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-BASELINE-PR127",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "allowed_target_state": "blob:b1abc4dca5afb40716fc045ab499d0f99bd35948",
+      "valid_for_pr": 127,
+      "not_before": "2026-09-12T12:24:44Z",
+      "expires_at": "2026-09-19T12:24:44Z",
+      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 baseline blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
+    },
+    {
+      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-GUARD-PR127",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "expected_old_blob": "fe39f21252a94bbd2b00553d63ac09f80e48aeca",
+      "allowed_target_state": "blob:216c38ec711864e84b453f3989677ed3e8b8d43a",
+      "valid_for_pr": 127,
+      "not_before": "2026-09-12T12:24:44Z",
+      "expires_at": "2026-09-19T12:24:44Z",
+      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 guard blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
+    },
+    {
+      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-TESTS-PR127",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "expected_old_blob": "ad3d5fb4e36435357e77a45c1304d9e137f80e7b",
+      "allowed_target_state": "blob:a381fff446dc857265bca6bf5629972e3f72a6d0",
+      "valid_for_pr": 127,
+      "not_before": "2026-09-12T12:24:44Z",
+      "expires_at": "2026-09-19T12:24:44Z",
+      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 tests blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
     }
   ],
   "schema_version": 1
