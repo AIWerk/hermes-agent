@@ -59,6 +59,36 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
+
+def _run_ci_environment_preflight(repo_root: Path) -> None:
+    if __package__:
+        from scripts.check_test_environment import check_ci_test_environment
+    else:
+        from check_test_environment import check_ci_test_environment
+
+    report = check_ci_test_environment(repo_root, Path(sys.executable))
+    if not report["passed"]:
+        raise RuntimeError(json.dumps(report, sort_keys=True))
+    print(
+        "Environment preflight: PASS "
+        f"tree={report['tree']} lock={report['lock_sha256']} "
+        f"packages={report['actual_count']} venv={report['environment_prefix']}"
+    )
+
+
+def _requires_ci_environment_preflight(
+    roots: List[Path],
+    explicit_files: List[Path] | None,
+    repo_root: Path,
+    *,
+    explicitly_required: bool = False,
+) -> bool:
+    if explicitly_required:
+        return True
+    if explicit_files is not None:
+        return False
+    return len(roots) == 1 and roots[0].resolve() == (repo_root / "tests").resolve()
+
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
 # image, etc.) and are run in their own dedicated CI jobs:
@@ -1025,6 +1055,9 @@ def main() -> int:
     if args.files:
         files = [repo_root / f for f in _split_pathspec(args.files)]
         roots = []
+        require_ci_environment = _requires_ci_environment_preflight(
+            roots, files, repo_root
+        )
     else:
         # Resolve discovery roots: positional path args override --paths if any
         # were supplied, otherwise --paths (which itself defaults to 'tests').
@@ -1032,6 +1065,21 @@ def main() -> int:
             roots = [repo_root / p for p in args.paths_positional]
         else:
             roots = [repo_root / p for p in _split_pathspec(args.paths)]
+
+        require_ci_environment = _requires_ci_environment_preflight(
+            roots, None, repo_root
+        )
+
+        if require_ci_environment:
+            try:
+                _run_ci_environment_preflight(repo_root)
+            except Exception as exc:
+                print(
+                    f"error: canonical test environment preflight failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
 
         if args.include_integration:
             # Caller takes responsibility — typically used via explicit -k filter.
