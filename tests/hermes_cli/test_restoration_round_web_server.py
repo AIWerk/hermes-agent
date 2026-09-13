@@ -1713,6 +1713,74 @@ class TestRestorationRoundWebServer:
             {"assistant": {"agent_name": "  "}, "display": {"agent_name": "", "assistant_name": "  "}}
         ) == "Hermes"
 
+    @pytest.mark.parametrize(
+        "path, expected",
+        [
+            (("assistant_user_display_name",), "Top Assistant"),
+            (("display_name",), "Top Display"),
+            (("dashboard", "user_display_name"), "Dashboard Display"),
+            (("dashboard", "user_name"), "Attila"),
+            (("dashboard", "customer_name"), "Dashboard Customer"),
+            (("dashboard", "customer", "display_name"), "Dashboard Nested Display"),
+            (("dashboard", "customer", "name"), "Dashboard Nested Name"),
+            (("assistant", "user_display_name"), "Assistant Display"),
+            (("assistant", "user_name"), "Assistant User"),
+            (("assistant", "customer_name"), "Assistant Customer"),
+            (("aiwerk", "user_display_name"), "AIWerk Display"),
+            (("aiwerk", "user_name"), "AIWerk User"),
+            (("aiwerk", "customer_name"), "AIWerk Customer"),
+            (("aiwerk", "customer", "display_name"), "AIWerk Nested Display"),
+            (("aiwerk", "customer", "name"), "AIWerk Nested Name"),
+            (("tenant", "user_display_name"), "Tenant Display"),
+            (("tenant", "user_name"), "Tenant User"),
+            (("tenant", "customer_name"), "Tenant Customer"),
+            (("tenant", "customer", "display_name"), "Tenant Nested Display"),
+            (("tenant", "customer", "name"), "Tenant Nested Name"),
+            (("branding", "user_display_name"), "Branding Display"),
+            (("branding", "user_name"), "Branding User"),
+            (("branding", "customer_name"), "Branding Customer"),
+        ],
+    )
+    def test_user_display_name_accepts_complete_config_source_chain(
+        self, monkeypatch, path, expected
+    ):
+        import hermes_cli.web_server as ws
+
+        for key in (
+            "AIWERK_CUI_USER_DISPLAY_NAME",
+            "AIWERK_CUI_USER_NAME",
+            "HERMES_USER_DISPLAY_NAME",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        config = current = {}
+        for key in path[:-1]:
+            current[key] = {}
+            current = current[key]
+        current[path[-1]] = expected
+
+        assert ws._assistant_user_display_name_from_config(config) == expected
+
+    def test_user_display_name_keeps_strict_missing_and_hostile_contract(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        for key in (
+            "AIWERK_CUI_USER_DISPLAY_NAME",
+            "AIWERK_CUI_USER_NAME",
+            "HERMES_USER_DISPLAY_NAME",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        assert ws._assistant_user_display_name_from_config({}) is None
+        assert ws._assistant_user_display_name_from_config(
+            {"dashboard": {"user_display_name": "<script>alert(1)</script>"}}
+        ) is None
+        assert ws._assistant_user_display_name_from_config(
+            {
+                "assistant_user_display_name": "<script>alert(1)</script>",
+                "dashboard": {"user_name": "Attila"},
+            }
+        ) == "Attila"
+
     def test_environment_overrides_restore_precedence_bounds_disable_switches_and_cache_identity(self, monkeypatch, tmp_path):
         import hermes_cli.web_server as ws
 
