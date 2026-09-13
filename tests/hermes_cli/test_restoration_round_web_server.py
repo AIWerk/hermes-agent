@@ -1659,6 +1659,60 @@ class TestRestorationRoundWebServer:
         )
         assert payload["whatsapp_setup"]["mode"] == "self-chat"
 
+    def test_clean_dashboard_display_name_rejects_unsafe_values(self):
+        import hermes_cli.web_server as ws
+
+        assert ws._clean_dashboard_display_name("Rocky\nAgent") == "Rocky Agent"
+        assert ws._clean_dashboard_display_name("Rocky {{ attacker }}") is None
+        assert ws._clean_dashboard_display_name("</script><script>alert(1)</script>") is None
+        assert ws._clean_dashboard_display_name({"name": "Rocky"}) is None
+        assert ws._clean_dashboard_display_name("A" * 81) is None
+        assert ws._clean_dashboard_display_name("") is None
+
+    def test_assistant_display_name_restores_environment_sources(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("AIWERK_CUI_AGENT_NAME", raising=False)
+        monkeypatch.setenv("HERMES_AGENT_NAME", "Hermes Env")
+        assert ws._assistant_display_name_from_config({"dashboard": {"agent_name": "Config"}}) == "Hermes Env"
+
+        monkeypatch.setenv("AIWERK_CUI_AGENT_NAME", "AIWerk Env")
+        assert ws._assistant_display_name_from_config({"dashboard": {"agent_name": "Config"}}) == "AIWerk Env"
+
+    def test_assistant_display_name_restores_config_sources(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("AIWERK_CUI_AGENT_NAME", raising=False)
+        monkeypatch.delenv("HERMES_AGENT_NAME", raising=False)
+        assert ws._assistant_display_name_from_config({"dashboard": {"agent_name": "Rocky"}}) == "Rocky"
+        assert ws._assistant_display_name_from_config({"dashboard": {"agent_name": "Theo"}}) == "Theo"
+
+        for section in ("assistant", "dashboard", "aiwerk", "branding"):
+            for key in ("agent_name", "assistant_name", "display_name", "name"):
+                expected = f"{section}-{key}"
+                assert ws._assistant_display_name_from_config({section: {key: expected}}) == expected
+        for key in ("agent_name", "assistant_name"):
+            expected = f"display-{key}"
+            assert ws._assistant_display_name_from_config({"display": {key: expected}}) == expected
+
+    def test_assistant_display_name_uses_skin_then_hermes_fallback(self, monkeypatch):
+        import hermes_cli.skin_engine as skin_engine
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("AIWERK_CUI_AGENT_NAME", raising=False)
+        monkeypatch.delenv("HERMES_AGENT_NAME", raising=False)
+
+        class _Skin:
+            def get_branding(self, key, fallback=""):
+                return "Skin Agent" if key == "agent_name" else fallback
+
+        monkeypatch.setattr(skin_engine, "load_skin", lambda _name: _Skin())
+        assert ws._assistant_display_name_from_config({"display": {"skin": "custom"}}) == "Skin Agent"
+        assert ws._assistant_display_name_from_config({}) == "Hermes"
+        assert ws._assistant_display_name_from_config(
+            {"assistant": {"agent_name": "  "}, "display": {"agent_name": "", "assistant_name": "  "}}
+        ) == "Hermes"
+
     def test_environment_overrides_restore_precedence_bounds_disable_switches_and_cache_identity(self, monkeypatch, tmp_path):
         import hermes_cli.web_server as ws
 
