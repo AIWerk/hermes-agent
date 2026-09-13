@@ -3432,13 +3432,49 @@ def _clean_dashboard_display_name(
 
 
 def _assistant_user_display_name_from_config(config: Dict[str, Any]) -> Optional[str]:
-    return _clean_dashboard_display_name(
-        os.environ.get("AIWERK_CUI_USER_DISPLAY_NAME")
-        or os.environ.get("AIWERK_CUI_USER_NAME")
-        or os.environ.get("HERMES_USER_DISPLAY_NAME")
-        or config.get("assistant_user_display_name")
-        or config.get("display_name")
+    candidates: List[Any] = [
+        os.environ.get("AIWERK_CUI_USER_DISPLAY_NAME"),
+        os.environ.get("AIWERK_CUI_USER_NAME"),
+        os.environ.get("HERMES_USER_DISPLAY_NAME"),
+        config.get("assistant_user_display_name"),
+        config.get("display_name"),
+    ]
+    nested_paths = (
+        ("dashboard", "user_display_name"),
+        ("dashboard", "user_name"),
+        ("dashboard", "customer_name"),
+        ("dashboard", "customer", "display_name"),
+        ("dashboard", "customer", "name"),
+        ("assistant", "user_display_name"),
+        ("assistant", "user_name"),
+        ("assistant", "customer_name"),
+        ("aiwerk", "user_display_name"),
+        ("aiwerk", "user_name"),
+        ("aiwerk", "customer_name"),
+        ("aiwerk", "customer", "display_name"),
+        ("aiwerk", "customer", "name"),
+        ("tenant", "user_display_name"),
+        ("tenant", "user_name"),
+        ("tenant", "customer_name"),
+        ("tenant", "customer", "display_name"),
+        ("tenant", "customer", "name"),
+        ("branding", "user_display_name"),
+        ("branding", "user_name"),
+        ("branding", "customer_name"),
     )
+    for path in nested_paths:
+        raw: Any = config
+        for key in path:
+            if not isinstance(raw, dict):
+                raw = None
+                break
+            raw = raw.get(key)
+        candidates.append(raw)
+    for raw in candidates:
+        value = _clean_dashboard_display_name(raw)
+        if value:
+            return value
+    return None
 
 
 def _assistant_display_name_from_config(config: Dict[str, Any]) -> str:
