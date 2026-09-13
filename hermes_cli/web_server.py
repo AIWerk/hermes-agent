@@ -3409,11 +3409,29 @@ def _format_swiss_datetime(value: Any) -> str:
     return str(value or "")
 
 
-def _clean_dashboard_display_name(value: Any) -> str:
-    return str(value or "").strip()
+def _clean_dashboard_display_name(
+    raw: Any, *, max_len: int = 80, first_token_only: bool = False
+) -> Optional[str]:
+    """Sanitize a short customer-facing display label for browser bootstrap/API use."""
+    if not isinstance(raw, str):
+        return None
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", raw)
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n'\"`<>;{}[]()")
+    if not value or "{{" in value or "}}" in value:
+        return None
+    if "@" in value and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        value = value.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+    if first_token_only:
+        match = re.match(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,40}", value)
+        value = match.group(0) if match else ""
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9 ._'’\-]{2,80}", value):
+        return None
+    return value[:max_len].strip()
 
 
-def _assistant_user_display_name_from_config(config: Dict[str, Any]) -> str:
+def _assistant_user_display_name_from_config(config: Dict[str, Any]) -> Optional[str]:
     return _clean_dashboard_display_name(
         os.environ.get("AIWERK_CUI_USER_DISPLAY_NAME")
         or os.environ.get("AIWERK_CUI_USER_NAME")
@@ -3424,16 +3442,37 @@ def _assistant_user_display_name_from_config(config: Dict[str, Any]) -> str:
 
 
 def _assistant_display_name_from_config(config: Dict[str, Any]) -> str:
-    display = _assistant_config_section(config, "display")
-    return _clean_dashboard_display_name(
-        os.environ.get("AIWERK_CUI_AGENT_NAME")
-        or display.get("agent_name")
-        or config.get("assistant_display_name")
-        or "Hermes"
-    )
+    candidates: List[Any] = [
+        os.environ.get("AIWERK_CUI_AGENT_NAME"),
+        os.environ.get("HERMES_AGENT_NAME"),
+    ]
+    for section_name in ("assistant", "dashboard", "aiwerk", "branding"):
+        section = config.get(section_name)
+        if isinstance(section, dict):
+            for key in ("agent_name", "assistant_name", "display_name", "name"):
+                candidates.append(section.get(key))
+    display = config.get("display")
+    if isinstance(display, dict):
+        for key in ("agent_name", "assistant_name"):
+            candidates.append(display.get(key))
+        skin_name = display.get("skin")
+        if isinstance(skin_name, str) and skin_name.strip():
+            try:
+                from hermes_cli.skin_engine import load_skin
+
+                candidates.append(
+                    load_skin(skin_name.strip()).get_branding("agent_name", "")
+                )
+            except Exception:
+                pass
+    for raw in candidates:
+        value = _clean_dashboard_display_name(raw)
+        if value:
+            return value
+    return "Hermes"
 
 
-def _assistant_user_display_name() -> str:
+def _assistant_user_display_name() -> Optional[str]:
     return _assistant_user_display_name_from_config(load_config())
 
 
