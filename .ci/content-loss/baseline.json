@@ -25,6 +25,16 @@
   ],
   "protected_paths": [
     {
+      "id": "honcho-injection-policy-regression-tests",
+      "path": "tests/honcho_plugin/test_session.py",
+      "required": true
+    },
+    {
+      "id": "honcho-injection-final-wire-tests",
+      "path": "tests/agent/test_api_content_sidecar.py",
+      "required": true
+    },
+    {
       "id": "immutable-release-contract",
       "path": "immutable-release-build.json",
       "required": true
@@ -591,6 +601,11 @@
   },
   "schema_version": 2,
   "selectors": [
+    {
+      "id": "honcho-first-turn-injection-policy",
+      "type": "python_honcho_injection_policy",
+      "path": "plugins/memory/honcho/__init__.py"
+    },
     {
       "id": "release-preserve-repository",
       "path": "immutable-release-build.json",
