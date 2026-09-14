@@ -1625,6 +1625,178 @@ def test_exact_refreshed_bootstrap_selector_controls(mutation: str, expected: st
     assert reasons == ([] if expected == "passed" else ["CAPABILITY_SELECTOR_FAILED"])
 
 
+_HONCHO_RESTORED = "f4df7f0b47c872c76018a1639688568533b4addc"
+_HONCHO_BROKEN = "a0e452202facb8feaa64e1debbb3c86eba825c1a"
+_HONCHO_ROWS = (
+    ("summary", "Session Summary", "includeSummary", False),
+    ("representation", "User Representation", "includeUserRepresentation", False),
+    ("card", "User Peer Card", "includeUserCard", True),
+    ("ai_representation", "AI Self-Representation", "includeAiRepresentation", False),
+    ("ai_card", "AI Identity Card", "includeAiCard", True),
+)
+
+
+def _honcho_selector() -> dict:
+    return {
+        "id": "honcho-first-turn-injection-policy",
+        "type": "python_honcho_injection_policy",
+        "path": "plugins/memory/honcho/__init__.py",
+    }
+
+
+def _honcho_source() -> str:
+    return (
+        f"_CONTEXT_SECTIONS = {_HONCHO_ROWS!r}\n"
+        "class HonchoMemoryProvider:\n"
+        "    def _injection_flag(self, name, default):\n"
+        "        return default\n"
+        "    def _format_first_turn_context(self, ctx):\n"
+        "        return '\\n\\n'.join(\n"
+        "            f\"## {header}\\n{ctx.get(key, '')}\"\n"
+        "            for key, header, flag, default in _CONTEXT_SECTIONS\n"
+        "            if ctx.get(key, '') and self._injection_flag(flag, default)\n"
+        "        )\n"
+    )
+
+
+@pytest.mark.parametrize("mutation", ["historical", *range(20)])
+def test_honcho_injection_selector_accepts_restoration_and_rejects_policy_loss(
+    mutation,
+) -> None:
+    selector = _honcho_selector()
+    if mutation == "historical":
+        root = Path(__file__).resolve().parents[2]
+        if any(_guard._commit_if_present(root, ref) is None
+               for ref in (_HONCHO_RESTORED, _HONCHO_BROKEN)):
+            pytest.skip("exact Honcho control commits unavailable in shallow checkout")
+        # Inspect exact Git-object product bytes, never import the candidate.
+        pair = _guard._historical_selector_status_pair(
+            root, _HONCHO_RESTORED, _HONCHO_BROKEN, selector
+        )
+        assert pair["positive_verdict"] == "PASS"
+        assert pair["negative_verdict"] == "FAIL"
+        return
+    source = _honcho_source()
+    assert _guard._python_honcho_injection_selector(source, selector)
+    rows = [list(row) for row in _HONCHO_ROWS]
+    row, column = divmod(mutation, 4)
+    rows[row][column] = not rows[row][column] if column == 3 else "removed"
+    broken = source.replace(repr(_HONCHO_ROWS), repr(tuple(tuple(r) for r in rows)))
+    assert not _guard._python_honcho_injection_selector(broken, selector)
+
+
+@pytest.mark.parametrize("case", [
+    "syntax", "comment", "missing-owner", "nested-owner", "duplicate-owner",
+    "missing-table", "nested-table", "duplicate-table", "empty-table", "duplicate-row",
+    "missing-method", "nested-method", "duplicate-method", "decorated-method",
+    "unconditional", "or-bypass", "empty-output", "early-return", "unused-comprehension",
+    "wrong-flag-call", "extra-filter", "integer-default", "overwritten-owner",
+    "overwritten-method", "overwritten-helper", "table-mutation", "unknown-selector",
+    "metaclass-owner", "decorated-helper",
+])
+def test_honcho_injection_selector_fails_closed_on_decoys_and_bad_source(case: str) -> None:
+    source = _honcho_source()
+    selector = _honcho_selector()
+    # Every negative is paired with the same recognizer accepting the complete source.
+    assert _guard._python_honcho_injection_selector(source, selector)
+    table, owner = source.split("class HonchoMemoryProvider:", 1)
+    method = "    def _format_first_turn_context"
+    variants = {
+        "syntax": "def (",
+        "comment": "\n".join("# " + line for line in source.splitlines()),
+        "missing-owner": source.replace("class HonchoMemoryProvider", "class Other"),
+        "nested-owner": table + "if False:\n" + "\n".join(
+            "    " + line for line in ("class HonchoMemoryProvider:" + owner).splitlines()),
+        "duplicate-owner": source + "class HonchoMemoryProvider:\n    pass\n",
+        "missing-table": source[len(table):],
+        "nested-table": "if False:\n    " + source,
+        "duplicate-table": table + source,
+        "empty-table": source.replace(repr(_HONCHO_ROWS), "()"),
+        "duplicate-row": source.replace(repr(_HONCHO_ROWS), repr(_HONCHO_ROWS + _HONCHO_ROWS[:1])),
+        "missing-method": source.replace("def _format_first_turn_context", "def other"),
+        "nested-method": source.replace(method, "    def unused(self):\n    " + method).replace(
+            "        return '\\n\\n'", "            return '\\n\\n'"),
+        "duplicate-method": source + "    def _format_first_turn_context(self, ctx):\n        return ''\n",
+        "decorated-method": source.replace(method, "    @staticmethod\n" + method),
+        "unconditional": source.replace(" and self._injection_flag(flag, default)", ""),
+        "or-bypass": source.replace(" and self._injection_flag", " or self._injection_flag"),
+        "empty-output": source.replace('f"## {header}\\n{ctx.get(key, \'\')}"', "''"),
+        "early-return": source.replace("        return '\\n\\n'", "        return ''\n        return '\\n\\n'"),
+        "unused-comprehension": source.replace("        return '\\n\\n'", "        unused = '\\n\\n'") + "        return ''\n",
+        "wrong-flag-call": source.replace("self._injection_flag(flag, default)", "self._injection_flag(flag, True)"),
+        "extra-filter": source.replace("if ctx.get", "if False if ctx.get"),
+        "integer-default": source.replace("False", "0"),
+        "overwritten-owner": source + "HonchoMemoryProvider = None\n",
+        "overwritten-method": source + "HonchoMemoryProvider._format_first_turn_context = lambda *a: ''\n",
+        "overwritten-helper": source + "    _injection_flag = lambda *a: True\n",
+        "table-mutation": source + "_CONTEXT_SECTIONS += ()\n",
+        "unknown-selector": source,
+        "metaclass-owner": source.replace("class HonchoMemoryProvider:", "class HonchoMemoryProvider(metaclass=Other):"),
+        "decorated-helper": source.replace("    def _injection_flag", "    @staticmethod\n    def _injection_flag"),
+    }
+    if case == "unknown-selector":
+        selector["allow_bypass"] = True
+    if case in {"syntax", "unknown-selector"}:
+        with pytest.raises(ContentLossError):
+            _guard._python_honcho_injection_selector(variants[case], selector)
+    else:
+        assert not _guard._python_honcho_injection_selector(variants[case], selector)
+
+
+def test_honcho_control_bootstrap_preserves_base_authority(repo, monkeypatch) -> None:
+    root, upstream, base0 = repo
+    selector = _honcho_selector()
+    path = selector["path"]
+    _write(root, path, _honcho_source())
+    _write(root, "scripts/ci/content_loss_guard.py", "# trusted control\n")
+    _write(root, "tests/ci/test_content_loss_guard.py", "# trusted tests\n")
+    base = _commit(root, "synthetic old authority")
+    baseline = _baseline(upstream)
+    assert _guard._honcho_historical_self_tests(root, baseline) == {}
+    # Candidate-only activation is not authority for its own range.
+    baseline["selectors"].append(selector)
+    _write(root, _guard.BASELINE_PATH, json.dumps(baseline) + "\n")
+    candidate = _commit(root, "unapproved selector activation")
+    report = evaluate_range(root, base, candidate, upstream, pr_number=18, now=_NOW)
+    assert report["authority_ref"] == base
+    assert selector["id"] not in report["selectors"]
+    assert "UNAPPROVED_CONTROL_PLANE_CHANGE" in _codes(report)
+    _git(root, "checkout", "-q", base)
+    # Exact approvals here are synthetic test data, not publication authority.
+    guard_path = "scripts/ci/content_loss_guard.py"
+    test_path = "tests/ci/test_content_loss_guard.py"
+    targets = {guard_path: "# compatible guard\n", test_path: "# compatible tests\n"}
+    targets[_guard.BASELINE_PATH] = json.dumps(baseline) + "\n"
+    approvals = [
+        _control_approval(root, base, approval_id=f"SYNTHETIC-{i}", subject_path=p,
+                          target_blob=_git(root, "hash-object", "--stdin", input_bytes=b.encode()),
+                          valid_for_pr=20 if p != _guard.BASELINE_PATH else 21)
+        for i, (p, b) in enumerate(targets.items())
+    ]
+    _write(root, _guard.RETIREMENTS_PATH, json.dumps({"schema_version": 1, "approvals": approvals}))
+    approval_base = _commit(root, "synthetic prior approval only")
+    assert evaluate_range(root, base, approval_base, upstream, pr_number=19, now=_NOW)["verdict"] == "PASS"
+    for p in (guard_path, test_path):
+        _write(root, p, targets[p])
+    compatible = _commit(root, "synthetic compatibility controls only")
+    report = evaluate_range(root, approval_base, compatible, upstream, pr_number=20, now=_NOW)
+    assert report["verdict"] == "PASS"
+    assert selector["id"] not in report["selectors"]
+    _write(root, _guard.BASELINE_PATH, targets[_guard.BASELINE_PATH])
+    activated = _commit(root, "synthetic separate baseline activation")
+    assert evaluate_range(root, compatible, activated, upstream, pr_number=21, now=_NOW)["verdict"] == "PASS"
+    _write(root, path, _honcho_source().replace(" and self._injection_flag(flag, default)", ""))
+    broken = _commit(root, "synthetic policy loss")
+    report = evaluate_range(root, activated, broken, upstream, pr_number=22, now=_NOW)
+    assert report["selectors"][selector["id"]] == "failed"
+    assert "CAPABILITY_SELECTOR_FAILED" in _codes(report)
+    calls = []
+    monkeypatch.setattr(_guard, "_historical_selector_status_pair",
+                        lambda *args: calls.append(args) or {"verdict": "FAIL"})
+    assert _guard._honcho_historical_self_tests(root, baseline) == {selector["id"]: {"verdict": "FAIL"}}
+    assert calls == [(root, _HONCHO_RESTORED, _HONCHO_BROKEN, selector)]
+
+
 def _core_dependencies_selector() -> dict:
     return {
         "id": "core-project-dependency-floor",
