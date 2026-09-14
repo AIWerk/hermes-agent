@@ -925,6 +925,113 @@ def _python_scoped_window_globals_selector(
     return expected <= actual
 
 
+def _python_honcho_injection_selector(source: str, selector: dict[str, Any]) -> bool:
+    """Recognize one bounded formatter grammar, not general Python semantics.
+
+    The table and single return must match the five-section contract. Formatting,
+    comments and a method docstring may vary; rewiring requires explicit review.
+    This does not prove the flag resolver, runtime dispatch, or downstream bytes.
+    Candidate source is parsed only, never imported, compiled or evaluated.
+    """
+    _require_exact_keys(selector, {"id", "type", "path"}, "Honcho selector")
+    if selector["type"] != "python_honcho_injection_policy":
+        raise ContentLossError("invalid Honcho selector type")
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError) as exc:
+        raise ContentLossError("Honcho selector source is not parseable") from exc
+    owners = [n for n in tree.body
+              if isinstance(n, ast.ClassDef) and n.name == "HonchoMemoryProvider"]
+    tables = [n for n in tree.body if isinstance(n, ast.Assign)
+              and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+              and n.targets[0].id == "_CONTEXT_SECTIONS"]
+    if (len(owners) != 1 or len(tables) != 1
+            or owners[0].decorator_list or owners[0].keywords):
+        return False
+    owner, table = owners[0], tables[0]
+    methods = [n for n in owner.body if isinstance(n, ast.FunctionDef)
+               and n.name == "_format_first_turn_context"]
+    helpers = [n for n in owner.body if isinstance(n, ast.FunctionDef)
+               and n.name == "_injection_flag"]
+    if len(methods) != 1 or len(helpers) != 1 or helpers[0].decorator_list:
+        return False
+    method = methods[0]
+    # A direct binding census rejects nested/duplicate declarations and explicit
+    # overwrites. It deliberately does not try to resolve arbitrary Python calls.
+    allowed = {
+        "HonchoMemoryProvider": owner,
+        "_CONTEXT_SECTIONS": table.targets[0],
+        "_format_first_turn_context": method,
+        "_injection_flag": helpers[0],
+    }
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            name = node.id
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            name = node.attr
+        elif isinstance(node, ast.arg):
+            name = node.arg
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.split(".")[0]
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            name = node.name
+        elif isinstance(node, ast.MatchMapping):
+            name = node.rest
+        if name in allowed and node is not allowed[name]:
+            return False
+    expected_table = ast.parse(
+        '(("summary", "Session Summary", "includeSummary", False),'
+        '("representation", "User Representation", "includeUserRepresentation", False),'
+        '("card", "User Peer Card", "includeUserCard", True),'
+        '("ai_representation", "AI Self-Representation", "includeAiRepresentation", False),'
+        '("ai_card", "AI Identity Card", "includeAiCard", True))', mode="eval"
+    ).body
+    if ast.dump(table.value) != ast.dump(expected_table):
+        return False
+    args = method.args
+    if (method.decorator_list or args.posonlyargs or args.kwonlyargs
+            or args.vararg or args.kwarg or args.defaults or args.kw_defaults
+            or [arg.arg for arg in args.args] != ["self", "ctx"]):
+        return False
+    body = method.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    expected_return = ast.parse(
+        "return '\\n\\n'.join("
+        "f\"## {header}\\n{ctx.get(key, '')}\" "
+        "for key, header, flag, default in _CONTEXT_SECTIONS "
+        "if ctx.get(key, '') and self._injection_flag(flag, default))"
+    ).body[0]
+    # Whole selected body comparison forbids dead-tail/nested decoys, discarded
+    # results, unconditional output, empty emissions and unrecognized filters.
+    return len(body) == 1 and ast.dump(body[0]) == ast.dump(expected_return)
+
+
+def _honcho_historical_self_tests(
+    repo: Path, baseline: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    """Old trusted baselines do not opt into new object or selector requirements."""
+    pairs = {}
+    for selector in baseline["selectors"]:
+        if selector.get("type") != "python_honcho_injection_policy":
+            continue
+        selector_id = selector.get("id")
+        if not isinstance(selector_id, str) or not selector_id or selector_id in pairs:
+            raise ContentLossError("invalid or duplicate Honcho historical selector id")
+        pairs[selector_id] = _historical_selector_status_pair(
+            repo,
+            "f4df7f0b47c872c76018a1639688568533b4addc",
+            "a0e452202facb8feaa64e1debbb3c86eba825c1a",
+            selector,
+        )
+    return pairs
+
+
 def _normalise_dependency_name(requirement: str) -> str:
     match = _DEPENDENCY_NAME_RE.match(requirement)
     if match is None:
@@ -1420,6 +1527,9 @@ def _evaluate_selectors(
         elif passed and selector_type == "python_scoped_window_globals_superset":
             source = _text_blob(repo, target_entries, path, f"selector file {path}")
             passed = _python_scoped_window_globals_selector(source, selector)
+        elif passed and selector_type == "python_honcho_injection_policy":
+            source = _text_blob(repo, target_entries, path, f"selector file {path}")
+            passed = _python_honcho_injection_selector(source, selector)
         elif passed and selector_type == "toml_project_dependencies_superset":
             source = _text_blob(repo, target_entries, path, f"selector file {path}")
             passed = _toml_project_dependencies_selector(source, selector)
@@ -1433,6 +1543,7 @@ def _evaluate_selectors(
             "json_array_contains_object",
             "typescript_set_superset",
             "python_scoped_window_globals_superset",
+            "python_honcho_injection_policy",
             "toml_project_dependencies_superset",
             "frontend_api_subset",
         }:
@@ -2189,6 +2300,9 @@ def main(argv: list[str] | None = None) -> int:
                     for selector_id, selector in sorted(class_selectors.items())
                 },
             }
+            report["class_self_tests"].update(
+                _honcho_historical_self_tests(args.repo, baseline)
+            )
             historical_range = evaluate_approved_merge_range(
                 args.repo,
                 _HISTORICAL_RANGE_ACTIVE,
