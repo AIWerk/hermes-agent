@@ -12,6 +12,7 @@ from plugins.memory.honcho.session import (
     HonchoSessionManager,
 )
 from plugins.memory.honcho import HonchoMemoryProvider
+from plugins.memory.honcho.client import HonchoClientConfig
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +530,35 @@ class TestDialecticCadenceDefaults:
 
 class TestBaseContextSummary:
     """Base context injection should include session summary when available."""
+
+    def test_format_respects_disabled_sections_and_keeps_enabled_cards(self):
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            raw={
+                "injection": {
+                    "includeSummary": False,
+                    "includeUserRepresentation": False,
+                    "includeUserCard": True,
+                    "includeAiRepresentation": False,
+                    "includeAiCard": True,
+                }
+            },
+            host="",
+        )
+        ctx = {
+            "summary": "FORBIDDEN SUMMARY",
+            "representation": "FORBIDDEN USER REPRESENTATION",
+            "card": "ALLOWED USER CARD",
+            "ai_representation": "FORBIDDEN AI REPRESENTATION",
+            "ai_card": "ALLOWED AI CARD",
+        }
+
+        formatted = provider._format_first_turn_context(ctx)
+
+        assert formatted == (
+            "## User Peer Card\nALLOWED USER CARD\n\n"
+            "## AI Identity Card\nALLOWED AI CARD"
+        )
 
     def test_format_includes_summary(self):
         """Session summary should appear first in the formatted context."""
