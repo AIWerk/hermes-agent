@@ -210,7 +210,37 @@
       "expires_at": "2026-09-19T12:24:44Z",
       "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 tests blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
     }
+    ,
+    {
+      "id": "POINT3-GUARD-PR135",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "expected_old_blob": "216c38ec711864e84b453f3989677ed3e8b8d43a",
+      "allowed_target_state": "blob:5651ee796ef16c697120ea4bf0a3f97aa763773d",
+      "valid_for_pr": 135,
+      "not_before": "2026-09-14T18:13:26Z",
+      "expires_at": "2026-09-21T18:13:26Z",
+      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+    },
+    {
+      "id": "POINT3-TESTS-PR135",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "expected_old_blob": "a381fff446dc857265bca6bf5629972e3f72a6d0",
+      "allowed_target_state": "blob:3dfe5b9c9fcfc97b3facceacdc80eaa219301d46",
+      "valid_for_pr": 135,
+      "not_before": "2026-09-14T18:13:26Z",
+      "expires_at": "2026-09-21T18:13:26Z",
+      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+    },
+    {
+      "id": "POINT3-BASELINE-PR136",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "b1abc4dca5afb40716fc045ab499d0f99bd35948",
+      "allowed_target_state": "blob:5a787b982238a65ff5b838ae01293409f7f9a384",
+      "valid_for_pr": 136,
+      "not_before": "2026-09-14T18:13:26Z",
+      "expires_at": "2026-09-21T18:13:26Z",
+      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+    }
   ],
   "schema_version": 1
 }
-
