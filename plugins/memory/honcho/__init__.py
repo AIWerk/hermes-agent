@@ -76,13 +76,13 @@ _PROMPT_HEADERS = {
     ),
 }
 
-# (context key, section header) for the injected base-context block, in display order.
+# (context key, section header, injection flag, safe default), in display order.
 _CONTEXT_SECTIONS = (
-    ("summary", "Session Summary"),
-    ("representation", "User Representation"),
-    ("card", "User Peer Card"),
-    ("ai_representation", "AI Self-Representation"),
-    ("ai_card", "AI Identity Card"),
+    ("summary", "Session Summary", "includeSummary", False),
+    ("representation", "User Representation", "includeUserRepresentation", False),
+    ("card", "User Peer Card", "includeUserCard", True),
+    ("ai_representation", "AI Self-Representation", "includeAiRepresentation", False),
+    ("ai_card", "AI Identity Card", "includeAiCard", True),
 )
 
 _PREWARM_QUERY = "Summarize what you know about this user. Focus on preferences, current projects, and working style."
@@ -152,11 +152,12 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
     def _injection_flag(self, name: str, default: bool) -> bool:
         """Resolve a host-aware injection flag without exposing raw config."""
-        raw = getattr(self._config, "raw", None) or {}
+        config = getattr(self, "_config", None)
+        raw = getattr(config, "raw", None) or {}
         root = raw.get("injection") if isinstance(raw, dict) else None
         root = root if isinstance(root, dict) else {}
         hosts = raw.get("hosts") if isinstance(raw, dict) else None
-        host_block = hosts.get(getattr(self._config, "host", ""), {}) if isinstance(hosts, dict) else {}
+        host_block = hosts.get(getattr(config, "host", ""), {}) if isinstance(hosts, dict) else {}
         host = host_block.get("injection") if isinstance(host_block, dict) else None
         host = host if isinstance(host, dict) else {}
         if name in host:
@@ -399,7 +400,11 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
     def _format_first_turn_context(self, ctx: dict) -> str:
         """Format the prefetch context dict into a readable system prompt block."""
-        return "\n\n".join(f"## {header}\n{ctx.get(key, '')}" for key, header in _CONTEXT_SECTIONS if ctx.get(key, ""))
+        return "\n\n".join(
+            f"## {header}\n{ctx.get(key, '')}"
+            for key, header, flag, default in _CONTEXT_SECTIONS
+            if ctx.get(key, "") and self._injection_flag(flag, default)
+        )
 
     def system_prompt_block(self) -> str:
         """Static mode header + tool instructions (prompt-cache friendly).
