@@ -58,7 +58,9 @@ def test_two_queries_never_consume_previous_query_caches(tmp_path, monkeypatch):
     host = {"recallSync": False}
     cli._setup_tuning({"recallSync": True}, host)
     assert host["recallSync"] is False
-    provider = make_provider()
+    provider = make_provider(
+        raw={"injection": {"includeUserRepresentation": True}},
+    )
     provider._base_context_cache = "STALE BASE"
     provider._prefetch_result = "STALE DIALECTIC"
     for turn, query in enumerate(("Plan the garden", "Debug the compiler"), 1):
