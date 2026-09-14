@@ -29,9 +29,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import MemoryManager, build_memory_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
 from hermes_state import SessionDB
+from plugins.memory.honcho import HonchoMemoryProvider
+from plugins.memory.honcho.client import HonchoClientConfig
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +513,88 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_honcho_section_policy_reaches_final_user_content(self, wire_env):
+        # Real provider/aggregator and local LLM HTTP; only the Honcho backend
+        # is stubbed. This does not exercise the Honcho SDK or remote service.
+        make_agent, handler, db, sid = wire_env
+        original = "Which memories matter for this request?"
+        produced = {
+            "summary": "FORBIDDEN SUMMARY",
+            "representation": "FORBIDDEN USER REPRESENTATION",
+            "card": "ALLOWED USER CARD",
+            "ai_representation": "FORBIDDEN AI REPRESENTATION",
+            "ai_card": "ALLOWED AI CARD",
+        }
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            enabled=True,
+            save_messages=False,
+            timeout=1,
+            raw={
+                "injection": {
+                    "includeSummary": False,
+                    "includeUserRepresentation": False,
+                    "includeUserCard": True,
+                    "includeAiRepresentation": False,
+                    "includeAiCard": True,
+                    "includeDialectic": False,
+                }
+            },
+        )
+        provider._manager = MagicMock()
+        provider._manager.get_prefetch_context.return_value = produced
+        provider._manager.pop_auth_notice.return_value = None
+        provider._session_key = sid
+        provider._session_initialized = True
+        provider._last_dialectic_turn = 0
+
+        memory_manager = MemoryManager(external_prefetch_timeout=2)
+        memory_manager.add_provider(provider)
+        agent = make_agent()
+        agent._memory_manager = memory_manager
+        try:
+            agent.run_conversation(original, conversation_history=[], task_id="honcho-wire")
+        finally:
+            memory_manager.shutdown_all()
+
+        provider._manager.get_prefetch_context.assert_called_once_with(sid, original)
+        provider._manager.stop_async_writer.assert_called_once_with()
+        provider._manager.shutdown.assert_not_called()
+        assert not any(t.is_alive() for t in (
+            provider._prefetch_thread, provider._sync_thread, provider._memwrite_thread
+        ) if t is not None)
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        user_messages = _user_messages(requests[0])
+        assert len(user_messages) == 1
+        sent_message = user_messages[0]
+        for forbidden in (
+            "FORBIDDEN SUMMARY", "## Session Summary",
+            "FORBIDDEN USER REPRESENTATION", "## User Representation",
+            "FORBIDDEN AI REPRESENTATION", "## AI Self-Representation",
+        ):
+            assert forbidden not in sent_message["content"]
+        expected_raw = (
+            "## User Peer Card\nALLOWED USER CARD\n\n"
+            "## AI Identity Card\nALLOWED AI CARD"
+        )
+        expected = (
+            original
+            + "\n\n"
+            + build_memory_context_block(expected_raw)
+            + "\n\nPLUGIN-CTX"
+        )
+        assert sent_message["content"] == expected
+        assert "api_content" not in sent_message
+        assert sent_message["content"].count("<memory-context>") == 1
+        assert sent_message["content"].count("</memory-context>") == 1
+        user_rows = [r for r in db.get_messages(sid) if r["role"] == "user"]
+        assert len(user_rows) == 1
+        assert user_rows[0]["content"] == original
+        assert user_rows[0]["api_content"] == sent_message["content"]
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the
