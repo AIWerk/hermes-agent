@@ -210,7 +210,7 @@ def run(repo, revision, image, evidence, base):
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         receipt["error"] = type(exc).__name__
     finally:
-        (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding='utf-8')
     print("Honcho retained behavior: " + ("PASS (2/2)" if receipt["passed"] else "FAIL"))
     return 0 if receipt["passed"] else 1
 
