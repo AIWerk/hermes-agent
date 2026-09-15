@@ -120,3 +120,74 @@ def test_report_storage_has_no_host_writer_and_bounds_collection(tmp_path):
         gate.bounded_output([sys.executable, "-c", "import os; os.write(1,b'x'*1000000)"], 16, 5)
     with pytest.raises(Exception):
         gate.bounded_output([sys.executable, "-c", "import time; time.sleep(5)"], 16, 0.1)
+
+
+@pytest.mark.parametrize("cleanup", ["timeout", "oserror", "nonzero", "success"])
+def test_cleanup_outcome_controls_gate_result(tmp_path, monkeypatch, capsys, cleanup):
+    import json
+    import subprocess
+
+    gate = load_gate()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([
+        "git", "-C", str(repo), "-c", "user.name=Gate fixture",
+        "-c", "user.email=gate@example.invalid", "commit", "--allow-empty", "-qm", "fixture",
+    ], check=True)
+    revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    report = ('<testsuites><testsuite tests="2" failures="0" errors="0" skipped="0">' + ''.join(
+        f'<testcase classname="test_wire" name="{name}"/>' for name in sorted(gate.EXPECTED)
+    ) + '</testsuite></testsuites>').encode()
+    events = []
+    original_output = gate.bounded_output
+    original_run = subprocess.run
+    original_validate = gate.validate_results
+
+    def output(command, limit, timeout):
+        if command[:3] == ["docker", "image", "inspect"]:
+            return ("sha256:" + "1" * 64).encode()
+        if command[:2] == ["docker", "run"]:
+            return b"container-id"
+        return original_output(command, limit, timeout)
+
+    def run(command, **kwargs):
+        if command[:2] == ["docker", "exec"]:
+            events.append("behavior-completed")
+            return subprocess.CompletedProcess(command, 0)
+        if command[:3] == ["docker", "rm", "--force"]:
+            assert events == ["behavior-completed", "report-validated"]
+            events.append("cleanup")
+            if cleanup == "timeout":
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            if cleanup == "oserror":
+                raise OSError("injected cleanup failure")
+            result = subprocess.CompletedProcess(command, 1 if cleanup == "nonzero" else 0)
+            if kwargs.get("check"):
+                result.check_returncode()
+            return result
+        return original_run(command, **kwargs)
+
+    def validate(path, returncode):
+        original_validate(path, returncode)
+        events.append("report-validated")
+
+    monkeypatch.setattr(gate, "bounded_output", output)
+    monkeypatch.setattr(gate.subprocess, "run", run)
+    monkeypatch.setattr(gate, "collect_report", lambda name: report)
+    monkeypatch.setattr(gate, "validate_results", validate)
+    evidence = tmp_path / "evidence"
+    status = gate.run(repo, revision, "fixture-image", evidence, revision)
+    receipt = json.loads((evidence / "receipt.json").read_text())
+    assert events == ["behavior-completed", "report-validated", "cleanup"]
+    assert receipt["returncode"] == 0
+    assert (evidence / "report.xml").read_bytes() == report
+    success = cleanup == "success"
+    assert (receipt["passed"], status) == (success, 0 if success else 1), receipt
+    assert capsys.readouterr().out == "Honcho retained behavior: " + ("PASS (2/2)\n" if success else "FAIL\n")
+    if success:
+        assert "error" not in receipt
+    else:
+        assert receipt["error"] == {
+            "timeout": "TimeoutExpired", "oserror": "OSError", "nonzero": "CalledProcessError",
+        }[cleanup]

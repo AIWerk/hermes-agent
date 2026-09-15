@@ -204,9 +204,9 @@ def run(repo, revision, image, evidence, base):
                 (evidence / "report.xml").write_bytes(report)
                 receipt["report_sha256"] = hashlib.sha256(report).hexdigest()
                 validate_results(evidence / "report.xml", completed.returncode)
-                receipt["passed"] = True
             finally:
-                subprocess.run(["docker", "rm", "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                subprocess.run(["docker", "rm", "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
+        receipt["passed"] = True
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         receipt["error"] = type(exc).__name__
     finally:
