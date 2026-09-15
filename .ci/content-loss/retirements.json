@@ -1,4 +1,4 @@
- {
+{
   "approvals": [
     {
       "id": "R2-CONTROL-BASELINE-PR97",
@@ -240,6 +240,16 @@
       "not_before": "2026-09-14T18:13:26Z",
       "expires_at": "2026-09-21T18:13:26Z",
       "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+    },
+    {
+      "id": "HONCHO-BEHAVIOR-ENROLLMENT",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "5a787b982238a65ff5b838ae01293409f7f9a384",
+      "allowed_target_state": "blob:a0c9917fff2c68f8b8ac98258e565a5427ababec",
+      "valid_for_pr": 139,
+      "not_before": "2026-09-15T20:03:28Z",
+      "expires_at": "2026-09-22T20:03:28Z",
+      "reason": "Enroll the six reviewed Honcho behavioral gate files and trusted dependency owners as protected controls; no guard, selector, upstream, product or runtime change. Authorized by Attila on 2026-09-15 at 22:00 CEST; seven-day UTC validity from final binding; only PR 139."
     }
   ],
   "schema_version": 1
