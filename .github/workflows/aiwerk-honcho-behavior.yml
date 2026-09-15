@@ -61,9 +61,10 @@ jobs:
 
       - name: Execute retained base harness in restricted disposable container
         env:
+          BASE: ${{ github.event.pull_request.base.sha || github.sha }}
           CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           python3 scripts/ci/honcho_behavior_gate.py --repo . \
-            --candidate "$CANDIDATE" --image honcho-behavior:trusted \
+            --base "$BASE" --candidate "$CANDIDATE" --image honcho-behavior:trusted \
             --evidence "$RUNNER_TEMP/honcho-behavior-evidence"

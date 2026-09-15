@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import selectors
+import time
 import stat
 import subprocess
 import tarfile
@@ -24,7 +26,7 @@ def extract_source(data, destination):
     """Extract Git data, not links/devices or repository metadata."""
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         members = archive.getmembers()
-        if sum(m.size for m in members) > 512 * 1024 * 1024:
+        if len(members) > 100000 or sum(m.size for m in members) > 512 * 1024 * 1024:
             raise ValueError("source exceeds budget")
         for member in members:
             path = PurePosixPath(member.name)
@@ -56,10 +58,10 @@ def container_command(image, source, trusted, results, name):
         "docker", "run", "--rm", "--name", name, "--network=none", "--read-only",
         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user=65534:65534",
         "--pids-limit=256", "--memory=2g", "--memory-swap=2g", "--cpus=2",
-        "--log-driver=none", "--tmpfs=/tmp:rw,nosuid,nodev,size=512m,mode=1777",
+        "--log-driver=none", "--tmpfs=/tmp:rw,nosuid,nodev,size=512m,nr_inodes=16384,mode=1777",
+        "--tmpfs=/results:rw,nosuid,nodev,noexec,size=4m,nr_inodes=64,mode=1777",
         "--mount", f"type=bind,src={source},dst=/candidate,readonly",
         "--mount", f"type=bind,src={trusted},dst=/trusted,readonly",
-        "--mount", f"type=bind,src={results},dst=/results",
         "--workdir=/candidate", "--entrypoint=/usr/local/bin/python",
         "--env=HOME=/tmp/home", "--env=HERMES_HOME=/tmp/home/.hermes",
         "--env=PYTEST_DISABLE_PLUGIN_AUTOLOAD=1", "--env=PYTHONDONTWRITEBYTECODE=1",
@@ -96,49 +98,119 @@ def validate_results(path, returncode):
         raise ValueError("invalid report") from exc
 
 
-def run(repo, revision, image, evidence):
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("candidate must be an exact commit SHA")
-    repo = repo.resolve()
-    resolved = subprocess.check_output(["git", "-C", str(repo), "rev-parse", revision + "^{commit}"], text=True).strip()
-    if resolved != revision:
-        raise ValueError("candidate identity mismatch")
-    image_id = subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        raise ValueError("unresolved dependency image")
-    trusted = Path(__file__).resolve().parents[2] / ".ci/honcho-behavior"
-    harness_hash = hashlib.sha256((trusted / "test_wire.py").read_bytes()).hexdigest()
-    archive = subprocess.check_output(["git", "-C", str(repo), "archive", "--format=tar", revision])
-    evidence.mkdir(parents=True, exist_ok=True)
-    receipt = {"commit": revision, "tree": subprocess.check_output(["git", "-C", str(repo), "rev-parse", revision + "^{tree}"], text=True).strip(),
-               "harness_sha256": harness_hash, "image": image_id, "passed": False}
-    with tempfile.TemporaryDirectory(prefix="honcho-gate-") as scratch:
-        scratch = Path(scratch)
-        scratch.chmod(0o755)
-        source, results = scratch / "source", scratch / "results"
-        extract_source(archive, source)
-        results.mkdir(mode=0o777)
-        results.chmod(0o777)
-        name = "honcho-gate-" + uuid.uuid4().hex
-        command = container_command(image_id, source, trusted, results, name)
-        receipt["command"] = command
+def bounded_output(command, limit, timeout):
+    """Bound pipe bytes and elapsed time; never log candidate output."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
         try:
-            completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
-            receipt["returncode"] = completed.returncode
+            deadline = time.monotonic() + timeout
+            data = bytearray()
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    chunk = os.read(proc.stdout.fileno(), min(65536, limit + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if len(data) > limit:
+                        raise ValueError("output exceeds budget")
+            if proc.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+                raise ValueError("bounded command failed")
+            return bytes(data)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def resolve_source(repo, base, head):
+    """Construct the exact effective tree, without candidate checkout or hooks."""
+    git = ["git", "--no-replace-objects", "-C", str(repo)]
+    identity = {}
+    for role, revision in (("base", base), ("head", head)):
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("source must be an exact commit SHA")
+        resolved = bounded_output(git + ["rev-parse", revision + "^{commit}"], 128, 30).decode().strip()
+        if resolved != revision:
+            raise ValueError("source identity mismatch")
+        identity[role + "_commit"] = revision
+        identity[role + "_tree"] = bounded_output(git + ["rev-parse", revision + "^{tree}"], 128, 30).decode().strip()
+    # --no-messages keeps conflict paths out of host logs. Nonzero exit rejects
+    # conflicts (including a tree Git produced containing conflict markers).
+    tree = bounded_output(git + ["merge-tree", "--write-tree", "--no-messages", base, head], 128, 60).decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tree):
+        raise ValueError("invalid effective tree")
+    identity["effective_tree"] = tree
+    identity["merge_strategy"] = "git merge-tree --write-tree"
+    identity["git_version"] = bounded_output(git + ["--version"], 128, 10).decode().strip()
+    return identity
+
+
+def collect_report(name):
+    # Separate trusted interpreter: no candidate imports. The host additionally
+    # bounds stdout regardless of the container-side checks; no recursive copy.
+    reader = (
+        "import os,stat,sys; "
+        "fd=os.open('/results/report.xml',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK); "
+        "s=os.fstat(fd); "
+        "assert stat.S_ISREG(s.st_mode) and s.st_size<=2097152; "
+        "data=os.read(fd,2097153); assert len(data)<=2097152; "
+        "sys.stdout.buffer.write(data)"
+    )
+    return bounded_output(["docker", "exec", name, "/usr/local/bin/python", "-I", "-c", reader], 2097152, 30)
+
+
+def run(repo, revision, image, evidence, base):
+    repo = repo.resolve()
+    evidence.mkdir(parents=True, exist_ok=True)
+    receipt = {"passed": False}
+    try:
+        receipt.update(resolve_source(repo, base, revision))
+        image_id = bounded_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], 128, 30).decode().strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+            raise ValueError("unresolved dependency image")
+        authority = Path(__file__).resolve().parents[2]
+        trusted = authority / ".ci/honcho-behavior"
+        receipt.update({
+            "image": image_id,
+            "authority_commit": bounded_output(["git", "-C", str(authority), "rev-parse", "HEAD"], 128, 30).decode().strip(),
+            "authority_tree": bounded_output(["git", "-C", str(authority), "rev-parse", "HEAD^{tree}"], 128, 30).decode().strip(),
+            "authority_sha256": {path: hashlib.sha256((authority / path).read_bytes()).hexdigest()
+                for path in ("scripts/ci/honcho_behavior_gate.py", ".ci/honcho-behavior/test_wire.py",
+                             ".ci/honcho-behavior/Dockerfile", "uv.lock", "pyproject.toml")},
+        })
+        archive = bounded_output(["git", "--no-replace-objects", "-C", str(repo), "archive", "--format=tar", receipt["effective_tree"]], 600 * 1024 * 1024, 60)
+        with tempfile.TemporaryDirectory(prefix="honcho-gate-") as scratch:
+            scratch = Path(scratch)
+            scratch.chmod(0o755)
+            source = scratch / "source"
+            extract_source(archive, source)
+            name = "honcho-gate-" + uuid.uuid4().hex
+            command = container_command(image_id, source, trusted, None, name)
+            # Keep tmpfs mounted while the test exec ends and the bounded report
+            # is collected. Idle PID1 is trusted, not the candidate interpreter.
+            start = command[:-3] + ["-I", "-c", "import time; time.sleep(390)"]
+            start.insert(2, "--detach")
+            execute = ["docker", "exec", name, "/usr/local/bin/python"] + command[-3:]
+            receipt["command"] = execute
+            receipt["container_command"] = start
             try:
-                report = read_report(results / "report.xml")
+                bounded_output(start, 128, 30)
+                completed = subprocess.run(execute, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+                receipt["returncode"] = completed.returncode
+                report = collect_report(name)
                 (evidence / "report.xml").write_bytes(report)
                 receipt["report_sha256"] = hashlib.sha256(report).hexdigest()
-                validate_results(results / "report.xml", completed.returncode)
+                validate_results(evidence / "report.xml", completed.returncode)
                 receipt["passed"] = True
-            except (ValueError, OSError) as exc:
-                receipt["error"] = type(exc).__name__
-        except subprocess.TimeoutExpired:
-            receipt["error"] = "container timeout"
-        finally:
-            subprocess.run(["docker", "rm", "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-            (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    # Never echo candidate stdout, XML, filenames or exception text as CI commands.
+            finally:
+                subprocess.run(["docker", "rm", "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        receipt["error"] = type(exc).__name__
+    finally:
+        (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print("Honcho retained behavior: " + ("PASS (2/2)" if receipt["passed"] else "FAIL"))
     return 0 if receipt["passed"] else 1
 
@@ -147,7 +219,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--candidate", required=True)
+    parser.add_argument("--base", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
-    raise SystemExit(run(args.repo, args.candidate, args.image, args.evidence.resolve()))
+    raise SystemExit(run(args.repo, args.candidate, args.image, args.evidence.resolve(), args.base))
