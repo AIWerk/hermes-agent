@@ -21,6 +21,14 @@
     ".ci/content-loss/baseline.json",
     ".ci/content-loss/retirements.json",
     "scripts/ci/content_loss_guard.py",
+    ".ci/honcho-behavior/Dockerfile",
+    ".ci/honcho-behavior/README.md",
+    ".ci/honcho-behavior/test_wire.py",
+    ".github/workflows/aiwerk-honcho-behavior.yml",
+    "scripts/ci/honcho_behavior_gate.py",
+    "tests/ci/test_honcho_behavior_gate.py",
+    "pyproject.toml",
+    "uv.lock",
     "tests/ci/test_content_loss_guard.py"
   ],
   "protected_paths": [
