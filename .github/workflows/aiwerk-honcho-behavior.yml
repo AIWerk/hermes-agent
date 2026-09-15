@@ -1,0 +1,70 @@
+name: AIWerk Honcho Behavior
+
+# Once enrolled on protected main, pull_request_target loads this workflow and
+# harness from base, not from a candidate-controlled workflow or path classifier.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: honcho-behavior-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  honcho-behavior:
+    name: AIWerk Honcho retained behavior
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout base authority only
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind exact candidate objects without checkout
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.sha }}
+          CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, subprocess
+          base, candidate, pr = (os.environ[k] for k in ('BASE', 'CANDIDATE', 'PR_NUMBER'))
+          assert all(re.fullmatch('[0-9a-f]{40}', v) for v in (base, candidate))
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == base
+          if pr:
+              assert re.fullmatch('[1-9][0-9]*', pr)
+              subprocess.run(['git', 'fetch', '--no-tags', 'origin', f'+refs/pull/{pr}/head:refs/aiwerk/honcho-candidate'], check=True)
+              assert subprocess.check_output(['git', 'rev-parse', 'refs/aiwerk/honcho-candidate'], text=True).strip() == candidate
+          subprocess.run(['git', 'cat-file', '-e', candidate + '^{commit}'], check=True)
+          PY
+
+      - name: Build dependency-only image from trusted base lock
+        run: |
+          set -euo pipefail
+          python3 -m pip install 'uv==0.10.2'
+          context=$(mktemp -d)
+          cp .ci/honcho-behavior/Dockerfile "$context/Dockerfile"
+          uv export --frozen --extra dev --extra honcho --no-emit-project --output-file "$context/requirements.txt" >/dev/null
+          docker build --tag honcho-behavior:trusted "$context"
+          rm -rf "$context"
+
+      - name: Execute retained base harness in restricted disposable container
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.sha }}
+          CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/honcho_behavior_gate.py --repo . \
+            --base "$BASE" --candidate "$CANDIDATE" --image honcho-behavior:trusted \
+            --evidence "$RUNNER_TEMP/honcho-behavior-evidence"
