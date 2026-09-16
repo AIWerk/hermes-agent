@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Empty, Queue
 from types import SimpleNamespace
 from typing import Any
 
@@ -150,12 +151,21 @@ def _record_model_calls_in_process(
     outbox_directory: str,
     count: int,
     start_barrier: Any | None = None,
+    results: Any | None = None,
 ) -> None:
     if start_barrier is not None:
-        start_barrier.wait()
+        start_barrier.wait(timeout=10)
     store = SharedMetricsStore(Path(database_path), Path(outbox_directory))
+    busy_calls = 0
     for _ in range(count):
-        store.record_model_call(_dimensions(), _resource())
+        try:
+            store.record_model_call(_dimensions(), _resource())
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_BUSY:
+                raise
+            busy_calls += 1
+    if results is not None:
+        results.put(busy_calls)
 
 
 def _record_client_active_in_process(
@@ -1452,28 +1462,124 @@ def test_concurrent_model_call_updates_are_transactional(tmp_path):
     assert restarted.counter_snapshot()[0]["value"] == 20
 
 
+@pytest.mark.parametrize("busy_attempts", [(), (1, 3)])
+def test_process_model_call_helper_reports_only_rejected_writes(
+    tmp_path, monkeypatch, busy_attempts
+):
+    database_path = tmp_path / "metrics.sqlite3"
+    outbox_directory = tmp_path / "outbox"
+    store = SharedMetricsStore(database_path, outbox_directory)
+    attempts = []
+
+    def record(dimensions, resource):
+        attempts.append((dimensions, resource))
+        if len(attempts) in busy_attempts:
+            # A real writer holds the lock throughout the bounded write attempt.
+            blocker = sqlite3.connect(database_path)
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                store.record_model_call(dimensions, resource)
+            finally:
+                blocker.rollback()
+                blocker.close()
+        else:
+            store.record_model_call(dimensions, resource)
+
+    monkeypatch.setitem(
+        _record_model_calls_in_process.__globals__,
+        "SharedMetricsStore",
+        lambda *_args: SimpleNamespace(record_model_call=record),
+    )
+    results = Queue()
+    _record_model_calls_in_process(
+        str(database_path), str(outbox_directory), 4, results=results
+    )
+    rejected = results.get(timeout=1)
+    assert rejected == len(busy_attempts)
+    with pytest.raises(Empty):
+        results.get_nowait()
+    assert attempts == [(_dimensions(), _resource())] * 4
+    assert store.counter_snapshot()[0]["value"] == 4 - rejected
+    for _ in range(rejected):
+        store.record_model_call(_dimensions(), _resource())
+    assert store.counter_snapshot()[0]["value"] == 4
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [
+        (sqlite3.OperationalError, sqlite3.SQLITE_LOCKED),
+        (sqlite3.OperationalError, sqlite3.SQLITE_BUSY_SNAPSHOT),
+        (sqlite3.OperationalError, None),
+        (RuntimeError, sqlite3.SQLITE_BUSY),
+    ],
+)
+def test_process_model_call_helper_propagates_other_errors(
+    tmp_path, monkeypatch, error_type, code
+):
+    error = error_type("must propagate")
+    if code is not None:
+        error.sqlite_errorcode = code
+
+    def record(*_args):
+        raise error
+
+    monkeypatch.setitem(
+        _record_model_calls_in_process.__globals__,
+        "SharedMetricsStore",
+        lambda *_args: SimpleNamespace(record_model_call=record),
+    )
+    results = Queue()
+    with pytest.raises(error_type) as caught:
+        _record_model_calls_in_process(
+            str(tmp_path / "metrics.sqlite3"), str(tmp_path / "outbox"),
+            4, results=results,
+        )
+    assert caught.value is error
+    with pytest.raises(Empty):
+        results.get_nowait()
+
+
 def test_cross_process_model_call_updates_are_transactional(tmp_path):
     database_path = tmp_path / "metrics.sqlite3"
     outbox_directory = tmp_path / "outbox"
     context = mp.get_context("spawn")
     start_barrier = context.Barrier(2)
+    results = context.Queue()
     processes = [
         context.Process(
             target=_record_model_calls_in_process,
-            args=(str(database_path), str(outbox_directory), 10, start_barrier),
+            args=(str(database_path), str(outbox_directory), 10, start_barrier, results),
         )
         for _ in range(2)
     ]
 
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=15)
-        assert not process.is_alive()
-        assert process.exitcode == 0
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+            assert not process.is_alive()
+            assert process.exitcode == 0
 
-    restarted = SharedMetricsStore(database_path, outbox_directory)
-    assert restarted.counter_snapshot()[0]["value"] == 20
+        rejected = [results.get(timeout=5) for _ in processes]
+        assert all(type(count) is int and 0 <= count <= 10 for count in rejected)
+        restarted = SharedMetricsStore(database_path, outbox_directory)
+        # Replay only writes rejected by the intentionally bounded write timeout,
+        # after every concurrent worker has finished (as in the thread test).
+        for _ in range(sum(rejected)):
+            restarted.record_model_call(_dimensions(), _resource())
+        assert restarted.counter_snapshot()[0]["value"] == 20
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+        results.close()
+        results.join_thread()
 
 
 def test_cross_process_client_active_attempts_record_one_install(tmp_path):

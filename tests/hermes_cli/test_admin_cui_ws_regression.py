@@ -140,7 +140,8 @@ def test_http_actor_and_session_visibility_use_canonical_recognized_roles(role: 
         {
             "id": "session-a",
             "model_config": {
-                "_cui_visibility_scope": "customer",
+                # Match the persisted producer policy, including aiwerk_admin.
+                "_cui_visibility_scope": "admin" if role in {"admin", "owner", "operator"} else "customer",
                 "_cui_actor_role": role,
                 "_cui_actor_id": "actor-a",
                 "_cui_tenant_id": "tenant-a",

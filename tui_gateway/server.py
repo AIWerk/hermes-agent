@@ -1035,6 +1035,17 @@ def _row_visible_to_cui_actor(row: dict | None, actor: dict | None) -> bool:
     role = str(actor.get("role") or "").strip().lower()
     if not (tenant_id and actor_id and role):
         return False
+    # Share HTTP's positive owner proof without replacing linked-channel,
+    # untagged, no-actor or historical admin fallback policy below.
+    from hermes_cli.dashboard_auth.session_ownership import has_exact_cui_session_owner
+
+    raw = row.get("model_config") if isinstance(row, dict) else None
+    try:
+        config = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        config = None
+    if isinstance(config, dict) and has_exact_cui_session_owner(config, actor):
+        return True
     metadata = _row_cui_metadata(row)
     if not metadata:
         return role in _CUI_ADMIN_ROLES or _cui_actor_owns_gateway_row(row, actor)
