@@ -14,12 +14,66 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+from typing import NamedTuple
 import xml.etree.ElementTree as ET
 
 EXPECTED = {
     f"test_honcho_section_policy_reaches_final_user_content[{case}]"
     for case in ("root", "host")
 }
+
+
+# Fixed authority-owned IDs. S must use these explicit parametrization IDs;
+# neither candidate collection nor candidate configuration defines this inventory.
+_HISTORY_ROLES = ("admin", "operator", "aiwerk_admin", "owner", "user", "customer",
+                  "tenant_user", "member", "tenant_admin", "support")
+_HISTORY_SHAPES = ("current", "legacy-flat", "legacy-nested", "legacy-both")
+_HISTORY_HTTP_FAULTS = (
+    "foreign-actor", "foreign-tenant", "foreign-role", "unowned", "missing-actor",
+    "missing-tenant", "missing-role", "unknown-row-role", "conflicting-scope",
+    "null-scope", "internal-scope", "conflicting-nested-actor", "conflicting-nested-tenant",
+    "conflicting-nested-role", "partial-nested", "partial-flat", "invalid-nested",
+    "unknown-request-role", "missing-request-actor", "missing-request-tenant",
+)
+HISTORY_EXPECTED = frozenset(
+    {f"test_exact_owner_recents_page_into_readable_history[{shape}-{role}]"
+     for shape in _HISTORY_SHAPES for role in _HISTORY_ROLES}
+    | {f"test_recents_and_history_deny_unproven_or_conflicting_ownership[{fault}-{role}]"
+       for fault in _HISTORY_HTTP_FAULTS for role in ("admin", "user")}
+    | {f"test_http_recent_id_resumes_through_authenticated_rpc_with_history[{shape}-{stored}-{request}]"
+       for shape in _HISTORY_SHAPES
+       for stored, request in (tuple((role, role) for role in _HISTORY_ROLES)
+                              + (("user", "customer"), ("customer", "member"),
+                                 ("admin", "aiwerk_admin"), ("aiwerk_admin", "operator")))}
+    | {f"test_new_legacy_resume_acceptance_does_not_admit_invalid_owners[{fault}-{shape}-{request}-{stored}]"
+       for fault in ("tenant", "actor", "role", "incomplete", "conflict")
+       for shape in ("current-alias", "legacy-flat", "legacy-nested", "legacy-both")
+       for request, stored in (("user", "user"), ("customer", "user"), ("aiwerk_admin", "admin"))}
+    | {f"test_admin_history_cannot_launder_foreign_compression_lineage[{end}]"
+       for end in ("root", "tip")}
+)
+
+
+class SuiteProfile(NamedTuple):
+    harness: PurePosixPath
+    expected: frozenset
+    classname: str
+    label: str
+
+    @property
+    def hash_paths(self):
+        return ("scripts/ci/honcho_behavior_gate.py", str(self.harness),
+                ".ci/honcho-behavior/Dockerfile", "uv.lock", "pyproject.toml")
+
+
+def suite_profile(suite="honcho"):
+    if suite == "honcho":
+        return SuiteProfile(PurePosixPath(".ci/honcho-behavior/test_wire.py"),
+                            frozenset(EXPECTED), "test_wire", "Honcho")
+    if suite == "session-history":
+        return SuiteProfile(PurePosixPath(".ci/session-history-behavior/test_history.py"),
+                            HISTORY_EXPECTED, "test_history", "Session-history")
+    raise ValueError("unknown fixed suite")
 
 
 def extract_source(data, destination):
@@ -45,14 +99,15 @@ def extract_source(data, destination):
                 target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
-def container_command(image, source, trusted, results, name):
+def container_command(image, source, trusted, results, name, *, suite="honcho"):
+    profile = suite_profile(suite)
     # Import trusted pytest before exposing candidate imports. No candidate tests,
     # conftest, pytest config, plugins or packaging hooks participate in selection.
     launcher = (
         "import sys,pytest; sys.path.insert(0,'/candidate'); "
         "raise SystemExit(pytest.main(['-c','/dev/null','--noconftest',"
         "'--rootdir=/trusted','--confcutdir=/trusted','--import-mode=importlib','-p','no:cacheprovider',"
-        "'-v','--tb=short','--junitxml=/results/report.xml','/trusted/test_wire.py']))"
+        f"'-v','--tb=short','--junitxml=/results/report.xml','/trusted/{profile.harness.name}']))"
     )
     return [
         "docker", "run", "--rm", "--name", name, "--network=none", "--read-only",
@@ -79,20 +134,21 @@ def read_report(path):
         return stream.read(2 * 1024 * 1024 + 1)
 
 
-def validate_results(path, returncode):
+def validate_results(path, returncode, *, suite="honcho"):
+    profile = suite_profile(suite)
     if returncode != 0:
         raise ValueError("candidate process did not succeed")
     try:
         root = ET.fromstring(read_report(path))
         suites = list(root.iter("testsuite"))
         cases = list(root.iter("testcase"))
-        if len(suites) != 1 or int(suites[0].get("tests", "-1")) != 2:
+        if len(suites) != 1 or int(suites[0].get("tests", "-1")) != len(profile.expected):
             raise ValueError("wrong test count")
         if any(int(suites[0].get(key, "-1")) != 0 for key in ("failures", "errors", "skipped")):
             raise ValueError("nonpassing suite")
-        if len(cases) != 2 or {c.get("name") for c in cases} != EXPECTED:
+        if len(cases) != len(profile.expected) or {c.get("name") for c in cases} != profile.expected:
             raise ValueError("missing, replaced or duplicate node")
-        if any(list(case) or case.get("classname") != "test_wire" for case in cases):
+        if any(list(case) or case.get("classname") != profile.classname for case in cases):
             raise ValueError("nonpassing or foreign node")
     except (ET.ParseError, TypeError) as exc:
         raise ValueError("invalid report") from exc
@@ -162,24 +218,25 @@ def collect_report(name):
     return bounded_output(["docker", "exec", name, "/usr/local/bin/python", "-I", "-c", reader], 2097152, 30)
 
 
-def run(repo, revision, image, evidence, base):
+def run(repo, revision, image, evidence, base, *, suite="honcho"):
     repo = repo.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
-    receipt = {"passed": False}
+    receipt = {"passed": False, "suite": suite}
+    profile = None
     try:
+        profile = suite_profile(suite)
         receipt.update(resolve_source(repo, base, revision))
         image_id = bounded_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], 128, 30).decode().strip()
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
             raise ValueError("unresolved dependency image")
         authority = Path(__file__).resolve().parents[2]
-        trusted = authority / ".ci/honcho-behavior"
+        trusted = authority / profile.harness.parent
         receipt.update({
             "image": image_id,
             "authority_commit": bounded_output(["git", "-C", str(authority), "rev-parse", "HEAD"], 128, 30).decode().strip(),
             "authority_tree": bounded_output(["git", "-C", str(authority), "rev-parse", "HEAD^{tree}"], 128, 30).decode().strip(),
             "authority_sha256": {path: hashlib.sha256((authority / path).read_bytes()).hexdigest()
-                for path in ("scripts/ci/honcho_behavior_gate.py", ".ci/honcho-behavior/test_wire.py",
-                             ".ci/honcho-behavior/Dockerfile", "uv.lock", "pyproject.toml")},
+                for path in profile.hash_paths},
         })
         archive = bounded_output(["git", "--no-replace-objects", "-C", str(repo), "archive", "--format=tar", receipt["effective_tree"]], 600 * 1024 * 1024, 60)
         with tempfile.TemporaryDirectory(prefix="honcho-gate-") as scratch:
@@ -188,7 +245,7 @@ def run(repo, revision, image, evidence, base):
             source = scratch / "source"
             extract_source(archive, source)
             name = "honcho-gate-" + uuid.uuid4().hex
-            command = container_command(image_id, source, trusted, None, name)
+            command = container_command(image_id, source, trusted, None, name, suite=suite)
             # Keep tmpfs mounted while the test exec ends and the bounded report
             # is collected. Idle PID1 is trusted, not the candidate interpreter.
             start = command[:-3] + ["-I", "-c", "import time; time.sleep(390)"]
@@ -203,7 +260,7 @@ def run(repo, revision, image, evidence, base):
                 report = collect_report(name)
                 (evidence / "report.xml").write_bytes(report)
                 receipt["report_sha256"] = hashlib.sha256(report).hexdigest()
-                validate_results(evidence / "report.xml", completed.returncode)
+                validate_results(evidence / "report.xml", completed.returncode, suite=suite)
             finally:
                 subprocess.run(["docker", "rm", "--force", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
         receipt["passed"] = True
@@ -211,16 +268,19 @@ def run(repo, revision, image, evidence, base):
         receipt["error"] = type(exc).__name__
     finally:
         (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding='utf-8')
-    print("Honcho retained behavior: " + ("PASS (2/2)" if receipt["passed"] else "FAIL"))
+    label = profile.label if profile else "Unknown suite"
+    result = f"PASS ({len(profile.expected)}/{len(profile.expected)})" if receipt["passed"] else "FAIL"
+    print(label + " retained behavior: " + result)
     return 0 if receipt["passed"] else 1
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", choices=("honcho", "session-history"), default="honcho")
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--base", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
-    raise SystemExit(run(args.repo, args.candidate, args.image, args.evidence.resolve(), args.base))
+    raise SystemExit(run(args.repo, args.candidate, args.image, args.evidence.resolve(), args.base, suite=args.suite))
