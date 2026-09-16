@@ -29,7 +29,11 @@
     "tests/ci/test_honcho_behavior_gate.py",
     "pyproject.toml",
     "uv.lock",
-    "tests/ci/test_content_loss_guard.py"
+    "tests/ci/test_content_loss_guard.py",
+    ".ci/session-history-behavior/test_history.py",
+    ".ci/session-history-behavior/README.md",
+    ".github/workflows/aiwerk-session-history-behavior.yml",
+    "tests/hermes_cli/test_cui_history_ownership.py"
   ],
   "protected_paths": [
     {
@@ -53,6 +57,16 @@
         "mode\": \"operator\""
       ],
       "path": "hermes_cli/operator_session.py",
+      "required": true
+    },
+    {
+      "id": "cui-history-ownership-regression-tests",
+      "path": "tests/hermes_cli/test_cui_history_ownership.py",
+      "required": true
+    },
+    {
+      "id": "cui-history-exact-owner-helper",
+      "path": "hermes_cli/dashboard_auth/session_ownership.py",
       "required": true
     }
   ],
