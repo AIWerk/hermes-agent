@@ -1,3 +1,4 @@
+
 {
   "approvals": [
     {
@@ -250,6 +251,36 @@
       "not_before": "2026-09-15T20:03:28Z",
       "expires_at": "2026-09-22T20:03:28Z",
       "reason": "Enroll the six reviewed Honcho behavioral gate files and trusted dependency owners as protected controls; no guard, selector, upstream, product or runtime change. Authorized by Attila on 2026-09-15 at 22:00 CEST; seven-day UTC validity from final binding; only PR 139."
+    },
+    {
+      "id": "CUI-HISTORY-LAUNCHER-PR142",
+      "subject_path": "scripts/ci/honcho_behavior_gate.py",
+      "expected_old_blob": "10e215641521b4923b0a800fe81e117d86bee080",
+      "allowed_target_state": "blob:527d900507225670c2bebc6479e37fb000ed6a0e",
+      "valid_for_pr": 142,
+      "not_before": "2026-09-16T17:26:53Z",
+      "expires_at": "2026-09-23T17:26:53Z",
+      "reason": "Proposed authorization for only the exact backward-compatible fixed session-history profile in the retained behavior launcher in PR 142. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized."
+    },
+    {
+      "id": "CUI-HISTORY-LAUNCHER-TESTS-PR142",
+      "subject_path": "tests/ci/test_honcho_behavior_gate.py",
+      "expected_old_blob": "61310f1c6385ae3ca5d0a1428725349ae0f6ed94",
+      "allowed_target_state": "blob:ce6c7afa845879d3bcc4608f60022a0942f17fde",
+      "valid_for_pr": 142,
+      "not_before": "2026-09-16T17:26:53Z",
+      "expires_at": "2026-09-23T17:26:53Z",
+      "reason": "Proposed authorization for only the exact regression coverage for the fixed session-history launcher profile in PR 142. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized."
+    },
+    {
+      "id": "CUI-HISTORY-ENROLLMENT-PR144",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "expected_old_blob": "a0c9917fff2c68f8b8ac98258e565a5427ababec",
+      "allowed_target_state": "blob:06bb909f7125191fb91e03d43350176dc622584d",
+      "valid_for_pr": 144,
+      "not_before": "2026-09-16T17:26:53Z",
+      "expires_at": "2026-09-23T17:26:53Z",
+      "reason": "Proposed authorization for only the exact baseline-only enrollment of the session-history retained harness, documentation, workflow and product regression test controls, plus required regression-test and exact-owner-helper paths in PR 144. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized."
     }
   ],
   "schema_version": 1
