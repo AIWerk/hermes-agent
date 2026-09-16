@@ -44,10 +44,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from hermes_cli import __version__
 from hermes_cli.config import get_hermes_home, load_config, load_env
-from hermes_cli.dashboard_auth.identity import (
-    is_complete_authenticated_identity,
-    normalize_role,
-)
+from hermes_cli.dashboard_auth.identity import is_complete_authenticated_identity
+from hermes_cli.dashboard_auth.session_ownership import has_exact_cui_session_owner
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -1362,15 +1360,10 @@ def _session_visible_to_cui_actor(row: Dict[str, Any], actor: Dict[str, Any] | N
         return False
     if not actor:
         return True
-    if actor.get("_restricted"):
+    if actor.get("_restricted") or not is_complete_authenticated_identity(actor):
         return False
     config = _session_model_config(row)
-    return (
-        config.get("_cui_visibility_scope") == "customer"
-        and normalize_role(config.get("_cui_actor_role")) is not None
-        and config.get("_cui_actor_id") == actor.get("actor_id")
-        and config.get("_cui_tenant_id") == actor.get("tenant_id")
-    )
+    return has_exact_cui_session_owner(config, actor)
 
 
 class _CuiSessionNotFound(Exception):
