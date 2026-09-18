@@ -479,11 +479,13 @@ def test_prompt_row_id_rewind_preserves_scaffold_before_regeneration(
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     session["agent"] = _Agent()
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)

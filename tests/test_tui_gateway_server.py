@@ -396,12 +396,14 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
             raise BrokenPipeError("broken pipe")
 
     class _ImmediateThread:
-        def __init__(self, target=None, **_kwargs):
+        def __init__(self, target=None, args=(), kwargs=None, **_thread_kwargs):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
             assert self._target is not None
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     session = _session(agent=None, agent_ready=threading.Event())
     server._sessions["iso-fallback"] = session
@@ -681,12 +683,16 @@ def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
 
 def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_kwargs):
+        def __init__(
+            self, target=None, args=(), kwargs=None, daemon=None, **_thread_kwargs
+        ):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
             assert self._target is not None
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     class _Agent:
         model = "gold-model"
@@ -6949,11 +6955,13 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     class _FakeDB:
         def replace_messages(
@@ -7299,12 +7307,16 @@ def _configure_immediate_prompt_run(
     monkeypatch, tmp_path, *, immediate_threads=True
 ):
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_kwargs):
+        def __init__(
+            self, target=None, args=(), kwargs=None, daemon=None, **_thread_kwargs
+        ):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
             if self._target is not None:
-                self._target()
+                self._target(*self._args, **self._kwargs)
 
         def is_alive(self):
             return False
@@ -8200,11 +8212,13 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
             raise ValueError("Title already in use")
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **kw):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, **kw):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     agent = _Agent()
     session = {
@@ -10967,11 +10981,13 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     server._sessions["sid"] = _session(agent=_Agent())
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
@@ -11007,11 +11023,13 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     fake_ctx = types.ModuleType("agent.context_references")
     fake_ctx.preprocess_context_references = (
@@ -12469,11 +12487,13 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     server._sessions["sid"] = _session(agent=_RacyAgent())
     session_ref["s"] = server._sessions["sid"]
@@ -12562,11 +12582,13 @@ def test_prompt_submit_merges_on_model_switch_marker(monkeypatch):
         return _is_model_switch_marker(entry)
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     # Test both: no prior marker, and prior marker present
     for label, prior_history in [
@@ -12661,11 +12683,13 @@ def test_prompt_submit_merges_on_personality_pivot_marker(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     server._sessions["sid"] = _session(
         agent=_PivotAgent(),
@@ -12731,11 +12755,13 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **kw):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, **kw):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     corrupted = "hello[" + "~[[e" * 8
     server._sessions["sid"] = _session(agent=_Agent())
@@ -12772,11 +12798,13 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     server._sessions["sid"] = _session(agent=_Agent())
     emits: list[tuple] = []
@@ -12827,11 +12855,13 @@ def test_prompt_submit_snapshots_history_after_pending_model_switch(monkeypatch)
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, **_kwargs):
+        def __init__(self, target=None, args=(), kwargs=None, **_thread_kwargs):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     def _apply_pending(_sid, session):
         with session["history_lock"]:
@@ -12882,11 +12912,13 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     original_history = [
         {"role": "user", "content": "first"},
@@ -13046,11 +13078,13 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     original_history = [
         {"role": "user", "content": "first"},
@@ -13146,11 +13180,13 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     tip_history = [
         {"role": "user", "content": "post-compress A"},
@@ -13475,7 +13511,7 @@ def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
     calls = {"interrupted": False, "started": False}
 
     class _FakeThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self.target = target
 
         def start(self):
@@ -16564,11 +16600,13 @@ def test_model_options_refresh_allows_custom_provider_probes(monkeypatch):
 class _ImmediateThread:
     """Runs the target callable synchronously so assertions can follow."""
 
-    def __init__(self, target=None, daemon=None):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
         self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
 
     def start(self):
-        self._target()
+        self._target(*self._args, **self._kwargs)
 
 
 def test_prompt_submit_wires_live_title_rename_callback(monkeypatch):
@@ -18223,10 +18261,12 @@ def test_notification_poller_delivers_completion(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
@@ -18291,10 +18331,12 @@ def test_notification_poller_skips_consumed(monkeypatch):
             return {"final_response": "ok", "messages": []}
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     sess = _session(agent=_Agent())
     server._sessions["sid_skip"] = sess
@@ -20792,11 +20834,13 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     server._sessions["sid"] = _session(agent=_Agent())
     try:
@@ -20835,12 +20879,14 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
             assert self._target is not None
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     def _inspect_trim_frame(**_kwargs):
         import inspect
@@ -21214,11 +21260,13 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     class _StubDb:
         def __init__(self):
@@ -21334,11 +21382,13 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
             self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
-            self._target()
+            self._target(*self._args, **self._kwargs)
 
     class _StubDb:
         def get_messages_as_conversation(self, *_args, **_kwargs):
