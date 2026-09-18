@@ -2121,7 +2121,7 @@ export interface AssistantTranscriptionResponse {
   provider?: string;
 }
 
-export type AssistantResourceStatus = "connected" | "limited" | "auth_required" | "not_configured" | "error";
+export type AssistantResourceStatus = "connected" | "configured" | "limited" | "auth_required" | "not_configured" | "error";
 
 export interface AssistantResourceMailItem {
   id?: string;

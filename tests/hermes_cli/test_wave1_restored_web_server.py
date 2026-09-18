@@ -585,6 +585,116 @@ class TestWave1RestoredTestWebServerEndpoints:
         assert agent_download.headers["x-content-type-options"] == "nosniff"
         assert agent_download.headers["content-security-policy"] == "sandbox"
 
+    def test_connector_summary_enumerates_every_enabled_mcp_server(self):
+        import hermes_cli.web_server as web_server
+
+        connectors = web_server._connector_summary(
+            {
+                "mcp_servers": {
+                    "aiwerk_bridge": {"url": "https://bridge.example.test/mcp", "enabled": True},
+                    "custom_local": {"command": "python", "enabled": True},
+                    "disabled_demo": {"command": "demo", "enabled": False},
+                    "internal-search": {"url": "https://search.example.test/mcp"},
+                    "tenant_neo4j": {"command": "python", "enabled": True},
+                }
+            },
+            {},
+            {},
+            {},
+            include_live_bridge_children=False,
+        )
+
+        assert connectors == [
+            {
+                "id": "aiwerk_bridge",
+                "label": "AIWerk Bridge",
+                "status": "connected",
+                "status_label": "Verbunden",
+                "capabilities": ["MCP", "Remote"],
+                "children": [],
+            },
+            {
+                "id": "mcp-c58876ca5f5a072337fb94bbc89d0ba55df94e5183c9815e91bfc9f9b9ee1ee4",
+                "label": "Custom Local",
+                "status": "configured",
+                "status_label": "Eingerichtet",
+                "capabilities": ["MCP", "Lokal"],
+            },
+            {
+                "id": "mcp-d11dccadb701e5a63ba230aadba271103256a7bb1bbbe6bad401cbe513179d8a",
+                "label": "Internal Search",
+                "status": "configured",
+                "status_label": "Eingerichtet",
+                "capabilities": ["MCP", "Remote"],
+            },
+            {
+                "id": "mcp-ef3fc44ba021f0e9b3972f168907c415e612a8b681ed28bcdf4cd8f56d4872c3",
+                "label": "Wissensdatenbank",
+                "status": "configured",
+                "status_label": "Eingerichtet",
+                "capabilities": ["MCP", "Lokal"],
+            },
+        ]
+
+    def test_connector_summary_matches_runtime_enabled_filter(self):
+        import hermes_cli.web_server as web_server
+
+        connectors = web_server._connector_summary(
+            {
+                "mcp_servers": {
+                    "enabled_default": {"command": "python"},
+                    "disabled_bool": {"command": "python", "enabled": False},
+                    "disabled_string": {"command": "python", "enabled": "false"},
+                    "disabled_zero": {"command": "python", "enabled": 0},
+                    "aiwerk_bridge": {},
+                    "malformed": {},
+                    "suspicious": {"command": "bash", "args": ["-c", "curl https://example.test"]},
+                }
+            },
+            {},
+            {},
+            {},
+            include_live_bridge_children=False,
+        )
+
+        assert [connector["label"] for connector in connectors] == ["Enabled Default"]
+
+    def test_connector_summary_assigns_stable_unique_ids_for_colliding_names(self):
+        import hermes_cli.web_server as web_server
+
+        config = {
+            "mcp_servers": {
+                "a b": {"command": "python"},
+                "a-b-c14cddc033f6": {"command": "python"},
+                "a-b-c14cddc033f6-4": {"command": "python"},
+                "a/b": {"url": "https://example.test/mcp"},
+                "hermes_neo4j": {"command": "python"},
+            }
+        }
+        first = web_server._connector_summary(
+            config, {}, {}, {}, include_live_bridge_children=False
+        )
+        second = web_server._connector_summary(
+            config, {}, {}, {}, include_live_bridge_children=False
+        )
+        target_alone = web_server._connector_summary(
+            {"mcp_servers": {"a/b": {"url": "https://example.test/mcp"}}},
+            {},
+            {},
+            {},
+            include_live_bridge_children=False,
+        )[0]
+
+        ids = [connector["id"] for connector in first]
+        assert ids == [connector["id"] for connector in second]
+        assert len(ids) == len(set(ids)) == 5
+        assert target_alone["id"] == next(
+            connector["id"] for connector in first if "Remote" in connector["capabilities"]
+        )
+        assert all(connector_id.startswith("mcp-") and connector_id != "mcp-" for connector_id in ids)
+        legacy = next(connector for connector in first if connector["label"] == "Wissensdatenbank")
+        assert legacy["id"] in ids
+
     def test_assistant_resources_lists_shared_folder_and_connectors(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 
@@ -639,7 +749,8 @@ class TestWave1RestoredTestWebServerEndpoints:
             "mcp_servers": {
                 "aiwerk_bridge": {"url": "http://127.0.0.1:8000/mcp", "enabled": True},
                 "disabled_demo": {"command": "demo", "enabled": False},
-                "hermes_neo4j": {"command": "python", "enabled": True},
+                "tenant_neo4j": {"command": "python", "enabled": True},
+                "custom_local": {"command": "python", "enabled": True},
             },
         })
         monkeypatch.setattr(web_server, "_can_open_system_folder", lambda: True)
@@ -700,8 +811,13 @@ class TestWave1RestoredTestWebServerEndpoints:
         assert open_folder_resp.status_code == 200
         assert opened == [shared]
         labels = {connector["label"] for connector in data["connectors"]}
-        assert labels == {"AIWerk Bridge", "Wissensbasis"}
-        assert all(connector["status"] == "connected" for connector in data["connectors"])
+        assert labels == {"AIWerk Bridge", "Custom Local", "Wissensdatenbank"}
+        statuses = {connector["label"]: connector["status"] for connector in data["connectors"]}
+        assert statuses == {
+            "AIWerk Bridge": "connected",
+            "Custom Local": "configured",
+            "Wissensdatenbank": "configured",
+        }
         assert all("MCP" in connector["capabilities"] for connector in data["connectors"])
         bridge = next(connector for connector in data["connectors"] if connector["label"] == "AIWerk Bridge")
         assert [child["label"] for child in bridge["children"]][:3] == ["CoinMarketCap", "Firecrawl", "Google Maps"]

@@ -218,6 +218,7 @@ const RIGHT_RAIL_ROW_ACTION_DISABLED_CLASS = "disabled:cursor-not-allowed disabl
 
 const RESOURCE_STATUS_COPY: Record<AssistantResourceStatus, { label: string; dot: string }> = {
   connected: { label: "Verbunden", dot: "#7bcf91" },
+  configured: { label: "Eingerichtet", dot: "#b7ad9c" },
   limited: { label: "Eingeschränkt", dot: "#d7b98e" },
   auth_required: { label: "Anmeldung nötig", dot: "#d7b98e" },
   not_configured: { label: "Nicht eingerichtet", dot: "#b7ad9c" },
