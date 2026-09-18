@@ -48,6 +48,7 @@ if TYPE_CHECKING:
         _resolve_model, _restore_agent_history_after_turn_error,
         _persist_live_session_runtime, _persist_live_session_system_prompt,
         _restart_slash_worker, _restore_agent_model_runtime, _retire_turn_marker, _run_prompt_submit,
+        _run_with_cui_actor_context,
         _session_cwd, _session_db, _session_home, _session_owns_notification_event,
         _sessions, _sessions_lock, _set_session_context, _speak_text_with_barge,
         _start_inflight_turn, _start_usage_ticker, _sync_agent_compression_with_config,
@@ -879,7 +880,10 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
         _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
-    run_thread = threading.Thread(target=run, daemon=True)
+    # Use server-owned session authority, including restricted and local no-actor scopes.
+    run_thread = threading.Thread(
+        target=_run_with_cui_actor_context,
+        args=(session.get("cui_actor_context"), run), daemon=True)
     with _sessions_lock:
         registered = _sessions.get(sid)
         can_start = not session.get("_closing") and (registered is None or registered is session)

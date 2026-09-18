@@ -155,10 +155,12 @@ class TestSyncSessionKeyAfterAutoCompress:
 
         # Use _ImmediateThread pattern to run synchronously
         class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None, **kw):
                 self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
             def start(self):
-                self._target()
+                self._target(*self._args, **self._kwargs)
 
         server._sessions["test-sid"] = session
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
@@ -223,10 +225,12 @@ class TestPendingTitleValueError:
         )
 
         class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None, **kw):
                 self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
             def start(self):
-                self._target()
+                self._target(*self._args, **self._kwargs)
 
         server._sessions["sid"] = session
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)

@@ -93,6 +93,13 @@ def db(tmp_path):
     session_db.close()
 
 
+def _use_freelist_vacuum_mode(db):
+    """Use a legacy/non-auto-vacuum layout when testing freelist behavior."""
+    db._conn.execute("PRAGMA auto_vacuum = NONE")
+    db.vacuum()
+    assert db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+
+
 @pytest.fixture(autouse=True)
 def _no_fts_rebuild_throttle(monkeypatch):
     """Zero the FTS-rebuild inter-chunk throttle for every test in this file.
@@ -3145,6 +3152,7 @@ class TestVacuum:
         """Real-DB check: freeing most of the file pushes the ratio past the gate."""
         from hermes_state_common import AUTO_VACUUM_MIN_FREELIST_RATIO
 
+        _use_freelist_vacuum_mode(db)
         db.create_session(session_id="keep", source="cli")
         db.append_message(session_id="keep", role="user", content="hi")
         for i in range(6):
@@ -3311,6 +3319,7 @@ class TestAutoMaintenance:
 
     def test_first_run_prunes_and_vacuums_when_mostly_reclaimable(self, db):
         """Pruning the bulk of the file's pages crosses the 25% gate → VACUUM runs."""
+        _use_freelist_vacuum_mode(db)
         db.create_session(session_id="new", source="cli")  # active, must survive
         db.append_message(session_id="new", role="user", content="hi")
         for i in range(6):

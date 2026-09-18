@@ -365,13 +365,16 @@ class TestFirstSigwinchBaseline:
 
         app = MagicMock()
         app.output.get_size.side_effect = RuntimeError("not attached")
-        monkeypatch.setattr(
-            cli_mod.shutil,
-            "get_terminal_size",
-            lambda _default: os_mod.terminal_size((97, 40)),
-        )
-
-        bare_cli._install_resize_recovery(app)
+        # Restore the process-global shutil module before pytest renders this
+        # test result; pytest itself calls get_terminal_size between call and
+        # fixture teardown.
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                cli_mod.shutil,
+                "get_terminal_size",
+                lambda *_args, **_kwargs: os_mod.terminal_size((97, 40)),
+            )
+            bare_cli._install_resize_recovery(app)
 
         assert bare_cli._last_resize_width == 97
 
@@ -381,12 +384,12 @@ class TestFirstSigwinchBaseline:
         app = MagicMock()
         app.output.get_size.side_effect = RuntimeError("not attached")
 
-        def _boom(_default):
+        def _boom(*_args, **_kwargs):
             raise RuntimeError("no tty")
 
-        monkeypatch.setattr(cli_mod.shutil, "get_terminal_size", _boom)
-
-        bare_cli._install_resize_recovery(app)  # must not raise
+        with monkeypatch.context() as scoped:
+            scoped.setattr(cli_mod.shutil, "get_terminal_size", _boom)
+            bare_cli._install_resize_recovery(app)  # must not raise
 
         assert getattr(bare_cli, "_last_resize_width", None) is None
 

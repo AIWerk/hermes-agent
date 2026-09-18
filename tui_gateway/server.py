@@ -1593,7 +1593,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
             ready.set()
 
-    build_thread = threading.Thread(target=_build, daemon=True)
+    # Fresh threads do not inherit the authenticated live-session actor scope.
+    build_thread = threading.Thread(
+        target=_run_with_cui_actor_context,
+        args=(session.get("cui_actor_context"), _build), daemon=True)
     # _wait_agent_for_prompt handle: dead thread + unset agent_ready = died hard; waiters must not sit out the cap.
     session["_agent_build_thread"] = build_thread
     build_thread.start()
