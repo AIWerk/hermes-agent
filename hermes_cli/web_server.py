@@ -1955,6 +1955,7 @@ def _safe_resource_id(value: Any) -> str:
 def _resource_status_label(status: str) -> str:
     return {
         "connected": "Verbunden",
+        "configured": "Eingerichtet",
         "auth_required": "Anmeldung nötig",
         "limited": "Eingeschränkt",
         "disabled": "Deaktiviert",
@@ -5289,18 +5290,57 @@ def _connector_summary(
     include_live_bridge_children: bool = True,
 ) -> list[Dict[str, Any]]:
     connectors: list[Dict[str, Any]] = []
-    servers = config.get("mcp_servers") if isinstance(config.get("mcp_servers"), dict) else {}
-    if isinstance(servers.get("aiwerk_bridge"), dict) and servers["aiwerk_bridge"].get("enabled", True):
-        bridge = {
-            "id": "aiwerk_bridge",
-            "label": "AIWerk Bridge",
-            "status": "connected",
-            "capabilities": ["MCP"],
-            "children": _aiwerk_bridge_subservers(config) if include_live_bridge_children else [],
-        }
-        connectors.append(bridge)
-    if isinstance(servers.get("hermes_neo4j"), dict) and servers["hermes_neo4j"].get("enabled", True):
-        connectors.append({"id": "hermes_neo4j", "label": "Wissensbasis", "status": "connected", "capabilities": ["MCP"]})
+    raw_servers = config.get("mcp_servers")
+    servers = raw_servers if isinstance(raw_servers, dict) else {}
+    from hermes_cli.mcp_security import validate_mcp_server_entry
+    from tools.mcp_tool_common import _parse_boolish
+
+    label_map = {
+        "aiwerk_bridge": "AIWerk Bridge",
+        "elevenlabs": "ElevenLabs",
+        "hermes_neo4j": "Wissensdatenbank",
+        "tenant_neo4j": "Wissensdatenbank",
+    }
+    for name, raw in sorted(servers.items(), key=lambda item: str(item[0])):
+        if not isinstance(raw, dict):
+            continue
+        details = raw
+        enabled = details.get("enabled", True)
+        if enabled == 0 or not _parse_boolish(enabled, default=True):
+            continue
+        server_name = str(name)
+        has_url = isinstance(details.get("url"), str) and bool(details["url"].strip())
+        has_command = isinstance(details.get("command"), str) and bool(details["command"].strip())
+        if not (has_url or has_command) or validate_mcp_server_entry(server_name, details):
+            continue
+        digest = _hashlib.sha256(server_name.encode("utf-8")).hexdigest()
+        normalized_name = _safe_resource_id(server_name)
+        fallback_label = re.sub(r"[._-]+", " ", normalized_name).strip().title() or "MCP Server"
+        connector_id = f"mcp-{digest}"
+        capabilities = ["MCP"]
+        if details.get("url"):
+            capabilities.append("Remote")
+        if details.get("command"):
+            capabilities.append("Lokal")
+        if server_name == "aiwerk_bridge":
+            status = "connected"
+            connectors.append({
+                "id": "aiwerk_bridge",
+                "label": label_map[server_name],
+                "status": status,
+                "status_label": _resource_status_label(status),
+                "capabilities": capabilities,
+                "children": _aiwerk_bridge_subservers(config) if include_live_bridge_children else [],
+            })
+            continue
+        status = "configured"
+        connectors.append({
+            "id": connector_id,
+            "label": label_map.get(server_name, fallback_label),
+            "status": status,
+            "status_label": _resource_status_label(status),
+            "capabilities": capabilities,
+        })
     return connectors
 
 
