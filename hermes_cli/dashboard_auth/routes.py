@@ -507,21 +507,27 @@ async def api_auth_me(request: Request):
     tenant_id = getattr(sess, "tenant_id", "") or sess.org_id
     actor_id = getattr(sess, "actor_id", "") or sess.user_id
     role = getattr(sess, "role", "") or "user"
-    return JSONResponse(
-        {
-            "user_id": sess.user_id,
-            "email": sess.email,
-            "display_name": sess.display_name,
-            "org_id": sess.org_id,
-            "provider": sess.provider,
-            "expires_at": sess.expires_at,
-            "tenant_id": tenant_id,
-            "actor_id": actor_id,
-            "role": role,
-            "greeting": greeting_identity_from_session(sess),
-        },
-        headers={"Cache-Control": "private, no-store"},
-    )
+    payload = {
+        "user_id": sess.user_id,
+        "email": sess.email,
+        "display_name": sess.display_name,
+        "org_id": sess.org_id,
+        "provider": sess.provider,
+        "expires_at": sess.expires_at,
+        "tenant_id": tenant_id,
+        "actor_id": actor_id,
+        "role": role,
+        "greeting": greeting_identity_from_session(sess),
+    }
+    authority = getattr(request.state, "effective_authority", None)
+    if authority is not None:
+        payload.update({
+            "default_profile": authority.default_profile,
+            "active_profile": authority.active_profile,
+            "capabilities": sorted(authority.effective_capabilities),
+            "authorization_revision": authority.policy_revision,
+        })
+    return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
 
 # ---------------------------------------------------------------------------
