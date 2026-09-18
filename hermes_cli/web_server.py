@@ -1570,8 +1570,6 @@ _MCP_BRIDGE_REQUEST_IDS: dict[str, int] = {}
 _MCP_BRIDGE_LOCK = threading.Lock()
 _MCP_BRIDGE_FINGERPRINT_KEY = secrets.token_bytes(32)
 _AIWERK_BRIDGE_READ_TOOLS = frozenset({
-    "list_subservers",
-    "list_tools",
     "search_gmail_messages",
     "get_gmail_messages_content_batch",
     "list_calendar_events",
@@ -1722,6 +1720,20 @@ def _mcp_bridge_router_call(config: Dict[str, Any], server: str, tool: str, para
     return result
 
 
+def _mcp_bridge_status_call(config: Dict[str, Any]) -> Dict[str, Any]:
+    key, session_id = _mcp_bridge_session(config)
+    request_id = _mcp_bridge_next_request_id(key)
+    payload = {"name": "mcp", "arguments": {"action": "status"}}
+    result, _ = _mcp_bridge_rpc(
+        config,
+        "tools/call",
+        payload,
+        session_id=session_id,
+        request_id=request_id,
+    )
+    return result
+
+
 def _call_aiwerk_bridge_tool(config: Dict[str, Any], *, server: str, tool: str, params: Dict[str, Any]) -> Dict[str, Any]:
     if tool not in _AIWERK_BRIDGE_READ_TOOLS:
         raise ValueError("AIWerk bridge dashboard access is read-only")
@@ -1738,6 +1750,35 @@ def _call_aiwerk_bridge_tool(config: Dict[str, Any], *, server: str, tool: str, 
 def _bridge_error_status(exc: BaseException) -> str:
     text = str(exc).lower()
     return "auth_required" if "auth" in text or "401" in text or "403" in text else "error"
+
+
+def _aiwerk_bridge_status_error(error: Any) -> RuntimeError:
+    code: Any = None
+    message: Any = None
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+
+    classification_text = " ".join(
+        str(value)
+        for value in (code, message)
+        if isinstance(value, (str, int)) and not isinstance(value, bool)
+    ).lower()
+    is_auth_error = (
+        "auth" in classification_text
+        or "401" in classification_text
+        or "403" in classification_text
+    )
+
+    safe_code = ""
+    if isinstance(code, int) and not isinstance(code, bool) and len(str(code)) <= 48:
+        safe_code = str(code)
+    elif isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,48}", code):
+        safe_code = code
+
+    code_suffix = f" ({safe_code})" if safe_code else ""
+    fixed_message = "Authentication required" if is_auth_error else "Bridge returned an error"
+    return RuntimeError(f"AIWerk bridge status failed{code_suffix}: {fixed_message}")
 
 
 def _parse_gmail_bridge_date(value: Any) -> str:
@@ -1961,15 +2002,40 @@ def _aiwerk_bridge_subserver_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _aiwerk_bridge_live_subservers(config: Dict[str, Any]) -> list[Dict[str, Any]]:
-    result = _mcp_bridge_router_call(config, "aiwerk", "list_subservers", {})
-    content = ((result.get("result") or {}).get("content") or [])
-    payload: Dict[str, Any] = {}
-    if content and isinstance(content[0], dict):
-        try:
-            payload = _json.loads(content[0].get("text") or "{}")
-        except _json.JSONDecodeError:
-            payload = {}
-    return [_aiwerk_bridge_subserver_item(item) for item in payload.get("servers", []) if isinstance(item, dict)]
+    result = _mcp_bridge_status_call(config)
+    if not isinstance(result, dict):
+        raise RuntimeError("AIWerk bridge status response is malformed")
+    if "error" in result:
+        raise _aiwerk_bridge_status_error(result.get("error"))
+
+    response = result.get("result")
+    if not isinstance(response, dict):
+        raise RuntimeError("AIWerk bridge status response is malformed")
+    content = response.get("content")
+    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+        raise RuntimeError("AIWerk bridge status content is malformed")
+    text = content[0].get("text")
+    if not isinstance(text, str):
+        raise RuntimeError("AIWerk bridge status content is malformed")
+    try:
+        payload = _json.loads(text)
+    except (TypeError, _json.JSONDecodeError) as exc:
+        raise RuntimeError("AIWerk bridge status content is malformed") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("AIWerk bridge status payload is malformed")
+    if "error" in payload:
+        raise _aiwerk_bridge_status_error(payload.get("error"))
+    if payload.get("action") != "status" or payload.get("mode") != "router":
+        raise RuntimeError("AIWerk bridge status payload has an invalid action or mode")
+    servers = payload.get("servers")
+    if not isinstance(servers, list) or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("name") or item.get("id"), str)
+        or not str(item.get("name") or item.get("id")).strip()
+        for item in servers
+    ):
+        raise RuntimeError("AIWerk bridge status payload has an invalid servers list")
+    return [_aiwerk_bridge_subserver_item(item) for item in servers]
 
 
 def _aiwerk_bridge_subservers(config: Dict[str, Any]) -> list[Dict[str, Any]]:
@@ -1984,7 +2050,14 @@ def _aiwerk_bridge_subservers(config: Dict[str, Any]) -> list[Dict[str, Any]]:
     try:
         return _aiwerk_bridge_live_subservers(config)
     except Exception as exc:
-        return [{"id": "aiwerk-bridge", "name": "aiwerk_bridge", "label": "AIWerk Bridge", "status": _bridge_error_status(exc)}]
+        status = _bridge_error_status(exc)
+        return [{
+            "id": "aiwerk-bridge",
+            "name": "aiwerk_bridge",
+            "label": "AIWerk Bridge",
+            "status": status,
+            "status_label": _resource_status_label(status),
+        }]
 
 
 def _email_sender_domain(sender: Any) -> str:
