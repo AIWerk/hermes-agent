@@ -486,25 +486,35 @@ def test_background_resource_refresh_preserves_authenticated_actor_context():
 def test_live_bridge_inventory_normalizes_subserver_status(monkeypatch):
     monkeypatch.setattr(
         web_server,
-        "_mcp_bridge_router_call",
-        lambda *_args, **_kwargs: {
-            "result": {
-                "content": [
-                    {
-                        "text": json.dumps(
-                            {
-                                "servers": [
-                                    {
-                                        "name": "google-workspace-aiwerk",
-                                        "status": "connected",
-                                    }
-                                ]
-                            }
-                        )
-                    }
-                ]
-            }
-        },
+        "_mcp_bridge_session",
+        lambda _config: ("normalized-status-key", "session-123"),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_rpc",
+        lambda *_args, **_kwargs: (
+            {
+                "result": {
+                    "content": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "action": "status",
+                                    "mode": "router",
+                                    "servers": [
+                                        {
+                                            "name": "google-workspace-aiwerk",
+                                            "status": "connected",
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    ]
+                }
+            },
+            "session-123",
+        ),
     )
 
     items = web_server._aiwerk_bridge_live_subservers(
@@ -517,3 +527,363 @@ def test_live_bridge_inventory_normalizes_subserver_status(monkeypatch):
 
     assert items[0]["id"] == "aiwerk-bridge-google-workspace-aiwerk"
     assert items[0]["status"] == "connected"
+
+
+def test_live_bridge_inventory_uses_status_action_and_session_lifecycle(monkeypatch):
+    calls = []
+    session_key = "actor-scoped-session-key"
+    web_server._MCP_BRIDGE_REQUEST_IDS[session_key] = 9
+
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: (session_key, "session-123"),
+    )
+
+    def fake_rpc(_config, method, params, *, session_id=None, request_id=1):
+        calls.append((method, params, session_id, request_id))
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "action": "status",
+                                "mode": "router",
+                                "servers": [
+                                    {"name": "vault", "status": "disconnected"},
+                                    {"name": "grok", "status": "lazy"},
+                                ],
+                            }
+                        ),
+                    }
+                ]
+            },
+        }, session_id
+
+    monkeypatch.setattr(web_server, "_mcp_bridge_rpc", fake_rpc)
+
+    try:
+        items = web_server._aiwerk_bridge_live_subservers({})
+    finally:
+        web_server._MCP_BRIDGE_REQUEST_IDS.pop(session_key, None)
+
+    assert calls == [
+        (
+            "tools/call",
+            {"name": "mcp", "arguments": {"action": "status"}},
+            "session-123",
+            9,
+        )
+    ]
+    assert [(item["name"], item["status"]) for item in items] == [
+        ("vault", "limited"),
+        ("grok", "limited"),
+    ]
+
+
+def test_live_bridge_inventory_accepts_valid_empty_status(monkeypatch):
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_rpc",
+        lambda *_args, **_kwargs: (
+            {
+                "result": {
+                    "content": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "action": "status",
+                                    "mode": "router",
+                                    "servers": [],
+                                }
+                            )
+                        }
+                    ]
+                }
+            },
+            "session-123",
+        ),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: ("empty-status-key", "session-123"),
+    )
+
+    assert web_server._aiwerk_bridge_live_subservers({}) == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        {"result": {}},
+        {"result": {"content": []}},
+        {"result": {"content": [{"text": "not-json"}]}},
+        {"result": {"content": [{"text": json.dumps([])}]}},
+        {
+            "result": {
+                "content": [
+                    {"text": json.dumps({"action": "call", "mode": "router", "servers": []})}
+                ]
+            }
+        },
+        {
+            "result": {
+                "content": [
+                    {"text": json.dumps({"action": "status", "mode": "worker", "servers": []})}
+                ]
+            }
+        },
+        {
+            "result": {
+                "content": [
+                    {"text": json.dumps({"action": "status", "mode": "router", "servers": {}})}
+                ]
+            }
+        },
+        {
+            "result": {
+                "content": [
+                    {"text": json.dumps({"action": "status", "mode": "router", "servers": ["vault"]})}
+                ]
+            }
+        },
+    ],
+)
+def test_live_bridge_inventory_rejects_malformed_status(monkeypatch, result):
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: ("malformed-status-key", "session-123"),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_rpc",
+        lambda *_args, **_kwargs: (result, "session-123"),
+    )
+
+    with pytest.raises(RuntimeError, match="status"):
+        web_server._aiwerk_bridge_live_subservers({})
+
+
+def test_live_bridge_inventory_does_not_project_json_rpc_error_text(monkeypatch):
+    attacker_values = (
+        "Bearer eyJhbGciOiJIUzI1NiJ9.bridge-status-signature",
+        "bridge-secret.example.invalid",
+        "query-token-Q7v9X2",
+        "correct-horse-battery-staple",
+        "opaqueValueWithoutALabel-6fb88d1e",
+        "vault-prod",
+        "bexio-private",
+        "apify-shadow",
+    )
+    attack_payload = (
+        "Bearer eyJhbGciOiJIUzI1NiJ9.bridge-status-signature; "
+        "url=https://bridge-secret.example.invalid/mcp?access_token=query-token-Q7v9X2; "
+        "password=correct-horse-battery-staple; "
+        "opaqueValueWithoutALabel-6fb88d1e; "
+        'servers=["vault-prod","bexio-private","apify-shadow"]'
+    )
+    error = {"code": attack_payload, "message": attack_payload}
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: ("rpc-error-key", "session-123"),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_rpc",
+        lambda *_args, **_kwargs: ({"error": error}, "session-123"),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        web_server._aiwerk_bridge_live_subservers({})
+
+    projected = str(raised.value)
+    assert projected == "AIWerk bridge status failed: Bridge returned an error"
+    assert all(value not in projected for value in attacker_values)
+    assert len(projected) <= 96
+
+
+def test_live_bridge_inventory_auth_error_is_classified_without_projecting_text(monkeypatch):
+    attacker_values = (
+        "Bearer auth-token-J4p8L0",
+        "auth-bridge.example.invalid",
+        "query-auth-token-N5m2C8",
+        "auth-password-T3k7R1",
+        "opaqueAuthValue-91e4c0",
+        "vault-auth-prod",
+        "bexio-auth-private",
+        "apify-auth-shadow",
+    )
+    attack_payload = (
+        "Authorization required; Bearer auth-token-J4p8L0; "
+        "url=https://auth-bridge.example.invalid/mcp?token=query-auth-token-N5m2C8; "
+        "password=auth-password-T3k7R1; opaqueAuthValue-91e4c0; "
+        'servers=["vault-auth-prod","bexio-auth-private","apify-auth-shadow"]'
+    )
+    error = {"code": attack_payload, "message": attack_payload}
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: ("payload-error-key", "session-123"),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_rpc",
+        lambda *_args, **_kwargs: (
+            {
+                "result": {
+                    "content": [
+                        {
+                            "text": json.dumps({"error": error})
+                        }
+                    ]
+                }
+            },
+            "session-123",
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        web_server._aiwerk_bridge_live_subservers({})
+
+    projected = str(raised.value)
+    assert projected == "AIWerk bridge status failed: Authentication required"
+    assert all(value not in projected for value in attacker_values)
+    assert len(projected) <= 96
+
+    monkeypatch.setattr(
+        web_server,
+        "_aiwerk_bridge_live_subservers",
+        lambda _config: (_ for _ in ()).throw(raised.value),
+    )
+    item = web_server._aiwerk_bridge_subservers({})[0]
+    assert item["status"] == "auth_required"
+    serialized_item = json.dumps(item, sort_keys=True)
+    assert all(value not in serialized_item for value in attacker_values)
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_suffix"),
+    [
+        (-32602, " (-32602)"),
+        (10**48, ""),
+        ("unknown_server", " (unknown_server)"),
+        ("not safe/code", ""),
+        ("x" * 49, ""),
+        (True, ""),
+    ],
+)
+def test_bridge_status_error_projects_only_safe_codes(code, expected_suffix):
+    projected = str(web_server._aiwerk_bridge_status_error({"code": code}))
+
+    assert projected == (
+        f"AIWerk bridge status failed{expected_suffix}: Bridge returned an error"
+    )
+
+
+def test_live_bridge_inventory_does_not_project_nonobject_error_payload(monkeypatch):
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: ("nonobject-error-key", "session-123"),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_rpc",
+        lambda *_args, **_kwargs: (
+            {"error": "raw response private-server Bearer top-secret-token"},
+            "session-123",
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        web_server._aiwerk_bridge_live_subservers({})
+
+    message = str(raised.value)
+    assert "private-server" not in message
+    assert "top-secret-token" not in message
+    assert len(message) <= 320
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (RuntimeError("AIWerk bridge status failed (503): unavailable"), "error"),
+        (RuntimeError("AIWerk bridge status failed (403): Authorization required"), "auth_required"),
+    ],
+)
+def test_bridge_inventory_errors_are_visible_resources(monkeypatch, error, expected_status):
+    monkeypatch.setattr(
+        web_server,
+        "_aiwerk_bridge_live_subservers",
+        lambda _config: (_ for _ in ()).throw(error),
+    )
+
+    items = web_server._aiwerk_bridge_subservers({})
+
+    assert items == [
+        {
+            "id": "aiwerk-bridge",
+            "name": "aiwerk_bridge",
+            "label": "AIWerk Bridge",
+            "status": expected_status,
+            "status_label": web_server._resource_status_label(expected_status),
+        }
+    ]
+
+
+def test_existing_bridge_tool_call_payload_is_unchanged(monkeypatch):
+    calls = []
+    session_key = "tool-call-key"
+    web_server._MCP_BRIDGE_REQUEST_IDS[session_key] = 4
+    monkeypatch.setattr(
+        web_server,
+        "_mcp_bridge_session",
+        lambda _config: (session_key, "session-456"),
+    )
+
+    def fake_rpc(_config, method, params, *, session_id=None, request_id=1):
+        calls.append((method, params, session_id, request_id))
+        return {"result": {"content": [{"text": json.dumps({"ok": True})}]}}, session_id
+
+    monkeypatch.setattr(web_server, "_mcp_bridge_rpc", fake_rpc)
+
+    try:
+        result = web_server._call_aiwerk_bridge_tool(
+            {},
+            server="google-workspace-aiwerk",
+            tool="search_gmail_messages",
+            params={"query": "invoice"},
+        )
+    finally:
+        web_server._MCP_BRIDGE_REQUEST_IDS.pop(session_key, None)
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            "tools/call",
+            {
+                "name": "mcp",
+                "arguments": {
+                    "server": "google-workspace-aiwerk",
+                    "tool": "search_gmail_messages",
+                    "params": {"query": "invoice"},
+                },
+            },
+            "session-456",
+            4,
+        )
+    ]
+
+
+def test_bridge_read_tool_allowlist_excludes_nonexistent_inventory_tools():
+    assert web_server._AIWERK_BRIDGE_READ_TOOLS.isdisjoint(
+        {"list_subservers", "list_tools"}
+    )
