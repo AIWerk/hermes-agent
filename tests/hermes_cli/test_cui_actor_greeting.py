@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -60,6 +61,62 @@ def test_auth_me_exposes_only_neutral_greeting_identity():
     payload = json.loads(response.body)
 
     assert payload["greeting"] == {"name": "Example", "context": "customer"}
+    assert response.headers["cache-control"] == "private, no-store"
+    for authority_field in (
+        "default_profile", "active_profile", "capabilities", "authorization_revision"
+    ):
+        assert authority_field not in payload
+
+
+def test_auth_me_adds_only_server_resolved_authority_fields(tmp_path, monkeypatch):
+    from hermes_cli.dashboard_auth.profile_policy import (
+        load_profile_policy,
+        resolve_effective_authority,
+    )
+
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps({
+        "version": 1,
+        "profiles": [{
+            "profile_id": "customer-home",
+            "tenant_id": "tenant-example",
+            "kind": "customer",
+            "enabled": True,
+        }],
+        "actors": [{
+            "tenant_id": "tenant-example",
+            "actor_id": "tenant-example:customer:user",
+            "default_profile": "customer-home",
+        }],
+        "memberships": [{
+            "tenant_id": "tenant-example",
+            "actor_id": "tenant-example:customer:user",
+            "profile_id": "customer-home",
+            "actions": ["session.read", "session.list"],
+        }],
+    }), encoding="utf-8")
+    policy_path.chmod(0o600)
+    import hermes_cli.dashboard_auth.profile_policy as policy_mod
+
+    marker_path = tmp_path / "hermes-profile-membership.required"
+    marker_path.write_bytes(b"required-v1\n")
+    marker_path.chmod(0o600)
+    monkeypatch.setattr(policy_mod, "REQUIRED_MARKER_PATH", str(marker_path), raising=False)
+    monkeypatch.setattr(policy_mod, "PROFILE_POLICY_PATH", str(policy_path), raising=False)
+    monkeypatch.setattr(policy_mod, "TRUSTED_ROOT_UID", os.getuid(), raising=False)
+    session = _session()
+    authority = resolve_effective_authority(session, load_profile_policy())
+    request = _request(session)
+    request.state.effective_authority = authority
+
+    response = asyncio.run(api_auth_me(request))
+    payload = json.loads(response.body)
+
+    assert payload["default_profile"] == "customer-home"
+    assert payload["active_profile"] == "customer-home"
+    assert payload["capabilities"] == ["session.list", "session.read"]
+    assert payload["authorization_revision"] == authority.policy_revision
+    assert "peer-home" not in response.body.decode()
     assert response.headers["cache-control"] == "private, no-store"
 
 

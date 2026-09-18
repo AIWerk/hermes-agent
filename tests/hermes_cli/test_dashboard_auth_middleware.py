@@ -14,6 +14,9 @@ without any external IDP.  Exercises:
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import secrets
 import threading
 
@@ -487,6 +490,224 @@ def test_api_auth_me_requires_auth(gated_app):
     # No cookies.
     r = gated_app.get("/api/auth/me")
     assert r.status_code == 401
+
+
+def _write_membership_policy(path, *, memberships=None):
+    document = {
+        "version": 1,
+        "profiles": [
+            {"profile_id": "stub-home", "tenant_id": "stub-org-1", "kind": "customer", "enabled": True},
+            {"profile_id": "private-peer", "tenant_id": "stub-org-1", "kind": "customer", "enabled": True},
+        ],
+        "actors": [{
+            "tenant_id": "stub-org-1",
+            "actor_id": "stub-user-1",
+            "default_profile": "stub-home",
+        }],
+        "memberships": memberships if memberships is not None else [{
+            "tenant_id": "stub-org-1",
+            "actor_id": "stub-user-1",
+            "profile_id": "stub-home",
+            "actions": ["session.read", "profile.discover", "session.list"],
+        }],
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _enable_profile_membership(monkeypatch, policy_path):
+    import hermes_cli.dashboard_auth.profile_policy as policy_mod
+
+    marker_path = policy_path.parent / "hermes-profile-membership.required"
+    marker_path.write_bytes(b"required-v1\n")
+    marker_path.chmod(0o600)
+    monkeypatch.setattr(policy_mod, "REQUIRED_MARKER_PATH", str(marker_path), raising=False)
+    monkeypatch.setattr(policy_mod, "PROFILE_POLICY_PATH", str(policy_path), raising=False)
+    monkeypatch.setattr(policy_mod, "TRUSTED_ROOT_UID", os.getuid(), raising=False)
+    return marker_path
+
+
+def test_enabled_membership_binds_server_authority_and_ignores_client_fields(
+    gated_app, tmp_path, monkeypatch
+):
+    policy_path = _write_membership_policy(tmp_path / "policy.json")
+    _enable_profile_membership(monkeypatch, policy_path)
+    _complete_stub_login(gated_app)
+
+    response = gated_app.get(
+        "/api/auth/me",
+        params={
+            "actor_id": "mallory",
+            "profile_id": "private-peer",
+            "capabilities": "profile.admin",
+        },
+        headers={
+            "X-Actor-Id": "mallory",
+            "X-Profile-Id": "private-peer",
+            "X-Capabilities": "profile.admin",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["actor_id"] == "stub-user-1"
+    assert body["default_profile"] == "stub-home"
+    assert body["active_profile"] == "stub-home"
+    assert body["capabilities"] == ["profile.discover", "session.list", "session.read"]
+    assert len(body["authorization_revision"]) == 64
+    assert "mallory" not in response.text
+    assert "private-peer" not in response.text
+    assert "profile.admin" not in body["capabilities"]
+
+
+def test_membership_removal_is_visible_on_the_next_request(gated_app, tmp_path, monkeypatch):
+    policy_path = _write_membership_policy(tmp_path / "policy.json")
+    _enable_profile_membership(monkeypatch, policy_path)
+    _complete_stub_login(gated_app)
+
+    allowed = gated_app.get("/api/auth/me")
+    assert allowed.status_code == 200
+
+    _write_membership_policy(policy_path, memberships=[])
+    denied = gated_app.get("/api/auth/me")
+
+    assert denied.status_code == 403
+    assert denied.json() == {"detail": "Forbidden"}
+    assert "stub-home" not in denied.text
+    assert "stub-user-1" not in denied.text
+
+
+@pytest.mark.parametrize("policy_state", ["missing", "malformed", "unreadable"])
+def test_enabled_policy_load_failure_is_generic_403(
+    gated_app, tmp_path, monkeypatch, policy_state
+):
+    policy_path = tmp_path / "policy.yaml"
+    if policy_state == "malformed":
+        policy_path.write_text("version: 1\nprofiles: [", encoding="utf-8")
+    marker_path = _enable_profile_membership(monkeypatch, policy_path)
+    if policy_state == "unreadable":
+        policy_path.write_text("version: 1", encoding="utf-8")
+        import hermes_cli.dashboard_auth.profile_policy as policy_mod
+        original = os.open
+
+        def denied(path, flags, *args, **kwargs):
+            if os.fspath(path) == str(policy_path):
+                raise PermissionError("denied")
+            return original(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(policy_mod.os, "open", denied)
+    _complete_stub_login(gated_app)
+
+    response = gated_app.get("/api/auth/me")
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Forbidden"}
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_absent_required_marker_preserves_auth_me_compatibility(gated_app, tmp_path, monkeypatch):
+    import hermes_cli.dashboard_auth.profile_policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "REQUIRED_MARKER_PATH", str(tmp_path / "absent.required"), raising=False)
+    monkeypatch.setattr(policy_mod, "PROFILE_POLICY_PATH", str(tmp_path / "absent.yaml"), raising=False)
+    monkeypatch.setattr(policy_mod, "TRUSTED_ROOT_UID", os.getuid(), raising=False)
+    _complete_stub_login(gated_app)
+
+    response = gated_app.get("/api/auth/me")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["user_id"] == "stub-user-1"
+    assert body["greeting"] == {"name": "Stub", "context": "customer"}
+    for authority_field in (
+        "default_profile", "active_profile", "capabilities", "authorization_revision"
+    ):
+        assert authority_field not in body
+
+
+def test_malformed_main_config_cannot_disable_fixed_policy(gated_app, tmp_path, monkeypatch):
+    from hermes_cli import config as config_mod
+
+    policy_path = _write_membership_policy(tmp_path / "policy.json")
+    _enable_profile_membership(monkeypatch, policy_path)
+    monkeypatch.setattr(
+        config_mod, "load_config_readonly",
+        lambda: (_ for _ in ()).throw(ValueError("malformed main config")),
+    )
+    _complete_stub_login(gated_app)
+
+    response = gated_app.get("/api/auth/me")
+
+    assert response.status_code == 200
+    assert response.json()["default_profile"] == "stub-home"
+
+
+def test_config_put_cannot_disable_or_retarget_fixed_policy(gated_app, tmp_path, monkeypatch):
+    import hermes_cli.dashboard_auth.profile_policy as policy_mod
+    import hermes_cli.web_routers.config_env as config_routes
+
+    policy_path = _write_membership_policy(tmp_path / "policy.json")
+    _enable_profile_membership(monkeypatch, policy_path)
+    saved = []
+    monkeypatch.setattr(config_routes, "read_raw_config", lambda: {})
+    monkeypatch.setattr(config_routes, "save_config", lambda config: saved.append(config))
+    _complete_stub_login(gated_app)
+
+    mutation = gated_app.put("/api/config", json={"config": {"dashboard": {
+        "profile_membership": {
+            "enabled": False,
+            "policy_path": str(tmp_path / "attacker.yaml"),
+        }
+    }}})
+    assert mutation.status_code == 200
+    assert saved
+
+    _write_membership_policy(policy_path, memberships=[])
+    denied = gated_app.get("/api/auth/me")
+    assert denied.status_code == 403
+    assert policy_mod.PROFILE_POLICY_PATH == str(policy_path)
+
+    defaults = gated_app.get("/api/config/defaults")
+    assert defaults.status_code == 200
+    assert "profile_membership" not in defaults.json()["dashboard"]
+
+
+def test_policy_denial_never_calls_downstream(tmp_path, monkeypatch):
+    from starlette.requests import Request
+    from starlette.responses import Response
+    import hermes_cli.dashboard_auth.profile_policy as policy_mod
+    from hermes_cli.dashboard_auth.middleware import _serve_authenticated
+
+    marker = tmp_path / "hermes-profile-membership.required"
+    marker.write_bytes(b"wrong-marker\n")
+    marker.chmod(0o600)
+    monkeypatch.setattr(policy_mod, "REQUIRED_MARKER_PATH", str(marker), raising=False)
+    monkeypatch.setattr(policy_mod, "PROFILE_POLICY_PATH", str(tmp_path / "missing.yaml"), raising=False)
+    monkeypatch.setattr(policy_mod, "TRUSTED_ROOT_UID", os.getuid(), raising=False)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/private", "raw_path": b"/private",
+        "query_string": b"", "headers": [], "scheme": "https", "server": ("test", 443),
+        "client": ("127.0.0.1", 1), "app": web_server.app,
+    })
+    calls = 0
+
+    async def downstream(_request):
+        nonlocal calls
+        calls += 1
+        return Response("unsafe")
+
+    response = asyncio.run(_serve_authenticated(
+        request, downstream,
+        Session(
+            user_id="u", email="u@example.test", display_name="U", org_id="t",
+            provider="stub", expires_at=4_000_000_000, access_token="a", refresh_token="r",
+            tenant_id="t", actor_id="u", role="user",
+        ),
+    ))
+
+    assert response.status_code == 403
+    assert calls == 0
 
 
 # ---------------------------------------------------------------------------

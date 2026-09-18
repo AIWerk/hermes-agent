@@ -120,12 +120,32 @@ def _verify_access_token(
         phase="verify" if audit else "bearer verify", log=_log, on_unreachable=_audit_unreachable)
 
 
+async def _serve_authenticated(request: Request, call_next, session) -> Response:
+    """Bind only provider-verified identity, then resolve a fresh server policy snapshot."""
+    from hermes_cli.dashboard_auth.profile_policy import (
+        ProfilePolicyError,
+        resolve_configured_authority,
+    )
+
+    request.state.session = session
+    try:
+        authority = resolve_configured_authority(session)
+    except ProfilePolicyError:
+        return JSONResponse(
+            {"detail": "Forbidden"},
+            status_code=403,
+            headers={"Cache-Control": "private, no-store"},
+        )
+    if authority is not None:
+        request.state.effective_authority = authority
+    return await call_next(request)
+
+
 async def _serve_refreshed(request: Request, call_next, new_session, provider: str) -> Response:
     """Serve the request under a just-rotated session and write the rotated cookies back. Writing
     the ROTATED RT is mandatory: Portal runs reuse detection, so replaying the stale RT would
     revoke the session."""
-    request.state.session = new_session
-    response = await call_next(request)
+    response = await _serve_authenticated(request, call_next, new_session)
     set_session_cookies(
         response, access_token=new_session.access_token, refresh_token=new_session.refresh_token,
         access_token_expires_in=_expires_in_seconds(new_session), use_https=detect_https(request),
@@ -165,8 +185,7 @@ async def gated_auth_middleware(
         except ProviderError as e:
             return unreachable_response(str(e))
         if bearer_session is not None:
-            request.state.session = bearer_session
-            return await call_next(request)
+            return await _serve_authenticated(request, call_next, bearer_session)
         return _unauth_response(request, reason="invalid_or_expired_session")
 
     at, _rt = read_session_cookies(request)
@@ -195,8 +214,7 @@ async def gated_auth_middleware(
             return _session_expired_response(request)
         return await _serve_refreshed(request, call_next, *refreshed)
 
-    request.state.session = session
-    response = await call_next(request)
+    response = await _serve_authenticated(request, call_next, session)
     if not provider_hint and session.provider:
         set_session_provider_cookie(
             response, provider=session.provider, use_https=detect_https(request),
