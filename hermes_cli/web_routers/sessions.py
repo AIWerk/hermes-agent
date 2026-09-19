@@ -156,6 +156,10 @@ def _restricted_actor_denied(actor: dict | None) -> None:
 
 
 def _customer_profile(profile: Optional[str], actor: dict | None) -> Optional[str]:
+    from hermes_cli.dashboard_auth.profile_access import http_decision
+    decision = http_decision.get()
+    if decision is not None:
+        return decision.target_profile
     if actor and not actor.get("_restricted"):
         if profile:
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
@@ -227,7 +231,9 @@ def get_sessions(
     try:
         # Auto-archive is the only write on this GET path: run it on its own
         # maintenance connection, then open the listing connection read-only.
-        _maybe_auto_archive_for_profile(profile)
+        from hermes_cli.dashboard_auth.profile_access import http_decision
+        if http_decision.get() is None:
+            _maybe_auto_archive_for_profile(profile)
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             min_message_count = max(0, min_messages)

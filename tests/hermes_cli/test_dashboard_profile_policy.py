@@ -17,6 +17,7 @@ ACTIONS = [
     "profile.discover", "profile.launch", "profile.use", "session.list",
     "session.search", "session.read", "session.export", "session.resume",
     "session.mutate", "profile.admin",
+    "behavior.read", "behavior.write",
 ]
 
 
@@ -183,8 +184,22 @@ def test_policy_revision_is_deterministic_and_changes_with_exact_bytes(tmp_path,
     assert changed != first
 
 
-def test_action_vocabulary_is_exact():
+def test_behavior_actions_are_separate_exact_vocabulary():
     assert tuple(_policy_module().PROFILE_ACTIONS) == tuple(ACTIONS)
+    assert {"behavior.read", "behavior.write"}.isdisjoint(
+        {action for action in ACTIONS if action.startswith("session.")}
+    )
+
+
+def test_behavior_write_wildcard_policy_is_rejected(tmp_path, monkeypatch):
+    policy_mod = _policy_module()
+    document = _document(memberships=[{
+        "tenant_id": "tenant-a", "actor_id": "admin", "profile_id": "*",
+        "actions": ["behavior.write"],
+    }])
+    _install_fixed_policy(monkeypatch, tmp_path, document)
+    with pytest.raises(policy_mod.ProfilePolicyError):
+        policy_mod.load_profile_policy()
 
 
 def test_fixed_production_authority_paths_and_caps_are_declared():

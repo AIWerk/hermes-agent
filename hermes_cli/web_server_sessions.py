@@ -115,6 +115,10 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     # Read-only file/sidecar preflight (port of kilocode#12508): repair-or-refuse BEFORE the first
     # connection so users get an actionable message instead of an opaque "attempt to write a readonly
     # database" from deep inside _init_schema.
+    from hermes_cli.dashboard_auth.profile_access import recheck_http_decision
+    decision = recheck_http_decision()
+    if read_only and decision is not None:
+        return SessionDB(db_path=db_path, read_only=True)
     if not read_only:
         return acquire(db_path)
 
@@ -187,6 +191,13 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     """
     from hermes_cli.web_server_cron import _cron_profile_home
     from hermes_state import _default_db_path
+    from hermes_cli.dashboard_auth.profile_access import recheck_http_decision
+    decision = recheck_http_decision()
+    if decision is not None:
+        if profile is not None and profile != decision.target_profile:
+            from fastapi import HTTPException
+            raise HTTPException(403, "profile access denied")
+        profile = decision.target_profile
 
     if profile:
         _name, home = _cron_profile_home(profile)

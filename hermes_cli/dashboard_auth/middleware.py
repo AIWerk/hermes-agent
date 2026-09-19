@@ -128,6 +128,9 @@ async def _serve_authenticated(request: Request, call_next, session) -> Response
     )
 
     request.state.session = session
+    # The delegated broker must record even policy/identity denials itself.
+    if request.url.path.startswith("/api/admin/session-reader/"):
+        return await call_next(request)
     try:
         authority = resolve_configured_authority(session)
     except ProfilePolicyError:

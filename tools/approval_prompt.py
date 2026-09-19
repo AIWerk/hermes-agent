@@ -266,8 +266,8 @@ def request_elicitation_consent(message: str, description: str, *,
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
         return "decline"
 
-    if _ctx._is_gateway_approval_context():
-        notify_cb = _a._gateway_notify_cb(session_key)
+    notify_cb = _a._gateway_notify_cb(session_key)
+    if _ctx._is_gateway_approval_context() or notify_cb is not None:
         if notify_cb is None:
             logger.warning("Elicitation requested in gateway session %s but no "
                            "notify_cb is registered — failing closed", session_key)

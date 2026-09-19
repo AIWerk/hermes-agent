@@ -360,6 +360,9 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
+    from hermes_cli.dashboard_auth.profile_access import deny_unsafe_socket
+    if await deny_unsafe_socket(ws):
+        return
     await ws.accept()
 
     # Profile via query param, like /api/pty and /api/console: the provider

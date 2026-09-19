@@ -253,6 +253,12 @@ async def handle_ws(
     callers (stdio-free harnesses, the embedded TUI child) omit it and get a
     ``None`` transport identity — unchanged behaviour.
     """
+    from hermes_cli.dashboard_auth.profile_access import authorize, ProfileAccessDenied
+    try:
+        authorize(auth_identity, "profile.use")
+    except ProfileAccessDenied:
+        await ws.close(code=4403, reason="profile access denied")
+        return
     peer = _ws_peer_label(ws)
     trusted_actor_context = sanitize_cui_actor_context(auth_identity)
     transport: WSTransport | None = None
@@ -331,6 +337,11 @@ async def handle_ws(
         while True:
             try:
                 raw = await ws.receive_text()
+                try:
+                    authorize(auth_identity, "profile.use")
+                except ProfileAccessDenied:
+                    disconnect_reason = "profile access denied"
+                    break
                 _note_dashboard_client_activity()
             except _WebSocketDisconnect as exc:
                 disconnect_reason = f"client_disconnect(code={getattr(exc, 'code', None)},reason={getattr(exc, 'reason', None)})"
@@ -430,7 +441,10 @@ async def handle_ws(
             except Exception:
                 _log.exception("ws transport teardown failed peer=%s", peer)
         try:
-            await ws.close()
+            if disconnect_reason == "profile access denied":
+                await ws.close(code=4403, reason=disconnect_reason)
+            else:
+                await ws.close()
         except Exception as exc:
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
         _log.info(

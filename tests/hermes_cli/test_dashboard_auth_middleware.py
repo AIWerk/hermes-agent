@@ -644,10 +644,23 @@ def test_malformed_main_config_cannot_disable_fixed_policy(gated_app, tmp_path, 
 
 
 def test_config_put_cannot_disable_or_retarget_fixed_policy(gated_app, tmp_path, monkeypatch):
+    from pathlib import Path
+
     import hermes_cli.dashboard_auth.profile_policy as policy_mod
     import hermes_cli.web_routers.config_env as config_routes
 
-    policy_path = _write_membership_policy(tmp_path / "policy.json")
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "stub-home").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    memberships = [{
+        "tenant_id": "stub-org-1",
+        "actor_id": "stub-user-1",
+        "profile_id": "stub-home",
+        "actions": ["session.read", "profile.discover", "session.list", "profile.admin"],
+    }]
+    policy_path = _write_membership_policy(tmp_path / "policy.json", memberships=memberships)
     _enable_profile_membership(monkeypatch, policy_path)
     saved = []
     monkeypatch.setattr(config_routes, "read_raw_config", lambda: {})
@@ -668,6 +681,15 @@ def test_config_put_cannot_disable_or_retarget_fixed_policy(gated_app, tmp_path,
     assert denied.status_code == 403
     assert policy_mod.PROFILE_POLICY_PATH == str(policy_path)
 
+    # Require verified identity for this schema assertion: the public-route
+    # shortcut otherwise omits the actor required by the profile.admin gate.
+    import hermes_cli.dashboard_auth.middleware as auth_middleware
+
+    _write_membership_policy(policy_path, memberships=memberships)
+    monkeypatch.setattr(
+        auth_middleware, "PUBLIC_API_PATHS",
+        auth_middleware.PUBLIC_API_PATHS - {"/api/config/defaults"},
+    )
     defaults = gated_app.get("/api/config/defaults")
     assert defaults.status_code == 200
     assert "profile_membership" not in defaults.json()["dashboard"]

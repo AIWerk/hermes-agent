@@ -109,6 +109,9 @@ async def _ws_gate(ws: WebSocket, kind: str) -> Optional[tuple[str, str, str]]:
     host/origin mismatch, 4408 peer not allowed. Returns ``(peer, mode, cred)``
     once every gate passes, or None after closing the socket.
     """
+    from hermes_cli.dashboard_auth.profile_access import deny_unsafe_socket
+    if await deny_unsafe_socket(ws):
+        return None
     peer = ws.client.host if ws.client else "?"
     if _assistant_mode_enabled():
         await ws.close(code=4403, reason="websocket disabled in assistant mode")
@@ -142,6 +145,9 @@ async def _ws_gate(ws: WebSocket, kind: str) -> Optional[tuple[str, str, str]]:
 async def _close_unless_sidecar_allowed(ws: WebSocket, *, assistant_gateway: bool = False) -> bool:
     """Pre-accept gates for the /api/ws, /api/pub and /api/events sidecars:
     4403 when chat is disabled or the request isn't allowed, 4401 on bad auth."""
+    from hermes_cli.dashboard_auth.profile_access import deny_unsafe_socket
+    if not assistant_gateway and await deny_unsafe_socket(ws):
+        return False
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return False

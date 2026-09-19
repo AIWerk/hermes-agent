@@ -149,8 +149,10 @@ def _listing_rows(db, limit: int, **kwargs) -> list:
 def _snapshot_sessions(rid):
     """``(list(_sessions.items()), None)`` under the lock, or ``(None, 5036 error)`` — fail CLOSED."""
     try:
+        from tui_gateway.profile_authorization import live_record_in_scope
         with _sessions_lock:
-            return list(_sessions.items()), None
+            return [(sid, record) for sid, record in _sessions.items()
+                    if live_record_in_scope(record)], None
     except Exception as e:
         return None, _err(rid, 5036, f"could not enumerate active sessions: {e}")
 
@@ -328,7 +330,7 @@ def _(rid, params: dict) -> dict:
             "follow_profile_config": _flag(params, "follow_profile_config"),
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
-            "cui_actor_context": sanitize_cui_actor_context(current_cui_actor_context()),
+            "cui_actor_context": current_cui_actor_context(),
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport}
         _register_session_cwd(_sessions[sid])
@@ -940,9 +942,12 @@ def _(rid, params: dict) -> dict:
     if not os.path.isdir(resolved):
         return _err(rid, 4017, f"working directory does not exist: {raw}")
     # Snapshot under the lock — concurrent RPCs mutate _sessions.
+    from tui_gateway.profile_authorization import live_record_in_scope
     with _sessions_lock:
         live_sid, live = next(
-            ((sid, sess) for sid, sess in list(_sessions.items()) if sess.get("session_key") == target), ("", None))
+            ((sid, sess) for sid, sess in list(_sessions.items())
+             if sess.get("session_key") == target and live_record_in_scope(sess)
+             and _live_record_visible_to_cui_actor(sess)), ("", None))
     branch, root = git_probe.branch(resolved), git_probe.common_repo_root(resolved)
     with _profile_db(params) as db:
         if db is None:
@@ -1075,6 +1080,8 @@ def _(rid, params: dict, session: dict, db) -> dict:
 def _(rid, params: dict) -> dict:
     """Set/clear ``hidden`` (leaves the default list, stays resumable by its owner) on a session + lineage:
     LIVE runtime id first (unpersisted drafts via ``pending_hidden``), then a stored id/key in the profile db."""
+    from tui_gateway.profile_authorization import authorize_lineage
+    from hermes_cli.dashboard_auth.profile_access import ProfileAccessDenied
     hidden = is_truthy_value(params.get("hidden", True))
     session, err = _sess_nowait(params, rid)
     with (_profile_db(params) if session is None else _session_db(session)) as db:
@@ -1083,15 +1090,24 @@ def _(rid, params: dict) -> dict:
         try:
             if session is not None:
                 key = session["session_key"]
+                authorize_lineage(db, key, params.get("profile"), allow_missing=True)
                 if not db.set_session_hidden(key, hidden):
                     session["pending_hidden"] = hidden  # no row yet: _ensure_session_db_row is born hidden
             else:
                 # ``resolve_session_id`` follows key/title aliases like the REST pin/archive path.
                 target = _str_param(params, "session_id")
                 if not (key := db.resolve_session_id(target) if hasattr(db, "resolve_session_id") else target):
+                    from hermes_cli.dashboard_auth.profile_access import authorize
+                    if authorize(current_bound_cui_actor_context(), "session.mutate", params.get("profile")):
+                        return _err(rid, 403, "profile access denied")
                     return err
+                if not _row_visible_to_cui_actor(db.get_session(key), current_cui_actor_context()):
+                    return _err(rid, 403, "profile access denied")
+                authorize_lineage(db, key, params.get("profile"))
                 db.set_session_hidden(key, hidden)
             return _ok(rid, {"hidden": hidden, "session_key": key})
+        except ProfileAccessDenied:
+            return _err(rid, 403, "profile access denied")
         except Exception as e:
             return _err(rid, 5007, str(e))
 
@@ -2290,10 +2306,8 @@ def _commit_gateway_session_boundary(session: dict, session_id: str) -> None:
 
 
 @method("session.side.back")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+@_with_db(5006, session_scoped=True)
+def _(rid, params: dict, session: dict, db) -> dict:
     sid = params.get("session_id", "")
     with session["history_lock"]:
         if session.get("running"):
@@ -2301,12 +2315,22 @@ def _(rid, params: dict) -> dict:
     wait_err = _wait_agent(session, rid)
     if wait_err:
         return wait_err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5006)
     source = _side_source()
     current_session_id = session.get("session_key") or sid
+    from tui_gateway.profile_authorization import authorize_lineage
+    from hermes_cli.dashboard_auth.profile_access import ProfileAccessDenied, _snapshot
     try:
+        if _snapshot(current_bound_cui_actor_context())[0] is not None:
+            with db._read_ctx() as conn:
+                pending = conn.execute(
+                    "SELECT parent_session_id, side_session_id FROM session_stack "
+                    "WHERE source=? AND side_session_id=? AND status='active' ORDER BY id DESC LIMIT 1",
+                    (source, current_session_id),
+                ).fetchone()
+            authorize_lineage(db, current_session_id, params.get("profile"))
+            if pending:
+                for key in pending:
+                    authorize_lineage(db, key, params.get("profile"))
         entry = db.pop_side_session(source=source, side_session_id=current_session_id)
         if not entry:
             return _ok(rid, {"mode": "main", "returned": False})
@@ -2334,15 +2358,15 @@ def _(rid, params: dict) -> dict:
                 "info": info,
             },
         )
+    except ProfileAccessDenied:
+        return _err(rid, 403, "profile access denied")
     except Exception as exc:
         return _err(rid, 5006, f"side session return failed: {exc}")
 
 
 @method("session.side.start")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+@_with_db(5006, session_scoped=True)
+def _(rid, params: dict, session: dict, db) -> dict:
     sid = params.get("session_id", "")
     with session["history_lock"]:
         if session.get("running"):
@@ -2350,9 +2374,6 @@ def _(rid, params: dict) -> dict:
     wait_err = _wait_agent(session, rid)
     if wait_err:
         return wait_err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5006)
     parent_session_id = session.get("session_key") or sid
     side_session_id = _new_session_key()
     source = _side_source()

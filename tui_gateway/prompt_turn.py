@@ -130,6 +130,15 @@ def _admit_prompt_turn(
     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
     bypass that once let a second backend run a duplicate turn."""
+    from tui_gateway.profile_authorization import authorize_session
+    from hermes_cli.dashboard_auth.profile_access import ProfileAccessDenied
+    try:
+        authorize_session(session)
+    except ProfileAccessDenied:
+        with session["history_lock"]:
+            session["running"] = False
+        _emit("error", sid, {"message": "profile access denied"})
+        return None
     # When the session already holds its lease this is a cheap dict check. See #94778.
     if (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
         logger.info(
@@ -484,6 +493,8 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     fail-closed refusal scope).  The config-model sync is skipped under a /model --once
     override (not pinned as model_override, the sync would clobber it); a model picked
     mid-turn is applied first so the explicit pick wins over a config change."""
+    from tui_gateway.profile_authorization import authorize_session
+    authorize_session(session)
     from tools.approval_context import set_current_session_key
     scopes = st.scopes
     scopes.approval = set_current_session_key(session["session_key"])
@@ -796,7 +807,9 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None) -> bool:
-    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
+    admitted = _run_with_cui_actor_context(
+        session.get("cui_actor_context"), _admit_prompt_turn,
+        sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
     images, agent = admitted
@@ -824,9 +837,11 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
-        st.marker_key = _record_turn_marker(session, text)
         goal_followup = None
         try:
+            from tui_gateway.profile_authorization import authorize_session
+            authorize_session(session)
+            st.marker_key = _record_turn_marker(session, text)
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
                 return
