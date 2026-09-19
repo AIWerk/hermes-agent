@@ -36,6 +36,8 @@ PROFILE_ACTIONS = (
     "session.resume",
     "session.mutate",
     "profile.admin",
+    "behavior.read",
+    "behavior.write",
 )
 _ACTION_SET = frozenset(PROFILE_ACTIONS)
 _DENIED = "profile access denied"
@@ -246,6 +248,8 @@ def _parse_policy(raw: bytes) -> ProfilePolicy:
         action_set: set[str] = set()
         for action in actions:
             if not isinstance(action, str) or action not in _ACTION_SET or action in action_set:
+                raise ProfilePolicyError("invalid membership")
+            if profile_id == "*" and action == "behavior.write":
                 raise ProfilePolicyError("invalid membership")
             action_set.add(action)
         grants[grant_key] = frozenset(action_set)

@@ -171,9 +171,15 @@ class ComputeHost:
         request_id = frame.get("request_id")
         try:
             from tui_gateway import server
-            body(server, sid, request_id)
+            from tui_gateway.profile_authorization import compute_actor_scope, _ACTIONS
+            route = str(frame.get("route_name") or "")
+            action_route = {"slash.save": "session.save", "slash.compress": "session.compress"}.get(route, route)
+            actions = _ACTIONS.get(action_route, ("profile.admin",))
+            with compute_actor_scope(frame, server._sessions.get(sid), actions):
+                body(server, sid, request_id)
         except Exception as exc:
-            if on_error is not None:
+            from hermes_cli.dashboard_auth.profile_access import ProfileAccessDenied
+            if on_error is not None and not isinstance(exc, ProfileAccessDenied):
                 on_error(sid)
             self._reply(error_kind, sid, request_id, **error_extra, message=str(exc))
 
@@ -208,53 +214,57 @@ class ComputeHost:
         if not sid:
             self._reply("turn.error", sid, request_id, message="sid required")
             return
+        admitted = False
         try:
             from tui_gateway import server
-            session = self._ensure_server_session(server, frame)
-            text = frame["text"] if "text" in frame else frame.get("prompt", "")
-            inflight = frame["text"] if "text" in frame else frame.get("prompt")
-            with session["history_lock"]:
-                queued_gen = frame.get("queued_prompt_generation")
-                current_gen = int(session.get("_queued_prompt_generation", 0))
-                if queued_gen is not None and current_gen != int(queued_gen):
-                    self._reply("turn.end", sid, request_id, interrupted=True, ended_ns=now_ns())
-                    return
-                if session.get("running"):
-                    self._reply("turn.error", sid, request_id, message="session busy")
-                    return
-                session.update(running=True, _turn_cancel_requested=False, last_active=time.time())
-                server._start_inflight_turn(session, inflight)
-                turn_started_at = time.time()
-            self._reply("turn.started", sid, request_id, started_ns=now_ns())
-            with contextlib.suppress(Exception):
-                server._ensure_session_db_row(session)
-            with contextlib.suppress(Exception):
-                import hermes_undo
-                hermes_undo.on_user_message_appended(session["session_key"])
-            with contextlib.suppress(Exception):
-                server._persist_branch_seed(session)
-            server._run_prompt_submit(
-                request_id, sid, session, text, display_kind=frame.get("display_kind") or None)
-            run_thread = session.get("_run_thread")
-            if run_thread is not None and hasattr(run_thread, "join"):
-                while run_thread.is_alive():
-                    run_thread.join(timeout=1.0)
-                    if run_thread.is_alive() and frame.get("turn_id"):
-                        self._emit_turn_activity(sid, session, frame["turn_id"], turn_started_at)
-            with session["history_lock"]:
-                meta = _history_meta(session)
-                interrupted = bool(session.get("_turn_cancel_requested"))
-            session_info = server._session_info(session.get("agent"), session)
-            with self._progress_lock:
-                self._progress_counter += 1
-            self._reply(
-                "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
-                session_info=session_info, session_info_emitted=True)
+            from tui_gateway.profile_authorization import compute_actor_scope
+            with compute_actor_scope(frame, server._sessions.get(sid)):
+                session = self._ensure_server_session(server, frame)
+                text = frame["text"] if "text" in frame else frame.get("prompt", "")
+                inflight = frame["text"] if "text" in frame else frame.get("prompt")
+                with session["history_lock"]:
+                    queued_gen = frame.get("queued_prompt_generation")
+                    current_gen = int(session.get("_queued_prompt_generation", 0))
+                    if queued_gen is not None and current_gen != int(queued_gen):
+                        self._reply("turn.end", sid, request_id, interrupted=True, ended_ns=now_ns())
+                        return
+                    if session.get("running"):
+                        self._reply("turn.error", sid, request_id, message="session busy")
+                        return
+                    admitted = True
+                    session.update(running=True, _turn_cancel_requested=False, last_active=time.time())
+                    server._start_inflight_turn(session, inflight)
+                    turn_started_at = time.time()
+                self._reply("turn.started", sid, request_id, started_ns=now_ns())
+                with contextlib.suppress(Exception):
+                    server._ensure_session_db_row(session)
+                with contextlib.suppress(Exception):
+                    import hermes_undo
+                    hermes_undo.on_user_message_appended(session["session_key"])
+                with contextlib.suppress(Exception):
+                    server._persist_branch_seed(session)
+                server._run_prompt_submit(
+                    request_id, sid, session, text, display_kind=frame.get("display_kind") or None)
+                run_thread = session.get("_run_thread")
+                if run_thread is not None and hasattr(run_thread, "join"):
+                    while run_thread.is_alive():
+                        run_thread.join(timeout=1.0)
+                        if run_thread.is_alive() and frame.get("turn_id"):
+                            self._emit_turn_activity(sid, session, frame["turn_id"], turn_started_at)
+                with session["history_lock"]:
+                    meta = _history_meta(session)
+                    interrupted = bool(session.get("_turn_cancel_requested"))
+                session_info = server._session_info(session.get("agent"), session)
+                with self._progress_lock:
+                    self._progress_counter += 1
+                self._reply(
+                    "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
+                    session_info=session_info, session_info_emitted=True)
         except Exception as exc:
             with contextlib.suppress(Exception):
                 from tui_gateway import server
                 session = server._sessions.get(sid)
-                if session is not None:
+                if admitted and session is not None:
                     with session.get("history_lock", threading.Lock()):
                         session["running"] = False
                         server._clear_inflight_turn(session)
@@ -280,18 +290,20 @@ class ComputeHost:
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
         session = server._sessions.get(sid)
-        if session is not None:
-            session["transport"] = self._transport
-            if frame.get("cols") is not None:
-                session["cols"] = int(frame.get("cols") or 80)
-            for key in ("cwd", "profile_home"):
-                if frame.get(key):
-                    session[key] = str(frame[key])
-        else:
-            session = self._build_server_session(server, frame, sid)
-        if isinstance(frame.get("attached_images"), list):
-            session["attached_images"] = list(frame.get("attached_images") or [])
-        return session
+        from tui_gateway.profile_authorization import compute_actor_scope
+        with compute_actor_scope(frame, session):
+            if session is not None:
+                session["transport"] = self._transport
+                if frame.get("cols") is not None:
+                    session["cols"] = int(frame.get("cols") or 80)
+                for key in ("cwd",):
+                    if frame.get(key):
+                        session[key] = str(frame[key])
+            else:
+                session = self._build_server_session(server, frame, sid)
+            if isinstance(frame.get("attached_images"), list):
+                session["attached_images"] = list(frame.get("attached_images") or [])
+            return session
 
     def _build_server_session(self, server: Any, frame: dict[str, Any], sid: str) -> dict:
         """Build the agent under the frame's profile scope and register the session."""
@@ -339,7 +351,7 @@ class ComputeHost:
                 server._init_session(
                     sid, key, agent, list(history), cols=int(frame.get("cols") or 80),
                     cwd=str(frame.get("cwd") or "") or None, session_db=session_db,
-                    source=frame.get("source"))
+                    source=frame.get("source"), profile_home=profile_home or None)
             finally:
                 reset_transport(token)
         except Exception:
@@ -360,6 +372,8 @@ class ComputeHost:
         session = server._sessions[sid]
         session["transport"] = self._transport
         session["profile_home"] = profile_home or session.get("profile_home")
+        session["profile"] = frame.get("profile")
+        session["cui_actor_context"] = frame.get("cui_actor_context")
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
         return session

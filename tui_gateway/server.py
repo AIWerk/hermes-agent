@@ -44,6 +44,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: 
 from agent.cui_actor_context import (  # noqa: F401  (split modules + tests patch through this facade)
     bind_cui_actor_context,
     current_cui_actor_context,
+    current_bound_cui_actor_context,
     reset_cui_actor_context,
     sanitize_cui_actor_context,
 )
@@ -61,22 +62,22 @@ _DASHBOARD_UPLOAD_ROOT = (Path(_hermes_home) / "dashboard_uploads").resolve()
 
 def _apply_cui_actor_env(actor_context: dict | None):
     """Compatibility adapter over the canonical per-flow actor ContextVar."""
-    actor = {
-        str(key): str(value)
-        for key, value in (actor_context or {}).items()
-        if key
-        in {
-            "tenant_id",
-            "actor_id",
-            "role",
-            "display_name",
-            "user_id",
-            "provider",
-            "_restricted",
-        }
-        and value is not None
-    }
-    return bind_cui_actor_context(actor) if actor else None
+    if actor_context is None:
+        from hermes_cli.dashboard_auth import profile_policy
+        try:
+            marker = profile_policy._read_trusted_file(
+                profile_policy.REQUIRED_MARKER_PATH,
+                max_bytes=profile_policy.MAX_MARKER_BYTES, missing_ok=True)
+        except profile_policy.ProfilePolicyError:
+            marker = b"invalid"
+        if marker is None:
+            return None
+    if actor_context is not None and (
+            not isinstance(actor_context, dict)
+            or any(type(actor_context.get(key)) is not str
+                   for key in ("tenant_id", "actor_id", "role"))):
+        actor_context = {"_restricted": "1"}
+    return bind_cui_actor_context(actor_context)
 
 
 def _clear_cui_actor_env(token) -> None:
@@ -930,7 +931,8 @@ def _err(rid, code: int, msg: str, data=None) -> dict:
 
 def method(name: str):
     def dec(fn):
-        _methods[name] = fn
+        from tui_gateway.profile_authorization import installed_handler
+        _methods[name] = installed_handler(sys.modules[__name__], name, fn)
         return fn
     return dec
 
@@ -1310,10 +1312,6 @@ def dispatch(req: dict, transport: Optional[Transport] = None, actor_context: di
     token = bind_transport(t)
     actor_token = _apply_cui_actor_env(actor_context)
     try:
-        if actor_context and req.get("method") == "session.events.since":
-            sid = str((req.get("params") or {}).get("session_id") or "")
-            if not _live_session_visible_to_cui_actor(sid, actor_context):
-                return _err(req.get("id"), 4001, "session not found")
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
             return normalized
@@ -1556,12 +1554,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
     def _build() -> None:
         with _sessions_lock:
             current = _sessions.get(sid)
-        if current is None:
+        if current is None or current is not session:
             ready.set()
             return
         notify_registered, scopes, session_db = False, None, None
+        tokens = None
         profile_home = current.get("profile_home")
         try:
+            from tui_gateway.profile_authorization import authorize_session
+            authorize_session(current)
             if not _await_resume_history(sid, current):
                 return
             tokens = _set_session_context(key)
@@ -1576,10 +1577,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 ensure_mcp_discovery_started()
             except Exception:
                 logger.warning("MCP discovery startup failed", exc_info=True)
-            try:
-                agent = _make_agent(sid, key, **_deferred_build_agent_kwargs(current, session_db))
-            finally:
-                _clear_session_context(tokens)
+            agent = _make_agent(sid, key, **_deferred_build_agent_kwargs(current, session_db))
             _attach_built_agent(current, agent)
             # No eager slash-worker pre-warm (slash.exec spawns on demand): each worker forks the full stdio
             # MCP fleet, and live-transport sessions are never reaped, so fleets would accumulate.
@@ -1589,6 +1587,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            if tokens is not None:
+                _clear_session_context(tokens)
             _finish_agent_build(
                 sid, key, current, notify_registered=notify_registered, scopes=scopes, session_db=session_db)
             ready.set()
@@ -2400,6 +2400,10 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # without baking in implicit MCP defaults. Using the wrong variant at agent creation time makes MCP
         # tools silently missing from the TUI. See PR #3252 for the original design split.
         enabled = _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
+        # Surface-only toolsets may become discoverable through a loaded plugin,
+        # but configured CLI defaults must never grant them to a non-owning
+        # client. Re-add them exclusively from the current session surface.
+        enabled -= _gui_surface_toolsets("desktop") - _gui_surface_toolsets("tui")
         if fallback_notice is not None:
             _tui_notice(fallback_notice)
         return sorted(enabled | _gui_surface_toolsets(session_platform)) if enabled else None
@@ -2897,6 +2901,7 @@ def _init_session(
             "tool_progress_mode": _load_tool_progress_mode(), "edit_snapshots": {}, "tool_started_at": {},
             # Profile-scoped HERMES_HOME (None = launch); SessionBranch copies the parent's (same state.db).
             "profile_home": profile_home,
+            "cui_actor_context": current_bound_cui_actor_context(),
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
@@ -2962,7 +2967,7 @@ def _deferred_session_record(
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
-        "cui_actor_context": sanitize_cui_actor_context(current_cui_actor_context()),
+        "cui_actor_context": current_bound_cui_actor_context(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
@@ -3067,12 +3072,14 @@ def _load_resume_transcript(db, stored_id: str) -> tuple[list, list, list]:
 
 def _schedule_resume_hydration(sid: str, stored_id: str, db, *, close_db: bool = False) -> None:
     """Load a cold resume's transcript off the JSON-RPC response path."""
+    session = _sessions.get(sid)
 
     def _run() -> None:
-        session = _sessions.get(sid)
         try:
-            if session is None:
+            if session is None or _sessions.get(sid) is not session:
                 return
+            from tui_gateway.profile_authorization import authorize_session
+            authorize_session(session, "session.resume", "profile.use")
             _emit("session.resume_progress", sid, {"phase": "history", "status": "loading"})
             db.reopen_session(stored_id)
             raw_history, display_history, prefix = _load_resume_transcript(db, stored_id)
@@ -3113,7 +3120,9 @@ def _schedule_resume_hydration(sid: str, stored_id: str, db, *, close_db: bool =
                     db.close()
                 except Exception:
                     logger.debug("failed to close resume db for %s", sid, exc_info=True)
-    threading.Thread(target=_run, daemon=True).start()
+    threading.Thread(target=_run_with_cui_actor_context,
+                     args=((session or {}).get("cui_actor_context"), _run),
+                     daemon=True).start()
 
 
 def _session_pending_kind(sid: str) -> str:

@@ -1,0 +1,7 @@
+name: tenant-admin-support
+version: 1.0.0
+description: "Delegated tenant session diagnosis and approval-protected assistant behavior policy management."
+author: AIWerk
+kind: backend
+provides_tools:
+  - tenant_admin_support

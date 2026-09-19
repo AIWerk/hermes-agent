@@ -584,10 +584,14 @@ async def _admin_permission_middleware(request: Request, call_next):
     actor = _cui_actor_context_from_request(request)
     token = _current_http_cui_actor.set(actor if actor != {"_restricted": "1"} else None)
     try:
-        denied = _enforce_admin_api_permission(request)
-        if denied is not None:
-            return denied
-        return await call_next(request)
+        from hermes_cli.dashboard_auth.profile_access import http_authorize
+        async def permitted(req):
+            if not req.url.path.startswith("/api/admin/session-reader/"):
+                denied = _enforce_admin_api_permission(req)
+                if denied is not None:
+                    return denied
+            return await call_next(req)
+        return await http_authorize(request, permitted)
     finally:
         _current_http_cui_actor.reset(token)
 
@@ -987,6 +991,8 @@ app.include_router(_status_routes.router)
 app.include_router(_actions_routes.router)
 app.include_router(_audio_routes.router)
 app.include_router(_actions_routes.status_router)
+from hermes_cli.web_routers.admin_session_reader import router as _admin_reader_router
+app.include_router(_admin_reader_router)
 app.include_router(_sessions_routes.list_router)
 app.include_router(_profiles_routes.sessions_router)
 app.include_router(_sessions_routes.search_router)

@@ -74,6 +74,8 @@ def _compute_host_turn_frame(
         "cwd": _session_cwd(session),
         "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
+        "profile": session.get("profile"),
+        "cui_actor_context": session.get("cui_actor_context"),
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
@@ -265,6 +267,10 @@ def _send_compute_host_control(
     sid: str, *, route_name: str, command: str = "", payload: dict | None = None,
     wait: bool = True, timeout: float = 30.0, on_late_ack=None) -> dict:
     frame = dict(payload or {})
+    with _sessions_lock:
+        session = _sessions.get(sid) or {}
+        frame.update(cui_actor_context=session.get("cui_actor_context"),
+                     profile=session.get("profile"), profile_home=session.get("profile_home"))
     frame.setdefault("type", "control")
     frame.setdefault("command", command)
     return _get_compute_host_supervisor().control(

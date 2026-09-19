@@ -249,6 +249,9 @@ def _sidebar_singleflight_cache(func):
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
+        from hermes_cli.dashboard_auth.profile_access import http_decision
+        if http_decision.get() is not None:
+            return func(*args, **kwargs)
         ttl = _SIDEBAR_CACHE_TTL_SECONDS
         if ttl <= 0:
             return func(*args, **kwargs)
@@ -501,13 +504,16 @@ def get_profiles_sessions_sidebar(
     customer_actor = actor if actor and not actor.get("_restricted") else None
     from hermes_cli import profiles as profiles_mod
 
-    try:
-        # Session aggregation only needs name/path; the lightweight enumerator
-        # avoids YAML/meta/gateway/skill probes for all profiles per refresh.
-        targets: List[Tuple[str, Path]] = profiles_mod.profiles_to_serve(multiplex=True)
-    except Exception:
-        _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
-        targets = []
+    from hermes_cli.dashboard_auth.profile_access import http_decision
+    decision = http_decision.get()
+    if decision is not None:
+        targets = [(decision.target_profile, profiles_mod.get_profile_dir(decision.target_profile))]
+    else:
+        try:
+            targets = profiles_mod.profiles_to_serve(multiplex=True)
+        except Exception:
+            _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
+            targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
@@ -597,7 +603,7 @@ def get_profiles_sessions_sidebar(
                     # Aggregated in SQL rather than over the recents window: the
                     # window is a page, and a total that shrank when you scrolled
                     # would be worse than no total at all.
-                    "usage": db.usage_totals(),
+                    "usage": {} if customer_actor else db.usage_totals(),
                     "cron": _slice(db, source="cron", cap=cron_cap),
                     "messaging": _slice(
                         db,
@@ -846,6 +852,15 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody, request: Reque
 
 @router.get("/api/profiles")
 async def list_profiles_endpoint():
+    from hermes_cli.dashboard_auth.profile_access import http_decision
+    decision = http_decision.get()
+    if decision is not None:
+        return {"profiles": [{"name": name, "is_default": name == decision.default_profile}
+                             for name in decision._policy._profiles
+                             if decision._policy.allows(decision.tenant_id, decision.actor_id,
+                                                        name, "profile.discover")
+                             and "profile.discover" in decision._policy._grants.get(
+                                 (decision.tenant_id, decision.actor_id, name), ())]}
     from hermes_cli import profiles as profiles_mod
     try:
         profiles = await run_in_threadpool(profiles_mod.list_profiles)
@@ -918,6 +933,10 @@ async def create_profile_endpoint(body: ProfileCreate):
 async def get_active_profile_endpoint():
     """``active`` is the sticky default written by ``hermes profile use`` (what new CLI
     invocations pick up); ``current`` is the profile this running dashboard is scoped to."""
+    from hermes_cli.dashboard_auth.profile_access import http_decision
+    decision = http_decision.get()
+    if decision is not None:
+        return {"active": decision.target_profile, "current": decision.target_profile}
     from hermes_cli import profiles as profiles_mod
 
     def _run():
