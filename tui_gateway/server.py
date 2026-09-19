@@ -2400,6 +2400,10 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # without baking in implicit MCP defaults. Using the wrong variant at agent creation time makes MCP
         # tools silently missing from the TUI. See PR #3252 for the original design split.
         enabled = _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
+        # Surface-only toolsets may become discoverable through a loaded plugin,
+        # but configured CLI defaults must never grant them to a non-owning
+        # client. Re-add them exclusively from the current session surface.
+        enabled -= _gui_surface_toolsets("desktop") - _gui_surface_toolsets("tui")
         if fallback_notice is not None:
             _tui_notice(fallback_notice)
         return sorted(enabled | _gui_surface_toolsets(session_platform)) if enabled else None

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -21,12 +20,18 @@ from typing import Any, Iterator
 from hermes_cli.dashboard_auth import profile_access, profile_policy
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows: the POSIX central store stays unavailable.
+    _fcntl = None
+fcntl: Any = _fcntl
+
 BEHAVIOR_POLICY_ROOT = "/var/lib/aiwerk/hermes/behavior-policy-v1"
 _DEPLOYED_BEHAVIOR_POLICY_ROOT = BEHAVIOR_POLICY_ROOT
 # Keep the deployment boundary stable even when a synthetic authority path is
 # installed before this module is first imported.
 _DEPLOYED_PROFILE_POLICY_PATH = "/etc/aiwerk/hermes-profile-membership.yaml"
-TRUSTED_SERVICE_UID = os.getuid()
+TRUSTED_SERVICE_UID = getattr(os, "getuid", lambda: -1)()
 MAX_INSTRUCTION_BYTES = 8_192
 MAX_RECORD_BYTES = 16_384
 MAX_RETAINED_VERSIONS = 256
@@ -581,6 +586,8 @@ class Store:
 
     def read_current(self, tenant_id: str, target_profile: str) -> PolicyRecord | None:
         tenant_id, target_profile = _validate_target(tenant_id, target_profile)
+        if fcntl is None:
+            raise _store_error()
         with _open_root() as root_fd:
             target = _open_target(root_fd, tenant_id, target_profile, create=False)
             if target is None:
@@ -601,6 +608,8 @@ class Store:
         self, tenant_id: str, target_profile: str, revision: int,
     ) -> PolicyRecord | None:
         tenant_id, target_profile = _validate_target(tenant_id, target_profile)
+        if fcntl is None:
+            raise _store_error()
         if type(revision) is not int or revision < 1:
             raise BehaviorPolicyValidationError("invalid revision")
         with _open_root() as root_fd:
@@ -624,6 +633,8 @@ class Store:
         before_revision: int | None = None,
     ) -> list[dict[str, Any]]:
         tenant_id, target_profile = _validate_target(tenant_id, target_profile)
+        if fcntl is None:
+            raise _store_error()
         if type(limit) is not int or not 1 <= limit <= MAX_HISTORY_LIMIT:
             raise BehaviorPolicyValidationError("invalid history limit")
         if before_revision is not None and (
@@ -655,6 +666,8 @@ class Store:
         rollback_of: int | None = None,
     ) -> PolicyRecord:
         tenant_id, target_profile = _validate_target(tenant_id, target_profile)
+        if fcntl is None:
+            raise _store_error()
         instructions = _validate_instructions(instructions)
         actor_id = _validate_identifier(actor_id, "actor_id")
         if expected_revision is not None and (
