@@ -334,6 +334,14 @@ def test_prompt_learn_assistant_gate_admin_session_preserves_authority(rpc, monk
     assert "result" in response, response
 
 
+def test_default_profile_resume_record_preserves_authority(rpc):
+    env, server = rpc
+    ctx = server._Resume("r", {"profile": "default", "cols": 100}, "stored-session")
+    assert ctx.profile == "default"
+    record = ctx.record("web", str(env.home), [])
+    assert record.get("profile") == "default", record
+
+
 def test_own_real_side_prompt_and_return_lifecycle(own_runtime, monkeypatch):
     env, server, db, session = own_runtime
     started = invoke(server, "session.side.start", {"session_id": "live"})

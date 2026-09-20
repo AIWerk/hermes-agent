@@ -552,10 +552,12 @@ class _Resume:
         ``overrides`` restores the stored model/provider/reasoning/tier so the deferred build matches eager."""
         if overrides is not None:
             extra.update(model_override=overrides.get("model_override"), resume_runtime_overrides=overrides or None)
-        return _deferred_session_record(
+        record = _deferred_session_record(
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
             profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+        record["profile"] = self.profile
+        return record
 
     def claim(self, sid: str, record: dict) -> dict | None:
         """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
