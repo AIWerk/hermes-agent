@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 from hermes_cli.dashboard_auth import profile_policy as policy
 from hermes_cli.dashboard_auth.profile_policy import ProfileAccessDenied
+from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 http_decision: ContextVar["ProfileDecision | None"] = ContextVar("http_profile_decision", default=None)
 
@@ -118,6 +119,8 @@ async def http_authorize(request, call_next):
     from urllib.parse import urlencode
 
     path = request.url.path.rstrip("/")
+    if path in PUBLIC_API_PATHS:
+        return await call_next(request)
     # Broker owns its denial audit and never enters the normal profile context.
     if path.startswith("/api/admin/session-reader/"):
         return await call_next(request)
