@@ -22,7 +22,7 @@ for _action, _names in {
                       'mcp.catalog mcp.servers.list mcp.servers.status mcp.servers.add mcp.servers.remove '
                       'mcp.servers.set_api_key mcp.servers.test mcp.servers.oauth.start mcp.servers.oauth.poll '
                       'mcp.servers.oauth.cancel mcp.servers.oauth.callback tools.configure reload.mcp'),
-    'profile.use': 'prompt.submit prompt.learn prompt.background prompt.btw',
+    'profile.use': 'prompt.submit prompt.learn prompt.background prompt.btw commands.catalog',
     'profile.discover': 'profiles.list',
 }.items():
     for _name in _names.split():
@@ -263,6 +263,12 @@ def installed_handler(server, name, handler):
                 return _roster(server, rid, normalized, actor)
             token = _rpc_scope.set((target, actions))
             try:
+                if name == "commands.catalog":
+                    from hermes_cli.profiles import get_profile_dir
+                    from hermes_cli.web_server_profiles import _hermes_home_scope
+
+                    with _hermes_home_scope(get_profile_dir(target)):
+                        return handler(rid, normalized)
                 return handler(rid, normalized)
             finally:
                 _rpc_scope.reset(token)

@@ -108,6 +108,7 @@ _HTTP_ACTIONS = (
     ("GET", r"/api/profiles(?:/active)?", "profile.discover"),
     ("POST", r"/api/profiles/[^/]+/open-terminal", "profile.launch"),
     ("GET", r"/api/profiles/[^/]+/(?:soul|desktop-overlay)", "profile.use"),
+    ("GET", r"/api/(?:dashboard/font|assistant/resources)", "profile.use"),
     ("GET|POST|PATCH|PUT|DELETE", r"/api/profiles(?:/.*)?", "profile.admin"),
     ("GET|POST|PATCH|PUT|DELETE", r"/api/(?:config|env|mcp|model|skills|tools)(?:/.*)?", "profile.admin"),
 )
@@ -127,6 +128,9 @@ async def http_authorize(request, call_next):
     if not path.startswith("/api/") or path.startswith("/api/auth/"):
         return await call_next(request)
     actor = getattr(request.state, "session", None)
+    profile_scoped_read = request.method == "GET" and path in {
+        "/api/dashboard/font", "/api/assistant/resources"
+    }
     try:
         snapshot, _ = _snapshot(actor)
         if snapshot is None:
@@ -181,7 +185,7 @@ async def http_authorize(request, call_next):
         return JSONResponse({"detail": _DENIED}, status_code=403)
     token = http_decision.set(decision)
     try:
-        if supported_config:
+        if supported_config or profile_scoped_read:
             from hermes_cli.profiles import get_profile_dir
             from hermes_cli.web_server_profiles import _hermes_home_scope
             with _hermes_home_scope(get_profile_dir(decision.target_profile)):
