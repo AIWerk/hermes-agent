@@ -236,6 +236,7 @@ def test_assistant_ws_gate_denies_admin_and_unknown_methods(web_server, method: 
         ("commands.catalog", {}),
         ("session.create", {"source": "web", "close_on_disconnect": True}),
         ("prompt.submit", {"session_id": "sid", "text": "hello"}),
+        ("prompt.learn", {"session_id": "sid", "text": ""}),
         (
             "approval.respond",
             {"session_id": "sid", "request_id": "req", "choice": "once"},

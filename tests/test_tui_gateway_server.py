@@ -381,6 +381,30 @@ def test_prompt_submit_unknown_session_logs_warning(caplog):
     )
 
 
+def test_prompt_learn_rewrites_request_into_agent_turn(monkeypatch):
+    from agent.learn_prompt import build_learn_prompt
+
+    submitted = []
+
+    def submit(rid, params):
+        submitted.append((rid, params))
+        return server._ok(rid, {"status": "streaming"})
+
+    monkeypatch.setitem(server._methods, "prompt.submit", submit)
+    response = server.handle_request({
+        "jsonrpc": "2.0",
+        "id": "learn-turn",
+        "method": "prompt.learn",
+        "params": {"session_id": "sid", "text": "the workflow we just used"},
+    })
+
+    assert response["result"]["status"] == "streaming"
+    assert submitted == [("learn-turn", {
+        "session_id": "sid",
+        "text": build_learn_prompt("the workflow we just used"),
+    })]
+
+
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):

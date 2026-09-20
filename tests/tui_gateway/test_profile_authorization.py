@@ -16,7 +16,7 @@ METHODS = [
     "session.side.start", "session.side.back", "session.cwd.set", "session.workspace.move",
     "session.active_list", "session.activate", "session.control", "session.control.read",
     "session.events.since", "session.events.stats", "session.usage", "session.context_breakdown",
-    "prompt.submit", "prompt.background", "prompt.btw", "config.get", "config.set",
+    "prompt.submit", "prompt.learn", "prompt.background", "prompt.btw", "config.get", "config.set",
     "profiles.list", "profiles.describe", "profiles.configure", "profiles.create",
     "mcp.catalog", "mcp.servers.list", "mcp.servers.status", "mcp.servers.add",
     "mcp.servers.remove", "tools.configure", "reload.mcp", "model.options",
@@ -93,6 +93,17 @@ def test_explicit_invalid_actor_does_not_inherit_authority(rpc, monkeypatch, act
     finally:
         server.reset_cui_actor_context(token)
     assert response.get("error", {}).get("message") == "profile access denied", response
+
+
+def test_prompt_learn_uses_profile_use_authority(rpc):
+    _, server = rpc
+    response = invoke(
+        server,
+        "prompt.learn",
+        {"session_id": "missing", "text": "the workflow we just used"},
+        actor=EMPLOYEE,
+    )
+    assert response.get("error", {}).get("message") == "session not found", response
 
 
 @pytest.mark.parametrize("field", ["profile", "name", "clone_from", "session_id", "session_key"])

@@ -566,6 +566,21 @@ def _lock_in_submit_turn(
     return None, fields
 
 
+@method("prompt.learn")
+def _(rid, params: dict) -> dict:
+    from agent.learn_prompt import build_learn_prompt
+
+    raw_text = params.get("text", "")
+    if not isinstance(raw_text, str):
+        return _err(rid, -32602, "text must be a string")
+    try:
+        text = build_learn_prompt(raw_text)
+    except Exception:
+        logger.exception("prompt.learn: failed to build learn prompt")
+        return _err(rid, 4004, "could not build learn prompt")
+    return _methods["prompt.submit"](rid, {**params, "text": text})
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text

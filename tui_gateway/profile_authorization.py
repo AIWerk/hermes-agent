@@ -22,7 +22,7 @@ for _action, _names in {
                       'mcp.catalog mcp.servers.list mcp.servers.status mcp.servers.add mcp.servers.remove '
                       'mcp.servers.set_api_key mcp.servers.test mcp.servers.oauth.start mcp.servers.oauth.poll '
                       'mcp.servers.oauth.cancel mcp.servers.oauth.callback tools.configure reload.mcp'),
-    'profile.use': 'prompt.submit prompt.background prompt.btw',
+    'profile.use': 'prompt.submit prompt.learn prompt.background prompt.btw',
     'profile.discover': 'profiles.list',
 }.items():
     for _name in _names.split():
