@@ -328,6 +328,7 @@ def _(rid, params: dict) -> dict:
             "parent_session_id": parent_session_id, "pending_title": _str_param(params, "title") or None,
             "pending_hidden": _flag(params, "hidden"), "room_plumbing": _flag(params, "room_plumbing"),
             "follow_profile_config": _flag(params, "follow_profile_config"),
+            "profile": profile,
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "cui_actor_context": current_cui_actor_context(),

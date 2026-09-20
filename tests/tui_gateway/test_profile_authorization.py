@@ -282,6 +282,58 @@ def test_own_real_resume_history_and_title_lifecycle(own_runtime):
     assert denied.get("error", {}).get("message") == "profile access denied", denied
 
 
+def test_prompt_learn_live_session_preserves_profile_authority(own_runtime, monkeypatch):
+    _, server, _, _ = own_runtime
+    admitted = threading.Event()
+    submitted = []
+
+    def run(_rid, _sid, _record, text, **_kwargs):
+        submitted.append(text)
+        admitted.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run)
+    response = invoke(
+        server,
+        "prompt.learn",
+        {"session_id": "live", "text": "the workflow we just used"},
+    )
+    assert "result" in response, response
+    assert admitted.wait(10)
+    assert submitted and submitted[0].startswith("[/learn]")
+    assert "the workflow we just used" in submitted[0]
+
+
+def test_prompt_learn_assistant_gate_admin_session_preserves_authority(rpc, monkeypatch):
+    env, server = rpc
+    from hermes_cli.web_server import _assistant_ws_request_gate
+    from tests.profile_authorization_support import ADMIN
+    from tests.tui_gateway.test_cui_actor_gateway_context import _patch_session_create_dependencies
+
+    _patch_session_create_dependencies(monkeypatch, env.home)
+    create = {
+        "method": "session.create",
+        "params": {"source": "web", "close_on_disconnect": True, "cols": 100},
+    }
+    assert _assistant_ws_request_gate(create, ADMIN) is None
+    created = invoke(server, create["method"], create["params"], actor=ADMIN)
+    assert "result" in created, created
+    sid = created["result"]["session_id"]
+    record = server._sessions[sid]
+    assert record.get("profile") == "default", record
+    assert record.get("profile_home") is None, record
+    assert record.get("cui_actor_context") == ADMIN, record
+
+    control = {"method": "prompt.submit", "params": {"session_id": sid, "text": "control turn"}}
+    assert _assistant_ws_request_gate(control, ADMIN) is None
+    control_response = invoke(server, control["method"], control["params"], actor=ADMIN)
+    assert "result" in control_response, control_response
+
+    learn = {"method": "prompt.learn", "params": {"session_id": sid, "text": "the workflow we just used"}}
+    assert _assistant_ws_request_gate(learn, ADMIN) is None
+    response = invoke(server, learn["method"], learn["params"], actor=ADMIN)
+    assert "result" in response, response
+
+
 def test_own_real_side_prompt_and_return_lifecycle(own_runtime, monkeypatch):
     env, server, db, session = own_runtime
     started = invoke(server, "session.side.start", {"session_id": "live"})
