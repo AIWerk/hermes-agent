@@ -16,7 +16,8 @@ METHODS = [
     "session.side.start", "session.side.back", "session.cwd.set", "session.workspace.move",
     "session.active_list", "session.activate", "session.control", "session.control.read",
     "session.events.since", "session.events.stats", "session.usage", "session.context_breakdown",
-    "prompt.submit", "prompt.learn", "prompt.background", "prompt.btw", "config.get", "config.set",
+    "prompt.submit", "prompt.learn", "prompt.background", "prompt.btw", "commands.catalog",
+    "config.get", "config.set",
     "profiles.list", "profiles.describe", "profiles.configure", "profiles.create",
     "mcp.catalog", "mcp.servers.list", "mcp.servers.status", "mcp.servers.add",
     "mcp.servers.remove", "tools.configure", "reload.mcp", "model.options",
@@ -104,6 +105,31 @@ def test_prompt_learn_uses_profile_use_authority(rpc):
         actor=EMPLOYEE,
     )
     assert response.get("error", {}).get("message") == "session not found", response
+
+
+def test_command_catalog_uses_profile_use_authority(rpc):
+    env, server = rpc
+    from hermes_constants import get_hermes_home
+
+    homes = []
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: homes.append(str(get_hermes_home())) or {
+            "quick_commands": {
+                "employee-only": {"description": "employee command", "type": "prompt"}
+            }
+        },
+    )
+    response = invoke(server, "commands.catalog", {})
+    try:
+        assert "result" in response, response
+        assert "/learn" in dict(response["result"]["pairs"])
+        assert "/employee-only" in dict(response["result"]["pairs"])
+        assert homes == [str(env.root / "profiles" / "employee-home")]
+    finally:
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize("field", ["profile", "name", "clone_from", "session_id", "session_key"])

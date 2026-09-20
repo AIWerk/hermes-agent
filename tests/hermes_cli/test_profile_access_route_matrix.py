@@ -142,6 +142,50 @@ def test_public_model_info_bypasses_profile_authorization_without_identity(api):
     assert response.json()["agent_name"]
 
 
+@pytest.mark.parametrize("path", ["/api/dashboard/font", "/api/assistant/resources"])
+def test_assistant_profile_reads_run_in_authorized_profile_scope(api, monkeypatch, path):
+    from hermes_constants import get_hermes_home
+
+    seen = []
+    if path.endswith("/font"):
+        from hermes_cli.web_routers import dashboard_ui
+
+        monkeypatch.setattr(
+            dashboard_ui,
+            "load_config",
+            lambda: seen.append(str(get_hermes_home())) or {},
+        )
+    else:
+        monkeypatch.setattr(
+            api.web,
+            "_assistant_resources_payload",
+            lambda *_args, **_kwargs: seen.append(str(get_hermes_home())) or {},
+        )
+    response = api.client.get(path)
+    assert response.status_code == 200, response.text
+    assert seen == [str(api.home)]
+
+
+def test_assistant_background_refresh_preserves_authorized_profile_scope(api):
+    import threading
+    from hermes_constants import get_hermes_home
+    from hermes_cli.web_server_profiles import _hermes_home_scope
+
+    done = threading.Event()
+    seen = []
+
+    def builder():
+        seen.append(str(get_hermes_home()))
+        done.set()
+        return {}
+
+    key = "profile-scope-regression"
+    with _hermes_home_scope(api.home):
+        assert api.web._assistant_schedule_resource_refresh(key, builder, 1)
+    assert done.wait(5), "background resource builder did not run"
+    assert seen == [str(api.home)]
+
+
 def test_own_mutation_and_denied_export_are_separate_grants(api):
     response = api.client.patch("/api/sessions/owned", json={"title": "safe title"})
     assert response.status_code == 200, response.text

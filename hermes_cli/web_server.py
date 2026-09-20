@@ -8,6 +8,7 @@ Usage: ``python -m hermes_cli.main web [--port 8080]``.
 
 from contextlib import asynccontextmanager
 import contextlib
+from contextvars import copy_context
 
 import asyncio
 from collections import deque
@@ -2546,7 +2547,13 @@ def _assistant_schedule_resource_refresh(full_key: str, builder, ttl_seconds: in
             with _ASSISTANT_RESOURCE_LOCK:
                 _ASSISTANT_RESOURCE_REFRESHING.discard(full_key)
 
-    thread = threading.Thread(target=refresh, name="assistant-resource-refresh", daemon=True)
+    refresh_context = copy_context()
+    thread = threading.Thread(
+        target=refresh_context.run,
+        args=(refresh,),
+        name="assistant-resource-refresh",
+        daemon=True,
+    )
     thread.start()
     return True
 
