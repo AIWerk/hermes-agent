@@ -4,6 +4,7 @@ import dataclasses
 import importlib
 import inspect
 import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -215,6 +216,58 @@ def test_fixed_production_authority_paths_and_caps_are_declared():
     assert policy_mod.MAX_ACTIONS_PER_MEMBERSHIP == 64
 
 
+def test_trusted_root_uid_matches_namespace_root_projection():
+    policy_mod = _policy_module()
+    assert policy_mod._trusted_root_uid() == os.stat("/").st_uid
+
+
+def test_namespace_root_projection_accepts_root_owned_fixed_files(monkeypatch, tmp_path):
+    policy_mod = _policy_module()
+    _install_fixed_policy(monkeypatch, tmp_path, _document())
+    monkeypatch.setattr(policy_mod, "TRUSTED_ROOT_UID", 0)
+    real_fstat = os.fstat
+    real_stat = os.stat
+
+    def projected_fstat(fd):
+        result = real_fstat(fd)
+        return SimpleNamespace(
+            st_mode=result.st_mode,
+            st_uid=65534,
+            st_size=result.st_size,
+            st_dev=result.st_dev,
+            st_ino=result.st_ino,
+        )
+
+    def projected_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path) != "/":
+            return result
+        return SimpleNamespace(
+            st_mode=result.st_mode,
+            st_uid=65534,
+            st_size=result.st_size,
+            st_dev=result.st_dev,
+            st_ino=result.st_ino,
+        )
+
+    monkeypatch.setattr(os, "fstat", projected_fstat)
+    monkeypatch.setattr(os, "stat", projected_stat)
+    authority = policy_mod.resolve_configured_authority(_session())
+    assert authority.active_profile == "employee-home"
+
+
+def test_trusted_file_rejects_group_or_world_writable_parent(monkeypatch, tmp_path):
+    policy_mod = _policy_module()
+    _install_fixed_policy(monkeypatch, tmp_path, _document())
+    original_mode = tmp_path.stat().st_mode & 0o777
+    tmp_path.chmod(0o777)
+    try:
+        with pytest.raises(policy_mod.ProfilePolicyError):
+            policy_mod.resolve_configured_authority(_session())
+    finally:
+        tmp_path.chmod(original_mode)
+
+
 def test_production_resolvers_expose_no_path_or_uid_inputs():
     policy_mod = _policy_module()
 
@@ -235,24 +288,25 @@ def test_trusted_reader_uses_required_descriptor_flags(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "open", recording_open)
     policy_mod.resolve_configured_authority(_session())
 
-    required = os.O_RDONLY
-    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
-        required |= getattr(os, flag_name, 0)
-    assert len(seen_flags) == 2
-    assert all(flags & required == required for flags in seen_flags)
+    common = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    nonblocking = common | getattr(os, "O_NONBLOCK", 0)
+    assert len(seen_flags) == 4
+    assert all(flags & common == common for flags in seen_flags)
+    assert seen_flags[1] & nonblocking == nonblocking
+    assert seen_flags[3] & nonblocking == nonblocking
 
 
 def test_trusted_reader_rejects_metadata_change_during_exact_read(tmp_path, monkeypatch):
     policy_mod = _policy_module()
     _install_fixed_policy(monkeypatch, tmp_path, _document())
     real_fstat = os.fstat
-    calls = 0
+    regular_calls = {}
 
     def changing_fstat(fd):
-        nonlocal calls
-        calls += 1
         result = real_fstat(fd)
-        if calls == 2:
+        if stat.S_ISREG(result.st_mode):
+            regular_calls[fd] = regular_calls.get(fd, 0) + 1
+        if regular_calls.get(fd) == 2:
             return SimpleNamespace(
                 st_mode=result.st_mode,
                 st_uid=result.st_uid,
@@ -302,7 +356,7 @@ def test_marker_requires_exact_schema_and_non_enoent_open_errors_fail_closed(tmp
     marker.write_bytes(b"required-v1\n")
     real_open = os.open
     def denied(path, flags, *args, **kwargs):
-        if os.fspath(path) == str(marker):
+        if os.fspath(path) == marker.name and kwargs.get("dir_fd") is not None:
             raise PermissionError("denied")
         return real_open(path, flags, *args, **kwargs)
     monkeypatch.setattr(os, "open", denied)

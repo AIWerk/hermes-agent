@@ -262,21 +262,54 @@ def _parse_policy(raw: bytes) -> ProfilePolicy:
     )
 
 
+def _trusted_root_uid() -> int:
+    """Return trusted root ownership as observed in the current namespace."""
+    if TRUSTED_ROOT_UID != 0:
+        return TRUSTED_ROOT_UID
+    try:
+        root_stat = os.stat("/", follow_symlinks=False)
+    except OSError as exc:
+        raise ProfilePolicyError("profile policy unavailable") from exc
+    if (not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or root_stat.st_uid < 0):
+        raise ProfilePolicyError("profile policy unavailable")
+    return root_stat.st_uid
+
+
 def _read_trusted_file(path: str, *, max_bytes: int, missing_ok: bool) -> bytes | None:
     if not isinstance(path, str) or not os.path.isabs(path):
+        raise ProfilePolicyError("profile policy unavailable")
+    parent, name = os.path.split(path)
+    if not parent or not name:
         raise ProfilePolicyError("profile policy unavailable")
     flags = os.O_RDONLY
     for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
         flags |= getattr(os, flag_name, 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW"):
+        directory_flags |= getattr(os, flag_name, 0)
     try:
-        fd = os.open(path, flags)
+        directory_fd = os.open(parent, directory_flags)
     except OSError as exc:
         if missing_ok and exc.errno == errno.ENOENT:
             return None
         raise ProfilePolicyError("profile policy unavailable") from exc
+    fd: int | None = None
     try:
+        trusted_uid = _trusted_root_uid()
+        directory_stat = os.fstat(directory_fd)
+        if (not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != trusted_uid
+                or directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise ProfilePolicyError("profile policy unavailable")
+        try:
+            fd = os.open(name, flags, dir_fd=directory_fd)
+        except OSError as exc:
+            if missing_ok and exc.errno == errno.ENOENT:
+                return None
+            raise ProfilePolicyError("profile policy unavailable") from exc
         before = os.fstat(fd)
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid != TRUSTED_ROOT_UID
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != trusted_uid
                 or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 or before.st_size < 0 or before.st_size > max_bytes):
             raise ProfilePolicyError("profile policy unavailable")
@@ -300,7 +333,9 @@ def _read_trusted_file(path: str, *, max_bytes: int, missing_ok: bool) -> bytes 
     except OSError as exc:
         raise ProfilePolicyError("profile policy unavailable") from exc
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        os.close(directory_fd)
 
 
 def load_profile_policy() -> ProfilePolicy:
