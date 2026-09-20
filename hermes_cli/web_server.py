@@ -1311,10 +1311,14 @@ def _assistant_ws_request_gate(request: Any, auth_identity: Any = None) -> str |
         command_name = command_parts[0] if command_parts else ""
         if command_name not in _ASSISTANT_ALLOWED_SLASH_COMMANDS:
             return "slash command is not available in assistant mode"
-    elif method in {"prompt.submit", "prompt.learn", "session.steer"}:
+    elif method in {"prompt.submit", "session.steer"}:
         allowed = {"session_id", "text"}
         if not str(params.get("text") or "").strip():
             return "text is required"
+    elif method == "prompt.learn":
+        allowed = {"session_id", "text"}
+        if not isinstance(params.get("text"), str):
+            return "text must be a string"
     elif method == "session.title":
         allowed = {"session_id", "title"}
     elif method == "session.notes":
