@@ -135,6 +135,13 @@ def test_absent_verified_identity_is_not_internal_token_bypass(api):
     assert response.status_code == 403
 
 
+def test_public_model_info_bypasses_profile_authorization_without_identity(api):
+    api.identity.clear()
+    response = api.client.get("/api/model/info")
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_name"]
+
+
 def test_own_mutation_and_denied_export_are_separate_grants(api):
     response = api.client.patch("/api/sessions/owned", json={"title": "safe title"})
     assert response.status_code == 200, response.text
