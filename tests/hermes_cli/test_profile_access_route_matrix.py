@@ -186,6 +186,87 @@ def test_assistant_background_refresh_preserves_authorized_profile_scope(api):
     assert seen == [str(api.home)]
 
 
+def test_admitted_assistant_http_contract_is_profile_scoped_and_fail_closed(api):
+    import asyncio
+
+    from hermes_cli.dashboard_auth import profile_access
+    from hermes_constants import get_hermes_home
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    async def dispatch(method, path, query=""):
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request({
+            "type": "http", "http_version": "1.1", "method": method,
+            "scheme": "https", "path": path, "raw_path": path.encode(),
+            "query_string": query.encode(), "headers": [], "client": ("127.0.0.1", 1),
+            "server": ("testserver", 443), "state": {},
+        }, receive)
+        request.state.session = SimpleNamespace(**api.identity)
+        seen = []
+
+        async def downstream(_request):
+            seen.append(str(get_hermes_home()))
+            return Response(status_code=204)
+
+        response = await profile_access.http_authorize(request, downstream)
+        return response, seen
+
+    contract = [
+        (method, path)
+        for path, methods in api.web._ASSISTANT_ALLOWED_HTTP.items()
+        if path.startswith(("/api/assistant/", "/api/cui/"))
+        for method in methods
+    ]
+    assert contract
+    for method, path in contract:
+        response, seen = asyncio.run(dispatch(method, path))
+        assert response.status_code == 204, (method, path, response.body)
+        assert seen == [str(api.home)], (method, path, seen)
+
+    api.env.document["memberships"].append({
+        "tenant_id": "tenant-a", "actor_id": "employee",
+        "profile_id": "peer-home", "actions": ["profile.use"],
+    })
+    api.env.save()
+    response, seen = asyncio.run(dispatch(
+        "GET", "/api/assistant/resources", "profile=peer-home"
+    ))
+    assert response.status_code == 403
+    assert seen == []
+
+    response, seen = asyncio.run(dispatch("POST", "/api/assistant/future-action"))
+    assert response.status_code == 403
+    assert seen == []
+
+
+def test_assistant_attachment_upload_uses_authorized_profile_home(api):
+    import base64
+    from pathlib import Path
+
+    one_pixel_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    response = api.client.post(
+        "/api/assistant/attachments",
+        files={"files": ("portrait.png", one_pixel_png, "image/png")},
+        data={"session_id": "synthetic-session"},
+    )
+    assert response.status_code == 200, response.text
+    attachment = response.json()["attachments"][0]
+    uploaded = Path(attachment["path"])
+    assert uploaded.parent == api.home / "dashboard_uploads"
+    assert uploaded.read_bytes() == one_pixel_png
+
+
 def test_own_mutation_and_denied_export_are_separate_grants(api):
     response = api.client.patch("/api/sessions/owned", json={"title": "safe title"})
     assert response.status_code == 200, response.text
