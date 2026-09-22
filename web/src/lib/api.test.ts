@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api, fetchJSON, setManagementProfile } from "./api";
+import { api, fetchJSON, resourceTimeDate, setManagementProfile } from "./api";
 
 const reloadMocks = vi.hoisted(() => ({
   attemptDashboardTokenReloadOnce: vi.fn(() => false),
@@ -86,6 +86,23 @@ describe("fetchJSON", () => {
     await expect(fetchJSON("/api/status")).resolves.toEqual({ ok: true });
 
     expect(reloadMocks.clearDashboardTokenReloadAttempt).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("resourceTimeDate", () => {
+  it("treats numeric Unix seconds from the resource API as seconds, not milliseconds", () => {
+    expect(resourceTimeDate(1_790_107_139.778)?.getTime()).toBe(1_790_107_139_778);
+    expect(resourceTimeDate(1_790_107_139.778)?.getUTCFullYear()).toBe(2026);
+  });
+
+  it("preserves millisecond timestamps and ISO strings", () => {
+    expect(resourceTimeDate(1_790_107_139_778)?.getTime()).toBe(1_790_107_139_778);
+    expect(resourceTimeDate("2026-09-22T19:58:59.778Z")?.toISOString()).toBe("2026-09-22T19:58:59.778Z");
+  });
+
+  it("returns null for missing or invalid values", () => {
+    expect(resourceTimeDate(null)).toBeNull();
+    expect(resourceTimeDate("not-a-date")).toBeNull();
   });
 });
 

@@ -4570,11 +4570,12 @@ def _todo_response() -> Dict[str, Any]:
 
 
 def _todo_summary(_config: Dict[str, Any]) -> Dict[str, Any]:
-    items = _todo_items(_read_todo_lines(_todo_path(_config)))
+    path = _todo_path(_config)
+    items = _todo_items(_read_todo_lines(path))
     open_items = [item for item in items if not item["done"]]
     done_count = len(items) - len(open_items)
     return {
-        "status": "connected" if items else "not_configured",
+        "status": "connected" if path.is_file() else "not_configured",
         "summary": f"{len(open_items)} offene Aufgaben",
         "items": open_items,
         "open_count": len(open_items),
