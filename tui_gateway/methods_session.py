@@ -360,6 +360,7 @@ def _(rid, params: dict) -> dict:
             "profile": profile,
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
+            "startup_tasks": {},
             "cui_actor_context": current_cui_actor_context(),
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport}
@@ -391,6 +392,17 @@ def _(rid, params: dict) -> dict:
     except Exception:
         logger.warning("session-start plugin task discovery failed", exc_info=True)
         startup_tasks = []
+    issued_tasks = {}
+    for task in startup_tasks:
+        if task.get("mode") != "generate":
+            continue
+        token = uuid.uuid4().hex
+        task["task_token"] = token
+        issued_tasks[token] = {
+            "plugin_id": task["plugin_id"],
+            "local_date": task["local_date"],
+        }
+    _sessions[sid]["startup_tasks"] = issued_tasks
     cwd = _sessions[sid]["cwd"]
     override = session_model_override or {}
     return _ok(rid, {

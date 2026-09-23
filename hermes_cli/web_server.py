@@ -1108,6 +1108,7 @@ _ASSISTANT_ALLOWED_RPC_METHODS = {
     "session.side.back",
     "session.events.since",
     "prompt.submit",
+    "prompt.background",
     "prompt.learn",
     "approval.respond",
     "config.get",
@@ -1316,6 +1317,12 @@ def _assistant_ws_request_gate(request: Any, auth_identity: Any = None) -> str |
         allowed = {"session_id", "text"}
         if not str(params.get("text") or "").strip():
             return "text is required"
+    elif method == "prompt.background":
+        allowed = {"session_id", "text", "startup_task_token"}
+        if not str(params.get("text") or "").strip():
+            return "text is required"
+        if not re.fullmatch(r"[0-9a-f]{32}", str(params.get("startup_task_token") or "")):
+            return "invalid startup task token"
     elif method == "prompt.learn":
         allowed = {"session_id", "text"}
         if not isinstance(params.get("text"), str):

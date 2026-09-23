@@ -5,7 +5,6 @@ method_ctx.bind_module), so they reference server.py globals bare.
 """
 
 import contextlib
-import re
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -1495,17 +1494,17 @@ def _(rid, params: dict) -> dict:
     session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
     if err:
         return err
-    raw_startup = params.get("startup_task")
-    startup = None
-    if isinstance(raw_startup, dict):
-        plugin_id = str(raw_startup.get("plugin_id") or "").strip()
-        local_date = str(raw_startup.get("local_date") or "").strip()
-        if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", plugin_id) and re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}", local_date
-        ):
-            startup = {"plugin_id": plugin_id, "local_date": local_date}
-
-    startup_payload = startup
+    token = str(params.get("startup_task_token") or "").strip()
+    startup_payload = None
+    if token:
+        with session["history_lock"]:
+            issued = session.setdefault("startup_tasks", {}).pop(token, None)
+        if isinstance(issued, dict):
+            startup_payload = {
+                "plugin_id": str(issued.get("plugin_id") or ""),
+                "local_date": str(issued.get("local_date") or ""),
+                "task_token": token,
+            }
 
     def body():
         from run_agent import AIAgent

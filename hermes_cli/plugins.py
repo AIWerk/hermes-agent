@@ -104,6 +104,16 @@ def _install_plugin_debug_handler(force: bool = False) -> None:
 
 _install_plugin_debug_handler()
 
+
+def plugin_gateway_injection_allowed(plugin_id: str) -> bool:
+    """Whether the active profile explicitly lets this plugin schedule gateway turns."""
+    try:
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return False
+    return (_plugin_settings_entry(cfg, plugin_id) or {}).get("allow_gateway_injection") is True
+
+
 VALID_HOOKS: Set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
@@ -628,11 +638,7 @@ class PluginContext:
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
-        try:
-            cfg = load_config_readonly() or {}
-        except Exception:
-            return False
-        return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True
+        return plugin_gateway_injection_allowed(self.plugin_id)
 
     @_serialized_replacement
     def register_cli_command(

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -175,15 +176,19 @@ def test_session_create_returns_sanitized_plugin_startup_tasks_without_persistin
     sid = response["result"]["session_id"]
 
     try:
-        assert response["result"]["startup_tasks"] == [
-            {
-                "kind": "session_start_task",
-                "mode": "generate",
-                "plugin_id": "aiwerk_daily_briefing",
-                "local_date": "2026-09-23",
-                "prompt": "Generate today's briefing",
-            }
-        ]
+        tasks = response["result"]["startup_tasks"]
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task["kind"] == "session_start_task"
+        assert task["mode"] == "generate"
+        assert task["plugin_id"] == "aiwerk_daily_briefing"
+        assert task["local_date"] == "2026-09-23"
+        assert task["prompt"] == "Generate today's briefing"
+        assert re.fullmatch(r"[0-9a-f]{32}", task["task_token"])
+        assert server._sessions[sid]["startup_tasks"][task["task_token"]] == {
+            "plugin_id": "aiwerk_daily_briefing",
+            "local_date": "2026-09-23",
+        }
         assert calls == [
             (
                 "on_session_reset",
@@ -216,7 +221,15 @@ def test_background_startup_task_reports_success_to_plugin_hook(monkeypatch):
             return {"final_response": "## Daily briefing\nReady."}
 
     calls = []
-    server._sessions["startup-sid"] = _session(agent=FakeAgent())
+    server._sessions["startup-sid"] = _session(
+        agent=FakeAgent(),
+        startup_tasks={
+            "issued-token": {
+                "plugin_id": "aiwerk_daily_briefing",
+                "local_date": "2026-09-23",
+            }
+        },
+    )
     monkeypatch.setattr("run_agent.AIAgent", FakeBackgroundAgent)
     monkeypatch.setattr(server, "_background_agent_kwargs", lambda agent, task_id: {})
     monkeypatch.setattr(
@@ -233,8 +246,8 @@ def test_background_startup_task_reports_success_to_plugin_hook(monkeypatch):
     monkeypatch.setattr(server, "_spawn_side_agent", run_inline)
 
     try:
-        response = server._methods["prompt.background"](
-            "startup-bg",
+        forged = server._methods["prompt.background"](
+            "forged-bg",
             {
                 "session_id": "startup-sid",
                 "text": "Generate today's briefing",
@@ -242,6 +255,17 @@ def test_background_startup_task_reports_success_to_plugin_hook(monkeypatch):
                     "plugin_id": "aiwerk_daily_briefing",
                     "local_date": "2026-09-23",
                 },
+            },
+        )
+        assert forged["result"]["text"] == "## Daily briefing\nReady."
+        assert calls == []
+
+        response = server._methods["prompt.background"](
+            "startup-bg",
+            {
+                "session_id": "startup-sid",
+                "text": "Generate today's briefing",
+                "startup_task_token": "issued-token",
             },
         )
         assert response["result"]["text"] == "## Daily briefing\nReady."
@@ -258,6 +282,7 @@ def test_background_startup_task_reports_success_to_plugin_hook(monkeypatch):
                 },
             )
         ]
+        assert server._sessions["startup-sid"]["startup_tasks"] == {}
     finally:
         server._sessions.pop("startup-sid", None)
 

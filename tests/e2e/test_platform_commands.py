@@ -48,14 +48,27 @@ class TestSlashCommands:
         runner.session_store.reset_session.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_new_exposes_fresh_session_route_to_plugin_reset_hook(
+    async def test_new_awaits_plugin_startup_turn_admission(
         self, adapter, runner, platform, monkeypatch,
     ):
         calls = []
+        startup = {
+            "kind": "gateway_session_start_task",
+            "plugin_id": "aiwerk_daily_briefing",
+            "session_id": "fresh-session",
+            "prompt": "Generate today's briefing",
+        }
+        def invoke_hook(name, **kwargs):
+            calls.append((name, kwargs))
+            return [{**startup, "session_id": kwargs["new_session_id"]}]
+
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke_hook)
         monkeypatch.setattr(
-            "hermes_cli.lifecycle.invoke_hook",
-            lambda name, **kwargs: calls.append((name, kwargs)) or [],
+            "hermes_cli.plugins.plugin_gateway_injection_allowed",
+            lambda plugin_id: plugin_id == "aiwerk_daily_briefing",
         )
+        dispatch = AsyncMock(return_value=True)
+        monkeypatch.setattr(runner, "_dispatch_plugin_message_injection", dispatch)
 
         await send_and_capture(adapter, "/new", platform)
 
@@ -67,6 +80,11 @@ class TestSlashCommands:
         assert payload["session_key"]
         assert payload["new_session_id"]
         assert payload["chat_id"]
+        dispatch.assert_awaited_once_with(
+            session_key=payload["session_key"],
+            content="Generate today's briefing",
+            plugin_id="aiwerk_daily_briefing",
+        )
 
     @pytest.mark.asyncio
     async def test_stop_when_no_agent_running(self, adapter, platform):
