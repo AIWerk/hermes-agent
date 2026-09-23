@@ -209,7 +209,9 @@ class GatewaySessionCommandsMixin:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook("on_session_reset", session_id=_new_sid, reason="new_session",
                          platform=source.platform.value if source.platform else "",
-                         old_session_id=_old_sid, new_session_id=_new_sid)
+                         old_session_id=_old_sid, new_session_id=_new_sid,
+                         session_key=session_key, host="gateway", chat_id=source.chat_id,
+                         thread_id=getattr(source, "thread_id", None), user_id=source.user_id)
         except Exception:
             pass
         try:

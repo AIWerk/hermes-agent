@@ -48,6 +48,27 @@ class TestSlashCommands:
         runner.session_store.reset_session.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_new_exposes_fresh_session_route_to_plugin_reset_hook(
+        self, adapter, runner, platform, monkeypatch,
+    ):
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda name, **kwargs: calls.append((name, kwargs)) or [],
+        )
+
+        await send_and_capture(adapter, "/new", platform)
+
+        reset_calls = [item for item in calls if item[0] == "on_session_reset"]
+        assert len(reset_calls) == 1
+        payload = reset_calls[0][1]
+        assert payload["host"] == "gateway"
+        assert payload["platform"] == platform.value
+        assert payload["session_key"]
+        assert payload["new_session_id"]
+        assert payload["chat_id"]
+
+    @pytest.mark.asyncio
     async def test_stop_when_no_agent_running(self, adapter, platform):
         send = await send_and_capture(adapter, "/stop", platform)
 

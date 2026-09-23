@@ -397,6 +397,52 @@ interface SessionInflightTurn {
   user?: string;
 }
 
+export interface SessionStartTask {
+  kind: "session_start_task";
+  mode: "generate" | "cached";
+  plugin_id: string;
+  local_date: string;
+  prompt?: string;
+  text?: string;
+}
+
+export function sessionStartMessage(task: SessionStartTask): ChatMessage | null {
+  if (task.kind !== "session_start_task" || !task.plugin_id?.trim()) return null;
+  if (task.mode === "cached") {
+    const text = task.text?.trim();
+    if (!text) return null;
+    return {
+      id: `session-start-${task.plugin_id}`,
+      role: "agent",
+      text,
+      status: "complete",
+    };
+  }
+  if (task.mode !== "generate" || !task.prompt?.trim()) return null;
+  return {
+    id: `session-start-${task.plugin_id}`,
+    role: "agent",
+    text: "Dein tägliches Briefing wird erstellt …",
+    status: "streaming",
+  };
+}
+
+export function sessionStartPromptRequest(
+  task: SessionStartTask,
+  sessionId: string,
+): { session_id: string; text: string; startup_task: { plugin_id: string; local_date: string } } | null {
+  if (task.kind !== "session_start_task" || task.mode !== "generate") return null;
+  const text = task.prompt?.trim();
+  const pluginId = task.plugin_id?.trim();
+  const localDate = task.local_date?.trim();
+  if (!text || !pluginId || !localDate || !sessionId) return null;
+  return {
+    session_id: sessionId,
+    text,
+    startup_task: { plugin_id: pluginId, local_date: localDate },
+  };
+}
+
 interface SessionOpenResult {
   session_id: string;
   session_key?: string;
@@ -407,6 +453,7 @@ interface SessionOpenResult {
   running?: boolean;
   status?: string;
   inflight?: SessionInflightTurn | null;
+  startup_tasks?: SessionStartTask[];
 }
 
 function persistentSessionIdFromOpenResult(result: SessionOpenResult): string {
@@ -2132,6 +2179,23 @@ export default function AiwerkAssistantPage() {
         }
       })();
     });
+    const offBackgroundComplete = gateway.on("background.complete", (ev) => {
+      const payload = (ev.payload ?? {}) as Record<string, unknown>;
+      const startup = payload.startup_task;
+      if (!startup || typeof startup !== "object") return;
+      const pluginId = String((startup as Record<string, unknown>).plugin_id || "").trim();
+      if (!pluginId) return;
+      const text = textFromPayload(payload).trim();
+      setMessages((current: ChatMessage[]) => current.map((message: ChatMessage) => (
+        message.id === `session-start-${pluginId}`
+          ? {
+              ...message,
+              text: text || "Das tägliche Briefing ist momentan nicht verfügbar.",
+              status: !text || text.startsWith("error:") ? "error" : "complete",
+            }
+          : message
+      )));
+    });
     const offError = gateway.on("error", (ev) => {
       const message = textFromPayload(ev.payload) || "Hermes-Gateway-Fehler";
       setError(message);
@@ -2196,13 +2260,32 @@ export default function AiwerkAssistantPage() {
         loadedMessages,
         () => welcomeMessageForAuthSession(authSessionRef.current),
       );
+      const startupTasks: SessionStartTask[] = Array.isArray(result.startup_tasks) ? result.startup_tasks : [];
+      const startupMessages = startupTasks
+        .map(sessionStartMessage)
+        .filter((message): message is ChatMessage => message !== null);
       registerHistoryAttachmentUrls(resumedMessages);
-      setMessages(resumedMessages);
+      setMessages([...resumedMessages, ...startupMessages]);
       setBusy(recoveredRunning);
       if (result.inflight?.streaming) activeTurnModeRef.current = "main";
       void refreshSessionMeta(gateway, result.session_id);
       void refreshRuntimeStatus(gateway, result.session_id);
       void refreshContextUsage(gateway, result.session_id);
+      for (const task of startupTasks) {
+        const request = sessionStartPromptRequest(task, result.session_id);
+        if (!request) continue;
+        void gateway.request("prompt.background", request, 30_000).catch(() => {
+          setMessages((current: ChatMessage[]) => current.map((message: ChatMessage) => (
+            message.id === `session-start-${task.plugin_id}`
+              ? {
+                  ...message,
+                  text: "Das tägliche Briefing ist momentan nicht verfügbar.",
+                  status: "error",
+                }
+              : message
+          )));
+        });
+      }
     }
 
     async function connect() {
@@ -2348,6 +2431,7 @@ export default function AiwerkAssistantPage() {
       offState();
       offDelta();
       offComplete();
+      offBackgroundComplete();
       offError();
       offToolStart();
       offToolComplete();
@@ -2454,7 +2538,26 @@ export default function AiwerkAssistantPage() {
       storeActiveSessionId(activeId);
       // Reclaim the previous session's preview blobs when starting fresh.
       revokeHistoryAttachmentUrls();
-      setMessages([welcomeMessageForAuthSession(authSessionRef.current)]);
+      const startupTasks: SessionStartTask[] = Array.isArray(result.startup_tasks) ? result.startup_tasks : [];
+      const startupMessages = startupTasks
+        .map(sessionStartMessage)
+        .filter((message): message is ChatMessage => message !== null);
+      setMessages([welcomeMessageForAuthSession(authSessionRef.current), ...startupMessages]);
+      for (const task of startupTasks) {
+        const request = sessionStartPromptRequest(task, nextSessionId);
+        if (!request) continue;
+        void gateway.request("prompt.background", request, 30_000).catch(() => {
+          setMessages((current: ChatMessage[]) => current.map((message: ChatMessage) => (
+            message.id === `session-start-${task.plugin_id}`
+              ? {
+                  ...message,
+                  text: "Das tägliche Briefing ist momentan nicht verfügbar.",
+                  status: "error",
+                }
+              : message
+          )));
+        });
+      }
       setSessionTitle("Neue Unterhaltung");
       setLiveNotes(null);
       setContextUsage(null);

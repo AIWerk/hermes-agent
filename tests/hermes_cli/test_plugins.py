@@ -35,6 +35,10 @@ from hermes_cli.middleware import (
 )
 
 
+def test_session_start_task_completion_is_a_supported_plugin_hook():
+    assert "on_session_start_task_complete" in VALID_HOOKS
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 

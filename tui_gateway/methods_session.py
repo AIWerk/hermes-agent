@@ -5,6 +5,7 @@ helpers (``_sessions``, ``_ok``, ``_err``, ...) bare; module-level helpers are p
 server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 
 import contextlib
+import re
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -297,6 +298,34 @@ def _create_overrides(params: dict) -> tuple:
     return model_override, reasoning_override, service_tier_override
 
 
+def _session_start_tasks(results) -> list[dict]:
+    """Project enabled-plugin lifecycle results into a small CUI-safe startup-task DTO."""
+    tasks = []
+    for raw in results if isinstance(results, list) else []:
+        if not isinstance(raw, dict) or raw.get("kind") != "session_start_task":
+            continue
+        mode = str(raw.get("mode") or "").strip()
+        plugin_id = str(raw.get("plugin_id") or "").strip()
+        local_date = str(raw.get("local_date") or "").strip()
+        if mode not in {"generate", "cached"} or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", plugin_id):
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", local_date):
+            continue
+        task = {
+            "kind": "session_start_task", "mode": mode,
+            "plugin_id": plugin_id, "local_date": local_date,
+        }
+        field = "prompt" if mode == "generate" else "text"
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        task[field] = value.strip()[:32000 if field == "prompt" else 24000]
+        tasks.append(task)
+        if len(tasks) >= 4:
+            break
+    return tasks
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
     (sid, source), key = _new_runtime_ids(params), _new_session_key()
@@ -353,11 +382,20 @@ def _(rid, params: dict) -> dict:
     # Return immediately so Ink can paint; the AIAgent builds right after the flush.
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        with _profile_build_scope(profile_home):
+            startup_tasks = _session_start_tasks(invoke_hook(
+                "on_session_reset", session_id=key, new_session_id=key, old_session_id=None,
+                session_key=key, platform=source, host="tui_gateway"))
+    except Exception:
+        logger.warning("session-start plugin task discovery failed", exc_info=True)
+        startup_tasks = []
     cwd = _sessions[sid]["cwd"]
     override = session_model_override or {}
     return _ok(rid, {
         "session_id": sid, "session_key": key, "stored_session_id": key, "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": _history_to_messages(history), "startup_tasks": startup_tasks,
         # Reflect the override now so the client doesn't clobber its sticky pick.
         "info": {"model": override.get("model") if override else _resolve_model(),
                  **({"provider": override["provider"]} if override.get("provider") else {}),

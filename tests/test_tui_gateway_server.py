@@ -144,6 +144,124 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
         reset_hermes_home_override(token)
 
 
+def test_session_create_returns_sanitized_plugin_startup_tasks_without_persisting_draft(
+    monkeypatch, tmp_path,
+):
+    calls = []
+    db = types.SimpleNamespace(get_session=lambda _session_id: None)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+
+    def invoke_hook(name, **kwargs):
+        calls.append((name, kwargs))
+        return [
+            {
+                "kind": "session_start_task",
+                "mode": "generate",
+                "plugin_id": "aiwerk_daily_briefing",
+                "local_date": "2026-09-23",
+                "prompt": "Generate today's briefing",
+                "ignored": "not public",
+            },
+            {"kind": "other", "prompt": "must be ignored"},
+            "invalid",
+        ]
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke_hook)
+    response = server._methods["session.create"](
+        "startup-create",
+        {"source": "web", "close_on_disconnect": True},
+    )
+    sid = response["result"]["session_id"]
+
+    try:
+        assert response["result"]["startup_tasks"] == [
+            {
+                "kind": "session_start_task",
+                "mode": "generate",
+                "plugin_id": "aiwerk_daily_briefing",
+                "local_date": "2026-09-23",
+                "prompt": "Generate today's briefing",
+            }
+        ]
+        assert calls == [
+            (
+                "on_session_reset",
+                {
+                    "session_id": response["result"]["session_key"],
+                    "new_session_id": response["result"]["session_key"],
+                    "old_session_id": None,
+                    "session_key": response["result"]["session_key"],
+                    "platform": "web",
+                    "host": "tui_gateway",
+                },
+            )
+        ]
+        assert db.get_session(response["result"]["session_key"]) is None
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_background_startup_task_reports_success_to_plugin_hook(monkeypatch):
+    class FakeAgent:
+        model = "test-model"
+
+    class FakeBackgroundAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, *, user_message, task_id):
+            assert user_message == "Generate today's briefing"
+            assert task_id.startswith("bg_")
+            return {"final_response": "## Daily briefing\nReady."}
+
+    calls = []
+    server._sessions["startup-sid"] = _session(agent=FakeAgent())
+    monkeypatch.setattr("run_agent.AIAgent", FakeBackgroundAgent)
+    monkeypatch.setattr(server, "_background_agent_kwargs", lambda agent, task_id: {})
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda name, **kwargs: calls.append((name, kwargs)) or [],
+    )
+
+    def run_inline(rid, session, task_id, parent, event, body, extra=None, cleanup=None):
+        text = body()
+        if cleanup is not None:
+            cleanup()
+        return {"jsonrpc": "2.0", "id": rid, "result": {"task_id": task_id, "text": text, **(extra or {})}}
+
+    monkeypatch.setattr(server, "_spawn_side_agent", run_inline)
+
+    try:
+        response = server._methods["prompt.background"](
+            "startup-bg",
+            {
+                "session_id": "startup-sid",
+                "text": "Generate today's briefing",
+                "startup_task": {
+                    "plugin_id": "aiwerk_daily_briefing",
+                    "local_date": "2026-09-23",
+                },
+            },
+        )
+        assert response["result"]["text"] == "## Daily briefing\nReady."
+        assert calls == [
+            (
+                "on_session_start_task_complete",
+                {
+                    "session_id": "session-key",
+                    "task_id": response["result"]["task_id"],
+                    "plugin_id": "aiwerk_daily_briefing",
+                    "local_date": "2026-09-23",
+                    "assistant_response": "## Daily briefing\nReady.",
+                    "platform": "web",
+                },
+            )
+        ]
+    finally:
+        server._sessions.pop("startup-sid", None)
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 

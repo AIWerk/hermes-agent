@@ -5,6 +5,7 @@ method_ctx.bind_module), so they reference server.py globals bare.
 """
 
 import contextlib
+import re
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -1494,14 +1495,40 @@ def _(rid, params: dict) -> dict:
     session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
     if err:
         return err
+    raw_startup = params.get("startup_task")
+    startup = None
+    if isinstance(raw_startup, dict):
+        plugin_id = str(raw_startup.get("plugin_id") or "").strip()
+        local_date = str(raw_startup.get("local_date") or "").strip()
+        if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", plugin_id) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", local_date
+        ):
+            startup = {"plugin_id": plugin_id, "local_date": local_date}
+
+    startup_payload = startup
 
     def body():
         from run_agent import AIAgent
         result = AIAgent(**_background_agent_kwargs(session["agent"], task_id)).run_conversation(
             user_message=text, task_id=task_id)
-        return _final_response_text(result)
+        response = _final_response_text(result)
+        if startup_payload is not None:
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+                invoke_hook(
+                    "on_session_start_task_complete",
+                    session_id=session.get("session_key", ""), task_id=task_id,
+                    plugin_id=startup_payload["plugin_id"],
+                    local_date=startup_payload["local_date"],
+                    assistant_response=response, platform="web",
+                )
+            except Exception:
+                logger.warning("session-start task completion hook failed", exc_info=True)
+        return response
 
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
+    extra = {"startup_task": startup_payload} if startup_payload is not None else None
+    return _spawn_side_agent(
+        rid, session, task_id, parent, "background.complete", body, extra=extra)
 
 
 @method("prompt.btw")
