@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import re
 import shlex
 from typing import Optional, Union
 
@@ -207,11 +208,36 @@ class GatewaySessionCommandsMixin:
         # Plugin on_session_reset hook (new session guaranteed to exist); best-effort.
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _invoke_hook("on_session_reset", session_id=_new_sid, reason="new_session",
-                         platform=source.platform.value if source.platform else "",
-                         old_session_id=_old_sid, new_session_id=_new_sid)
+            hook_results = _invoke_hook(
+                "on_session_reset", session_id=_new_sid, reason="new_session",
+                platform=source.platform.value if source.platform else "",
+                old_session_id=_old_sid, new_session_id=_new_sid,
+                session_key=session_key, host="gateway", chat_id=source.chat_id,
+                thread_id=getattr(source, "thread_id", None), user_id=source.user_id,
+            )
+            from hermes_cli.plugins import plugin_gateway_injection_allowed
+            for task in hook_results:
+                if not isinstance(task, dict) or task.get("kind") != "gateway_session_start_task":
+                    continue
+                plugin_id = str(task.get("plugin_id") or "").strip()
+                prompt = str(task.get("prompt") or "").strip()
+                if (
+                    not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", plugin_id)
+                    or not prompt
+                    or len(prompt) > 32000
+                    or str(task.get("session_id") or "") != str(_new_sid or "")
+                    or not plugin_gateway_injection_allowed(plugin_id)
+                ):
+                    continue
+                admitted = await self._dispatch_plugin_message_injection(
+                    session_key=session_key, content=prompt, plugin_id=plugin_id)
+                if not admitted:
+                    logger.warning(
+                        "Session-start plugin turn was not admitted: plugin=%s session=%s",
+                        plugin_id, session_key,
+                    )
         except Exception:
-            pass
+            logger.warning("Session-start plugin turn dispatch failed", exc_info=True)
         try:
             from hermes_cli.tips import get_random_tip
             _tip_line = t("gateway.reset.tip", tip=get_random_tip())

@@ -1494,14 +1494,40 @@ def _(rid, params: dict) -> dict:
     session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
     if err:
         return err
+    token = str(params.get("startup_task_token") or "").strip()
+    startup_payload = None
+    if token:
+        with session["history_lock"]:
+            issued = session.setdefault("startup_tasks", {}).pop(token, None)
+        if isinstance(issued, dict):
+            startup_payload = {
+                "plugin_id": str(issued.get("plugin_id") or ""),
+                "local_date": str(issued.get("local_date") or ""),
+                "task_token": token,
+            }
 
     def body():
         from run_agent import AIAgent
         result = AIAgent(**_background_agent_kwargs(session["agent"], task_id)).run_conversation(
             user_message=text, task_id=task_id)
-        return _final_response_text(result)
+        response = _final_response_text(result)
+        if startup_payload is not None:
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+                invoke_hook(
+                    "on_session_start_task_complete",
+                    session_id=session.get("session_key", ""), task_id=task_id,
+                    plugin_id=startup_payload["plugin_id"],
+                    local_date=startup_payload["local_date"],
+                    assistant_response=response, platform="web",
+                )
+            except Exception:
+                logger.warning("session-start task completion hook failed", exc_info=True)
+        return response
 
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
+    extra = {"startup_task": startup_payload} if startup_payload is not None else None
+    return _spawn_side_agent(
+        rid, session, task_id, parent, "background.complete", body, extra=extra)
 
 
 @method("prompt.btw")

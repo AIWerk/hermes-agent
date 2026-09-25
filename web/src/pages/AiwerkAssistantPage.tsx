@@ -396,6 +396,62 @@ interface SessionInflightTurn {
   user?: string;
 }
 
+export interface SessionStartTask {
+  kind: "session_start_task";
+  mode: "generate" | "cached";
+  plugin_id: string;
+  local_date: string;
+  task_token?: string;
+  prompt?: string;
+  text?: string;
+}
+
+function sessionStartMessageId(task: SessionStartTask): string | null {
+  const pluginId = task.plugin_id?.trim();
+  const suffix = task.mode === "generate" ? task.task_token?.trim() : task.local_date?.trim();
+  return pluginId && suffix ? `session-start-${pluginId}-${suffix}` : null;
+}
+
+export function sessionStartCompletionMessageId(
+  eventSessionId: string | null | undefined,
+  activeSessionId: string | null | undefined,
+  startup: { plugin_id?: unknown; task_token?: unknown },
+): string | null {
+  if (!eventSessionId || eventSessionId !== activeSessionId) return null;
+  const pluginId = typeof startup.plugin_id === "string" ? startup.plugin_id.trim() : "";
+  const taskToken = typeof startup.task_token === "string" ? startup.task_token.trim() : "";
+  return pluginId && taskToken ? `session-start-${pluginId}-${taskToken}` : null;
+}
+
+export function sessionStartMessage(task: SessionStartTask): ChatMessage | null {
+  if (task.kind !== "session_start_task") return null;
+  const id = sessionStartMessageId(task);
+  if (!id) return null;
+  if (task.mode === "cached") {
+    const text = task.text?.trim();
+    if (!text) return null;
+    return { id, role: "agent", text, status: "complete" };
+  }
+  if (task.mode !== "generate" || !task.prompt?.trim()) return null;
+  return {
+    id,
+    role: "agent",
+    text: "Dein tägliches Briefing wird erstellt …",
+    status: "streaming",
+  };
+}
+
+export function sessionStartPromptRequest(
+  task: SessionStartTask,
+  sessionId: string,
+): { session_id: string; text: string; startup_task_token: string } | null {
+  if (task.kind !== "session_start_task" || task.mode !== "generate") return null;
+  const text = task.prompt?.trim();
+  const taskToken = task.task_token?.trim();
+  if (!text || !taskToken || !sessionId) return null;
+  return { session_id: sessionId, text, startup_task_token: taskToken };
+}
+
 interface SessionOpenResult {
   session_id: string;
   session_key?: string;
@@ -406,6 +462,7 @@ interface SessionOpenResult {
   running?: boolean;
   status?: string;
   inflight?: SessionInflightTurn | null;
+  startup_tasks?: SessionStartTask[];
 }
 
 function persistentSessionIdFromOpenResult(result: SessionOpenResult): string {
@@ -2131,6 +2188,27 @@ export default function AiwerkAssistantPage() {
         }
       })();
     });
+    const offBackgroundComplete = gateway.on("background.complete", (ev) => {
+      const payload = (ev.payload ?? {}) as Record<string, unknown>;
+      const startup = payload.startup_task;
+      if (!startup || typeof startup !== "object") return;
+      const messageId = sessionStartCompletionMessageId(
+        ev.session_id,
+        sessionIdRef.current,
+        startup as Record<string, unknown>,
+      );
+      if (!messageId) return;
+      const text = textFromPayload(payload).trim();
+      setMessages((current: ChatMessage[]) => current.map((message: ChatMessage) => (
+        message.id === messageId
+          ? {
+              ...message,
+              text: text || "Das tägliche Briefing ist momentan nicht verfügbar.",
+              status: !text || text.startsWith("error:") ? "error" : "complete",
+            }
+          : message
+      )));
+    });
     const offError = gateway.on("error", (ev) => {
       const message = textFromPayload(ev.payload) || "Hermes-Gateway-Fehler";
       setError(message);
@@ -2172,6 +2250,7 @@ export default function AiwerkAssistantPage() {
       const activeId = persistentSessionId || result.session_id;
       const recoveredRunning = Boolean(result.running || result.status === "working" || result.status === "waiting" || result.inflight?.streaming);
       setSessionId(result.session_id);
+      sessionIdRef.current = result.session_id;
       setActiveSessionKey(activeId);
       storeActiveSessionId(activeId);
       setSessionTitle((current) => (options.recovered && current ? current : "Neue Unterhaltung"));
@@ -2195,13 +2274,36 @@ export default function AiwerkAssistantPage() {
         loadedMessages,
         () => welcomeMessageForAuthSession(authSessionRef.current),
       );
+      const startupTasks: SessionStartTask[] = Array.isArray(result.startup_tasks) ? result.startup_tasks : [];
+      const startupMessages = startupTasks
+        .map(sessionStartMessage)
+        .filter((message): message is ChatMessage => message !== null);
       registerHistoryAttachmentUrls(resumedMessages);
-      setMessages(resumedMessages);
+      setMessages([...resumedMessages, ...startupMessages]);
       setBusy(recoveredRunning);
       if (result.inflight?.streaming) activeTurnModeRef.current = "main";
       void refreshSessionMeta(gateway, result.session_id);
       void refreshRuntimeStatus(gateway, result.session_id);
       void refreshContextUsage(gateway, result.session_id);
+      for (const task of startupTasks) {
+        const request = sessionStartPromptRequest(task, result.session_id);
+        if (!request) continue;
+        void gateway.request("prompt.background", {
+          session_id: request.session_id,
+          text: request.text,
+          startup_task_token: request.startup_task_token,
+        }, 30_000).catch(() => {
+          setMessages((current: ChatMessage[]) => current.map((message: ChatMessage) => (
+            message.id === sessionStartMessageId(task)
+              ? {
+                  ...message,
+                  text: "Das tägliche Briefing ist momentan nicht verfügbar.",
+                  status: "error",
+                }
+              : message
+          )));
+        });
+      }
     }
 
     async function connect() {
@@ -2347,6 +2449,7 @@ export default function AiwerkAssistantPage() {
       offState();
       offDelta();
       offComplete();
+      offBackgroundComplete();
       offError();
       offToolStart();
       offToolComplete();
@@ -2453,7 +2556,30 @@ export default function AiwerkAssistantPage() {
       storeActiveSessionId(activeId);
       // Reclaim the previous session's preview blobs when starting fresh.
       revokeHistoryAttachmentUrls();
-      setMessages([welcomeMessageForAuthSession(authSessionRef.current)]);
+      const startupTasks: SessionStartTask[] = Array.isArray(result.startup_tasks) ? result.startup_tasks : [];
+      const startupMessages = startupTasks
+        .map(sessionStartMessage)
+        .filter((message): message is ChatMessage => message !== null);
+      setMessages([welcomeMessageForAuthSession(authSessionRef.current), ...startupMessages]);
+      for (const task of startupTasks) {
+        const request = sessionStartPromptRequest(task, nextSessionId);
+        if (!request) continue;
+        void gateway.request("prompt.background", {
+          session_id: request.session_id,
+          text: request.text,
+          startup_task_token: request.startup_task_token,
+        }, 30_000).catch(() => {
+          setMessages((current: ChatMessage[]) => current.map((message: ChatMessage) => (
+            message.id === sessionStartMessageId(task)
+              ? {
+                  ...message,
+                  text: "Das tägliche Briefing ist momentan nicht verfügbar.",
+                  status: "error",
+                }
+              : message
+          )));
+        });
+      }
       setSessionTitle("Neue Unterhaltung");
       setLiveNotes(null);
       setContextUsage(null);

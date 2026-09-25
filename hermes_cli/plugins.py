@@ -104,6 +104,16 @@ def _install_plugin_debug_handler(force: bool = False) -> None:
 
 _install_plugin_debug_handler()
 
+
+def plugin_gateway_injection_allowed(plugin_id: str) -> bool:
+    """Whether the active profile explicitly lets this plugin schedule gateway turns."""
+    try:
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return False
+    return (_plugin_settings_entry(cfg, plugin_id) or {}).get("allow_gateway_injection") is True
+
+
 VALID_HOOKS: Set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
@@ -123,7 +133,7 @@ VALID_HOOKS: Set[str] = {
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset",
+    "on_session_finalize", "on_session_reset", "on_session_start_task_complete",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -628,11 +638,7 @@ class PluginContext:
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
-        try:
-            cfg = load_config_readonly() or {}
-        except Exception:
-            return False
-        return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True
+        return plugin_gateway_injection_allowed(self.plugin_id)
 
     @_serialized_replacement
     def register_cli_command(

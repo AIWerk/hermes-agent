@@ -436,7 +436,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
             for match in call_pattern.finditer(candidate)
         )
 
-    assert len(closure_calls) == 30
+    assert len(closure_calls) == 32
     assert {path for path, _match in closure_calls} == {
         "lib/gatewayClient.ts",
         "pages/AiwerkAssistantPage.tsx",
@@ -459,7 +459,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         for path, match in closure_calls
         if path == "pages/AiwerkAssistantPage.tsx"
     ]
-    assert len(matches) == 29
+    assert len(matches) == 31
     def object_keys_after(start: int) -> set[str]:
         brace = source.find("{", start)
         assert brace >= 0
@@ -491,6 +491,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         "title": "Customer title",
         "limit": 12,
         "text": "hello",
+        "startup_task_token": "0" * 32,
         "request_id": "req",
         "choice": "once",
         "value": "on",
@@ -530,6 +531,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         "session.side.back",
         "session.events.since",
         "prompt.submit",
+        "prompt.background",
         "prompt.learn",
         "approval.respond",
         "config.get",
