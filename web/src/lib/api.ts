@@ -2272,6 +2272,17 @@ export interface AssistantContactCreateRequest {
   link_current_context?: boolean;
 }
 
+export type ResourceTimeValue = string | number | null | undefined;
+
+export function resourceTimeDate(value: ResourceTimeValue): Date | null {
+  if (value === null || value === undefined || value === "") return null;
+  const normalized = typeof value === "number" && Math.abs(value) < 100_000_000_000
+    ? value * 1000
+    : value;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export interface AssistantResourcesResponse {
   checked_at: string;
   email: {
@@ -2307,8 +2318,8 @@ export interface AssistantResourcesResponse {
     resources: Record<string, {
       cached: boolean;
       stale?: boolean;
-      updated_at: string;
-      expires_at: string;
+      updated_at: string | number | null;
+      expires_at: string | number | null;
       ttl_seconds: number;
       last_error?: string;
     }>;

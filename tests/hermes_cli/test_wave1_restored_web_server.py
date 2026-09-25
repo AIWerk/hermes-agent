@@ -894,6 +894,27 @@ class TestWave1RestoredTestWebServerEndpoints:
         assert "- [x] Angebot erledigt <!-- hermes:id=abc status=pending -->" in todo_file.read_text(encoding="utf-8")
         assert self.client.post("/api/assistant/todos/edit", json={"id": item["id"], "text": "   "}).status_code == 400
 
+    def test_assistant_todo_summary_empty_initialized_store_is_connected(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        todo_file = tmp_path / "TODO.md"
+        todo_file.write_text("# TODO\n", encoding="utf-8")
+        monkeypatch.setenv("AIWERK_CUI_TODO_PATH", str(todo_file))
+
+        initialized = getattr(web_server, "_todo_summary")({})
+        todo_file.unlink()
+        missing = getattr(web_server, "_todo_summary")({})
+
+        assert initialized == {
+            "status": "connected",
+            "summary": "0 offene Aufgaben",
+            "items": [],
+            "open_count": 0,
+            "done_count": 0,
+            "total_count": 0,
+        }
+        assert missing["status"] == "not_configured"
+
     def test_assistant_todo_summary_strips_hermes_metadata_from_items(self, tmp_path, monkeypatch):
         import hermes_cli.web_server as web_server
 

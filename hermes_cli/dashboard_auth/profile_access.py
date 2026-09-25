@@ -109,6 +109,12 @@ _HTTP_ACTIONS = (
     ("POST", r"/api/profiles/[^/]+/open-terminal", "profile.launch"),
     ("GET", r"/api/profiles/[^/]+/(?:soul|desktop-overlay)", "profile.use"),
     ("GET", r"/api/(?:dashboard/font|assistant/resources)", "profile.use"),
+    ("GET|HEAD|OPTIONS", r"/api/assistant/artifacts/open", "profile.use"),
+    ("GET|POST", r"/api/assistant/(?:calendar/view|shared-folder/open)", "profile.use"),
+    ("GET|HEAD|OPTIONS|POST", r"/api/assistant/email/view", "profile.use"),
+    ("POST", r"/api/assistant/(?:attachments(?:/resource)?|audio/(?:transcribe|tts)|shared-folder/open-folder|support|todos(?:/(?:add|update|edit))?|transcribe|tts)", "profile.use"),
+    ("GET", r"/api/cui/(?:contacts/(?:frequent|search)|context/contacts)", "profile.use"),
+    ("POST", r"/api/cui/(?:contacts|contacts/(?:hide|search))", "profile.use"),
     ("GET|POST|PATCH|PUT|DELETE", r"/api/profiles(?:/.*)?", "profile.admin"),
     ("GET|POST|PATCH|PUT|DELETE", r"/api/(?:config|env|mcp|model|skills|tools)(?:/.*)?", "profile.admin"),
 )
@@ -128,9 +134,7 @@ async def http_authorize(request, call_next):
     if not path.startswith("/api/") or path.startswith("/api/auth/"):
         return await call_next(request)
     actor = getattr(request.state, "session", None)
-    profile_scoped_read = request.method == "GET" and path in {
-        "/api/dashboard/font", "/api/assistant/resources"
-    }
+    profile_scoped_resource = False
     try:
         snapshot, _ = _snapshot(actor)
         if snapshot is None:
@@ -138,6 +142,10 @@ async def http_authorize(request, call_next):
         action = next((action for methods, pattern, action in _HTTP_ACTIONS
                        if re.fullmatch(methods, request.method) and re.fullmatch(pattern, path)),
                       "profile.admin")
+        profile_scoped_resource = action == "profile.use" and (
+            path == "/api/dashboard/font"
+            or path.startswith(("/api/assistant/", "/api/cui/"))
+        )
         targets = request.query_params.getlist("profile")
         targets += request.query_params.getlist("recents_profile")
         body = {}
@@ -151,6 +159,8 @@ async def http_authorize(request, call_next):
                     targets.append(body["profile"])
                 if path in {"/api/profiles", "/api/profiles/active", "/api/profiles/import"} and "name" in body:
                     targets.append(body["name"])
+        if profile_scoped_resource and targets:
+            raise ProfileAccessDenied(_DENIED)
         match = re.fullmatch(r"/api/profiles/([^/]+)(?:/.*)?", path)
         if match and match[1] not in {"sessions", "projects", "active", "import"}:
             targets.append(match[1])
@@ -185,7 +195,7 @@ async def http_authorize(request, call_next):
         return JSONResponse({"detail": _DENIED}, status_code=403)
     token = http_decision.set(decision)
     try:
-        if supported_config or profile_scoped_read:
+        if supported_config or profile_scoped_resource:
             from hermes_cli.profiles import get_profile_dir
             from hermes_cli.web_server_profiles import _hermes_home_scope
             with _hermes_home_scope(get_profile_dir(decision.target_profile)):

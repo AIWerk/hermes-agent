@@ -6,7 +6,7 @@ import { buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, typ
 import { buildApprovalResponseParams } from "@/lib/cui-approval";
 
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
-import { HERMES_BASE_PATH, api, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse } from "@/lib/api";
+import { HERMES_BASE_PATH, api, resourceTimeDate, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse, type ResourceTimeValue } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
 import { CUI_SUPPORTED_SLASH_COMMANDS, formatCuiUsage, isCuiSlashInput, slashBase } from "@/lib/cui-slash";
 import { safeWindowOpen } from "@/lib/safe-open";
@@ -229,10 +229,9 @@ function resourceStatusCopy(status?: AssistantResourceStatus): { label: string; 
   return RESOURCE_STATUS_COPY[status ?? "not_configured"] ?? RESOURCE_STATUS_COPY.not_configured;
 }
 
-function formatResourceTime(value?: string | null, options?: { year?: boolean }): string {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
+function formatResourceTime(value: ResourceTimeValue, options?: { year?: boolean }): string {
+  const date = resourceTimeDate(value);
+  if (!date) return "";
   return date.toLocaleString("de-CH", {
     day: "2-digit",
     month: "2-digit",

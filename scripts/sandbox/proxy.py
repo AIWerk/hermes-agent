@@ -11,14 +11,17 @@ forwards to the real host:
   sandbox is isolated from the *host*, not from the internet: a real install
   still has to reach PyPI and npm.
 
-HTTPS is intercepted by minting a per-host certificate from the sandbox's own
-throwaway CA, which the payload trusts via CURL_CA_BUNDLE / SSL_CERT_FILE.
+HTTPS fixture hosts are intercepted by minting a per-host certificate from the
+sandbox's own throwaway CA, which the payload trusts via CURL_CA_BUNDLE /
+SSL_CERT_FILE. Other HTTPS hosts use a transparent CONNECT tunnel, preserving
+end-to-end TLS for package registries and large downloads.
 
 Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 """
 
 import os
 import pathlib
+import select
 import socket
 import ssl
 import subprocess
@@ -27,11 +30,24 @@ import threading
 from urllib.parse import unquote, urlsplit
 
 ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
+TRUST_BUNDLE = CERTS / 'ca-bundle.pem'
 
 LISTEN_ADDRESS = ('127.0.0.1', 8080)
 MAX_REQUEST_BYTES = 65536
 UPSTREAM_TIMEOUT_SECONDS = 30
 CERT_VALIDITY_DAYS = 2
+
+
+def build_trust_bundle():
+    """Publish the fixture CA plus public roots for intercepted and tunneled TLS."""
+    parts = []
+    for path in (CERTS / 'ca.pem', REAL_CA):
+        content = path.read_bytes()
+        parts.append(content if content.endswith(b'\n') else content + b'\n')
+    temporary = TRUST_BUNDLE.with_name(f'{TRUST_BUNDLE.name}.{os.getpid()}.tmp')
+    temporary.write_bytes(b''.join(parts))
+    os.replace(temporary, TRUST_BUNDLE)
+    return TRUST_BUNDLE
 
 
 def read_request(conn):
@@ -150,6 +166,18 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+def relay_tunnel(left, right):
+    """Relay a raw CONNECT tunnel in both directions until either side closes."""
+    peers = {left: right, right: left}
+    while True:
+        readable, _, _ = select.select(tuple(peers), (), ())
+        for source in readable:
+            chunk = source.recv(MAX_REQUEST_BYTES)
+            if not chunk:
+                return
+            peers[source].sendall(chunk)
+
+
 def forward_https(conn, host, port, request):
     context = ssl.create_default_context(cafile=str(REAL_CA))
     with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
@@ -168,10 +196,20 @@ def forward_http(conn, host, port, request, target):
         relay(upstream, conn)
 
 
-def handle_connect(conn, target):
-    """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
-    host, _, port_text = target.rpartition(':')
-    port = int(port_text or '443')
+def tunnel_connect(conn, host, port):
+    """Pass through non-fixture HTTPS without terminating end-to-end TLS."""
+    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as upstream:
+        conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        # create_connection's timeout is for bounded establishment only. The
+        # installer owns the whole-operation timeout; retaining 30 seconds here
+        # aborts slow package streams mid-transfer and surfaces as SSL EOF.
+        conn.settimeout(None)
+        upstream.settimeout(None)
+        relay_tunnel(conn, upstream)
+
+
+def intercept_connect(conn, host, port):
+    """Terminate TLS for a fixture host so request paths can be overridden."""
     conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -187,6 +225,23 @@ def handle_connect(conn, target):
             respond_fixture(tls, found)
         else:
             forward_https(tls, host, port, nested)
+
+
+def handle_connect(conn, target):
+    """Intercept fixture hosts and transparently tunnel every other host."""
+    host, _, port_text = target.rpartition(':')
+    port = int(port_text or '443')
+    fixture_host = bool(
+        host
+        and host not in {'.', '..'}
+        and '/' not in host
+        and '\\' not in host
+        and (ROOT / host).is_dir()
+    )
+    if fixture_host:
+        intercept_connect(conn, host, port)
+    else:
+        tunnel_connect(conn, host, port)
 
 
 def host_from_headers(request):
@@ -224,6 +279,7 @@ def handle(conn):
 
 
 def main():
+    build_trust_bundle()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(LISTEN_ADDRESS)
