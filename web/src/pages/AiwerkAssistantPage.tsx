@@ -9,6 +9,7 @@ import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, resourceTimeDate, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse, type ResourceTimeValue } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
 import { CUI_SUPPORTED_SLASH_COMMANDS, formatCuiUsage, isCuiSlashInput, slashBase } from "@/lib/cui-slash";
+import { activeProfileFromAuth, assistantDocumentTitle } from "@/lib/cui-profile-branding";
 import { safeWindowOpen } from "@/lib/safe-open";
 
 // Object URLs (blob:) this client minted via URL.createObjectURL. Only these may
@@ -123,6 +124,8 @@ interface DashboardAuthSession {
   display_name?: string;
   tenant_id?: string;
   role?: string;
+  default_profile?: string;
+  active_profile?: string;
   greeting?: {
     name?: string | null;
     context?: CuiGreetingContext;
@@ -1279,6 +1282,20 @@ export default function AiwerkAssistantPage() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    api.getModelInfo(activeProfileFromAuth(authSession))
+      .then((info) => {
+        if (!cancelled) setModelInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setModelInfo(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authSession]);
+
   const handleLogout = useCallback(async () => {
     setLoggingOut(true);
     try {
@@ -1825,6 +1842,10 @@ export default function AiwerkAssistantPage() {
   }, [modelInfo]);
   const assistantName = useMemo(() => cleanAssistantName(modelInfo?.agent_name), [modelInfo?.agent_name]);
   const assistantInitial = assistantName.charAt(0).toUpperCase();
+
+  useEffect(() => {
+    if (modelInfo) document.title = assistantDocumentTitle(assistantName);
+  }, [assistantName, modelInfo]);
 
   const liveNotesText = useMemo(() => formatLiveNotes(liveNotes), [liveNotes]);
   const headerBadges = useMemo(() => statusBadges(runtimeStatus, approvals.length), [runtimeStatus, approvals.length]);
@@ -2425,16 +2446,6 @@ export default function AiwerkAssistantPage() {
         if (!cancelled) setRecentSessions((res.sessions ?? []).slice(0, 10));
       })
       .catch(() => undefined);
-    api
-      .getModelInfo()
-      .then((info) => {
-        if (!cancelled) {
-          setModelInfo(info);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setModelInfo(null);
-      });
 
     return () => {
       cancelled = true;

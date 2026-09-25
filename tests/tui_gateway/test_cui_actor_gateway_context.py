@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_state import SessionDB
 from tui_gateway import server
 
 
@@ -134,6 +135,34 @@ def test_deferred_record_captures_allowlisted_dispatch_actor():
 
     assert record["cui_actor_context"] == TRUSTED_ACTOR
     assert server.current_cui_actor_context() == {}
+
+
+def test_first_prompt_profile_row_stamps_saved_cui_actor(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profiles" / "lumo"
+    profile_home.mkdir(parents=True)
+    SessionDB(profile_home / "state.db").close()
+    monkeypatch.setattr(server, "_resolve_model", lambda: "synthetic-model")
+
+    session = {
+        "session_key": "owned-first-prompt",
+        "profile_home": str(profile_home),
+        "source": "web",
+        "cui_actor_context": TRUSTED_ACTOR,
+    }
+
+    ensure_row = getattr(server, "_ensure_session_db_row")
+    assert ensure_row(session) is True
+    row = None
+    with SessionDB(profile_home / "state.db", read_only=True) as db:
+        row = db.get_session("owned-first-prompt")
+
+    assert row is not None
+    assert row["profile_name"] == "lumo"
+    config = json.loads(row["model_config"])
+    assert config["_cui_actor_context"] == TRUSTED_ACTOR
+    assert config["_cui_actor_id"] == TRUSTED_ACTOR["actor_id"]
+    assert config["_cui_tenant_id"] == TRUSTED_ACTOR["tenant_id"]
+    assert config["_cui_visibility_scope"] == "customer"
 
 
 def test_deferred_record_preserves_trusted_no_actor_authority():

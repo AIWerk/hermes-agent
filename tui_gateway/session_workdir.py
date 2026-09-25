@@ -17,9 +17,10 @@ from .method_ctx import bind_module
 
 if TYPE_CHECKING:
     from tui_gateway.server import (
-        _current_profile_name, _db_error, _emit, _get_db, _launch_configured_cwd,
+        _CuiActorScopedSessionDB, _current_profile_name, _db_error, _emit, _get_db, _launch_configured_cwd,
         _load_cfg, _profile_configured_cwd, _profile_home, _resolve_model,
-        _resolve_session_platform, _session_info, _sessions, _visible_live_session, logger,
+        _resolve_session_platform, _session_info, _sessions, _visible_live_session,
+        current_cui_actor_context, logger,
     )
 
 
@@ -352,11 +353,15 @@ _WORKDIR_DB_OPEN_FAILED = object()
 @contextlib.contextmanager
 def _workdir_owner_db(session: dict, fail_log: str):
     """Body of :func:`_session_db`; ``_ensure_session_db_row`` uses it directly so a patched ``_session_db`` can't alter rows."""
-    db, close_db = None, False
+    db, close_db, acquired_db = None, False, None
     if profile_home := session.get("profile_home"):
         try:
             from hermes_state_registry import acquire
-            db, close_db = acquire(Path(profile_home) / "state.db"), True
+            raw_db = acquire(Path(profile_home) / "state.db")
+            acquired_db = raw_db
+            actor = session.get("cui_actor_context") or current_cui_actor_context()
+            db = _CuiActorScopedSessionDB(raw_db, actor) if actor else raw_db
+            close_db = True
         except Exception:
             logger.debug(fail_log, exc_info=True)
             db = _WORKDIR_DB_OPEN_FAILED
@@ -365,10 +370,10 @@ def _workdir_owner_db(session: dict, fail_log: str):
     try:
         yield db
     finally:
-        if close_db and db is not None:
+        if close_db and acquired_db is not None:
             with contextlib.suppress(Exception):
                 from hermes_state_registry import release_or_close
-                release_or_close(db)
+                release_or_close(acquired_db)
 
 
 @contextlib.contextmanager
