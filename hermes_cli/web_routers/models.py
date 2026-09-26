@@ -49,8 +49,11 @@ def _load_config_scoped(profile: Optional[str]) -> dict:
 
 
 def _dashboard_agent_name(config: dict) -> str:
-    dashboard = config.get("dashboard") if isinstance(config.get("dashboard"), dict) else {}
-    value = str(dashboard.get("agent_name") or "").strip()
+    dashboard_value = config.get("dashboard")
+    dashboard = dashboard_value if isinstance(dashboard_value, dict) else {}
+    temporal_value = config.get("temporal_context")
+    temporal = temporal_value if isinstance(temporal_value, dict) else {}
+    value = str(dashboard.get("agent_name") or temporal.get("display_name") or "").strip()
     return value or "Agent"
 
 

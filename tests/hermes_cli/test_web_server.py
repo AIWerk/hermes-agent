@@ -4341,6 +4341,18 @@ class TestModelInfoEndpoint:
         assert resp.status_code == 200
         assert resp.json()["agent_name"] == "Rocky"
 
+    def test_model_info_falls_back_to_profile_temporal_display_name(self, monkeypatch):
+        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
+            "model": "openai/gpt-5.6",
+            "temporal_context": {"display_name": "Lumo"},
+        })
+
+        with patch("agent.model_metadata.get_model_context_length", return_value=200000):
+            resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["agent_name"] == "Lumo"
+
     def test_model_info_empty_model_uses_dashboard_agent_name(self, monkeypatch):
         import hermes_cli.web_server as ws
 
