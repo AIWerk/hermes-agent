@@ -39,6 +39,24 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
     sid = "detached-turn"
     session = _session(sid)
     forwarded = []
+    activity_arrived = threading.Condition()
+    activity_turns = set()
+    suppressed_activity_turns = set()
+
+    def relay(message: dict) -> None:
+        params = message.get("params")
+        if message.get("method") != "compute_host.activity" or not isinstance(params, dict):
+            server._relay_compute_host_rpc(message)
+            return
+        turn_id = params.get("turn_id")
+        with activity_arrived:
+            if turn_id in suppressed_activity_turns:
+                return
+        server._relay_compute_host_rpc(message)
+        with activity_arrived:
+            activity_turns.add(turn_id)
+            activity_arrived.notify_all()
+
     monkeypatch.setattr(server, "_sessions", {sid: session})
     monkeypatch.setattr(server, "_pending_ws_reaps", {})
     monkeypatch.setattr(server, "write_json", lambda msg: forwarded.append(msg) or True)
@@ -52,7 +70,7 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
     supervisor = HostSupervisor(
         argv=[sys.executable, str(Path(__file__).resolve()), mode, str(tmp_path)],
         registry_path=tmp_path / "host.json", env={"HERMES_HOME": str(home)},
-        expected_hermes_home=str(home), rpc_sink=server._relay_compute_host_rpc,
+        expected_hermes_home=str(home), rpc_sink=relay,
         heartbeat_secs=1, autostart=False)
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *args: supervisor)
     try:
@@ -101,17 +119,21 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             supervisor._handle_host_frame({"type": "turn.end", "sid": sid, "request_id": old_request})
             assert session["running"]
             assert session["_compute_host_turn_id"] == new_token
-            deadline = time.monotonic() + 5
-            while not (tmp_path / "provider-started").exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert (tmp_path / "provider-started").exists()
-            # Also replay a delayed sample from the previous dispatch.
+            deadline = time.monotonic() + 12
+            with activity_arrived:
+                while new_token not in activity_turns and time.monotonic() < deadline:
+                    activity_arrived.wait(deadline - time.monotonic())
+                assert new_token in activity_turns
+                # Freeze the genuine no-activity sample so a later child sample
+                # cannot conceal an incorrectly accepted old-token replay.
+                suppressed_activity_turns.add(new_token)
+            assert "_compute_host_activity_ns" in session
+            assert session["_compute_host_activity_ns"] is None
+            assert not server._ws_orphan_turn_activity_is_fresh(session)
+            # A delayed sample from the previous dispatch must not refresh this turn.
             server._relay_compute_host_rpc({"method": "compute_host.activity", "params": {
                 "session_id": sid, "turn_id": old_token, "activity_ns": time.perf_counter_ns()}})
-            deadline = time.monotonic() + 3
-            while "_compute_host_activity_ns" not in session and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert "_compute_host_activity_ns" in session
+            assert session["_compute_host_activity_ns"] is None
             assert not server._ws_orphan_turn_activity_is_fresh(session)
             server._pending_ws_reaps[sid].callback()
             assert session["_client_gone_interrupt_requested"]
