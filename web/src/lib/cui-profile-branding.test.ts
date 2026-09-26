@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   activeProfileFromAuth,
   assistantDocumentTitle,
-} from "./cui-profile-branding";
+} from "./cui-greeting";
 
 describe("profile-scoped CUI branding", () => {
   it("uses server-resolved active profile before the default profile", () => {

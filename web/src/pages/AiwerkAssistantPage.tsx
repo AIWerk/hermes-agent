@@ -2,14 +2,14 @@ import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image a
 import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
-import { buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, type CuiGreetingContext } from "@/lib/cui-greeting";
+import { activeProfileFromAuth, assistantDocumentTitle, buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, type CuiGreetingContext } from "@/lib/cui-greeting";
 import { buildApprovalResponseParams } from "@/lib/cui-approval";
 
 import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, resourceTimeDate, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse, type ResourceTimeValue } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
 import { CUI_SUPPORTED_SLASH_COMMANDS, formatCuiUsage, isCuiSlashInput, slashBase } from "@/lib/cui-slash";
-import { activeProfileFromAuth, assistantDocumentTitle } from "@/lib/cui-profile-branding";
+
 import { safeWindowOpen } from "@/lib/safe-open";
 
 // Object URLs (blob:) this client minted via URL.createObjectURL. Only these may
