@@ -87,6 +87,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+Environment="PYTHONDONTWRITEBYTECODE=1"
 ExecStart={python_path} {script_path} run
 WorkingDirectory={working_dir}
 Restart=on-failure

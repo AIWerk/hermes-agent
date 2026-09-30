@@ -17,7 +17,15 @@ import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-import yaml
+
+# Stale-module bridge: this module binds ``utils.file_signature`` at import time, so a fresh
+# import in a post-pull updater process (pre-handoff purge keeps root modules cached) dies
+# unless the stale ``utils`` is dropped first. See hermes_cli.stale_modules.
+from hermes_cli.stale_modules import drop_stale_root_modules
+
+drop_stale_root_modules()
+
+from utils import fast_safe_load, file_signature
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +33,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (mtime_ns, size, parsed)
+# path_key -> (*file_signature, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
@@ -69,7 +77,7 @@ def invalidate_managed_cache() -> None:
 
 
 def _cached_read_snapshot(path: Path, cache: Dict[str, tuple], parse):
-    """Read, fingerprint, and parse one immutable byte snapshot."""
+    """Read, content-fingerprint, and parse one immutable byte snapshot."""
     try:
         st = path.stat()
         raw = path.read_bytes()
@@ -83,6 +91,31 @@ def _cached_read_snapshot(path: Path, cache: Dict[str, tuple], parse):
             return copy.deepcopy(hit[3]), key
     try:
         parsed = parse(io.StringIO(raw.decode("utf-8")))
+    except Exception as exc:
+        logger.warning(
+            "managed scope: failed to parse %s: %s — IGNORING this managed file. "
+            "Admin policy from this file is NOT being applied. Fix and restart.", path, exc)
+        return None, key
+    with _CACHE_LOCK:
+        cache[path_key] = (*key, copy.deepcopy(parsed))
+    return parsed, key
+
+
+def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+    """Shared stat-signature-keyed path read for managed files."""
+    try:
+        st = path.stat()
+        raw = path.read_bytes()
+    except OSError:
+        return None  # absent
+    key = file_signature(st)
+    path_key = str(path)
+    with _CACHE_LOCK:
+        hit = cache.get(path_key)
+        if hit is not None and hit[:len(key)] == key:
+            return copy.deepcopy(hit[len(key)])
+    try:
+        parsed = parse(path)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
@@ -90,23 +123,11 @@ def _cached_read_snapshot(path: Path, cache: Dict[str, tuple], parse):
             path,
             exc,
         )
-        return None, key
+        return None
     with _CACHE_LOCK:
         cache[path_key] = (*key, copy.deepcopy(parsed))
-    return parsed, key
-
-
-
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared stat + content-keyed read. Returns a deepcopy of the parsed value.
-
-    Returns ``None`` when the file is absent or fails to parse (fail-open). A
-    parse failure is logged LOUDLY — the admin needs to know their policy isn't
-    being applied — but never raises, so a malformed managed file can't brick
-    startup.
-    """
-    parsed, _signature = _cached_read_snapshot(path, cache, parse)
     return parsed
+
 
 
 def _load_managed_file(name: str, cache: Dict[str, tuple], parse) -> dict:
@@ -129,22 +150,20 @@ def load_managed_config_with_signature() -> Tuple[dict, Tuple[int, int, bytes]]:
     if managed_dir is None:
         return {}, (0, 0, b"")
     parsed, signature = _cached_read_snapshot(
-        managed_dir / "config.yaml",
-        _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
-    )
+        managed_dir / "config.yaml", _CONFIG_CACHE, lambda f: fast_safe_load(f) or {})
     return (parsed if isinstance(parsed, dict) else {}), signature
-
-
-
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda f: yaml.safe_load(f) or {})
 
 
 def load_managed_env() -> Dict[str, str]:
     """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
-    return _load_managed_file(".env", _ENV_CACHE, _parse_env)
+    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
+
+
+def _parse_managed_env(path: Path) -> Dict[str, str]:
+    from agent.secret_scope import load_env_file
+
+    path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
+    return load_env_file(path)
 
 
 def apply_managed_overlay(config: dict) -> dict:
@@ -173,15 +192,6 @@ def apply_managed_overlay(config: dict) -> dict:
     except Exception:  # noqa: BLE001 — overlay must never break a caller
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
-
-
-def _parse_env(f) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for line in map(str.strip, f):
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            out[key.strip()] = value.strip().strip("\"'")
-    return out
 
 
 def _flatten_keys(d: dict, prefix: str = "") -> set:

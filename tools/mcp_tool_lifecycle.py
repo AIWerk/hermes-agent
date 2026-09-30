@@ -84,82 +84,119 @@ def _filter_mcp_children(pids: set) -> set:
     return kept
 
 
-def _clear_connect_cooldowns(names=None) -> None:
+def _clear_connect_cooldowns(keys=None) -> None:
     """Drop connect-retry cooldowns: a restart must re-attempt every server immediately, not
     honour a stale per-server backoff. Caller holds ``_core._lock``."""
-    if names is None:
+    if keys is None:
         _core._server_connect_retry_after.clear()
         _core._server_connect_failures.clear()
     else:
-        for name in names:
-            _core._server_connect_retry_after.pop(name, None)
-            _core._server_connect_failures.pop(name, None)
+        for key in keys:
+            _core._server_connect_retry_after.pop(key, None)
+            _core._server_connect_failures.pop(key, None)
 
 
-def shutdown_mcp_servers(
-    *, scope: Optional[str] = None, server_names: Optional[set[str]] = None
-):
+def _reregister_orphaned_adopters() -> None:
+    """Re-run MCP registration for profiles whose ADOPTED shared connection an owner's
+    ``/reload-mcp`` just tore down. Their tools vanished with the owner's teardown and nothing
+    re-runs their discovery until THEY reload, so they sat tool-less behind a healthy-looking
+    status (#106005). Runs after the owner's rediscovery, under each adopter's own home + secret
+    scope (its ``${VAR}`` refs must resolve to ITS credentials): the adopter re-adopts the owner's
+    new identical connection or connects its own."""
+    with _core._lock:
+        pending = dict(_core._orphaned_adopters)
+        _core._orphaned_adopters.clear()
+    if not pending:
+        return
+    from pathlib import Path
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import mcp_tool_discovery as _discovery
+    from tools.mcp_tool_config import _load_mcp_config
+    for adopter, names in pending.items():
+        home_token = secret_token = None
+        try:
+            home_token = set_hermes_home_override(adopter)
+            secret_token = set_secret_scope(build_profile_secret_scope(Path(adopter)), profile_home=adopter)
+            servers = {n: c for n, c in (_load_mcp_config() or {}).items() if n in names}
+            if servers:
+                _discovery.register_mcp_servers(servers)
+        except Exception:
+            logger.debug("MCP: re-registration for profile scope %s failed", adopter, exc_info=True)
+        finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+
+
+def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = None,
+                         timeout: float = 15.0):
     """Close MCP server connections (in parallel) and stop the background loop. Each server
     Task is signalled to exit its own ``async with`` so the anyio cancel-scope cleanup runs in
     the Task that opened it. ``scope`` restricts teardown to one multiplexed profile's servers
     (its ``/reload-mcp`` must not kill other profiles') and leaves the shared loop running if
-    anything else is still connected."""
+    anything else is still connected. ``names`` restricts it further to those server names
+    (dropped-from-config pruning); other servers' bookkeeping is untouched. Only the bare call
+    (no ``scope``, no ``names``) is the process-wide wildcard: the launch profile's registry
+    scope IS ``None``, so ``scope=None, names={...}`` prunes that unscoped owner's servers and
+    must leave a served profile's same-named ``(B, name)`` connection alone. ``timeout`` bounds
+    the wait for the close to land on the MCP loop — a caller running one pass per served
+    profile under a total budget divides it, or N profiles × 15s starve the wildcard pass that
+    actually stops the loop."""
+    from tools.mcp_tool_scope import _key_name, _key_scope
+    wildcard = scope is None and names is None
     with _core._lock:
-        def selected_key(key: Any) -> bool:
-            key_scope = (
-                _core._server_scope_from_state_key(key)
-                or _core._server_scope_keys.get(key)
-            )
-            scope_matches = (
-                key_scope == scope
-                if server_names is not None
-                else scope is None or key_scope == scope
-            )
-            return scope_matches and (
-                server_names is None
-                or _core._server_name_from_state_key(key) in server_names
-            )
+        def selected_key(key) -> bool:
+            owner = _core._server_scope_keys.get(key, _key_scope(key))
+            return (wildcard or owner == scope) and (names is None or _key_name(key) in names)
 
+        all_state_keys = (
+            set(_core._servers) | set(_core._server_connect_claims)
+            | set(_core._server_scope_keys) | set(_core._server_tool_scopes)
+            | set(_core._server_connecting) | set(_core._server_connect_errors)
+            | set(_core._server_connect_retry_after) | set(_core._server_connect_failures)
+            | set(_core._lazy_server_configs) | set(_core._lazy_server_fingerprints)
+            | set(_core._lazy_server_tool_names) | set(_core._server_error_counts)
+            | set(_core._server_breaker_opened_at) | set(_core._server_errors_all_application)
+            | set(_core._server_trust_levels) | set(_core._tool_read_only_hints)
+            | set(_core._parallel_safe_servers) | set(_core._mcp_tool_server_names.values())
+        )
+        selected_status = {key for key in all_state_keys if selected_key(key)}
         selected = [key for key in _core._servers if selected_key(key)]
         claimed = [key for key in _core._server_connect_claims if selected_key(key)]
         servers_snapshot = []
-        seen_server_ids: set[int] = set()
-        for server in (
-            [_core._servers[key] for key in selected]
-            + [_core._server_connect_claims[key] for key in claimed]
-        ):
-            if id(server) not in seen_server_ids:
-                seen_server_ids.add(id(server))
+        seen = set()
+        for server in ([_core._servers[key] for key in selected]
+                       + [_core._server_connect_claims[key] for key in claimed]):
+            if id(server) not in seen:
+                seen.add(id(server))
                 servers_snapshot.append(server)
-        all_state_keys = (
-            set(_core._servers)
-            | set(_core._server_connect_claims)
-            | set(_core._server_scope_keys)
-            | set(_core._server_connecting)
-            | set(_core._server_connect_errors)
-            | set(_core._lazy_server_configs)
-            | set(_core._lazy_server_fingerprints)
-            | set(_core._lazy_server_tool_names)
-            | set(_core._server_connect_retry_after)
-            | set(_core._server_connect_failures)
-            | set(_core._server_error_counts)
-            | set(_core._server_breaker_opened_at)
-            | set(_core._server_trust_levels)
-            | set(_core._tool_read_only_hints)
-            | set(_core._parallel_safe_servers)
-            | set(_core._mcp_tool_server_names.values())
-        )
-        selected_status = {key for key in all_state_keys if selected_key(key)}
-        selected_tool_keys = {
-            tool_key
-            for tool_key, server_key in _core._mcp_tool_server_names.items()
-            if selected_key(server_key)
-        }
         selected_lazy_tools = [
-            (key, list(_core._lazy_server_tool_names.get(key, [])))
-            for key in selected_status
-            if key in _core._lazy_server_configs
+            (key, list(_core._lazy_server_tool_names.get(key, ())))
+            for key in selected_status if key in _core._lazy_server_configs
         ]
+        remaining_server_names = {
+            _key_name(key) for key in all_state_keys if key not in selected_status
+        }
+        selected_tool_names = set()
+        for tool_name, server_name in _core._mcp_tool_server_names.items():
+            owner_name = _key_name(server_name)
+            if owner_name not in remaining_server_names and (
+                    wildcard or names is None or owner_name in names):
+                selected_tool_names.add(tool_name)
+        # Adopters of the connections being torn down lose their overlays with the tasks' own
+        # ``_deregister_tools``; remember them so the next discovery pass re-registers them
+        # (``_reregister_orphaned_adopters``).
+        if not wildcard:
+            for key in selected:
+                for adopter in _core._server_tool_scopes.get(key, ()):
+                    if adopter != scope:
+                        _core._orphaned_adopters.setdefault(adopter, set()).add(_key_name(key))
+        # A connection still being established has no shutdown coroutine yet. Revoke its
+        # publication claim immediately so completion cannot resurrect a removed config.
+        for key in claimed:
+            _core._server_connect_claims.pop(key, None)
 
     def clear_selected_status():
         _core._server_connecting.difference_update(selected_status)
@@ -167,31 +204,25 @@ def shutdown_mcp_servers(
         for key in selected_status:
             _core._server_connect_errors.pop(key, None)
             _core._server_scope_keys.pop(key, None)
+            _core._server_tool_scopes.pop(key, None)
             _core._lazy_server_configs.pop(key, None)
             _core._lazy_server_fingerprints.pop(key, None)
             _core._lazy_server_tool_names.pop(key, None)
             _core._server_error_counts.pop(key, None)
             _core._server_breaker_opened_at.pop(key, None)
+            _core._server_errors_all_application.pop(key, None)
             _core._server_trust_levels.pop(key, None)
             _core._tool_read_only_hints.pop(key, None)
             _core._server_connect_claims.pop(key, None)
-        for key in selected_tool_keys:
-            _core._mcp_tool_server_names.pop(key, None)
+        for tool_name in selected_tool_names:
+            _core._mcp_tool_server_names.pop(tool_name, None)
 
-    # Cache-only lazy servers have no MCPServerTask whose shutdown hook can
-    # deregister them. Remove their scoped registry entries explicitly before
-    # dropping provenance/state.
+    # Cache-only lazy servers have no task shutdown hook to deregister them.
     if selected_lazy_tools:
         from tools import mcp_tool_registration as _registration
-        from tools.registry import registry
         for key, tool_names in selected_lazy_tools:
-            server_name = _core._server_name_from_state_key(key)
-            tool_scope = _core._server_scope_from_state_key(key)
             for tool_name in tool_names:
-                entry = registry.get_entry(tool_name, scope=tool_scope)
-                if entry is not None and entry.toolset == f"mcp-{server_name}":
-                    registry.deregister(tool_name, scope=tool_scope)
-                _registration._forget_mcp_tool_server(tool_name, state_key=key)
+                _registration._deregister_mcp_tool_all_scopes(key, tool_name)
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still be populated here — a server that
     # failed to connect is never recorded in ``_servers`` (that is the very premise of the #50394 cooldown),
@@ -204,11 +235,11 @@ def shutdown_mcp_servers(
                 if isinstance(result, Exception):
                     logger.debug("Error closing MCP server '%s': %s", server.name, result)
             with _core._lock:
-                for name in selected:
-                    _core._servers.pop(name, None)
-                    _core._server_scope_keys.pop(name, None)
+                for key in selected:
+                    _core._servers.pop(key, None)
+                    _core._server_scope_keys.pop(key, None)
                 clear_selected_status()
-                _clear_connect_cooldowns(None if scope is None else selected_status)
+                _clear_connect_cooldowns(None if wildcard else selected_status)
 
         with _core._lock:
             loop = _core._mcp_loop
@@ -217,7 +248,7 @@ def shutdown_mcp_servers(
             future = safe_schedule_threadsafe(_shutdown(), loop, logger=logger, log_message="MCP shutdown: failed to schedule")
             if future is not None:
                 try:
-                    future.result(timeout=15)
+                    future.result(timeout=timeout)
                 except BaseException as exc:
                     logger.debug("Error during MCP shutdown: %s", exc)
 
@@ -225,9 +256,15 @@ def shutdown_mcp_servers(
     # (a server that failed to connect is never in ``_servers`` — the most likely state for
     # stale backoff entries), no connect-cooldown state may survive shutdown.
     with _core._lock:
-        clear_selected_status()
-        _clear_connect_cooldowns(None if scope is None else selected_status)
-    _loop._stop_mcp_loop(only_if_idle=scope is not None or server_names is not None)
+        if not servers_snapshot:
+            clear_selected_status()
+        _clear_connect_cooldowns(None if wildcard else selected_status)
+    _loop._stop_mcp_loop(only_if_idle=not wildcard)
+    # A removed subset still shares its profile's log with the remaining servers.
+    # Full/profile shutdown must also release handles left by completed CLI/UI probes.
+    if names is None:
+        from tools.mcp_tool_config import _close_mcp_stderr_logs
+        _close_mcp_stderr_logs(scope=scope)
 
 
 def _take_reapable_pids(include_active: bool, server_name: Any = None) -> tuple[Dict[int, Any], Dict[int, int]]:

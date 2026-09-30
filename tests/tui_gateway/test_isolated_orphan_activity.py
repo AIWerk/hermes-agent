@@ -1,9 +1,9 @@
 """Detached Desktop/TUI turns use child-owned activity, not process heartbeats."""
 
-from pathlib import Path
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -12,14 +12,15 @@ from tui_gateway.host_supervisor import HostSupervisor
 
 
 class _Timer:
-    def __init__(self, delay, callback):
-        self.delay, self.callback = delay, callback
+    def __init__(self, _delay, callback, *args, **kwargs):
+        self.delay = _delay
+        self.callback = callback
 
     def start(self):
-        pass
+        return None
 
     def cancel(self):
-        pass
+        return None
 
 
 def _session(sid):
@@ -166,7 +167,6 @@ def test_activity_relay_is_fenced_and_ages(monkeypatch, change):
         monkeypatch.setattr(server.time, "perf_counter_ns", lambda: params["activity_ns"] + 31_000_000_000)
         server._relay_compute_host_rpc({"method": "compute_host.activity", "params": params})
         assert not server._ws_orphan_turn_activity_is_fresh(session)
-
 
 def _run_child(mode, directory):
     import socket

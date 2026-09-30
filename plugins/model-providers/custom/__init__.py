@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from agent.reasoning_effort import OPENAI_COMPAT_WIRE_EFFORTS, clamp_effort
 from providers import register_provider
 from providers.base import ProviderProfile
+from utils import base_url_host_matches
 
 
 def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
@@ -41,6 +42,29 @@ def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
 
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
+
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
+        """The OpenAI-compat wire set, mirroring this profile's own chat-completions clamp.
+
+        Without this declaration the Responses transport clamps onto the OpenAI
+        per-model ladder (``codex_supported_efforts``), where ``max`` is gpt-5.6-only —
+        so a custom relay's model had a configured ``max`` silently demoted to
+        ``xhigh`` while the same provider over chat-completions forwarded ``max``
+        unchanged (#114249). A custom endpoint's vocabulary is undiscoverable, so
+        the widest OpenAI-compat set is the honest ceiling; ``ultra`` still clamps
+        to ``max`` via the shared ``clamp_effort`` policy.
+        """
+        return OPENAI_COMPAT_WIRE_EFFORTS
+
+    def default_reasoning_config(self, model: str | None = None) -> dict | None:
+        """Unset ``agent.reasoning_effort`` → ``medium``, as on the Nous / OpenRouter profiles.
+
+        Leaving the field off lets the endpoint's own default apply, and for a hosted reasoning
+        model that default can be its ceiling: kimi-k3 behind an OpenAI-compatible relay defaults
+        to ``max`` — 3x the reasoning tokens and ~3x the latency of medium. The agent skips this
+        default for models the catalog marks non-reasoning (``agent.reasoning_params``).
+        """
+        return {"enabled": True, "effort": "medium"}
 
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, ollama_num_ctx: int | None = None, **ctx: Any
@@ -84,9 +108,20 @@ class CustomProfile(ProviderProfile):
         if reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
+            # Explicit capability metadata is authoritative.  Unknown generic
+            # OpenAI-compatible endpoints may optimistically send the field and
+            # rely on the bounded rejection-retry ladder, except for known strict
+            # Mistral endpoints; Ollama-local control remains explicit.
             reasoning_supported = (
                 is_ollama
-                or (capabilities is not None and capabilities.supports_reasoning)
+                or (
+                    capabilities is not None
+                    and capabilities.supports_reasoning
+                )
+                or (
+                    capabilities is None
+                    and not base_url_host_matches(base_url, "api.mistral.ai")
+                )
             )
         if (
             reasoning_supported
@@ -96,7 +131,10 @@ class CustomProfile(ProviderProfile):
             and _effort
             and _effort != "none"
         ):
-            top_level["reasoning_effort"] = clamp_effort(_effort, OPENAI_COMPAT_WIRE_EFFORTS)
+            top_level["reasoning_effort"] = (
+                "default" if base_url_host_matches(str(base_url or ""), "api.groq.com")
+                else clamp_effort(_effort, OPENAI_COMPAT_WIRE_EFFORTS)
+            )
         elif reasoning_supported and reasoning_config and isinstance(reasoning_config, dict):
             if _effort == "none" or _enabled is False:
                 # Ollama's /v1/chat/completions silently ignores
@@ -107,6 +145,12 @@ class CustomProfile(ProviderProfile):
                 top_level["reasoning_effort"] = "none"
                 if is_ollama:
                     extra_body["think"] = False
+            elif _effort and base_url_host_matches(str(ctx.get("base_url") or ""), "api.groq.com"):
+                # Groq's OpenAI-compatible wire accepts top-level reasoning_effort only as
+                # "none" / "default"; any graded level ("medium", "high") 400s (#75089).
+                top_level["reasoning_effort"] = "default"
+            elif _effort:
+                top_level["reasoning_effort"] = clamp_effort(_effort, OPENAI_COMPAT_WIRE_EFFORTS)
         return extra_body, top_level
 
     def fetch_models(
