@@ -311,7 +311,7 @@ def test_emit_redacts_host_paths_from_live_message_frames(monkeypatch):
         {
             "text": "done",
             "error": "failed at /home/alice/private.log",
-            "reasoning": {"summary": "read /tmp/private/notes.txt"},
+            "reasoning": "read /tmp/private/notes.txt",
             "rendered": "done from /var/private/result.txt",
         },
     )
@@ -321,7 +321,7 @@ def test_emit_redacts_host_paths_from_live_message_frames(monkeypatch):
     assert delta_payload["text"] == "Created report.pdf\n"
     assert "rendered" not in delta_payload
     assert "/home/alice" not in complete_payload["error"]
-    assert "/tmp/private" not in complete_payload["reasoning"]["summary"]
+    assert "/tmp/private" not in complete_payload["reasoning"]
     assert "/var/private" not in complete_payload["rendered"]
 
 

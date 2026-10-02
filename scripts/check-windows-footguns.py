@@ -148,7 +148,7 @@ FOOTGUNS: list[Footgun] = [
         # explicit builtins-style open() call.  Path.open() is rare in the
         # codebase compared to open() and can be audited separately.
         pattern=re.compile(
-            r"""(?:^|[\s\(,;=])(?<![.\w])open\s*\(\s*[^,)]+\s*(?:,\s*['"](?P<mode>[^'"]*)['"])?"""
+            r"""(?:^|[\s\(,;=])(?<![.\w])open\s*\(\s*(?:[^,()]|\([^()]*\))+\s*(?:,\s*['"](?P<mode>[^'"]*)['"])?"""
         ),
         message=(
             "open() without an explicit encoding= uses the platform default "
@@ -429,6 +429,27 @@ FOOTGUNS: list[Footgun] = [
             # still caught. AST-level enforcement for multi-line calls
             # lives in the gateway guard test.
             and _call_closes_on_line(line, m.end())
+        ),
+    ),
+    Footgun(
+        name="module-level import of a POSIX-only stdlib module",
+        # Only unindented imports: a top-level `import fcntl` fails at import time on Windows and takes
+        # every importer down with it (tools.bot_desktop.lease took computer_use down on native
+        # Windows). Indented imports inside a function or a try/except ImportError are the fix shape.
+        pattern=re.compile(
+            r"^(?:import\s+(?:fcntl|pwd|grp|termios|resource|pty|tty)\b"
+            r"|from\s+(?:fcntl|pwd|grp|termios|resource|pty|tty)\s+import\b)"
+        ),
+        message=(
+            "fcntl/pwd/grp/termios/resource/pty/tty do not exist on Windows; a module-level import "
+            "raises ModuleNotFoundError and breaks every module that imports this one."
+        ),
+        fix=(
+            "Import lazily inside the function that needs it, or\n"
+            "try:\n"
+            "    import fcntl\n"
+            "except ImportError:\n"
+            "    fcntl = None  # and take the Windows path when None"
         ),
     ),
 ]

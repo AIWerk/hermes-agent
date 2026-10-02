@@ -57,7 +57,7 @@ def test_unresolved_ancestry_does_not_abort_tree_cleanup(guard_probe, error_kind
 
     ProcessRegistry._terminate_host_pid(root_pid)
 
-    assert calls == [(sibling_pid, signal.SIGTERM), (root_pid, signal.SIGTERM)]
+    assert calls == [(root_pid, signal.SIGTERM), (sibling_pid, signal.SIGTERM)]
 
 
 def test_verified_foreign_receives_no_signal(guard_probe):

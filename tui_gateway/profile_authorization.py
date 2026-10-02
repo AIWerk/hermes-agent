@@ -197,6 +197,13 @@ def _roster(server, rid, params, actor):
 def installed_handler(server, name, handler):
     @wraps(handler)
     def guarded(rid, params):
+        def validate(candidate):
+            contract = server._contracts.METHODS.get(name)
+            if contract is None:
+                return candidate, None
+            accepted, problem = server._contracts.validate_params(contract, candidate)
+            return accepted, (server._err(rid, 4000, problem) if problem is not None else None)
+
         # This transport reply resolves one already-authorized, exact pending
         # request. The initiating worker owns the actor/profile authorization.
         if name == "approval.respond":
@@ -208,11 +215,18 @@ def installed_handler(server, name, handler):
                 if name == 'session.events.since' and actor and not server._live_session_visible_to_cui_actor(
                         params.get('session_id', ''), actor):
                     return server._err(rid, 4001, 'session not found')
-                return handler(rid, params)
+                accepted, invalid = validate(params)
+                return invalid if invalid is not None else handler(rid, accepted)
             if authority is None:
                 raise ProfileAccessDenied('profile access denied')
             if not isinstance(params, dict):
                 return server._err(rid, -32602, 'invalid params: expected an object')
+            # Client-supplied actor fields are never authority. Ignore them when a
+            # transport-bound actor exists; only the bound ContextVar is persisted.
+            params = {
+                key: value for key, value in params.items()
+                if key != 'actor_context' and not key.startswith('_cui_')
+            }
             _selectors(params)
             actions = _ACTIONS.get(name)
             if actions is None:
@@ -222,7 +236,7 @@ def installed_handler(server, name, handler):
                 target = params.get('name', target)
                 if 'profile' in params and target != params['profile']:
                     raise ProfileAccessDenied('profile access denied')
-            sid = params.get('session_id')
+            sid = None if name == 'session.create' else params.get('session_id')
             if sid and 'profile' not in params:
                 # Root-authorized candidate names only; no sensitive live/session
                 # lookup when this actor has no profile granting the operation.
@@ -236,7 +250,7 @@ def installed_handler(server, name, handler):
                     authorize(actor, action, target)
             if 'clone_from' in params:
                 authorize(actor, 'profile.admin', params['clone_from'])
-            sid = params.get('session_id')
+            sid = None if name == 'session.create' else params.get('session_id')
             record = None
             if sid:
                 with server._sessions_lock:
@@ -248,8 +262,33 @@ def installed_handler(server, name, handler):
                     for action in actions:
                         authorize(actor, action, effective)
                     if not server._live_session_visible_to_cui_actor(sid, actor):
+                        if name == 'config.set':
+                            return server._err(rid, 4001, 'session not found')
                         raise ProfileAccessDenied('profile access denied')
                     target = effective
+            if sid and record is None:
+                from hermes_cli.profiles import get_profile_dir
+                from hermes_state import SessionDB
+
+                db_path = get_profile_dir(target) / 'state.db'
+                if db_path.is_file():
+                    with SessionDB(db_path=db_path, read_only=True) as db:
+                        durable = db.get_session(str(sid)) or db.get_session_by_title(str(sid))
+                        if durable is None:
+                            resolved = db.resolve_session_id(str(sid))
+                            durable = db.get_session(resolved) if resolved else None
+                        if durable:
+                            tip = db.get_compression_tip(str(durable.get('id') or ''))
+                            if tip:
+                                durable = db.get_session(tip) or durable
+                    if durable:
+                        effective = str(durable.get('profile_name') or target)
+                        if effective != target or not server._session_visible_to_cui_actor(durable, actor):
+                            raise ProfileAccessDenied('profile access denied')
+                        for action in actions:
+                            authorize(actor, action, effective)
+                        target = effective
+                        record = durable
             if record is None:
                 for action in actions:
                     authorize(actor, action, target)
@@ -258,7 +297,10 @@ def installed_handler(server, name, handler):
             if name.startswith('prompt.') and any(key in params for key in (
                     'truncate_before_row_id', 'truncate_before_user_ordinal', 'confirm_truncate')):
                 authorize(actor, 'session.mutate', target)
-            normalized = {**params, 'profile': target}
+            accepted, invalid = validate(params)
+            if invalid is not None:
+                return invalid
+            normalized = {**accepted, 'profile': target}
             if name == 'profiles.list':
                 return _roster(server, rid, normalized, actor)
             token = _rpc_scope.set((target, actions))

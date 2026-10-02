@@ -4,12 +4,19 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from agent.verification_evidence import (
     classify_verification_command,
     mark_workspace_edited,
     record_terminal_result,
     verification_status,
 )
+
+
+@pytest.fixture(autouse=True)
+def _enable_verification_lifecycle(monkeypatch):
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
 
 def _node_project(root: Path) -> None:

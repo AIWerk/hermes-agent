@@ -46,6 +46,7 @@ def test_dispatch_stores_only_server_actor_allowlist_and_resets(monkeypatch, tmp
             },
             actor_context=actor,
         )
+        assert "result" in response, response
         sid = response["result"]["session_id"]
         assert server._sessions[sid]["cui_actor_context"] == TRUSTED_ACTOR
         assert server.current_cui_actor_context() == {}
@@ -661,6 +662,7 @@ def test_optional_live_inheritance_confines_completion_create_and_oneshot(monkey
                 "params": {"session_id": "foreign"},
             },
         )
+        assert "result" in created, created
         assert created["result"]["info"]["cwd"] == str(fallback_cwd)
 
         completed = _request_as(
@@ -777,7 +779,8 @@ def test_config_set_confines_all_session_consuming_branches_before_mutation(monk
                 "params": {"key": "model", "value": "global-model"},
             },
         )
-        assert global_model["result"]["value"] == "global-model"
+        assert global_model.get("error", {}).get("code") == 4001, global_model
+        assert "requires a live session" in global_model["error"]["message"]
 
         global_focus_status = _request_as(
             TRUSTED_ACTOR,
@@ -863,7 +866,7 @@ def test_profile_resume_reauthorizes_resolved_continuation_tip_before_side_effec
     monkeypatch.setattr(
         server,
         "_schedule_resume_hydration",
-        lambda sid, target, db, close_db=False: effects.append(("history", target)),
+        lambda sid, target, db, close_db=False, **_kwargs: effects.append(("history", target)),
     )
     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: effects.append(("cap", None)))
 
