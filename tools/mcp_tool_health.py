@@ -9,7 +9,6 @@ import time
 from typing import Iterable, Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
 from tools.mcp_tool_schema import mcp_prefixed_tool_name
-from tools.mcp_tool_registration import _forget_mcp_tool_server
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_registration as _registration
 
@@ -127,13 +126,8 @@ class MCPServerHealthMixin:
         """Deregister *tool_names* this server's toolset still owns (never a colliding name owned by another server)."""
         from tools.registry import registry
         for tool_name in tool_names:
-            scope = getattr(self, "registry_scope", _core._server_registry_scope(self.name))  # type: ignore[attr-defined]
-            entry = registry.get_entry(tool_name, scope=scope)
-            if entry is not None and entry.toolset == f"mcp-{self.name}":  # type: ignore[attr-defined]
-                registry.deregister(tool_name, scope=scope)
-                _forget_mcp_tool_server(
-                    tool_name, state_key=getattr(self, "state_key", None)
-                )
+            if registry.get_toolset_for_tool(tool_name) == f"mcp-{self.name}":
+                _registration._deregister_mcp_tool_all_scopes(self, tool_name)
 
     async def _refresh_tools(self):
         """Re-fetch tools on ``tools/list_changed`` and update the registry. The lock serializes rapid-fire
@@ -143,7 +137,16 @@ class MCPServerHealthMixin:
         async with self._refresh_lock:
             old_tool_names = set(self._registered_tool_names)
             async with self._rpc_lock:
-                new_mcp_tools = await _core._paginate_full_list(self.session.list_tools, "tools", self.name)
+                # Snapshot the session only once the RPC lock is held: run() resets self.session
+                # to None on every transport teardown (reconnect, backoff, park, cancel) outside
+                # both locks, so a refresh queued behind the lock can wake up mid-restart
+                # (#109824). Skipping is correct — the reconnect's own discovery re-lists tools
+                # and the next tools/list_changed re-arms this refresh against the live session.
+                session = self.session
+                if session is None:
+                    logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
+                    return
+                new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
             # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
             # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
             self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
@@ -200,13 +203,15 @@ class MCPServerHealthMixin:
         Only then is the reconnect budget cleared: a handshake that drops moments later must keep
         consuming ``_reconnect_retries`` so a flapping transport still reaches the park.
 
-        Called from the keepalive success path (session survived at least one full keepalive interval) and
-        the tool-call success path. See #62212.
+        Called from the keepalive success path (session survived a full keepalive interval — for
+        stdio without a keepalive, a full default interval idle with the child alive) and the
+        tool-call success path. See #62212.
         """
         if self._session_proven:
             return
         self._session_proven = True
         self._reconnect_retries = 0
+        self._park_reason = None
         if self._was_parked:
             self._was_parked = False
             logger.warning("MCP server '%s': revived — session healthy again after "

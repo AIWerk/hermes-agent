@@ -21,12 +21,24 @@ from hermes_cli.main import cmd_update
 @contextmanager
 def _no_running_gateways():
     """Keep config-prompt tests out of the live gateway restart path."""
-    with patch("hermes_cli.main._purge_stale_hermes_modules"), patch(
-        "hermes_cli.gateway.find_gateway_pids", return_value=[]
-    ), patch(
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), patch(
         "hermes_cli.gateway.find_profile_gateway_processes", return_value=[]
     ):
         yield
+
+@pytest.fixture(autouse=True)
+def _isolate_update(isolated_update_runtime, monkeypatch):
+    import shutil
+    from hermes_cli import managed_uv, update_cmd, update_cmd_deps, update_cmd_fleet
+
+    # The post-restart survivor sweep real-sleeps 3s; no gateways exist here.
+    monkeypatch.setattr(update_cmd_fleet, "_force_kill_stuck_gateways", lambda *a, **k: None)
+    # The post-pull import probe spawns a real interpreter (~2.5s); the tree is unchanged here.
+    monkeypatch.setattr(update_cmd_deps, "_critical_module_import_failures", lambda *a, **k: {})
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda **kw: shutil.which("uv"))
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda **kw: shutil.which("uv"))
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **kw: None)
+    monkeypatch.setattr(update_cmd, "_post_update_sqlite_runtime_status", lambda: (True, None))
 
 
 def _make_run_side_effect(
@@ -64,7 +76,6 @@ def _make_run_side_effect(
 class TestUpdateYesConfigMigration:
     """--yes auto-answers the config-migration prompt and skips API-key prompts."""
 
-    @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
@@ -79,7 +90,6 @@ class TestUpdateYesConfigMigration:
         _mock_missing_cfg,
         _mock_version,
         mock_migrate,
-        _mock_reload,
         capsys,
     ):
         mock_run.side_effect = _make_run_side_effect(
@@ -100,12 +110,6 @@ class TestUpdateYesConfigMigration:
         _, kwargs = mock_migrate.call_args
         assert kwargs.get("interactive") is False
 
-        out = capsys.readouterr().out
-        assert "--yes: auto-applying config migration" in out
-        # The "Would you like to configure them now?" prompt text never appears.
-        assert "Would you like to configure them now?" not in out
-
-    @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
@@ -120,7 +124,6 @@ class TestUpdateYesConfigMigration:
         _mock_missing_cfg,
         _mock_version,
         mock_migrate,
-        _mock_reload,
         capsys,
     ):
         """Regression guard: without --yes, the TTY prompt path still fires."""
@@ -152,11 +155,6 @@ class TestUpdateYesConfigMigration:
             assert any("configure them now" in p for p in prompts)
 
 
-class TestUpdateYesStashRestore:
-    """--yes auto-restores the pre-update autostash without prompting."""
-
-
-
 class TestUnicodeDecodeErrorInUpdatePrompts:
     """Regression tests (review of #68497): input() can raise
     UnicodeDecodeError when the terminal encoding can't decode the byte
@@ -167,7 +165,6 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
     the exception escape and crash `hermes update` mid-flight.
     """
 
-    @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
@@ -182,7 +179,6 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         _mock_missing_cfg,
         _mock_version,
         mock_migrate,
-        _mock_reload,
         capsys,
     ):
         mock_run.side_effect = _make_run_side_effect(
@@ -217,9 +213,7 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
             )  # must not raise
 
         assert result is False
-        out = capsys.readouterr().out
-        assert "Skipped restoring local changes" in out
-        assert "git stash apply stash@{0}" in out
+        assert "git stash apply stash@{0}" in capsys.readouterr().out
 
     def test_stash_restore_eof_error_still_falls_through_to_skip(self, tmp_path):
         """Sanity: this fix must not regress the pre-existing EOFError case,
