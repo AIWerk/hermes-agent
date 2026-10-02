@@ -89,7 +89,9 @@ def wire_env():
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
 
-    test_home = tempfile.mkdtemp(prefix="hermes_api_content_")
+    prev_tempdir = tempfile.tempdir
+    tempfile.tempdir = None
+    test_home = tempfile.mkdtemp(prefix="hermes_api_content_", dir="/tmp")
     os.makedirs(os.path.join(test_home, ".hermes"))
     prev_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
@@ -120,11 +122,12 @@ def wire_env():
                 [{"context": "PLUGIN-CTX"}] if hook == "pre_llm_call" else []
             ),
         ):
-            yield make_agent, _MockHandler, db, sid
+            yield make_agent, _MockHandler, db, sid, Path(test_home)
     finally:
         srv.shutdown()
         db.close()
         shutil.rmtree(test_home, ignore_errors=True)
+        tempfile.tempdir = prev_tempdir
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
@@ -142,10 +145,10 @@ def _user_messages(req: dict) -> list:
 
 
 @pytest.mark.parametrize("policy_source", ["root", "host"])
-def test_honcho_section_policy_reaches_final_user_content(wire_env, tmp_path, policy_source):
+def test_honcho_section_policy_reaches_final_user_content(wire_env, policy_source):
     # Real provider/aggregator and local LLM HTTP; only the Honcho backend
     # is stubbed. This does not exercise the Honcho SDK or remote service.
-    make_agent, handler, db, sid = wire_env
+    make_agent, handler, db, sid, test_home = wire_env
     original = "Which memories matter for this request?"
     produced = {
         "summary": "FORBIDDEN SUMMARY",
@@ -169,7 +172,7 @@ def test_honcho_section_policy_reaches_final_user_content(wire_env, tmp_path, po
     if policy_source == "host":
         raw["injection"] = {key: not value for key, value in injection.items()}
         raw["hosts"] = {"hermes": {"injection": injection}}
-    config_path = tmp_path / "honcho.json"
+    config_path = test_home / "honcho.json"
     config_path.write_text(json.dumps(raw))
     provider._config = HonchoClientConfig.from_global_config(
         host="hermes", config_path=config_path,
@@ -191,7 +194,13 @@ def test_honcho_section_policy_reaches_final_user_content(wire_env, tmp_path, po
         memory_manager.shutdown_all()
 
     provider._manager.get_prefetch_context.assert_called_once_with(sid, original)
-    provider._manager.stop_async_writer.assert_called_once_with()
+    provider._manager.stop_async_writer.assert_called_once()
+    stop_call = provider._manager.stop_async_writer.call_args
+    assert stop_call.args == ()
+    assert set(stop_call.kwargs) == {"timeout"}
+    timeout = stop_call.kwargs["timeout"]
+    assert isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+    assert 0 < timeout <= 5
     provider._manager.shutdown.assert_not_called()
     assert not any(t.is_alive() for t in (
         provider._prefetch_thread, provider._sync_thread, provider._memwrite_thread
