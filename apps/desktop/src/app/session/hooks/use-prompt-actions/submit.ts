@@ -1,3 +1,4 @@
+import type { PromptSubmitResult as SharedPromptSubmitResult } from '@hermes/shared'
 import { type MutableRefObject, useCallback } from 'react'
 
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
@@ -23,6 +24,7 @@ import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
 import { isStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
+  $activeSessionId,
   $sessions,
   resolveComposerSessionKey,
   setActiveSessionId,
@@ -45,6 +47,7 @@ import {
   inlineErrorMessage,
   isProviderSetupError,
   isSessionBusyError,
+  isSessionNotOwnedError,
   isTargetSessionBusy,
   releaseSubmitInFlight,
   SessionRecoveryAborted,
@@ -69,7 +72,7 @@ interface SubmitPromptDeps {
   syncAttachmentsForSubmit: (
     sessionId: string,
     attachments: ComposerAttachment[],
-    options?: { updateComposerAttachments?: boolean }
+    options?: { storedSessionId?: null | string; updateComposerAttachments?: boolean }
   ) => Promise<{ attachments: ComposerAttachment[]; sessionId: string }>
   updateSessionState: (
     sessionId: string,
@@ -98,12 +101,11 @@ const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
   setMessages
 }
 
-interface PromptSubmitResult {
+interface PromptSubmitResult extends SharedPromptSubmitResult {
   auto_reset?: boolean
   auto_reset_reason?: string
   previous_session_key?: string
   session_key?: string
-  status?: string
   stored_session_id?: string
 }
 
@@ -140,6 +142,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const attachments = (options?.attachments ?? scope.readAttachments()).filter((a): a is ComposerAttachment =>
         Boolean(a)
       )
+
+      const titlePreview = attachments.find(
+        a => typeof a.titlePreview === 'string' && a.titlePreview.trim()
+      )?.titlePreview
 
       const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
@@ -396,6 +402,36 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         }
       }
 
+      // Point the pane at a runtime this submit just resumed for its stored
+      // session. ChatView renders the `$sessionStates` slice named by
+      // `$activeSessionId`, while the optimistic row and every stream event
+      // land in the resumed runtime's slice — pinning only the ref left the
+      // chat painting the dead runtime, so the prompt, its reply, and every
+      // later turn stayed invisible until a relaunch (#71733, #117867).
+      // `session.resume` omits messages, so carry the transcript the pane is
+      // showing into the empty slice (same conversation only — lineage-
+      // matched, since compression rotates the tip id) instead of collapsing
+      // the thread to the new prompt until the next refresh.
+      const rebindPaneToResumedRuntime = (sid: string, storedId: string) => {
+        const paneRuntimeId = $activeSessionId.get()
+        const paneState = paneRuntimeId && paneRuntimeId !== sid ? $sessionStates.get()[paneRuntimeId] : undefined
+        const sessions = $sessions.get()
+
+        if (
+          paneState?.messages.length &&
+          paneState.storedSessionId &&
+          resolveComposerSessionKey(paneState.storedSessionId, sessions) ===
+            resolveComposerSessionKey(storedId, sessions)
+        ) {
+          const carried = paneState.messages
+
+          updateSessionState(sid, state => (state.messages.length ? state : { ...state, messages: carried }), storedId)
+        }
+
+        activeSessionIdRef.current = sid
+        setActiveSessionId(sid)
+      }
+
       // Idempotent optimistic insert — re-running with the resolved sessionId
       // after createBackendSessionForSend just overwrites with the same id.
       const seedOptimistic = (sid: string) => {
@@ -638,7 +674,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             sessionId = resumed.session_id
 
             if (targetIsCurrentView()) {
-              activeSessionIdRef.current = sessionId
+              rebindPaneToResumedRuntime(sessionId, targetStoredSessionId)
             }
           }
         } catch {
@@ -737,6 +773,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // plain text survived sleep/wake but images reported "session not
         // found". The attach path recovers and reports the live id back here.
         const attachResult = await syncAttachmentsForSubmit(sessionId, attachments, {
+          storedSessionId: targetStoredSessionId,
           updateComposerAttachments: usingComposerAttachments
         })
 
@@ -773,12 +810,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // rather than at Hermes. The gateway turns this into a per-turn hint
           // to read the window underneath and work in it.
           ...($hudMode.get() && { surface: 'hud' }),
+          // A GPT-Live delegation: the text is a voice transcript and the reply
+          // will be spoken by the voice model. Wins over HUD for this turn.
+          ...(options?.surface && { surface: options.surface }),
+          ...(options?.surface && options.voiceContext && { voice_context: options.voiceContext }),
           // A queue drain is a "run after" message, never a live-turn
           // correction. The flag tells the gateway's busy path to hold it for
           // the next turn untouched — without it, losing the settle race
           // (client saw idle, server still unwinding) redirects or interrupts
           // the live turn with text the user explicitly queued.
-          ...(options?.fromQueue && { queued: true })
+          ...(options?.fromQueue && { queued: true }),
+          ...(titlePreview && { title_preview: titlePreview })
         })
 
         // On sleep/wake the gateway's in-memory session may have been cleared
@@ -793,7 +835,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
-          const submit = await withSessionNotFoundResume<PromptSubmitResult>(
+          const submitted = await withSessionNotFoundResume<PromptSubmitResult>(
             sessionId,
             recoverStoredSessionId,
             liveId =>
@@ -831,8 +873,26 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
-          submitResult = submit.result
-          effectiveSessionId = submit.sessionId
+
+          submitResult = submitted.result
+          effectiveSessionId = submitted.sessionId
+
+          const rowId = submitted.result?.user_row_id
+
+          if (typeof rowId === 'number' && Number.isSafeInteger(rowId) && rowId > 0) {
+            updateSessionState(submitted.sessionId, state => {
+              const index = state.messages.findIndex(message => message.id === optimisticId && message.role === 'user')
+
+              if (index < 0 || state.messages[index].rowId === rowId) {
+                return state
+              }
+
+              return {
+                ...state,
+                messages: state.messages.map((message, i) => (i === index ? { ...message, rowId } : message))
+              }
+            })
+          }
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
@@ -882,6 +942,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         const message = inlineErrorMessage(err, copy.promptFailed)
         const occurredAt = Date.now() / 1000
+        // Another surface owns the session (#106217): a deterministic gateway
+        // refusal, so the error card drops Retry and offers a new session.
+        const notOwned = isSessionNotOwnedError(err)
 
         updateSessionState(
           sessionId,
@@ -894,6 +957,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 role: 'assistant',
                 parts: [],
                 error: message || copy.promptFailed,
+                ...(notOwned && { errorSurface: { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false } }),
                 branchGroupId: state.pendingBranchGroup ?? undefined,
                 completedAt: occurredAt,
                 timestamp: occurredAt

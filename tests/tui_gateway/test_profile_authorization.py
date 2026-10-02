@@ -215,7 +215,11 @@ def test_both_registrars_install_outer_guard(rpc):
 def test_queued_worker_rechecks_policy_at_execution(rpc, monkeypatch):
     env, server = rpc
     queued = []
-    monkeypatch.setattr(server, "_pool", SimpleNamespace(submit=queued.append))
+    class _QueuedPool:
+        def submit(self, fn):
+            queued.append(fn)
+            return SimpleNamespace(add_done_callback=lambda _callback: None)
+    monkeypatch.setattr(server, "_pool", _QueuedPool())
     responses = []
     transport = SimpleNamespace(write=responses.append)
     server.dispatch({"jsonrpc": "2.0", "id": "r", "method": "session.resume", "params": {"session_id": "owned"}}, transport=transport, actor_context=EMPLOYEE)

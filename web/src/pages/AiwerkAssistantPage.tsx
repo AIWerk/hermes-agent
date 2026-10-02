@@ -1,11 +1,11 @@
 import { CalendarDays, ChevronRight, ExternalLink, FileText, FolderOpen, Image as ImageIcon, KeyRound, LifeBuoy, Link as LinkIcon, ListChecks, LogOut, Mail, Mic, Paperclip, Pencil, Phone, PlugZap, Plus, RefreshCw, Search, Send, Square, UserRound, Volume2, VolumeX, X } from "lucide-react";
 import { Fragment, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { ServerRequestMap } from "@hermes/shared";
 
 import { Markdown } from "@/components/Markdown";
 import { activeProfileFromAuth, assistantDocumentTitle, buildWelcomeMessage, resolveGreetingName, withAuthenticatedWelcome, type CuiGreetingContext } from "@/lib/cui-greeting";
-import { buildApprovalResponseParams } from "@/lib/cui-approval";
 
-import { GatewayClient, type GatewayEvent } from "@/lib/gatewayClient";
+import { GatewayClient } from "@/lib/gatewayClient";
 import { HERMES_BASE_PATH, api, resourceTimeDate, type AssistantConnectorSummary, type AssistantContactItem, type AssistantResourceEventItem, type AssistantResourcesResponse, type AssistantResourceMailItem, type AssistantResourceStatus, type AssistantSharedFolderItem, type AssistantSupportRequest, type AssistantTodoItem, type AssistantUploadedAttachment, type ModelInfoResponse, type ResourceTimeValue } from "@/lib/api";
 import { SLASH_MENU_LABEL, localizeSlashCategory, localizeSlashCommandDescription, readConfiguredCuiLocale } from "@/lib/aiwerk-cui-i18n";
 import { CUI_SUPPORTED_SLASH_COMMANDS, formatCuiUsage, isCuiSlashInput, slashBase } from "@/lib/cui-slash";
@@ -104,6 +104,7 @@ interface ApprovalCard {
   command?: string;
   description?: string;
   source?: string;
+  respond: (approved: boolean) => void;
 }
 
 interface ApprovalSummary {
@@ -690,7 +691,7 @@ function textFromPayload(payload: unknown): string {
   }
 }
 
-function approvalFromPayload(payload: unknown): Omit<ApprovalCard, "id"> {
+function approvalFromPayload(payload: unknown): Omit<ApprovalCard, "id" | "respond"> {
   if (!payload || typeof payload !== "object") return { detail: textFromPayload(payload) || "Eine Aktion braucht Ihre Bestätigung." };
   const data = payload as Record<string, unknown>;
   const command = typeof data.command === "string" ? data.command : undefined;
@@ -2244,14 +2245,35 @@ export default function AiwerkAssistantPage() {
     };
     const offToolStart = gateway.on("tool.start", (ev) => updateTools(ev.payload, "running"));
     const offToolComplete = gateway.on("tool.complete", (ev) => updateTools(ev.payload, "done"));
-    const pushApproval = (ev: GatewayEvent) => {
-      const approval = approvalFromPayload(ev.payload);
-      setApprovals((prev) => [{ id: newId("approval"), ...approval }, ...prev].slice(0, 4));
+    const pushApproval = (id: string, payload: unknown, respond: (approved: boolean) => void) => {
+      const approval = approvalFromPayload(payload);
+      setApprovals((prev) => [{ id, ...approval, respond }, ...prev].slice(0, 4));
       setActiveStatusModal("approvals");
     };
-    const offApproval = gateway.on("approval.request", pushApproval);
-    const offClarify = gateway.on("clarify.request", pushApproval);
-    const offTitle = gateway.on<{ title?: string }>("session.title", (ev) => {
+    const offRequest = gateway.onRequest((request) => {
+      if (request.method === "approval") {
+        const params = request.params as ServerRequestMap["approval"]["params"];
+        pushApproval(request.id, params, (approved) => {
+          request.respond({ choice: approved ? "once" : "deny" });
+        });
+        return;
+      }
+      if (request.method === "clarify") {
+        const params = request.params as ServerRequestMap["clarify"]["params"];
+        pushApproval(request.id, params, (approved) => {
+          if (!approved) {
+            request.respond({});
+          } else if (params.questions?.length) {
+            request.respond({ answers: Object.fromEntries(params.questions.map((question) => [question.qid, "yes"])) });
+          } else {
+            request.respond({ answer: "yes" });
+          }
+        });
+        return;
+      }
+      return false;
+    });
+    const offTitle = gateway.on("session.title", (ev) => {
       if (ev.session_id && sessionIdRef.current && ev.session_id !== sessionIdRef.current) return;
       const title = ev.payload?.title?.trim();
       if (title) setSessionTitle(title);
@@ -2464,8 +2486,7 @@ export default function AiwerkAssistantPage() {
       offError();
       offToolStart();
       offToolComplete();
-      offApproval();
-      offClarify();
+      offRequest();
       offTitle();
       offSessionInfo();
       gateway.close();
@@ -2961,20 +2982,12 @@ export default function AiwerkAssistantPage() {
   };
 
   const resolveApproval = async (id: string, approve: boolean) => {
-    const gateway = gatewayRef.current;
+    const approval = approvals.find((item) => item.id === id);
     const remaining = approvals.filter((a) => a.id !== id);
     setApprovals(remaining);
     if (remaining.length === 0) setActiveStatusModal(null);
     showToast(approve ? "Freigegeben" : "Abgelehnt");
-    if (!gateway || !sessionId) return;
-    try {
-      await gateway.request(
-        "approval.respond",
-        buildApprovalResponseParams(sessionId, id, approve),
-      );
-    } catch {
-      /* surfaced via gateway error handler */
-    }
+    approval?.respond(approve);
   };
 
   const showMainThinking = busy && activeTurnMode !== "side" && messages[messages.length - 1]?.status !== "streaming";

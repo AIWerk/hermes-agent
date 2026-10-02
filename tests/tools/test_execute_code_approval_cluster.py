@@ -25,7 +25,6 @@ import pytest
 from tools import approval as A
 import tools.approval_detection as approval_detection
 from tools import approval_context
-from tools import approval_context
 from tools import approval_smart
 from tools.thread_context import propagate_context_to_thread
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
@@ -96,12 +95,9 @@ def test_thread_context_clears_stale_worker_callbacks_before_target_when_parent_
 
     def callback_api():
         return (
-            lambda: None,
-            lambda: None,
-            lambda value: state.__setitem__("approval", value),
-            lambda value: state.__setitem__("sudo", value),
-            lambda: None,
-            lambda value: state.__setitem__("operator", value),
+            (lambda: None, lambda value: state.__setitem__("approval", value)),
+            (lambda: None, lambda value: state.__setitem__("sudo", value)),
+            (lambda: None, lambda value: state.__setitem__("operator", value)),
         )
 
     monkeypatch.setattr(TC, "_callback_api", callback_api)
@@ -141,21 +137,20 @@ def test_helper_revokes_partial_install_before_target(monkeypatch):
         TC,
         "_callback_api",
         lambda: (
-            lambda: approval_cb,
-            lambda: sudo_cb,
-            set_approval,
-            set_sudo,
-            lambda: operator_cb,
-            set_operator,
+            (lambda: approval_cb, set_approval),
+            (lambda: sudo_cb, set_sudo),
+            (lambda: operator_cb, set_operator),
         ),
     )
     seen = []
 
-    TC.propagate_context_to_thread(
-        lambda: seen.append(tuple(state.values()))
-    )()
+    with pytest.raises(RuntimeError, match="clean prompt callback context"):
+        TC.propagate_context_to_thread(
+            lambda: seen.append(tuple(state.values()))
+        )()
 
-    assert seen == [(None, None, None)]
+    assert seen == []
+    assert state == {"approval": None, "sudo": None, "operator": None}
 
 
 def test_helper_attempts_every_clear_when_one_setter_raises(monkeypatch):
@@ -187,12 +182,9 @@ def test_helper_attempts_every_clear_when_one_setter_raises(monkeypatch):
         TC,
         "_callback_api",
         lambda: (
-            lambda: approval_cb,
-            lambda: sudo_cb,
-            set_approval,
-            set_sudo,
-            lambda: operator_cb,
-            set_operator,
+            (lambda: approval_cb, set_approval),
+            (lambda: sudo_cb, set_sudo),
+            (lambda: operator_cb, set_operator),
         ),
     )
 
@@ -535,6 +527,13 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
 
 def test_terminal_serializes_smart_deny_pending_capabilities(monkeypatch):
     from tools import terminal_tool as terminal_module
+    import hermes_cli.operator_verification as operator_verification
+
+    monkeypatch.setattr(
+        operator_verification,
+        "operator_verification_block_reason_for_command",
+        lambda *_args, **_kwargs: None,
+    )
 
     monkeypatch.setattr(
         terminal_module,

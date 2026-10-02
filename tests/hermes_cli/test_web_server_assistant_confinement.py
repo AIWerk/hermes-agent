@@ -254,6 +254,56 @@ def test_assistant_ws_gate_allows_exact_customer_contract(
     assert request["params"]["_cui_actor_id"] == "tenant-a:user-1"
 
 
+def test_assistant_ws_gate_allows_exact_server_request_protocol(
+    web_server, assistant_identity
+) -> None:
+    capability = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "client.capabilities",
+        "params": {"server_requests": True},
+    }
+    assert web_server._assistant_ws_request_gate(capability, assistant_identity) is None
+    assert capability["params"] == {"server_requests": True}
+
+    for response in (
+        {"jsonrpc": "2.0", "id": "srq-0123456789ab", "result": {"choice": "once"}},
+        {
+            "jsonrpc": "2.0",
+            "id": "srq-abcdef012345",
+            "error": {"code": -32601, "message": "unsupported"},
+        },
+    ):
+        assert web_server._assistant_ws_request_gate(response, assistant_identity) is None
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"jsonrpc": "2.0", "id": 1, "method": "client.capabilities", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "client.capabilities",
+            "params": {"server_requests": False},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "client.capabilities",
+            "params": {"server_requests": True, "extra": True},
+        },
+        {"jsonrpc": "2.0", "id": "client-1", "result": {"choice": "once"}},
+        {"jsonrpc": "2.0", "id": "srq-0123456789ab", "result": {}, "error": {}},
+        {"jsonrpc": "2.0", "id": "srq-0123456789ab", "result": {}, "extra": True},
+    ],
+)
+def test_assistant_ws_gate_rejects_malformed_server_request_protocol(
+    web_server, assistant_identity, frame: dict
+) -> None:
+    assert web_server._assistant_ws_request_gate(frame, assistant_identity) is not None
+
+
 def test_assistant_frontend_startup_requests_match_ws_gate(
     web_server, assistant_identity
 ) -> None:
@@ -414,7 +464,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         "components/Markdown.tsx",
         "lib/aiwerk-cui-i18n.ts",
         "lib/api.ts",
-        "lib/cui-approval.ts",
+        "lib/api-error.ts",
         "lib/cui-greeting.ts",
         "lib/cui-slash.ts",
         "lib/dashboard-auth-reload.ts",
@@ -436,7 +486,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
             for match in call_pattern.finditer(candidate)
         )
 
-    assert len(closure_calls) == 32
+    assert len(closure_calls) == 31
     assert {path for path, _match in closure_calls} == {
         "lib/gatewayClient.ts",
         "pages/AiwerkAssistantPage.tsx",
@@ -459,7 +509,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
         for path, match in closure_calls
         if path == "pages/AiwerkAssistantPage.tsx"
     ]
-    assert len(matches) == 31
+    assert len(matches) == 30
     def object_keys_after(start: int) -> set[str]:
         brace = source.find("{", start)
         assert brace >= 0
@@ -475,13 +525,6 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
                     )
                 )
         raise AssertionError("unterminated frontend RPC params object")
-
-    approval_source = (root / "web/src/lib/cui-approval.ts").read_text(encoding="utf-8")
-    approval_body = approval_source.split("return {", 1)[1].split("};", 1)[0]
-    approval_keys = set(
-        re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", approval_body)
-    )
-    assert approval_keys == {"session_id", "request_id", "choice"}
 
     values = {
         "session_id": "sid",
@@ -500,7 +543,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
     for match in matches:
         method = match.group("method")
         seen_methods.add(method)
-        keys = approval_keys if method == "approval.respond" else object_keys_after(match.end())
+        keys = object_keys_after(match.end())
         params = {key: values[key] for key in keys if key not in {"key", "command"}}
         if "key" in keys:
             tail = source[match.end() : source.find("}", match.end())]
@@ -520,6 +563,7 @@ def test_every_assistant_frontend_rpc_call_matches_exact_ws_contract(
     assert seen_methods <= web_server._ASSISTANT_ALLOWED_RPC_METHODS
     assert web_server._ASSISTANT_ALLOWED_RPC_METHODS == {
         "gateway.ping",
+        "client.capabilities",
         "session.create",
         "session.resume",
         "session.title",

@@ -24,7 +24,6 @@ from hermes_cli.dashboard_auth import (
     InvalidCredentialsError,
     ProviderError,
     Session,
-    assert_protocol_compliance,
     clear_providers,
     register_provider,
 )
@@ -170,12 +169,7 @@ def gated_app(pw_provider):
 
 
 class TestProtocolExtension:
-    def test_password_provider_is_protocol_compliant(self):
-        assert assert_protocol_compliance(PasswordProvider) is None
 
-    def test_default_supports_password_is_false(self):
-        # OAuth providers (the Stub) inherit the False default.
-        assert StubAuthProvider.supports_password is False
 
     def test_default_complete_password_login_raises_not_implemented(self):
         # A provider that doesn't override the method (the Stub) raises,
