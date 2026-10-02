@@ -1,125 +1,124 @@
-
 {
   "approvals": [
     {
+      "allowed_target_state": "blob:fce91773628be47bd4969ccce3814b77fa8e7764",
+      "expected_old_blob": "db5f44bdf2cdfe6406b757f2ec2f3512c6992312",
+      "expires_at": "2026-09-09T13:00:00Z",
       "id": "R2-CONTROL-BASELINE-PR97",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "db5f44bdf2cdfe6406b757f2ec2f3512c6992312",
-      "allowed_target_state": "blob:fce91773628be47bd4969ccce3814b77fa8e7764",
-      "valid_for_pr": 97,
       "not_before": "2026-09-02T13:00:00Z",
-      "expires_at": "2026-09-09T13:00:00Z",
-      "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension in a separate control-plane transition."
+      "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension in a separate control-plane transition.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 97
     },
     {
-      "id": "R2-CONTROL-GUARD-PR97",
-      "subject_path": "scripts/ci/content_loss_guard.py",
-      "expected_old_blob": "77566d69af8fa99f63f60c3405d95b78ee12eac8",
       "allowed_target_state": "blob:e8926a2858cad6215018725c18262d99b646138a",
-      "valid_for_pr": 97,
-      "not_before": "2026-09-02T13:00:00Z",
+      "expected_old_blob": "77566d69af8fa99f63f60c3405d95b78ee12eac8",
       "expires_at": "2026-09-09T13:00:00Z",
-      "reason": "Authorize the exact protected-marker enforcement implementation as an isolated control-plane transition."
+      "id": "R2-CONTROL-GUARD-PR97",
+      "not_before": "2026-09-02T13:00:00Z",
+      "reason": "Authorize the exact protected-marker enforcement implementation as an isolated control-plane transition.",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "valid_for_pr": 97
     },
     {
-      "id": "R2-CONTROL-GUARD-TESTS-PR97",
-      "subject_path": "tests/ci/test_content_loss_guard.py",
-      "expected_old_blob": "65590ce824705414d95e94c35a7dfc5d4ab44e3f",
       "allowed_target_state": "blob:afe5965b174577737a6f92ce201e2b2aabe02120",
-      "valid_for_pr": 97,
-      "not_before": "2026-09-02T13:00:00Z",
+      "expected_old_blob": "65590ce824705414d95e94c35a7dfc5d4ab44e3f",
       "expires_at": "2026-09-09T13:00:00Z",
-      "reason": "Authorize the exact protected-marker regression coverage alongside its isolated guard transition."
+      "id": "R2-CONTROL-GUARD-TESTS-PR97",
+      "not_before": "2026-09-02T13:00:00Z",
+      "reason": "Authorize the exact protected-marker regression coverage alongside its isolated guard transition.",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "valid_for_pr": 97
     },
     {
-      "id": "R2-CONTROL-BASELINE-PR98",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "db5f44bdf2cdfe6406b757f2ec2f3512c6992312",
       "allowed_target_state": "blob:fce91773628be47bd4969ccce3814b77fa8e7764",
-      "valid_for_pr": 98,
-      "not_before": "2026-09-02T13:00:00Z",
+      "expected_old_blob": "db5f44bdf2cdfe6406b757f2ec2f3512c6992312",
       "expires_at": "2026-09-09T13:00:00Z",
-      "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension after the guard schema transition."
+      "id": "R2-CONTROL-BASELINE-PR98",
+      "not_before": "2026-09-02T13:00:00Z",
+      "reason": "Authorize the exact R2 operator-session protected-path and marker baseline extension after the guard schema transition.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 98
     },
     {
-      "id": "CUI-CONTROL-BASELINE-PR107",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "fce91773628be47bd4969ccce3814b77fa8e7764",
       "allowed_target_state": "blob:885d520c3b04a3ff0828a81d6471a09f2b75ba86",
-      "valid_for_pr": 107,
-      "not_before": "2026-09-04T19:24:57Z",
+      "expected_old_blob": "fce91773628be47bd4969ccce3814b77fa8e7764",
       "expires_at": "2026-09-11T19:24:57Z",
-      "reason": "Authorize the exact CUI slash-command floor and frontend API required-path baseline extension as an isolated control-plane transition."
+      "id": "CUI-CONTROL-BASELINE-PR107",
+      "not_before": "2026-09-04T19:24:57Z",
+      "reason": "Authorize the exact CUI slash-command floor and frontend API required-path baseline extension as an isolated control-plane transition.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 107
     },
     {
-      "id": "CUI-CONTROL-GUARD-PR107",
-      "subject_path": "scripts/ci/content_loss_guard.py",
-      "expected_old_blob": "e8926a2858cad6215018725c18262d99b646138a",
       "allowed_target_state": "blob:9a2c3117d660dae94b0c8f73948838b92a10a400",
-      "valid_for_pr": 107,
-      "not_before": "2026-09-04T19:24:57Z",
+      "expected_old_blob": "e8926a2858cad6215018725c18262d99b646138a",
       "expires_at": "2026-09-11T19:24:57Z",
-      "reason": "Authorize the exact v5 class-level CUI slash-command floor and frontend API subset enforcement as an isolated control-plane transition."
-    },
-    {
-      "id": "CUI-CONTROL-GUARD-TESTS-PR107",
-      "subject_path": "tests/ci/test_content_loss_guard.py",
-      "expected_old_blob": "afe5965b174577737a6f92ce201e2b2aabe02120",
-      "allowed_target_state": "blob:bfddc3ed5492d9d15bff8129dee6c02eb07eb0f8",
-      "valid_for_pr": 107,
+      "id": "CUI-CONTROL-GUARD-PR107",
       "not_before": "2026-09-04T19:24:57Z",
-      "expires_at": "2026-09-11T19:24:57Z",
-      "reason": "Authorize the exact v5 regression coverage for the isolated CUI control-plane transition."
-    },
-    {
-      "id": "FORKLOSS-CONTROL-BASELINE-PR110",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "885d520c3b04a3ff0828a81d6471a09f2b75ba86",
-      "allowed_target_state": "blob:c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
-      "valid_for_pr": 110,
-      "not_before": "2026-09-05T11:12:05Z",
-      "expires_at": "2026-09-12T11:12:05Z",
-      "reason": "Authorize the exact fork-loss SPA bootstrap and core dependency capability floors as an isolated control-plane transition."
-    },
-    {
-      "id": "FORKLOSS-CONTROL-GUARD-PR110",
+      "reason": "Authorize the exact v5 class-level CUI slash-command floor and frontend API subset enforcement as an isolated control-plane transition.",
       "subject_path": "scripts/ci/content_loss_guard.py",
-      "expected_old_blob": "9a2c3117d660dae94b0c8f73948838b92a10a400",
-      "allowed_target_state": "blob:9054171a6157b88013d151160be540ecbe8e8255",
-      "valid_for_pr": 110,
-      "not_before": "2026-09-05T11:12:05Z",
-      "expires_at": "2026-09-12T11:12:05Z",
-      "reason": "Authorize the exact fork-loss class selectors and merge-PR-aware range replay as an isolated control-plane transition."
+      "valid_for_pr": 107
     },
     {
-      "id": "FORKLOSS-CONTROL-GUARD-TESTS-PR110",
+      "allowed_target_state": "blob:bfddc3ed5492d9d15bff8129dee6c02eb07eb0f8",
+      "expected_old_blob": "afe5965b174577737a6f92ce201e2b2aabe02120",
+      "expires_at": "2026-09-11T19:24:57Z",
+      "id": "CUI-CONTROL-GUARD-TESTS-PR107",
+      "not_before": "2026-09-04T19:24:57Z",
+      "reason": "Authorize the exact v5 regression coverage for the isolated CUI control-plane transition.",
       "subject_path": "tests/ci/test_content_loss_guard.py",
-      "expected_old_blob": "bfddc3ed5492d9d15bff8129dee6c02eb07eb0f8",
-      "allowed_target_state": "blob:7381ec1d6d55869309831b27bae3a895df2ca556",
-      "valid_for_pr": 110,
-      "not_before": "2026-09-05T11:12:05Z",
+      "valid_for_pr": 107
+    },
+    {
+      "allowed_target_state": "blob:c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
+      "expected_old_blob": "885d520c3b04a3ff0828a81d6471a09f2b75ba86",
       "expires_at": "2026-09-12T11:12:05Z",
-      "reason": "Authorize the exact fork-loss class and approved merge-range regression coverage."
-    },
-    {
-      "id": "UPSTREAM-29112BEF-BASELINE-TRANSITION",
+      "id": "FORKLOSS-CONTROL-BASELINE-PR110",
+      "not_before": "2026-09-05T11:12:05Z",
+      "reason": "Authorize the exact fork-loss SPA bootstrap and core dependency capability floors as an isolated control-plane transition.",
       "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
-      "allowed_target_state": "blob:a38ffab3a8ec7ac6c29c51b91e350215258dd92c",
-      "valid_for_pr": 115,
-      "not_before": "2026-09-06T20:58:06Z",
-      "expires_at": "2026-09-13T20:58:06Z",
-      "reason": "Authorize the exact upstream-pin transition to v2026.8.31 by changing only accepted_upstream_commit in a separate control PR; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired."
+      "valid_for_pr": 110
     },
     {
-      "id": "UPSTREAM-29112BEF-WORKFLOW-DERIVATION",
-      "subject_path": ".github/workflows/aiwerk-content-loss-guard.yml",
-      "expected_old_blob": "ef484275048c83dc0a72b16ceb5910c81db91fb0",
-      "allowed_target_state": "blob:089ebddf11237483c6afdc2e8b120e08584c0153",
-      "valid_for_pr": 115,
-      "not_before": "2026-09-06T20:58:06Z",
+      "allowed_target_state": "blob:9054171a6157b88013d151160be540ecbe8e8255",
+      "expected_old_blob": "9a2c3117d660dae94b0c8f73948838b92a10a400",
+      "expires_at": "2026-09-12T11:12:05Z",
+      "id": "FORKLOSS-CONTROL-GUARD-PR110",
+      "not_before": "2026-09-05T11:12:05Z",
+      "reason": "Authorize the exact fork-loss class selectors and merge-PR-aware range replay as an isolated control-plane transition.",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "valid_for_pr": 110
+    },
+    {
+      "allowed_target_state": "blob:7381ec1d6d55869309831b27bae3a895df2ca556",
+      "expected_old_blob": "bfddc3ed5492d9d15bff8129dee6c02eb07eb0f8",
+      "expires_at": "2026-09-12T11:12:05Z",
+      "id": "FORKLOSS-CONTROL-GUARD-TESTS-PR110",
+      "not_before": "2026-09-05T11:12:05Z",
+      "reason": "Authorize the exact fork-loss class and approved merge-range regression coverage.",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "valid_for_pr": 110
+    },
+    {
+      "allowed_target_state": "blob:a38ffab3a8ec7ac6c29c51b91e350215258dd92c",
+      "expected_old_blob": "c8bd4f83bddcbcc7b7dcea8a678899b0da6c3682",
       "expires_at": "2026-09-13T20:58:06Z",
-      "reason": "Authorize only the exact workflow transition that derives the upstream pin from the protected base baseline for both guard modes; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired."
+      "id": "UPSTREAM-29112BEF-BASELINE-TRANSITION",
+      "not_before": "2026-09-06T20:58:06Z",
+      "reason": "Authorize the exact upstream-pin transition to v2026.8.31 by changing only accepted_upstream_commit in a separate control PR; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 115
+    },
+    {
+      "allowed_target_state": "blob:089ebddf11237483c6afdc2e8b120e08584c0153",
+      "expected_old_blob": "ef484275048c83dc0a72b16ceb5910c81db91fb0",
+      "expires_at": "2026-09-13T20:58:06Z",
+      "id": "UPSTREAM-29112BEF-WORKFLOW-DERIVATION",
+      "not_before": "2026-09-06T20:58:06Z",
+      "reason": "Authorize only the exact workflow transition that derives the upstream pin from the protected base baseline for both guard modes; no feature, path, test, marker, selector, protected control, or recovery-ledger obligation is retired.",
+      "subject_path": ".github/workflows/aiwerk-content-loss-guard.yml",
+      "valid_for_pr": 115
     },
     {
       "allowed_target_state": "blob:fe39f21252a94bbd2b00553d63ac09f80e48aeca",
@@ -152,135 +151,634 @@
       "valid_for_pr": 118
     },
     {
+      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "expires_at": "2026-09-17T23:49:28Z",
       "id": "UPSTREAM-2237BE35-SPA-ANCHOR-SLOT-1",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
-      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
-      "valid_for_pr": 124,
       "not_before": "2026-09-10T23:49:28Z",
-      "expires_at": "2026-09-17T23:49:28Z",
-      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
+      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 124
     },
     {
+      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "expires_at": "2026-09-17T23:49:28Z",
       "id": "UPSTREAM-2237BE35-SPA-ANCHOR-SLOT-2",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
-      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
-      "valid_for_pr": 125,
       "not_before": "2026-09-10T23:49:28Z",
-      "expires_at": "2026-09-17T23:49:28Z",
-      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
+      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 125
     },
     {
+      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
+      "expires_at": "2026-09-17T23:49:28Z",
       "id": "UPSTREAM-2237BE35-SPA-ANCHOR-SLOT-3",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
-      "allowed_target_state": "blob:c8694a7e3b6b6e54e780e806f50b0146577a9085",
-      "valid_for_pr": 126,
       "not_before": "2026-09-10T23:49:28Z",
-      "expires_at": "2026-09-17T23:49:28Z",
-      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired."
+      "reason": "Authorize only (1) moving assistant-spa-bootstrap-global-floor root_function from mount_spa to _assistant_ui_bootstrap_js, retaining the helper list and all four required globals; (2) accepted_upstream_commit 29112bef099274229cadff79cdff7bf7b99c4b77 to 2237be355906fbe6065ce1815711eee52b2d646e and previous_accepted_upstream_commit to 29112bef099274229cadff79cdff7bf7b99c4b77. No product capability, required global, path, test, marker or recovery obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 126
     },
     {
-      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-BASELINE-PR127",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
       "allowed_target_state": "blob:b1abc4dca5afb40716fc045ab499d0f99bd35948",
-      "valid_for_pr": 127,
-      "not_before": "2026-09-12T12:24:44Z",
+      "expected_old_blob": "f9d1469ccde9674aa63f28251278b0cb96d07340",
       "expires_at": "2026-09-19T12:24:44Z",
-      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 baseline blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
+      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-BASELINE-PR127",
+      "not_before": "2026-09-12T12:24:44Z",
+      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 baseline blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 127
     },
     {
-      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-GUARD-PR127",
-      "subject_path": "scripts/ci/content_loss_guard.py",
-      "expected_old_blob": "fe39f21252a94bbd2b00553d63ac09f80e48aeca",
       "allowed_target_state": "blob:216c38ec711864e84b453f3989677ed3e8b8d43a",
-      "valid_for_pr": 127,
-      "not_before": "2026-09-12T12:24:44Z",
+      "expected_old_blob": "fe39f21252a94bbd2b00553d63ac09f80e48aeca",
       "expires_at": "2026-09-19T12:24:44Z",
-      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 guard blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
-    },
-    {
-      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-TESTS-PR127",
-      "subject_path": "tests/ci/test_content_loss_guard.py",
-      "expected_old_blob": "ad3d5fb4e36435357e77a45c1304d9e137f80e7b",
-      "allowed_target_state": "blob:a381fff446dc857265bca6bf5629972e3f72a6d0",
-      "valid_for_pr": 127,
+      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-GUARD-PR127",
       "not_before": "2026-09-12T12:24:44Z",
-      "expires_at": "2026-09-19T12:24:44Z",
-      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 tests blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired."
-    }
-    ,
-    {
-      "id": "POINT3-GUARD-PR135",
+      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 guard blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired.",
       "subject_path": "scripts/ci/content_loss_guard.py",
-      "expected_old_blob": "216c38ec711864e84b453f3989677ed3e8b8d43a",
-      "allowed_target_state": "blob:5651ee796ef16c697120ea4bf0a3f97aa763773d",
-      "valid_for_pr": 135,
-      "not_before": "2026-09-14T18:13:26Z",
-      "expires_at": "2026-09-21T18:13:26Z",
-      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+      "valid_for_pr": 127
     },
     {
-      "id": "POINT3-TESTS-PR135",
+      "allowed_target_state": "blob:a381fff446dc857265bca6bf5629972e3f72a6d0",
+      "expected_old_blob": "ad3d5fb4e36435357e77a45c1304d9e137f80e7b",
+      "expires_at": "2026-09-19T12:24:44Z",
+      "id": "BOOTSTRAP-SELECTOR-CANDIDATE3-TESTS-PR127",
+      "not_before": "2026-09-12T12:24:44Z",
+      "reason": "Authorize only the exact accepted candidate 2f963697bfc3d640e29f9a90058335642e6e2d24 tests blob in a separate replacement control PR, including strict new-root/legacy bootstrap selector and match/case binding closure. No product capability, required global, protected path, marker, or recovery obligation is retired.",
       "subject_path": "tests/ci/test_content_loss_guard.py",
-      "expected_old_blob": "a381fff446dc857265bca6bf5629972e3f72a6d0",
+      "valid_for_pr": 127
+    },
+    {
+      "allowed_target_state": "blob:5651ee796ef16c697120ea4bf0a3f97aa763773d",
+      "expected_old_blob": "216c38ec711864e84b453f3989677ed3e8b8d43a",
+      "expires_at": "2026-09-21T18:13:26Z",
+      "id": "POINT3-GUARD-PR135",
+      "not_before": "2026-09-14T18:13:26Z",
+      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired.",
+      "subject_path": "scripts/ci/content_loss_guard.py",
+      "valid_for_pr": 135
+    },
+    {
       "allowed_target_state": "blob:3dfe5b9c9fcfc97b3facceacdc80eaa219301d46",
-      "valid_for_pr": 135,
-      "not_before": "2026-09-14T18:13:26Z",
+      "expected_old_blob": "a381fff446dc857265bca6bf5629972e3f72a6d0",
       "expires_at": "2026-09-21T18:13:26Z",
-      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+      "id": "POINT3-TESTS-PR135",
+      "not_before": "2026-09-14T18:13:26Z",
+      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired.",
+      "subject_path": "tests/ci/test_content_loss_guard.py",
+      "valid_for_pr": 135
     },
     {
-      "id": "POINT3-BASELINE-PR136",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "b1abc4dca5afb40716fc045ab499d0f99bd35948",
       "allowed_target_state": "blob:5a787b982238a65ff5b838ae01293409f7f9a384",
-      "valid_for_pr": 136,
-      "not_before": "2026-09-14T18:13:26Z",
+      "expected_old_blob": "b1abc4dca5afb40716fc045ab499d0f99bd35948",
       "expires_at": "2026-09-21T18:13:26Z",
-      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired."
+      "id": "POINT3-BASELINE-PR136",
+      "not_before": "2026-09-14T18:13:26Z",
+      "reason": "Authorize only this exact point3 static-control blob transition; no capability, path, test, marker, upstream or recovery obligation is retired.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 136
     },
     {
-      "id": "HONCHO-BEHAVIOR-ENROLLMENT",
-      "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "5a787b982238a65ff5b838ae01293409f7f9a384",
       "allowed_target_state": "blob:a0c9917fff2c68f8b8ac98258e565a5427ababec",
-      "valid_for_pr": 139,
-      "not_before": "2026-09-15T20:03:28Z",
+      "expected_old_blob": "5a787b982238a65ff5b838ae01293409f7f9a384",
       "expires_at": "2026-09-22T20:03:28Z",
-      "reason": "Enroll the six reviewed Honcho behavioral gate files and trusted dependency owners as protected controls; no guard, selector, upstream, product or runtime change. Authorized by Attila on 2026-09-15 at 22:00 CEST; seven-day UTC validity from final binding; only PR 139."
-    },
-    {
-      "id": "CUI-HISTORY-LAUNCHER-PR142",
-      "subject_path": "scripts/ci/honcho_behavior_gate.py",
-      "expected_old_blob": "10e215641521b4923b0a800fe81e117d86bee080",
-      "allowed_target_state": "blob:527d900507225670c2bebc6479e37fb000ed6a0e",
-      "valid_for_pr": 142,
-      "not_before": "2026-09-16T17:26:53Z",
-      "expires_at": "2026-09-23T17:26:53Z",
-      "reason": "Proposed authorization for only the exact backward-compatible fixed session-history profile in the retained behavior launcher in PR 142. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized."
-    },
-    {
-      "id": "CUI-HISTORY-LAUNCHER-TESTS-PR142",
-      "subject_path": "tests/ci/test_honcho_behavior_gate.py",
-      "expected_old_blob": "61310f1c6385ae3ca5d0a1428725349ae0f6ed94",
-      "allowed_target_state": "blob:ce6c7afa845879d3bcc4608f60022a0942f17fde",
-      "valid_for_pr": 142,
-      "not_before": "2026-09-16T17:26:53Z",
-      "expires_at": "2026-09-23T17:26:53Z",
-      "reason": "Proposed authorization for only the exact regression coverage for the fixed session-history launcher profile in PR 142. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized."
-    },
-    {
-      "id": "CUI-HISTORY-ENROLLMENT-PR144",
+      "id": "HONCHO-BEHAVIOR-ENROLLMENT",
+      "not_before": "2026-09-15T20:03:28Z",
+      "reason": "Enroll the six reviewed Honcho behavioral gate files and trusted dependency owners as protected controls; no guard, selector, upstream, product or runtime change. Authorized by Attila on 2026-09-15 at 22:00 CEST; seven-day UTC validity from final binding; only PR 139.",
       "subject_path": ".ci/content-loss/baseline.json",
-      "expected_old_blob": "a0c9917fff2c68f8b8ac98258e565a5427ababec",
-      "allowed_target_state": "blob:06bb909f7125191fb91e03d43350176dc622584d",
-      "valid_for_pr": 144,
-      "not_before": "2026-09-16T17:26:53Z",
+      "valid_for_pr": 139
+    },
+    {
+      "allowed_target_state": "blob:527d900507225670c2bebc6479e37fb000ed6a0e",
+      "expected_old_blob": "10e215641521b4923b0a800fe81e117d86bee080",
       "expires_at": "2026-09-23T17:26:53Z",
-      "reason": "Proposed authorization for only the exact baseline-only enrollment of the session-history retained harness, documentation, workflow and product regression test controls, plus required regression-test and exact-owner-helper paths in PR 144. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized."
+      "id": "CUI-HISTORY-LAUNCHER-PR142",
+      "not_before": "2026-09-16T17:26:53Z",
+      "reason": "Proposed authorization for only the exact backward-compatible fixed session-history profile in the retained behavior launcher in PR 142. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized.",
+      "subject_path": "scripts/ci/honcho_behavior_gate.py",
+      "valid_for_pr": 142
+    },
+    {
+      "allowed_target_state": "blob:ce6c7afa845879d3bcc4608f60022a0942f17fde",
+      "expected_old_blob": "61310f1c6385ae3ca5d0a1428725349ae0f6ed94",
+      "expires_at": "2026-09-23T17:26:53Z",
+      "id": "CUI-HISTORY-LAUNCHER-TESTS-PR142",
+      "not_before": "2026-09-16T17:26:53Z",
+      "reason": "Proposed authorization for only the exact regression coverage for the fixed session-history launcher profile in PR 142. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized.",
+      "subject_path": "tests/ci/test_honcho_behavior_gate.py",
+      "valid_for_pr": 142
+    },
+    {
+      "allowed_target_state": "blob:06bb909f7125191fb91e03d43350176dc622584d",
+      "expected_old_blob": "a0c9917fff2c68f8b8ac98258e565a5427ababec",
+      "expires_at": "2026-09-23T17:26:53Z",
+      "id": "CUI-HISTORY-ENROLLMENT-PR144",
+      "not_before": "2026-09-16T17:26:53Z",
+      "reason": "Proposed authorization for only the exact baseline-only enrollment of the session-history retained harness, documentation, workflow and product regression test controls, plus required regression-test and exact-owner-helper paths in PR 144. Effective only through normal approval-ledger review and merge; no capability, existing control, selector, upstream pin or recovery obligation is retired. No required-check activation or runtime deployment is authorized.",
+      "subject_path": ".ci/content-loss/baseline.json",
+      "valid_for_pr": 144
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "1224bad910f9bde3c96a2014370a5a2a25d51022",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-01",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 1: Desktop E2E mock support relocated to the current JS test harness; no product owner is removed.",
+      "subject_path": "apps/desktop/e2e/mock-server.ts",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "1445d9809632de3014623e14543b547dceb30fa0",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-02",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 2: Historical AIWerk mockup documentation only; no runtime import or consumer.",
+      "subject_path": "docs/aiwerk/mockups/INTEGRATION.md",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "5df45aa94f20e3a204d6fdc0c21b5bb2931c6e48",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-03",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 3: Historical AIWerk mockup documentation only; no runtime import or consumer.",
+      "subject_path": "docs/aiwerk/mockups/README.md",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "5f24be6572b9977538dfad082d345a6f49507532",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-04",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 4: Static mockup artifact only; not the shipped dashboard implementation.",
+      "subject_path": "docs/aiwerk/mockups/hermes-agent-dashboard.html",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "169430f955254f256478195bf7bfbff82e035b0d",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-05",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 5: Historical integration-plan documentation only; no executable owner.",
+      "subject_path": "docs/aiwerk/mockups/hermes-dashboard-backend-integration-plan.md",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "c902b50c3eaf60072e4aa115aaddee92a9df5e54",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-06",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 6: ACP adapter tests relocated with retained redaction assertions.",
+      "subject_path": "tests/acp/test_edit_approval.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "eebcf84c3bf3218830d70d186ce2b9efd457ad8b",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-07",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 7: ACP adapter event tests relocated to current owner namespace.",
+      "subject_path": "tests/acp/test_events.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "52e1684d58e7edc4657b6a0c1d872b6653751a0d",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-08",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 8: ACP adapter permission tests relocated to current owner namespace.",
+      "subject_path": "tests/acp/test_permissions.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "2ffb0093a4b81a4e29d28bbf72e898cf9d580786",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-09",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 9: ACP server tests relocated; retained outbound-sanitization nodes exist in current owner.",
+      "subject_path": "tests/acp/test_server.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "919b2b25b3421227b71d31e752f9f762ef2908c7",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-10",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 10: Tool-argument projection tests relocated with exact retained node names.",
+      "subject_path": "tests/acp/test_tool_argument_projection.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "d322d7627c283b000cc7d29f4f4bed2dbd48faa5",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-11",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 11: Issue-65429 regression was renamed without loss of the behavioral assertions.",
+      "subject_path": "tests/agent/test_skip_memory_store_65429.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "7b20cc7c535e8323a7efde6959fe84e7c7843d30",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-12",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 12: CLI test owner namespace migration.",
+      "subject_path": "tests/cli/test_cli_approval_ui.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "d2ad114941aeab70ca4a00ad8f405986c71959fc",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-13",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 13: CLI browser recovery tests relocated.",
+      "subject_path": "tests/cli/test_cli_browser_connect_recovered.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "e12819c412c330b001bda556ce44b929b15d20c4",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-14",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 14: CLI browser launcher tests relocated with exact launcher-config nodes.",
+      "subject_path": "tests/cli/test_cli_browser_launcher_recovery.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "7cd9aac48e0ef1c039a2a5a4964a67791db7e639",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-15",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 15: CLI redraw tests relocated.",
+      "subject_path": "tests/cli/test_cli_force_redraw.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "2080eaec171fae3076635e3079e79fb68e973181",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-16",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 16: Fresh-command tests relocated with exact retained validation nodes.",
+      "subject_path": "tests/cli/test_cli_fresh.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "6d1e12e6400f8c57b20ff81e3ade52aee8583afb",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-17",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 17: CLI goal-interrupt tests relocated.",
+      "subject_path": "tests/cli/test_cli_goal_interrupt.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "0661592950869ad7070a58131b7f635efa66d710",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-18",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 18: Session-command and Honcho-preview tests relocated with exact retained nodes.",
+      "subject_path": "tests/cli/test_cli_new_session.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "c180a7dc724dd522911749bd72d589e94f150063",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-19",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 19: CLI secret-capture tests relocated.",
+      "subject_path": "tests/cli/test_cli_secret_capture.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "2fdc9f01c036004a5f912ee62ae96481287923cb",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-20",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 20: CLI destructive-slash E2E test owner migration.",
+      "subject_path": "tests/cli/test_destructive_slash_inline_skip_e2e.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "3105810c7e0c888761b037b8193ebfbb2be99de5",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-21",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 21: Language-command tests relocated with exact retained language/skin nodes.",
+      "subject_path": "tests/cli/test_language_command.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "34ed6d768317f122fc4de0ac75135d68e757040b",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-22",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 22: Oneshot cleanup tests relocated with exact provider-shutdown nodes.",
+      "subject_path": "tests/cli/test_oneshot_cleanup.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "cdc4bc79a3ab0b8e516d460d5e8a930119f91ed9",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-23",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 23: Reasoning command ownership moved to the gateway/current dispatch owner.",
+      "subject_path": "tests/cli/test_reasoning_command.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "46cc66e6ba3815003eb1094808d099668206187d",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-24",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 24: Side-command tests relocated to current CLI owner.",
+      "subject_path": "tests/cli/test_side_command.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "8b9fbcadd5a2e253abc8aaace6bac321110e10f9",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-25",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 25: Dropped-tool-call recovery contract was composed into the current degenerate-final recovery owner.",
+      "subject_path": "tests/run_agent/test_dropped_tool_call_recovery.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "4d207159117c2160e2b5226061094ab56ef5d761",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-26",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 26: Memory-write bridge tests relocated with exact blocked/success/malformed nodes.",
+      "subject_path": "tests/run_agent/test_memory_write_bridge.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "be59b1ce134dcae6781ee2c8077703b249e1dbf9",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-27",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 27: Agent tests relocated to current package owner.",
+      "subject_path": "tests/run_agent/test_run_agent.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "34b5c8a70ae3162b01196d3c6e7b73c0eb8d0433",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-28",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 28: Codex response tests relocated; exact retained fence and provider nodes remain.",
+      "subject_path": "tests/run_agent/test_run_agent_codex_responses.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "8263e891b8e590c80ddaee57e7c8a3ccd26ae9ff",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-29",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 29: Steering tests relocated.",
+      "subject_path": "tests/run_agent/test_steer.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "f424f15b69e975924ddb9eb4a78d277b90a9df17",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-30",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 30: Heartbeat and memory-write authorization tests relocated with exact retained node.",
+      "subject_path": "tests/run_agent/test_tool_activity_heartbeat.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "c02239a0a706f100d467828f4e7b4ff2ec5c399a",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-31",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 31: Tool-batch segmentation tests relocated.",
+      "subject_path": "tests/run_agent/test_tool_batch_segmentation.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "7cd637f44a95425136278878a02f140c77705d84",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-32",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 32: Runtime guardrail tests relocated.",
+      "subject_path": "tests/run_agent/test_tool_call_guardrail_runtime.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "62463d6294fc31411204c023881887442bc3e2d2",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-33",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 33: FTS admission tests relocated to state owner.",
+      "subject_path": "tests/state/test_fts_rebuild_admission.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "3c961b061b7d0c56985e61374b8e4314cb6e0671",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-34",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 34: Rank19 repair-required tests relocated with exact retained nodes.",
+      "subject_path": "tests/state/test_fts_repair_required_rank19.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "e7772e070d86891f36eef574f0f1215484fdd01e",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-35",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 35: FTS runtime rebuild tests relocated.",
+      "subject_path": "tests/state/test_fts_runtime_rebuild.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "318ae8a435f01bcf0e821aeb3b06089716d1b4a1",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-36",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 36: AIWerk FTS regression tests relocated.",
+      "subject_path": "tests/state/test_fts_runtime_rebuild_aiwerk_regressions.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "76689eb9bb3da7d824b1b110a4c6d89d407159d4",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-37",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 37: Offline-repair lock regression test relocated with exact retained node.",
+      "subject_path": "tests/state/test_offline_repair_lock_regression.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "43c81e8be13e31b858d8de4660b4b1fcb0e17b31",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-38",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 38: State tests moved into the hermes_state owner directory.",
+      "subject_path": "tests/test_hermes_state.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "8fe84960afb294f291d64a5ce21c28cdd887397e",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-39",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 39: Installer test moved under the scripts/install owner.",
+      "subject_path": "tests/test_install_macos_launcher.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "cf309ad1b7d1ea08cb794c58dec6d183f2a398a1",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-40",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 40: Installer workspace test moved under the scripts/install owner.",
+      "subject_path": "tests/test_install_sh_node_deps_workspaces.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "8c1abf5007f5036462d91d0434c88ee6d7cb75b9",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-41",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 41: Lazy-session regressions moved to the TUI gateway owner.",
+      "subject_path": "tests/test_lazy_session_regressions.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "5d97193252c77a82ad094c8aa905e6bda3b9a674",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-42",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 42: Test-runner contract moved under scripts tests.",
+      "subject_path": "tests/test_run_tests_parallel.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "abd3c10382e377de8f8a94578cf7549cca49a162",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-43",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 43: Malformed-session DB tests moved to their CLI API owner.",
+      "subject_path": "tests/test_session_detail_malformed_db.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "2b6848eef7a60e8eeccf29bf6cc56c4876767c00",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-44",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 44: SQLite lock inspection tests moved to state owner with exact retained process-lock node.",
+      "subject_path": "tests/test_sqlite_lock_safe_inspection.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "a6465783e0278397b166ec95cd28e189fbd89329",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-45",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 45: Stale marker repair tests moved to state owner.",
+      "subject_path": "tests/test_stale_tool_call_marker_session_repair.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "92712e4c81da268ccd4bd653b30fd3d3e1078622",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-46",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 46: TUI gateway server tests moved to the gateway owner; current file retains AIWerk startup-task and authorization nodes.",
+      "subject_path": "tests/test_tui_gateway_server.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "absent",
+      "expected_old_blob": "f74d739efb6799dfaff7eef340c3600cd625fb53",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-47",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "47/47 semantic row 47: WAL checkpoint tests moved to state owner.",
+      "subject_path": "tests/test_wal_checkpoint_strategy.py",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "blob:cab6428ecdc623aab146ef637ad821aa141b1a24",
+      "expected_old_blob": "d6cb9cc3efd2e922fe05a6fdfa5732fb65ff1c52",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-48",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "Exact PR162 dependency control transition; validity window intentionally unset.",
+      "subject_path": "pyproject.toml",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "blob:579da8c61e7a7ff9e2892fecf869e0339d04f1cc",
+      "expected_old_blob": "bceb4da39159cdf6e0b103b576582e7ccd57e84d",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-49",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "Exact PR162 dependency control transition; validity window intentionally unset.",
+      "subject_path": "uv.lock",
+      "valid_for_pr": 165
+    },
+    {
+      "allowed_target_state": "blob:38c98f5a37596c4a681cdf108788032972bc2c81",
+      "expected_old_blob": "c79c6aa9a03172396b1260fa434944c4ca15cdd5",
+      "expires_at": "2026-10-03T11:07:48Z",
+      "id": "PR162-CLOSURE-163-50",
+      "not_before": "2026-10-02T11:07:48Z",
+      "reason": "Trusted Honcho harness correction; future control PR and validity window intentionally unset.",
+      "subject_path": ".ci/honcho-behavior/test_wire.py",
+      "valid_for_pr": 164
     }
   ],
   "schema_version": 1
