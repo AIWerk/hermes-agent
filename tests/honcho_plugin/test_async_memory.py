@@ -348,6 +348,16 @@ class TestAsyncWriterThread:
         mgr.stop_async_writer()
         assert mgr._async_thread is None
 
+    def test_stop_async_writer_passes_timeout_to_join(self, make_manager):
+        mgr = make_manager(write_frequency="async")
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        mgr._async_thread = thread
+
+        mgr.stop_async_writer(timeout=0.25)
+
+        thread.join.assert_called_once_with(timeout=0.25)
+
 
 # ---------------------------------------------------------------------------
 # async retry on failure

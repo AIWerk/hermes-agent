@@ -95,6 +95,10 @@ class TestShutdown:
         p._manager.flush_all.assert_not_called()
         p._manager.shutdown.assert_not_called()
         p._manager.stop_async_writer.assert_called_once()
+        stop_call = p._manager.stop_async_writer.call_args
+        assert stop_call.args == ()
+        assert set(stop_call.kwargs) == {"timeout"}
+        assert 0 < stop_call.kwargs["timeout"] <= 5
 
     def test_enabled_shuts_down_manager(self):
         p = self._provider_for_shutdown(save_messages=True)
