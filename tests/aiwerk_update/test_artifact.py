@@ -21,6 +21,12 @@ from scripts.aiwerk_update.artifact import (
 from scripts.aiwerk_update.contract import canonical_bytes
 
 
+def test_updater_entrypoint_has_payload_relocatable_shebang() -> None:
+    entrypoint = Path(__file__).parents[2] / "scripts/aiwerk-runtime-integrate"
+
+    assert entrypoint.read_bytes().splitlines()[0] == b"#!/usr/bin/env python3"
+
+
 def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
