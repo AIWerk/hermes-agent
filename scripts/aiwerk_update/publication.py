@@ -364,13 +364,18 @@ class GitHubPublisher:
             ("supply-chain", lambda name: "supply" in name and "chain" in name),
             ("osv", lambda name: "osv" in name),
         ):
-            matches = [
-                row
-                for row in check_verdict.get("checks", [])
-                if predicate(str(row.get("name", "")).casefold())
-            ]
-            if len(matches) == 1:
-                evidence[detector] = canonical_sha256(matches[0])
+            matches = sorted(
+                (
+                    row
+                    for row in check_verdict.get("checks", [])
+                    if predicate(str(row.get("name", "")).casefold())
+                ),
+                key=lambda row: (str(row.get("name", "")), int(row.get("id", 0))),
+            )
+            if matches and any(row.get("conclusion") == "success" for row in matches):
+                evidence[detector] = canonical_sha256(
+                    {"schema": 1, "detector": detector, "checks": matches}
+                )
         return evidence
 
     def publish(
