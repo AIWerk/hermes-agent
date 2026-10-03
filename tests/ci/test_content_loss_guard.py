@@ -454,6 +454,342 @@ def test_prior_exact_retirement_allows_only_bound_path_blob_and_pr(
     assert "FORK_OWNED_PATH_REMOVED" not in _codes(report)
 
 
+def test_check_transition_accepts_one_parent_prepublication_candidate(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    root, upstream, base = repo
+    _write(root, "new-product.txt", "new product\n")
+    target = _commit(root, "one-parent candidate")
+    json_out = tmp_path / "transition.json"
+    markdown_out = tmp_path / "transition.md"
+
+    rc = main(
+        [
+            "check-transition",
+            "--repo",
+            str(root),
+            "--active",
+            base,
+            "--target",
+            target,
+            "--upstream",
+            upstream,
+            "--json-out",
+            str(json_out),
+            "--markdown-out",
+            str(markdown_out),
+        ]
+    )
+
+    assert rc == 0
+    assert json.loads(json_out.read_text())["mode"] == "transition"
+
+
+def _content_bound_control_approval(
+    *, old_blob: str, new_blob: str, approval_id: str = "CTRL-CONTENT-1"
+) -> dict:
+    return {
+        "id": approval_id,
+        "transition_class": "control-transition",
+        "subject_path": "control.txt",
+        "expected_old_blob": old_blob,
+        "allowed_target_state": f"blob:{new_blob}",
+        "not_before": "2026-08-31T00:00:00Z",
+        "expires_at": "2026-09-01T00:00:00Z",
+        "reason": "exact content-bound control transition",
+    }
+
+
+def _content_bound_retirement(*, path: str, old_blob: str) -> dict:
+    return {
+        "id": "RET-CONTENT-1",
+        "transition_class": "path-retirement",
+        "subject_path": path,
+        "expected_old_blob": old_blob,
+        "allowed_target_state": "absent",
+        "not_before": "2026-08-31T00:00:00Z",
+        "expires_at": "2026-09-01T00:00:00Z",
+        "reason": "exact content-bound path retirement",
+    }
+
+
+def _repo_with_content_bound_control_approval(
+    repo: tuple[Path, str, str],
+) -> tuple[Path, str, str, str]:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["protected_controls"].append("control.txt")
+    _write(root, "control.txt", "old control\n")
+    _write(root, baseline_path.relative_to(root).as_posix(), json.dumps(baseline, sort_keys=True) + "\n")
+    control_base = _commit(root, "add protected control")
+    old_blob = _git(root, "rev-parse", f"{control_base}:control.txt")
+    _write(root, "control.txt", "new control\n")
+    new_blob = _git(root, "hash-object", "control.txt")
+    _write(root, "control.txt", "old control\n")
+    ledger = {
+        "schema_version": 2,
+        "approvals": [],
+        "transition_approvals": [
+            _content_bound_control_approval(old_blob=old_blob, new_blob=new_blob)
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    approval_base = _commit(root, "publish content-bound approval")
+    return root, upstream, approval_base, new_blob
+
+
+def test_schema2_transition_approval_publication_is_ledger_only_and_append_only(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["protected_controls"].append("control.txt")
+    _write(root, "control.txt", "old control\n")
+    _write(root, baseline_path.relative_to(root).as_posix(), json.dumps(baseline, sort_keys=True) + "\n")
+    base = _commit(root, "add protected control")
+    old_blob = _git(root, "rev-parse", f"{base}:control.txt")
+    _write(root, "control.txt", "new control\n")
+    new_blob = _git(root, "hash-object", "control.txt")
+    _write(root, "control.txt", "old control\n")
+    ledger = {
+        "schema_version": 2,
+        "approvals": [],
+        "transition_approvals": [
+            _content_bound_control_approval(old_blob=old_blob, new_blob=new_blob)
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    target = _commit(root, "publish content-bound approval")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "PASS"
+    assert report["content_control_transition_approvals_added"] == ["CTRL-CONTENT-1"]
+
+
+def test_schema2_approval_publication_rejects_product_hitchhiking(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base0 = repo
+    old_blob = _git(root, "rev-parse", f"{base0}:fork-only.txt")
+    ledger = {
+        "schema_version": 2,
+        "approvals": [],
+        "transition_approvals": [
+            _content_bound_retirement(path="fork-only.txt", old_blob=old_blob)
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    _write(root, "new-product.txt", "unreviewed product byte\n")
+    target = _commit(root, "invalid mixed approval publication")
+
+    report = evaluate_range(root, base0, target, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert "MIXED_CONTROL_AND_PRODUCT_CHANGE" in _codes(report)
+    assert report["content_path_retirement_approvals_added"] == []
+
+
+def test_schema2_transition_approval_rejects_pr_binding_and_duplicate_binding() -> None:
+    first = _content_bound_control_approval(old_blob="a" * 40, new_blob="b" * 40)
+    with_pr = {**first, "valid_for_pr": 165}
+    with pytest.raises(ContentLossError, match="keys mismatch"):
+        _guard._validate_retirements(
+            {"schema_version": 2, "approvals": [], "transition_approvals": [with_pr]}
+        )
+
+    duplicate = {**first, "id": "CTRL-CONTENT-2"}
+    with pytest.raises(ContentLossError, match="overlapping content-bound"):
+        _guard._validate_retirements(
+            {
+                "schema_version": 2,
+                "approvals": [],
+                "transition_approvals": [first, duplicate],
+            }
+        )
+    renewal = {
+        **first,
+        "id": "CTRL-CONTENT-RENEWED",
+        "not_before": first["expires_at"],
+        "expires_at": "2026-09-02T00:00:00Z",
+    }
+    validated = _guard._validate_retirements(
+        {
+            "schema_version": 2,
+            "approvals": [],
+            "transition_approvals": [first, renewal],
+        }
+    )
+    assert [item["id"] for item in validated["transition_approvals"]] == [
+        "CTRL-CONTENT-1",
+        "CTRL-CONTENT-RENEWED",
+    ]
+
+
+def test_content_bound_path_retirement_is_independent_of_future_pr_number(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base0 = repo
+    old_blob = _git(root, "rev-parse", f"{base0}:fork-only.txt")
+    ledger = {
+        "schema_version": 2,
+        "approvals": [],
+        "transition_approvals": [
+            _content_bound_retirement(path="fork-only.txt", old_blob=old_blob)
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    base = _commit(root, "publish content-bound retirement")
+    (root / "fork-only.txt").unlink()
+    target = _commit(root, "retire exact path")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=999, now=_NOW)
+
+    assert report["verdict"] == "PASS"
+    assert report["retirements_applied"] == ["RET-CONTENT-1"]
+
+
+def test_candidate_content_bound_retirement_cannot_self_authorize(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base = repo
+    old_blob = _git(root, "rev-parse", f"{base}:fork-only.txt")
+    ledger = {
+        "schema_version": 2,
+        "approvals": [],
+        "transition_approvals": [
+            _content_bound_retirement(path="fork-only.txt", old_blob=old_blob)
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    (root / "fork-only.txt").unlink()
+    target = _commit(root, "self authorize content retirement")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=999, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["retirements_applied"] == []
+    assert "FORK_OWNED_PATH_REMOVED" in _codes(report)
+
+
+def test_content_bound_control_transition_is_independent_of_future_pr_number(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base, _new_blob = _repo_with_content_bound_control_approval(repo)
+    _write(root, "control.txt", "new control\n")
+    target = _commit(root, "apply exact control bytes")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=999, now=_NOW)
+
+    assert report["verdict"] == "PASS"
+    assert report["control_transitions_applied"] == ["CTRL-CONTENT-1"]
+    assert "MIXED_CONTROL_AND_PRODUCT_CHANGE" not in _codes(report)
+
+
+def test_content_bound_control_transition_still_rejects_mixed_product_pr(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base, _new_blob = _repo_with_content_bound_control_approval(repo)
+    _write(root, "control.txt", "new control\n")
+    _write(root, "product-added.txt", "ordinary product byte\n")
+    target = _commit(root, "mix approved control and product bytes")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=999, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert "MIXED_CONTROL_AND_PRODUCT_CHANGE" in _codes(report)
+
+
+def test_content_bound_control_transition_wrong_blob_fails_closed(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base, _new_blob = _repo_with_content_bound_control_approval(repo)
+    _write(root, "control.txt", "different control\n")
+    _write(root, "product-added.txt", "ordinary product byte\n")
+    target = _commit(root, "apply wrong control bytes")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=999, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["control_transitions_applied"] == []
+    assert "UNAPPROVED_CONTROL_PLANE_CHANGE" in _codes(report)
+    assert "MIXED_CONTROL_AND_PRODUCT_CHANGE" in _codes(report)
+
+
+def test_candidate_content_bound_approval_cannot_self_authorize(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["protected_controls"].append("control.txt")
+    _write(root, "control.txt", "old control\n")
+    _write(root, baseline_path.relative_to(root).as_posix(), json.dumps(baseline, sort_keys=True) + "\n")
+    base = _commit(root, "add protected control")
+    old_blob = _git(root, "rev-parse", f"{base}:control.txt")
+    _write(root, "control.txt", "new control\n")
+    new_blob = _git(root, "hash-object", "control.txt")
+    ledger = {
+        "schema_version": 2,
+        "approvals": [],
+        "transition_approvals": [
+            _content_bound_control_approval(old_blob=old_blob, new_blob=new_blob)
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    _write(root, "product-added.txt", "ordinary product byte\n")
+    target = _commit(root, "attempt self authorization")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=999, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert report["control_transitions_applied"] == []
+    assert "MIXED_CONTROL_AND_PRODUCT_CHANGE" in _codes(report)
+
+
+def test_legacy_pr_bound_control_approval_remains_mixed_ineligible(
+    repo: tuple[Path, str, str],
+) -> None:
+    root, upstream, _base = repo
+    baseline_path = root / ".ci/content-loss/baseline.json"
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline["protected_controls"].append("control.txt")
+    _write(root, "control.txt", "old control\n")
+    _write(root, baseline_path.relative_to(root).as_posix(), json.dumps(baseline, sort_keys=True) + "\n")
+    control_base = _commit(root, "add protected control")
+    old_blob = _git(root, "rev-parse", f"{control_base}:control.txt")
+    _write(root, "control.txt", "new control\n")
+    new_blob = _git(root, "hash-object", "control.txt")
+    _write(root, "control.txt", "old control\n")
+    ledger = {
+        "schema_version": 1,
+        "approvals": [
+            {
+                "id": "LEGACY-CONTROL-17",
+                "subject_path": "control.txt",
+                "expected_old_blob": old_blob,
+                "allowed_target_state": f"blob:{new_blob}",
+                "valid_for_pr": 17,
+                "not_before": "2026-08-31T00:00:00Z",
+                "expires_at": "2026-09-01T00:00:00Z",
+                "reason": "legacy exact transition",
+            }
+        ],
+    }
+    _write(root, ".ci/content-loss/retirements.json", json.dumps(ledger, sort_keys=True) + "\n")
+    base = _commit(root, "publish legacy approval")
+    _write(root, "control.txt", "new control\n")
+    _write(root, "product-added.txt", "ordinary product byte\n")
+    target = _commit(root, "apply legacy mixed change")
+
+    report = evaluate_range(root, base, target, upstream, pr_number=17, now=_NOW)
+
+    assert report["verdict"] == "FAIL"
+    assert "MIXED_CONTROL_AND_PRODUCT_CHANGE" in _codes(report)
+
+
 @pytest.mark.parametrize("preserve", [False])
 def test_immutable_release_semantic_selector_blocks_hollow_contract(
     repo: tuple[Path, str, str], preserve: bool
@@ -1103,7 +1439,7 @@ def test_success_report_binds_all_authority_objects_and_completeness(
 
     report = evaluate_range(root, base, base, upstream, pr_number=17, now=_NOW)
 
-    assert report["guard_version"] == "r7a-v2"
+    assert report["guard_version"] == "r7a-v3-content-bound-transitions"
     assert report["program_status"] == {
         "canonical_recovery_complete": False,
         "phase": "incomplete-bootstrap",
@@ -1193,7 +1529,7 @@ def test_cli_error_still_writes_canonical_error_envelope(
 
     assert rc == 3
     assert report["verdict"] == "ERROR"
-    assert report["guard_version"] == "r7a-v2"
+    assert report["guard_version"] == "r7a-v3-content-bound-transitions"
     assert report["reason_codes"] == ["EVIDENCE_ERROR"]
     assert report["completeness"] == {
         "all_selectors_evaluated": False,
@@ -2069,6 +2405,63 @@ def test_approved_merge_range_rejects_noncanonical_merge_subject(
 
     with pytest.raises(ContentLossError, match="merge subject"):
         _guard.evaluate_approved_merge_range(root, active, target, upstream)
+
+
+def test_approved_merge_range_preserves_v2_evidence_per_hop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commits = ["a" * 40, "b" * 40, "c" * 40]
+    monkeypatch.setattr(
+        _guard,
+        "_approved_merge_hops",
+        lambda *_args: [
+            (commits[0], commits[1], 17, _NOW),
+            (commits[1], commits[2], 18, _NOW),
+        ],
+    )
+    monkeypatch.setattr(_guard, "_resolve", lambda _root, ref, _kind: ref)
+    reports = iter(
+        [
+            {
+                "verdict": "PASS",
+                "reason_codes": [],
+                "authority_blobs": {},
+                "authority_manifest_blob": None,
+                "completeness": {},
+                "control_plane_changes": [],
+                "control_transition_approvals_added": [],
+                "content_control_transition_approvals_added": ["CTRL-V2"],
+                "content_path_retirement_approvals_added": [],
+                "control_transitions_applied": [],
+                "path_retirement_approvals_added": [],
+                "retirements_applied": [],
+            },
+            {
+                "verdict": "PASS",
+                "reason_codes": [],
+                "authority_blobs": {},
+                "authority_manifest_blob": None,
+                "completeness": {},
+                "control_plane_changes": ["control.txt"],
+                "control_transition_approvals_added": [],
+                "content_control_transition_approvals_added": [],
+                "content_path_retirement_approvals_added": [],
+                "control_transitions_applied": ["CTRL-V2"],
+                "path_retirement_approvals_added": [],
+                "retirements_applied": [],
+            },
+        ]
+    )
+    monkeypatch.setattr(_guard, "evaluate_range", lambda *_args, **_kwargs: next(reports))
+
+    report = _guard.evaluate_approved_merge_range(
+        tmp_path, commits[0], commits[2], "d" * 40
+    )
+
+    assert report["range_hops"][0]["content_control_transition_approvals_added"] == [
+        "CTRL-V2"
+    ]
+    assert report["range_hops"][1]["control_transitions_applied"] == ["CTRL-V2"]
 
 
 def test_approved_merge_range_rejects_wrong_pr_binding(
