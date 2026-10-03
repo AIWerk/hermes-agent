@@ -34,7 +34,7 @@ _HISTORICAL_RANGE_TARGET = _HISTORICAL_CLASS_TARGET
 _HISTORICAL_RANGE_UPSTREAM = "cbd8de8ad64530be01efea23b7764d5c37c634ed"
 _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 _REGULAR_MODES = {"100644", "100755"}
-_GUARD_VERSION = "r7a-v2"
+_GUARD_VERSION = "r7a-v3-content-bound-transitions"
 _RECOVERY_PACKET_SHA256 = "8262d0e5fac12fc0b6f856f0e7e7091fe9e089e78310aec7f16dc2d120a089ec"
 _RECOVERY_LEDGER_SHA256 = "b99ea555b9ee0eeac3e60ce702502b217f5aa130e89ec2c8cecb0d24b8dba894"
 
@@ -332,9 +332,24 @@ def _validate_baseline(value: Any) -> dict[str, Any]:
 
 
 def _validate_retirements(value: Any) -> dict[str, Any]:
-    retirements = _require_exact_keys(value, {"schema_version", "approvals"}, "retirements")
-    if retirements["schema_version"] != 1 or not isinstance(retirements["approvals"], list):
+    if not isinstance(value, dict):
+        raise ContentLossError("retirements must be an object")
+    schema_version = value.get("schema_version")
+    if schema_version == 1:
+        retirements = _require_exact_keys(value, {"schema_version", "approvals"}, "retirements")
+        retirements = {**retirements, "transition_approvals": []}
+    elif schema_version == 2:
+        retirements = _require_exact_keys(
+            value,
+            {"schema_version", "approvals", "transition_approvals"},
+            "retirements",
+        )
+    else:
         raise ContentLossError("unsupported retirements schema")
+    if not isinstance(retirements["approvals"], list) or not isinstance(
+        retirements["transition_approvals"], list
+    ):
+        raise ContentLossError("retirement approval collections must be lists")
     ids: set[str] = set()
     required = {
         "id",
@@ -366,21 +381,69 @@ def _validate_retirements(value: Any) -> dict[str, Any]:
             raise ContentLossError(f"retirement {item['id']} has invalid PR binding")
         if not isinstance(item["reason"], str) or not item["reason"].strip():
             raise ContentLossError(f"retirement {item['id']} has no reason")
-        parsed_times: dict[str, datetime] = {}
-        for field in ("not_before", "expires_at"):
-            try:
-                parsed = datetime.fromisoformat(str(item[field]).replace("Z", "+00:00"))
-            except ValueError as exc:
-                raise ContentLossError(f"retirement {item['id']} has invalid {field}") from exc
-            if parsed.tzinfo is None or parsed.utcoffset() is None:
-                raise ContentLossError(
-                    f"retirement {item['id']} {field} must include timezone"
-                )
-            parsed_times[field] = parsed.astimezone(timezone.utc)
+        parsed_times = {field: _parse_time(str(item[field])) for field in ("not_before", "expires_at")}
         if parsed_times["not_before"] >= parsed_times["expires_at"]:
             raise ContentLossError(
                 f"retirement {item['id']} has non-positive validity interval"
             )
+    transition_required = {
+        "id",
+        "transition_class",
+        "subject_path",
+        "expected_old_blob",
+        "allowed_target_state",
+        "not_before",
+        "expires_at",
+        "reason",
+    }
+    bindings: dict[tuple[str, str, str, str], list[tuple[datetime, datetime]]] = {}
+    for index, raw in enumerate(retirements["transition_approvals"]):
+        item = _require_exact_keys(
+            raw,
+            transition_required,
+            f"retirements.transition_approvals[{index}]",
+        )
+        if not isinstance(item["id"], str) or not item["id"] or item["id"] in ids:
+            raise ContentLossError("approval ids must be unique non-empty strings")
+        ids.add(item["id"])
+        transition_class = item["transition_class"]
+        if transition_class not in {"control-transition", "path-retirement"}:
+            raise ContentLossError(f"transition approval {item['id']} has invalid class")
+        if not isinstance(item["subject_path"], str) or not item["subject_path"]:
+            raise ContentLossError(f"transition approval {item['id']} has invalid subject_path")
+        if not _OID_RE.fullmatch(str(item["expected_old_blob"])):
+            raise ContentLossError(f"transition approval {item['id']} has invalid expected_old_blob")
+        target_state = item["allowed_target_state"]
+        if transition_class == "control-transition":
+            valid_target = (
+                isinstance(target_state, str)
+                and target_state.startswith("blob:")
+                and _OID_RE.fullmatch(target_state[5:]) is not None
+            )
+        else:
+            valid_target = target_state == "absent"
+        if not valid_target:
+            raise ContentLossError(
+                f"transition approval {item['id']} has invalid target for its class"
+            )
+        if not isinstance(item["reason"], str) or not item["reason"].strip():
+            raise ContentLossError(f"transition approval {item['id']} has no reason")
+        not_before = _parse_time(str(item["not_before"]))
+        expires_at = _parse_time(str(item["expires_at"]))
+        if not_before >= expires_at:
+            raise ContentLossError(
+                f"transition approval {item['id']} has non-positive validity interval"
+            )
+        binding = (
+            item["transition_class"],
+            item["subject_path"],
+            item["expected_old_blob"],
+            item["allowed_target_state"],
+        )
+        windows = bindings.setdefault(binding, [])
+        if any(max(start, not_before) < min(end, expires_at) for start, end in windows):
+            raise ContentLossError("overlapping content-bound transition approval")
+        windows.append((not_before, expires_at))
     return retirements
 
 
@@ -461,7 +524,7 @@ def _historical_baseline() -> tuple[dict[str, Any], dict[str, Any], dict[str, st
     }
     return (
         baseline,
-        {"schema_version": 1, "approvals": []},
+        {"schema_version": 1, "approvals": [], "transition_approvals": []},
         {"baseline": "historical-built-in", "retirements": "historical-built-in"},
     )
 
@@ -516,6 +579,29 @@ def _matching_retirement(
     return matches[0] if matches else None
 
 
+def _matching_content_retirement(
+    approvals: list[dict[str, Any]],
+    *,
+    path: str,
+    old_blob: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    matches = [
+        item
+        for item in approvals
+        if item["transition_class"] == "path-retirement"
+        and item["subject_path"] == path
+        and item["expected_old_blob"] == old_blob
+        and item["allowed_target_state"] == "absent"
+        and _parse_time(item["not_before"])
+        <= now.astimezone(timezone.utc)
+        < _parse_time(item["expires_at"])
+    ]
+    if len(matches) > 1:
+        raise ContentLossError(f"multiple content-bound retirements match {path}")
+    return matches[0] if matches else None
+
+
 def _matching_control_transition(
     approvals: list[dict[str, Any]],
     *,
@@ -543,6 +629,30 @@ def _matching_control_transition(
     return matches[0] if matches else None
 
 
+def _matching_content_control_transition(
+    approvals: list[dict[str, Any]],
+    *,
+    path: str,
+    old_blob: str,
+    target_blob: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    matches = [
+        item
+        for item in approvals
+        if item["transition_class"] == "control-transition"
+        and item["subject_path"] == path
+        and item["expected_old_blob"] == old_blob
+        and item["allowed_target_state"] == f"blob:{target_blob}"
+        and _parse_time(item["not_before"])
+        <= now.astimezone(timezone.utc)
+        < _parse_time(item["expires_at"])
+    ]
+    if len(matches) > 1:
+        raise ContentLossError(f"multiple content-bound control transitions match {path}")
+    return matches[0] if matches else None
+
+
 def _validate_append_only_approvals(
     *,
     repo: Path,
@@ -560,6 +670,43 @@ def _validate_append_only_approvals(
     )
     old = base_retirements["approvals"]
     new = candidate["approvals"]
+    old_transitions = base_retirements["transition_approvals"]
+    new_transitions = candidate["transition_approvals"]
+    if candidate["schema_version"] == 2 and new == old:
+        if (
+            len(new_transitions) <= len(old_transitions)
+            or new_transitions[: len(old_transitions)] != old_transitions
+        ):
+            return None
+        added_transitions = new_transitions[len(old_transitions) :]
+        content_control_ids: list[str] = []
+        content_retirement_ids: list[str] = []
+        for item in added_transitions:
+            subject = item["subject_path"]
+            active = active_entries.get(subject)
+            if (
+                active is None
+                or active["type"] != "blob"
+                or active["mode"] not in _REGULAR_MODES
+                or item["expected_old_blob"] != active["oid"]
+            ):
+                return None
+            if item["transition_class"] == "control-transition":
+                if subject not in controls or subject == RETIREMENTS_PATH:
+                    return None
+                content_control_ids.append(item["id"])
+            elif item["transition_class"] == "path-retirement":
+                if subject in controls:
+                    return None
+                content_retirement_ids.append(item["id"])
+            else:
+                return None
+        return {
+            "control": [],
+            "content_control": sorted(content_control_ids),
+            "content_retirement": sorted(content_retirement_ids),
+            "path_retirement": [],
+        }
     if len(new) <= len(old) or new[: len(old)] != old or pr_number is None:
         return None
     added = new[len(old) :]
@@ -589,6 +736,8 @@ def _validate_append_only_approvals(
             return None
     return {
         "control": sorted(control_ids),
+        "content_control": [],
+        "content_retirement": [],
         "path_retirement": sorted(retirement_ids),
     }
 
@@ -1689,13 +1838,20 @@ def evaluate_range(
     missing_items: list[dict[str, Any]] = []
     for path in sorted(active_entries.keys() - target_entries.keys()):
         old = active_entries[path]
-        retirement = _matching_retirement(
-            retirements["approvals"],
+        retirement = _matching_content_retirement(
+            retirements["transition_approvals"],
             path=path,
             old_blob=old["oid"],
-            pr_number=pr_number,
             now=now,
         )
+        if retirement is None:
+            retirement = _matching_retirement(
+                retirements["approvals"],
+                path=path,
+                old_blob=old["oid"],
+                pr_number=pr_number,
+                now=now,
+            )
         upstream_entry = upstream_entries.get(path)
         previous_upstream_entry = previous_upstream_entries.get(path)
         if upstream_entry is None:
@@ -1770,25 +1926,33 @@ def evaluate_range(
     control_changes = sorted(path for path in changed if path in control_set)
     non_control_changes = [path for path in changed if path not in control_set]
     control_approvals_added: list[str] = []
+    content_control_approvals_added: list[str] = []
+    content_retirement_approvals_added: list[str] = []
     path_retirement_approvals_added: list[str] = []
     control_transitions_applied: list[str] = []
     if control_changes and non_control_changes:
         reasons.append("MIXED_CONTROL_AND_PRODUCT_CHANGE")
-    elif control_changes == [RETIREMENTS_PATH]:
-        added = _validate_append_only_approvals(
-            repo=root,
-            active_entries=active_entries,
-            target_entries=target_entries,
-            base_retirements=retirements,
-            controls=control_set,
-            pr_number=pr_number,
-        )
+    if control_changes == [RETIREMENTS_PATH]:
+        if non_control_changes:
+            added = None
+        else:
+            added = _validate_append_only_approvals(
+                repo=root,
+                active_entries=active_entries,
+                target_entries=target_entries,
+                base_retirements=retirements,
+                controls=control_set,
+                pr_number=pr_number,
+            )
         if added is None:
             reasons.append("UNAPPROVED_CONTROL_PLANE_CHANGE")
         else:
             control_approvals_added = added["control"]
+            content_control_approvals_added = added["content_control"]
+            content_retirement_approvals_added = added["content_retirement"]
             path_retirement_approvals_added = added["path_retirement"]
     elif control_changes:
+        unapproved_mixed = False
         for path in control_changes:
             active_entry = active_entries.get(path)
             target_entry = target_entries.get(path)
@@ -1801,16 +1965,25 @@ def evaluate_range(
                 and target_entry["type"] == "blob"
                 and target_entry["mode"] in _REGULAR_MODES
             ):
-                transition = _matching_control_transition(
-                    retirements["approvals"],
+                transition = _matching_content_control_transition(
+                    retirements["transition_approvals"],
                     path=path,
                     old_blob=active_entry["oid"],
                     target_blob=target_entry["oid"],
-                    pr_number=pr_number,
                     now=now,
                 )
+                if transition is None and not non_control_changes:
+                    transition = _matching_control_transition(
+                        retirements["approvals"],
+                        path=path,
+                        old_blob=active_entry["oid"],
+                        target_blob=target_entry["oid"],
+                        pr_number=pr_number,
+                        now=now,
+                    )
             if transition is None:
                 reasons.append("UNAPPROVED_CONTROL_PLANE_CHANGE")
+                unapproved_mixed = unapproved_mixed or bool(non_control_changes)
             else:
                 control_transitions_applied.append(transition["id"])
                 if path == BASELINE_PATH:
@@ -1821,6 +1994,8 @@ def evaluate_range(
                             "candidate baseline",
                         )
                     )
+        if unapproved_mixed or (RETIREMENTS_PATH in control_changes and non_control_changes):
+            reasons.append("MIXED_CONTROL_AND_PRODUCT_CHANGE")
 
     reason_codes = sorted(set(reasons))
     report = {
@@ -1837,6 +2012,8 @@ def evaluate_range(
         },
         "control_plane_changes": control_changes,
         "control_transition_approvals_added": control_approvals_added,
+        "content_control_transition_approvals_added": content_control_approvals_added,
+        "content_path_retirement_approvals_added": content_retirement_approvals_added,
         "control_transitions_applied": sorted(control_transitions_applied),
         "path_retirement_approvals_added": path_retirement_approvals_added,
         "generated_at": now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1972,6 +2149,22 @@ def evaluate_approved_merge_range(
                 "verdict": hop_report["verdict"],
                 "reason_codes": hop_report["reason_codes"],
                 "authority_blobs": hop_report["authority_blobs"],
+                "control_transition_approvals_added": hop_report[
+                    "control_transition_approvals_added"
+                ],
+                "content_control_transition_approvals_added": hop_report[
+                    "content_control_transition_approvals_added"
+                ],
+                "content_path_retirement_approvals_added": hop_report[
+                    "content_path_retirement_approvals_added"
+                ],
+                "control_transitions_applied": hop_report[
+                    "control_transitions_applied"
+                ],
+                "path_retirement_approvals_added": hop_report[
+                    "path_retirement_approvals_added"
+                ],
+                "retirements_applied": hop_report["retirements_applied"],
             }
         )
         if hop_report["verdict"] != "PASS":
@@ -1998,6 +2191,8 @@ def evaluate_approved_merge_range(
     )
     for field in (
         "control_transition_approvals_added",
+        "content_control_transition_approvals_added",
+        "content_path_retirement_approvals_added",
         "control_transitions_applied",
         "path_retirement_approvals_added",
         "retirements_applied",
@@ -2100,7 +2295,7 @@ def write_reports(report: dict[str, Any], *, json_out: Path, markdown_out: Path)
 def _error_report(args: argparse.Namespace, exc: ContentLossError) -> dict[str, Any]:
     if args.command == "check-pr":
         inputs = {"active": args.base, "target": args.head, "upstream": args.upstream}
-    elif args.command == "check-range":
+    elif args.command in {"check-range", "check-transition"}:
         inputs = {"active": args.active, "target": args.target, "upstream": args.upstream}
     else:
         inputs = {
@@ -2132,11 +2327,12 @@ def _error_report(args: argparse.Namespace, exc: ContentLossError) -> dict[str, 
 def _cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("check-range", "check-pr"):
+    for name in ("check-range", "check-transition", "check-pr"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--repo", type=Path, default=Path.cwd())
-        cmd.add_argument("--active" if name == "check-range" else "--base", required=True)
-        cmd.add_argument("--target" if name == "check-range" else "--head", required=True)
+        is_direct = name in {"check-range", "check-transition"}
+        cmd.add_argument("--active" if is_direct else "--base", required=True)
+        cmd.add_argument("--target" if is_direct else "--head", required=True)
         cmd.add_argument("--upstream", required=True)
         cmd.add_argument("--pr-number", type=int)
         cmd.add_argument("--json-out", type=Path, required=True)
@@ -2335,6 +2531,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.target,
                 args.upstream,
             )
+        elif args.command == "check-transition":
+            if args.pr_number is not None:
+                raise ContentLossError("check-transition is independent of PR numbers")
+            report = evaluate_range(
+                args.repo,
+                args.active,
+                args.target,
+                args.upstream,
+                pr_number=None,
+            )
+            report["mode"] = "transition"
         else:
             if args.pr_number is None:
                 raise ContentLossError("check-pr requires --pr-number")
