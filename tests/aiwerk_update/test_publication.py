@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import pytest
 
+from scripts.aiwerk_update.contract import canonical_sha256
 from scripts.aiwerk_update.publication import (
     GitHubClient,
     GitHubPublisher,
@@ -69,6 +70,54 @@ def test_all_visible_latest_terminal_and_required_success_is_pass() -> None:
     assert [row["name"] for row in verdict["checks"]] == sorted(
         [*REQUIRED, "optional-build", "osv-scanner"]
     )
+
+
+def test_detector_evidence_binds_every_matching_matrix_check() -> None:
+    checks = [
+        {
+            "id": 30,
+            "name": "Supply-chain scan / Scan PR for critical supply chain risks",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://example.invalid/30",
+            "app_id": 1,
+        },
+        {
+            "id": 20,
+            "name": "Supply-chain scan / Aggregate review statuses",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://example.invalid/20",
+            "app_id": 1,
+        },
+        {
+            "id": 50,
+            "name": "OSV scan / Scan lockfiles / osv-scan",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://example.invalid/50",
+            "app_id": 1,
+        },
+        {
+            "id": 40,
+            "name": "OSV scan / Emit review status",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://example.invalid/40",
+            "app_id": 1,
+        },
+    ]
+
+    evidence = GitHubPublisher._check_evidence({"checks": list(reversed(checks))})
+
+    supply = sorted(checks[:2], key=lambda row: (row["name"], row["id"]))
+    osv = sorted(checks[2:], key=lambda row: (row["name"], row["id"]))
+    assert evidence == {
+        "supply-chain": canonical_sha256(
+            {"schema": 1, "detector": "supply-chain", "checks": supply}
+        ),
+        "osv": canonical_sha256({"schema": 1, "detector": "osv", "checks": osv}),
+    }
 
 
 def test_workflow_inventory_requires_active_triggerable_ci() -> None:
