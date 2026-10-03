@@ -1,0 +1,8 @@
+#!/usr/bin/python3 -B
+"""Stable executable entrypoint for updater-owned AIWerk refreshes."""
+
+from aiwerk_update.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
