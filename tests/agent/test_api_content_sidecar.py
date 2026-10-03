@@ -559,7 +559,11 @@ class TestWireInvariant:
             memory_manager.shutdown_all()
 
         provider._manager.get_prefetch_context.assert_called_once_with(sid, original)
-        provider._manager.stop_async_writer.assert_called_once_with()
+        provider._manager.stop_async_writer.assert_called_once()
+        stop_call = provider._manager.stop_async_writer.call_args
+        assert stop_call.args == ()
+        assert set(stop_call.kwargs) == {"timeout"}
+        assert 0 < stop_call.kwargs["timeout"] <= 5
         provider._manager.shutdown.assert_not_called()
         assert not any(t.is_alive() for t in (
             provider._prefetch_thread, provider._sync_thread, provider._memwrite_thread

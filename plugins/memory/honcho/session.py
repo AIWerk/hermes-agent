@@ -339,11 +339,11 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                 self._async_thread = spawn_context_thread(self._async_writer_loop, name="honcho-async-writer")
                 self._async_thread.start()
 
-    def stop_async_writer(self) -> None:
-        """Join the async writer WITHOUT flushing (saveMessages: false must still exit cleanly)."""
+    def stop_async_writer(self, timeout: float = 10.0) -> None:
+        """Join the async writer without flushing, bounded by ``timeout``."""
         if self._async_queue is not None and self._async_thread is not None and self._async_thread.is_alive():
             self._async_queue.put(_ASYNC_SHUTDOWN)
-            self._async_thread.join(timeout=10)
+            self._async_thread.join(timeout=timeout)
 
     def shutdown(self) -> None:
         """Flush everything, then stop the async writer thread."""

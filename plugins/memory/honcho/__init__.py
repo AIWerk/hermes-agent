@@ -880,7 +880,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             if getattr(self._config, "save_messages", True):
                 manager.shutdown()  # flush_all() + join the writer
             else:
-                manager.stop_async_writer()
+                manager.stop_async_writer(timeout=5.0)
 
 
 def register(ctx) -> None:
