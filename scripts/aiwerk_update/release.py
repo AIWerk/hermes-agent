@@ -20,6 +20,88 @@ class ReleaseError(RuntimeError):
     pass
 
 
+def _required_digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ReleaseError(f"artifact verification incomplete: {label}")
+    return value
+
+
+def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
+    paths = verification.get("proof_receipts")
+    kinds = {
+        "installed_update_check": "AIWERK_INSTALLED_UPDATE_CHECK_RECEIPT",
+        "extracted_target_preflight": "AIWERK_EXTRACTED_TARGET_PREFLIGHT_RECEIPT",
+        "recovery": "AIWERK_RECOVERY_PROOF_RECEIPT",
+    }
+    if not isinstance(paths, dict) or set(paths) != set(kinds):
+        raise ReleaseError("artifact verification incomplete: persisted proof receipts")
+    documents: dict[str, tuple[bytes, dict[str, Any]]] = {}
+    for name, kind in kinds.items():
+        path = Path(str(paths[name]))
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            raise ReleaseError(f"persisted proof receipt unavailable: {name}")
+        try:
+            raw = path.read_bytes()
+            value = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ReleaseError(f"persisted proof receipt invalid: {name}: {exc}") from exc
+        if not isinstance(value, dict) or raw != canonical_bytes(value):
+            raise ReleaseError(f"persisted proof receipt is not canonical: {name}")
+        if value.get("schema_version") != 1 or value.get("kind") != kind:
+            raise ReleaseError(f"persisted proof receipt kind mismatch: {name}")
+        for field in (
+            "artifact_root",
+            "source_commit",
+            "source_git_tree",
+            "installed_updater_source_identity",
+            "installed_updater_wheel_identity",
+        ):
+            if value.get(field) != verification.get(field):
+                raise ReleaseError(f"persisted proof receipt identity mismatch: {name}")
+        documents[name] = raw, value
+    check = documents["installed_update_check"][1]
+    if (
+        check.get("status") != "AVAILABLE"
+        or check.get("exit_code") != 0
+        or check.get("release_id") != verification.get("release_id")
+        or check.get("archive_sha256") != verification.get("archive_sha256")
+        or check.get("archive_size") != verification.get("archive_size")
+    ):
+        raise ReleaseError("persisted update-check receipt is not an exact AVAILABLE result")
+    target = documents["extracted_target_preflight"][1]
+    if (
+        target.get("status") != "PASS"
+        or target.get("exit_code") != 0
+        or target.get("release_id") != verification.get("release_id")
+        or target.get("target_root") != str(Path(str(verification["artifact_root"])) / "runtime")
+    ):
+        raise ReleaseError("persisted extracted-target receipt mismatch")
+    recovery = documents["recovery"][1]
+    if (
+        recovery.get("status") != "PASS"
+        or recovery.get("disposition") != "FORWARD_ONLY_PRESTART_RECOVERY_PROVED"
+        or recovery.get("migration_class") != "forward_only"
+        or recovery.get("native_rollback_supported") is not False
+        or recovery.get("post_start_policy") != "CONTAINMENT_ONLY"
+        or recovery.get("target_bridge_verified") is not True
+        or recovery.get("predecessor_bridge_verified") is not True
+        or recovery.get("units_verified") is not True
+        or recovery.get("release_id") != verification.get("release_id")
+    ):
+        raise ReleaseError("persisted forward-only recovery proof is incomplete")
+    return {
+        "installed_update_check_receipt_sha256": hashlib.sha256(
+            documents["installed_update_check"][0]
+        ).hexdigest(),
+        "extracted_target_preflight_receipt_sha256": hashlib.sha256(
+            documents["extracted_target_preflight"][0]
+        ).hexdigest(),
+        "recovery_receipt_sha256": hashlib.sha256(documents["recovery"][0]).hexdigest(),
+    }
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -131,15 +213,24 @@ def write_artifact_handoff(
         "release_manifest_sha256",
         "archive_sha256",
         "archive_size",
+        "installed_updater_source_identity",
+        "installed_updater_wheel_identity",
     )
     if any(key not in verification for key in required):
         raise ReleaseError("artifact verification is incomplete")
+    for key in (
+        "installed_updater_source_identity",
+        "installed_updater_wheel_identity",
+    ):
+        _required_digest(verification[key], key)
+    proof_hashes = _verified_proof_hashes(verification)
     handoff = {
         "schema_version": 1,
         "kind": "AIWERK_LOCAL_ACTIVATION_HANDOFF",
         "status": "HANDOFF_READY",
         "artifact_root": resolved,
         **{key: verification[key] for key in required},
+        **proof_hashes,
         "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
         "service_restart": "NOT_RUN",
         "tenant_operations": "NOT_RUN",
@@ -155,19 +246,21 @@ def write_local_handoff(
     verification: dict[str, Any],
 ) -> dict[str, Any]:
     if verification.get("verdict") != "PASS":
-        raise ReleaseError("Local handoff requires a passing immutable release verification")
+        raise ReleaseError("Local fixture handoff requires a passing immutable release verification")
+    if verification.get("kind") != "AIWERK_IMMUTABLE_RELEASE_VERIFICATION":
+        raise ReleaseError("Local fixture handoff verification kind mismatch")
     verified_root = verification.get("release_root")
     if verified_root != str(release_root.resolve()):
-        raise ReleaseError("Local handoff release_root differs from verified release root")
+        raise ReleaseError("Local fixture handoff release_root differs from verified release root")
     handoff = {
         "schema_version": 1,
-        "kind": "AIWERK_LOCAL_ACTIVATION_HANDOFF",
-        "status": "HANDOFF_READY",
+        "kind": "AIWERK_LOCAL_HANDOFF_FIXTURE",
+        "status": "FIXTURE_ONLY",
         "release_root": str(release_root.resolve()),
         "source_commit": verification["source_commit"],
         "source_tree": verification["source_tree"],
         "manifest_sha256": verification["manifest_sha256"],
-        "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
+        "activation": "NOT_RUN_FIXTURE_ONLY",
         "service_restart": "NOT_RUN",
         "tenant_operations": "NOT_RUN",
     }

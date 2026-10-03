@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import csv
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -52,6 +55,102 @@ def _digest(value: Any, label: str) -> str:
     return value
 
 
+def _installed_updater_identities(root: Path) -> tuple[str, str]:
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as exc:
+        raise ArtifactError(f"installed updater root unavailable: {exc}") from exc
+    if root.is_symlink() or not resolved.is_dir() or root.absolute() != resolved:
+        raise ArtifactError("installed updater root must be a physical canonical directory")
+    packages = [path for path in resolved.rglob("aiwerk_runtime_updater") if path.is_dir()]
+    dist_infos = [
+        path
+        for path in resolved.rglob("aiwerk_runtime_updater-*.dist-info")
+        if path.is_dir()
+    ]
+    if (
+        len(packages) != 1
+        or len(dist_infos) != 1
+        or packages[0].parent != dist_infos[0].parent
+        or packages[0].is_symlink()
+        or dist_infos[0].is_symlink()
+    ):
+        raise ArtifactError("installed updater package or distribution metadata is ambiguous")
+    package_root = packages[0]
+    dist_info = dist_infos[0]
+    record = dist_info / "RECORD"
+    if record.is_symlink() or not record.is_file():
+        raise ArtifactError("installed distribution requires exactly one RECORD")
+    try:
+        rows = list(csv.reader(io.StringIO(record.read_text(encoding="utf-8"))))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise ArtifactError(f"installed RECORD unavailable: {exc}") from exc
+    if not rows or any(len(row) != 3 for row in rows):
+        raise ArtifactError("installed RECORD is not a bijection")
+    declared = {row[0]: (row[1], row[2]) for row in rows}
+    if len(declared) != len(rows):
+        raise ArtifactError("installed RECORD is not a bijection")
+    base = dist_info.parent
+    wheel_entries: list[dict[str, Any]] = []
+    located: dict[str, Path] = {}
+    for name in sorted(declared):
+        candidate = base / name
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ArtifactError("installed RECORD member unavailable")
+        path = candidate.resolve(strict=True)
+        try:
+            path.relative_to(resolved)
+        except ValueError as exc:
+            raise ArtifactError("installed RECORD member escapes updater root") from exc
+        raw = path.read_bytes()
+        recorded, size = declared[name]
+        if path != record:
+            wanted = "sha256=" + base64.urlsafe_b64encode(
+                hashlib.sha256(raw).digest()
+            ).rstrip(b"=").decode()
+            if recorded != wanted or not size.isdigit() or int(size) != len(raw):
+                raise ArtifactError(f"installed RECORD mismatch: {name}")
+        located[name] = path
+        wheel_entries.append(
+            {"path": name, "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        )
+    record_name = record.relative_to(base).as_posix()
+    if set(located) != set(declared) or record_name not in located:
+        raise ArtifactError("installed RECORD is not a bijection")
+    source_entries: list[dict[str, Any]] = []
+    for path in sorted(package_root.rglob("*.py"), key=lambda item: item.relative_to(package_root).as_posix()):
+        if path.is_symlink() or not path.is_file():
+            raise ArtifactError("installed updater source member unavailable")
+        raw = path.read_bytes()
+        source_entries.append(
+            {
+                "path": "package/" + path.relative_to(package_root).as_posix(),
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    marker = dist_info.name + "/"
+    for name, path in sorted(located.items()):
+        if marker not in name or name.endswith(("RECORD", "direct_url.json")):
+            continue
+        raw = path.read_bytes()
+        source_entries.append(
+            {
+                "path": "metadata/" + name.split(marker, 1)[1],
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    source_entries.sort(key=lambda row: row["path"])
+    source_manifest = canonical_bytes(
+        {"schema": 1, "kind": "aiwerk-updater-source-manifest", "entries": source_entries}
+    )
+    wheel_manifest = canonical_bytes(
+        {"schema": 1, "kind": "aiwerk-installed-wheel", "entries": wheel_entries}
+    )
+    return hashlib.sha256(source_manifest).hexdigest(), hashlib.sha256(wheel_manifest).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactBuildConfig:
     payload_builder: Path
@@ -66,6 +165,7 @@ class ArtifactBuildConfig:
     python_sha256: str
     epoch: int
     source_input_sha256: dict[str, str]
+    installed_updater_root: Path
 
     @classmethod
     def from_dict(
@@ -83,6 +183,7 @@ class ArtifactBuildConfig:
             "python_prefix",
             "python_sha256",
             "epoch",
+            "installed_updater_root",
         }
         if not isinstance(raw, dict) or set(raw) != required:
             raise ArtifactError("artifact build configuration schema mismatch")
@@ -95,6 +196,7 @@ class ArtifactBuildConfig:
                 "wheelhouse",
                 "wheel_lock",
                 "python_prefix",
+                "installed_updater_root",
             )
         }
         return cls(
@@ -146,6 +248,7 @@ class ArtifactBuildConfig:
             raise ArtifactError("wheel lock must be an absolute regular file")
         if not self.python_prefix.is_absolute() or not self.python_prefix.is_dir():
             raise ArtifactError("Python prefix must be an absolute directory")
+        _installed_updater_identities(self.installed_updater_root)
 
 
 class ExternalRuntimeArtifactBuilder:
@@ -205,6 +308,9 @@ class ExternalRuntimeArtifactBuilder:
         evidence: dict[str, Any],
     ) -> dict[str, Any]:
         source_repo = source_repo.resolve(strict=True)
+        installed_source_identity, installed_wheel_identity = _installed_updater_identities(
+            self.config.installed_updater_root
+        )
         output = output.absolute()
         if output.is_symlink():
             raise ArtifactError("artifact output cannot be a symlink")
@@ -215,6 +321,8 @@ class ExternalRuntimeArtifactBuilder:
                 output,
                 expected_commit=source_commit,
                 expected_git_tree=source_tree,
+                expected_installed_updater_source_identity=installed_source_identity,
+                expected_installed_updater_wheel_identity=installed_wheel_identity,
             )
         if not isinstance(evidence, dict) or set(evidence) != {
             "qualification_sha256",
@@ -405,6 +513,8 @@ class ExternalRuntimeArtifactBuilder:
             output,
             expected_commit=source_commit,
             expected_git_tree=source_tree,
+            expected_installed_updater_source_identity=installed_source_identity,
+            expected_installed_updater_wheel_identity=installed_wheel_identity,
         )
 
 
@@ -555,6 +665,8 @@ def verify_artifact_package(
     *,
     expected_commit: str,
     expected_git_tree: str,
+    expected_installed_updater_source_identity: str | None = None,
+    expected_installed_updater_wheel_identity: str | None = None,
 ) -> dict[str, Any]:
     root = root.absolute()
     if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
@@ -599,6 +711,18 @@ def verify_artifact_package(
     updater_raw, _updater = _document(
         root / "updater-manifest.json", kind="aiwerk-updater-source-manifest"
     )
+    if expected_installed_updater_source_identity is not None:
+        _digest(
+            expected_installed_updater_source_identity,
+            "expected_installed_updater_source_identity",
+        )
+        if _sha_bytes(updater_raw) != expected_installed_updater_source_identity:
+            raise ArtifactError("installed updater identity mismatch")
+    if expected_installed_updater_wheel_identity is not None:
+        _digest(
+            expected_installed_updater_wheel_identity,
+            "expected_installed_updater_wheel_identity",
+        )
     qualification_raw, qualification = _document(
         root / "qualification-receipt.json", kind="aiwerk-qualification-receipt"
     )
@@ -678,7 +802,7 @@ def verify_artifact_package(
     ):
         raise ArtifactError("approved pin hash graph mismatch")
     _verify_archive(archive, [*payload_entries, *aux_entries])
-    return {
+    result = {
         "schema_version": 1,
         "kind": "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION",
         "verdict": "PASS",
@@ -694,3 +818,8 @@ def verify_artifact_package(
         "aux_manifest_sha256": _sha_bytes(aux_raw),
         "approved_pin_sha256": _sha_bytes(pin_raw),
     }
+    if expected_installed_updater_source_identity is not None:
+        result["installed_updater_source_identity"] = expected_installed_updater_source_identity
+    if expected_installed_updater_wheel_identity is not None:
+        result["installed_updater_wheel_identity"] = expected_installed_updater_wheel_identity
+    return result

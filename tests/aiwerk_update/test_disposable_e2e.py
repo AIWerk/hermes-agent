@@ -25,6 +25,26 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+class FixtureProofArtifactBuilder:
+    """Test-only wrapper; production evidence must come from persisted real receipts."""
+
+    def __init__(self) -> None:
+        self.builder = DisposableSnapshotArtifactBuilder()
+
+    def build_verified(self, **kwargs) -> dict:
+        receipt = self.builder.build_verified(**kwargs)
+        receipt.update(
+            {
+                "installed_updater_source_identity": "1" * 64,
+                "installed_updater_wheel_identity": "2" * 64,
+                "installed_update_check_receipt_sha256": "3" * 64,
+                "extracted_target_preflight_receipt_sha256": "4" * 64,
+                "recovery_receipt_sha256": "5" * 64,
+            }
+        )
+        return receipt
+
+
 class LocalQualifier:
     def qualify(
         self,
@@ -87,14 +107,15 @@ def test_two_repository_disposable_e2e_reaches_handoff_without_network(tmp_path:
         upstream_commit=candidate,
         protected_controls={"pyproject.toml"},
         publisher=LocalGitPublisher(fork=fork, workspace=tmp_path / "merges"),
-        artifact_builder=DisposableSnapshotArtifactBuilder(),
+        artifact_builder=FixtureProofArtifactBuilder(),
         qualifier=LocalQualifier(),
         approval_not_before=datetime(2026, 10, 3, tzinfo=timezone.utc),
         approval_expires_at=datetime(2026, 10, 10, tzinfo=timezone.utc),
     )
 
-    assert handoff["status"] == "HANDOFF_READY"
-    assert handoff["activation"].startswith("NOT_RUN")
+    assert handoff["status"] == "FIXTURE_ONLY"
+    assert handoff["kind"] == "AIWERK_LOCAL_HANDOFF_FIXTURE"
+    assert handoff["activation"] == "NOT_RUN_FIXTURE_ONLY"
     publication = json.loads((store.root / "publication.json").read_text())
     assert [publication[name]["pr_url"] for name in ("approval", "control", "product")] == [
         "local://approval/1",
@@ -104,4 +125,5 @@ def test_two_repository_disposable_e2e_reaches_handoff_without_network(tmp_path:
     assert _git(source, "ls-remote", str(fork), "refs/heads/main").split()[0] == publication[
         "product"
     ]["merged_commit"]
-    assert json.loads((store.root / "state.json").read_text())["phase"] == "HANDOFF_READY"
+    assert json.loads((store.root / "state.json").read_text())["phase"] == "EXECUTING"
+    assert store.next_stage() == "handoff"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -205,7 +206,7 @@ def test_verify_artifact_package_rejects_payload_aux_path_overlap(tmp_path: Path
         verify_artifact_package(root, expected_commit=commit, expected_git_tree=git_tree)
 
 
-def test_external_builder_uses_payload_compiler_locked_wheels_and_no_activation(
+def test_external_builder_binds_selected_installed_updater_on_fresh_and_reuse(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source"
@@ -255,8 +256,22 @@ def test_external_builder_uses_payload_compiler_locked_wheels_and_no_activation(
         name: _sha((source / name).read_bytes())
         for name in ("pyproject.toml", "uv.lock", "immutable-release-build.json")
     }
+    installed_updater = tmp_path / "installed-updater"
+    package = installed_updater / "aiwerk_runtime_updater"
+    package.mkdir(parents=True)
+    (package / "cli.py").write_bytes(b"VERSION = '2.24.0'\n")
+    dist_info = installed_updater / "aiwerk_runtime_updater-2.24.0.dist-info"
+    dist_info.mkdir()
+    record = dist_info / "RECORD"
+    cli_raw = (package / "cli.py").read_bytes()
+    cli_digest = base64.urlsafe_b64encode(hashlib.sha256(cli_raw).digest()).rstrip(b"=").decode()
+    record.write_text(
+        f"aiwerk_runtime_updater/cli.py,sha256={cli_digest},{len(cli_raw)}\n"
+        "aiwerk_runtime_updater-2.24.0.dist-info/RECORD,,\n"
+    )
     commands: list[tuple[str, ...]] = []
     inventory_sha = "9" * 64
+    built_identity: dict[str, str] = {}
 
     def runner(argv: tuple[str, ...], cwd: Path) -> None:
         commands.append(argv)
@@ -280,8 +295,22 @@ def test_external_builder_uses_payload_compiler_locked_wheels_and_no_activation(
         elif argv[0] == str(runtime_tool):
             Path(argv[argv.index("--output") + 1]).mkdir()
 
-    def verifier(root: Path, *, expected_commit: str, expected_git_tree: str):
+    def verifier(
+        root: Path,
+        *,
+        expected_commit: str,
+        expected_git_tree: str,
+        expected_installed_updater_source_identity: str,
+        expected_installed_updater_wheel_identity: str,
+    ):
         assert root.is_dir()
+        measured = {
+            "installed_updater_source_identity": expected_installed_updater_source_identity,
+            "installed_updater_wheel_identity": expected_installed_updater_wheel_identity,
+        }
+        if built_identity and measured != built_identity:
+            raise ArtifactError("installed updater identity mismatch")
+        built_identity.update(measured)
         return {
             "schema_version": 1,
             "kind": "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION",
@@ -294,6 +323,7 @@ def test_external_builder_uses_payload_compiler_locked_wheels_and_no_activation(
             "release_manifest_sha256": "a" * 64,
             "archive_sha256": "b" * 64,
             "archive_size": 1,
+            **measured,
         }
 
     config = ArtifactBuildConfig(
@@ -309,6 +339,7 @@ def test_external_builder_uses_payload_compiler_locked_wheels_and_no_activation(
         python_sha256=_sha(Path(os.path.realpath(sys.executable)).read_bytes()),
         epoch=1,
         source_input_sha256=input_hashes,
+        installed_updater_root=installed_updater,
     )
     builder = ExternalRuntimeArtifactBuilder(config, runner=runner, verifier=verifier)
 
@@ -327,4 +358,29 @@ def test_external_builder_uses_payload_compiler_locked_wheels_and_no_activation(
     runtime_argv = next(argv for argv in commands if argv[0] == str(runtime_tool))
     assert old_payload.name not in " ".join(runtime_argv)
     assert "hermes_agent-1.2.3-py3-none-any.whl" in " ".join(runtime_argv)
+    assert len(receipt["installed_updater_source_identity"]) == 64
+    assert len(receipt["installed_updater_wheel_identity"]) == 64
+    assert receipt["installed_updater_source_identity"] != receipt["installed_updater_wheel_identity"]
+    assert builder.build_verified(
+        source_repo=source,
+        source_commit=commit,
+        source_tree=tree,
+        output=tmp_path / "artifact",
+        evidence={
+            "qualification_sha256": "6" * 64,
+            "detector_sha256": {"supply-chain": "7" * 64, "osv": "8" * 64},
+        },
+    ) == receipt
+    record.write_bytes(b"aiwerk_runtime_updater/cli.py,changed,\n")
+    with pytest.raises(ArtifactError, match="installed (?:updater identity|RECORD) mismatch"):
+        builder.build_verified(
+            source_repo=source,
+            source_commit=commit,
+            source_tree=tree,
+            output=tmp_path / "artifact",
+            evidence={
+                "qualification_sha256": "6" * 64,
+                "detector_sha256": {"supply-chain": "7" * 64, "osv": "8" * 64},
+            },
+        )
     assert not any("systemctl" in item or "activate" in item for argv in commands for item in argv)

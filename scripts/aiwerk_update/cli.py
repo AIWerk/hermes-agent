@@ -374,6 +374,195 @@ def _evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prove_handoff(args: argparse.Namespace) -> int:
+    run_root = Path(args.run_root)
+    updater_python = Path(args.updater_python)
+    config = Path(args.config)
+    artifact_root = Path(args.artifact_root)
+    predecessor_config = Path(args.predecessor_config)
+    predecessor_root = Path(args.predecessor_root)
+    for label, path, directory in (
+        ("run root", run_root, True),
+        ("updater Python", updater_python, False),
+        ("target config", config, False),
+        ("artifact root", artifact_root, True),
+        ("predecessor config", predecessor_config, False),
+        ("predecessor root", predecessor_root, True),
+    ):
+        resolved = path.resolve(strict=True)
+        if path.is_symlink() or path.absolute() != resolved or (resolved.is_dir() != directory):
+            raise StateError(f"{label} must be a physical canonical {'directory' if directory else 'file'}")
+    verification_path = run_root / "artifact.json"
+    verification_raw = verification_path.read_bytes()
+    verification = json.loads(verification_raw)
+    if (
+        not isinstance(verification, dict)
+        or verification_raw != canonical_bytes(verification)
+        or verification.get("kind") != "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION"
+        or verification.get("verdict") != "PASS"
+        or verification.get("artifact_root") != str(artifact_root)
+    ):
+        raise StateError("artifact verification is unavailable or mismatched")
+    for field, size in (
+        ("source_commit", 40),
+        ("source_git_tree", 40),
+        ("release_id", 40),
+        ("archive_sha256", 64),
+        ("installed_updater_source_identity", 64),
+        ("installed_updater_wheel_identity", 64),
+    ):
+        value = verification.get(field)
+        if not isinstance(value, str) or len(value) != size or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise StateError(f"artifact verification identity malformed: {field}")
+    if not isinstance(verification.get("archive_size"), int) or verification["archive_size"] < 1:
+        raise StateError("artifact verification archive size malformed")
+    publication_path = artifact_root / "publication.json"
+    publication_raw = publication_path.read_bytes()
+    publication_sha256 = hashlib.sha256(publication_raw).hexdigest()
+    for path in (config, predecessor_config):
+        raw = path.read_bytes()
+        value = json.loads(raw)
+        if not isinstance(value, dict) or raw != canonical_bytes(value):
+            raise StateError("recovery configuration is not canonical JSON")
+        if value.get("migration_class") != "forward_only":
+            raise StateError("recovery proof requires the exact forward_only policy")
+
+    def native(module: str, *argv: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            [str(updater_python), "-I", "-B", "-m", module, *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            close_fds=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise StateError(
+                f"native handoff proof failed: {module}: rc={result.returncode}: {result.stderr[-1000:]}"
+            )
+        return result
+
+    check_result = native(
+        "aiwerk_runtime_updater.cli",
+        "--lock-path",
+        str(run_root / "native-check.lock"),
+        "update",
+        "--check",
+        "--version",
+        verification["release_id"],
+        "--config",
+        str(config),
+        "--expect-updater-sha256",
+        verification["installed_updater_source_identity"],
+        "--expect-publication-sha256",
+        publication_sha256,
+        "--expect-archive-sha256",
+        verification["archive_sha256"],
+        "--expect-archive-size",
+        str(verification["archive_size"]),
+        "--receipt-stdout",
+        "--request-dir",
+        str(run_root / "native-requests"),
+    )
+    try:
+        check_value = json.loads(check_result.stdout)
+    except json.JSONDecodeError as exc:
+        raise StateError("native update check output is not JSON") from exc
+    expected_check = {
+        "status": "AVAILABLE",
+        "release_id": verification["release_id"],
+        "archive_sha256": verification["archive_sha256"],
+        "archive_size": verification["archive_size"],
+        "migration_class": "forward_only",
+    }
+    if check_value != expected_check:
+        raise StateError("native update check did not return the exact AVAILABLE result")
+    target_result = native(
+        "aiwerk_runtime_updater.artifact_preflight",
+        "--config",
+        str(config),
+        "--release-root",
+        str(artifact_root / "runtime"),
+    )
+    target_output = target_result.stdout.strip()
+    if not target_output.startswith("Hermes Agent v"):
+        raise StateError("native extracted-target preflight output mismatch")
+    target_bridge = native(
+        "aiwerk_runtime_updater.systemd_bridge_render",
+        "--config",
+        str(config),
+        "--verify-installed-root",
+        str(artifact_root / "runtime"),
+    )
+    predecessor_bridge = native(
+        "aiwerk_runtime_updater.systemd_bridge_render",
+        "--config",
+        str(predecessor_config),
+        "--verify-installed-root",
+        str(predecessor_root),
+    )
+    common = {
+        "schema_version": 1,
+        "artifact_root": str(artifact_root),
+        "source_commit": verification["source_commit"],
+        "source_git_tree": verification["source_git_tree"],
+        "installed_updater_source_identity": verification["installed_updater_source_identity"],
+        "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
+    }
+    receipts = {
+        "installed-update-check.json": {
+            **common,
+            "kind": "AIWERK_INSTALLED_UPDATE_CHECK_RECEIPT",
+            "status": "AVAILABLE",
+            "exit_code": 0,
+            "release_id": verification["release_id"],
+            "archive_sha256": verification["archive_sha256"],
+            "archive_size": verification["archive_size"],
+            "migration_class": "forward_only",
+            "stdout_sha256": hashlib.sha256(check_result.stdout.encode()).hexdigest(),
+        },
+        "extracted-target-preflight.json": {
+            **common,
+            "kind": "AIWERK_EXTRACTED_TARGET_PREFLIGHT_RECEIPT",
+            "status": "PASS",
+            "exit_code": 0,
+            "release_id": verification["release_id"],
+            "target_root": str(artifact_root / "runtime"),
+            "version_output": target_output,
+            "stdout_sha256": hashlib.sha256(target_result.stdout.encode()).hexdigest(),
+        },
+        "recovery-proof.json": {
+            **common,
+            "kind": "AIWERK_RECOVERY_PROOF_RECEIPT",
+            "status": "PASS",
+            "release_id": verification["release_id"],
+            "disposition": "FORWARD_ONLY_PRESTART_RECOVERY_PROVED",
+            "migration_class": "forward_only",
+            "native_rollback_supported": False,
+            "post_start_policy": "CONTAINMENT_ONLY",
+            "target_bridge_verified": True,
+            "predecessor_bridge_verified": True,
+            "units_verified": True,
+            "target_bridge_stdout_sha256": hashlib.sha256(target_bridge.stdout.encode()).hexdigest(),
+            "predecessor_bridge_stdout_sha256": hashlib.sha256(
+                predecessor_bridge.stdout.encode()
+            ).hexdigest(),
+        },
+    }
+    if any((run_root / name).exists() or (run_root / name).is_symlink() for name in receipts):
+        raise StateError("handoff proof receipt already exists")
+    for name, value in receipts.items():
+        _atomic_write(run_root / name, canonical_bytes(value))
+    _emit({"status": "PROOFS_READY", "run_root": str(run_root)}, as_json=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aiwerk-runtime-integrate")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -416,6 +605,15 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--refresh-root")
     evidence.add_argument("--run-id")
     evidence.set_defaults(handler=_evidence)
+
+    prove = sub.add_parser("prove-handoff")
+    prove.add_argument("--run-root", required=True)
+    prove.add_argument("--updater-python", required=True)
+    prove.add_argument("--config", required=True)
+    prove.add_argument("--artifact-root", required=True)
+    prove.add_argument("--predecessor-config", required=True)
+    prove.add_argument("--predecessor-root", required=True)
+    prove.set_defaults(handler=_prove_handoff)
     return parser
 
 

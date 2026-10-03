@@ -282,12 +282,25 @@ class RunStore:
         if state["phase"] != "EXECUTING" or self.next_stage() != "handoff":
             raise StateError("handoff can finish only after artifact completion")
         activation = handoff.get("activation")
+        proof_fields = (
+            "installed_updater_source_identity",
+            "installed_updater_wheel_identity",
+            "installed_update_check_receipt_sha256",
+            "extracted_target_preflight_receipt_sha256",
+            "recovery_receipt_sha256",
+        )
+        proofs_valid = all(
+            isinstance(handoff.get(field), str)
+            and len(handoff[field]) == 64
+            and all(character in "0123456789abcdef" for character in handoff[field])
+            for field in proof_fields
+        )
         if (
             handoff.get("status") != "HANDOFF_READY"
-            or not isinstance(activation, str)
-            or not activation.startswith("NOT_RUN")
+            or activation != "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME"
+            or not proofs_valid
         ):
-            raise StateError("handoff must be ready and explicitly non-activating")
+            raise StateError("handoff identity proof is incomplete or activation is blocked")
         _atomic_write(self.root / "local-handoff.json", canonical_bytes(handoff))
         final = {
             "schema_version": 1,
