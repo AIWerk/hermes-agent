@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,8 +8,10 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 
+import pytest
+
 from scripts.aiwerk_update.release import MANIFEST, inventory_release, verify_release
-from scripts.aiwerk_update.state import RunStore
+from scripts.aiwerk_update.state import RunStore, StateError
 from scripts.aiwerk_update.workflow import PublicationResult, execute_update
 
 
@@ -181,6 +184,43 @@ def test_execute_update_runs_control_then_product_and_stops_at_handoff(tmp_path:
     assert json.loads((store.root / "artifact.json").read_text())["verdict"] == "PASS"
     assert not (store.root / "manifest.sha256").exists()
     assert not (store.root / "candidate" / ".git").exists()
+
+
+def test_artifact_stage_binds_verification_before_handoff(tmp_path: Path) -> None:
+    repo, base, candidate = _candidate(tmp_path)
+    store = RunStore.create(
+        tmp_path / "runs",
+        run_id="artifact-binding",
+        request={"through": "local-handoff", "source_publication": True},
+        authority={"base_commit": base, "target_commit": candidate},
+    )
+    store.record_preflight({"verdict": "PASS", "failures": []})
+    execute_update(
+        store=store,
+        candidate_repo=repo,
+        base_commit=base,
+        candidate_commit=candidate,
+        upstream_commit=candidate,
+        protected_controls={"pyproject.toml"},
+        publisher=LocalPublisher(),
+        artifact_builder=SourceArtifactBuilder(),
+        qualifier=LocalQualifier(),
+        approval_not_before=datetime(2026, 10, 2, tzinfo=timezone.utc),
+        approval_expires_at=datetime(2026, 10, 9, tzinfo=timezone.utc),
+        stop_after="artifact",
+    )
+    artifact_path = store.root / "artifact.json"
+    state = json.loads((store.root / "state.json").read_text())
+    assert state["artifact_verification_sha256"] == hashlib.sha256(
+        artifact_path.read_bytes()
+    ).hexdigest()
+    artifact = json.loads(artifact_path.read_text())
+    artifact["installed_updater_source_identity"] = "9" * 64
+    artifact_path.write_bytes(
+        (json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+    with pytest.raises(StateError, match="artifact verification hash mismatch"):
+        RunStore.open(store.root)
 
 
 def test_execute_update_resumes_after_product_publication_without_republishing(

@@ -11,7 +11,11 @@ import venv
 
 import pytest
 
-from scripts.aiwerk_update.artifact import _installed_updater_identities
+from scripts.aiwerk_update.artifact import (
+    _installed_identity_receipt_path,
+    _installed_updater_identities,
+)
+from scripts.aiwerk_update import cli as cli_module
 from scripts.aiwerk_update.cli import build_parser, main
 from scripts.aiwerk_update.contract import canonical_bytes
 from scripts.aiwerk_update.source import capture_git_authority
@@ -244,7 +248,12 @@ def test_cli_exposes_resume_and_verifies_terminal_evidence(tmp_path: Path, capsy
 
 def _producer_fixture(tmp_path: Path, *, available: bool = True) -> list[str]:
     run_root = tmp_path / "run"
-    run_root.mkdir()
+    RunStore.create(
+        tmp_path,
+        run_id="run",
+        request={"through": "local-handoff", "source_publication": True},
+        authority={"base_commit": "a" * 40, "target_commit": "b" * 40},
+    )
     artifact_root = tmp_path / "artifact"
     runtime = artifact_root / "runtime"
     runtime.mkdir(parents=True)
@@ -369,7 +378,9 @@ def _builder_bound_producer_fixture(tmp_path: Path) -> list[str]:
     run_root = Path(argv[argv.index("--run-root") + 1])
     artifact_path = run_root / "artifact.json"
     verification = json.loads(artifact_path.read_text())
-    identity_receipt_path = tmp_path / "installed-updater-identity.json"
+    identity_receipt_path = _installed_identity_receipt_path(
+        Path(verification["artifact_root"])
+    )
     identity_receipt = {
         "schema_version": 1,
         "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
@@ -390,6 +401,13 @@ def _builder_bound_producer_fixture(tmp_path: Path) -> list[str]:
         installed_updater_identity_receipt_sha256=hashlib.sha256(identity_raw).hexdigest(),
     )
     artifact_path.write_bytes(canonical_bytes(verification))
+    store = RunStore.open(run_root)
+    store.record_preflight({"verdict": "PASS", "failures": []})
+    store.begin_execution()
+    for stage in ("control", "product", "publication"):
+        store.complete_stage(stage)
+    store.bind_artifact_verification(verification)
+    store.complete_stage("artifact")
     return argv
 
 
@@ -429,6 +447,65 @@ def test_prove_handoff_accepts_builder_bound_independently_measured_root(
         path = run_root / name
         assert path.is_file()
         assert not path.is_symlink()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_prove_handoff_rejects_caller_forged_builder_identity_receipt(
+    tmp_path: Path, capsys
+) -> None:
+    argv = _builder_bound_producer_fixture(tmp_path / "forged-binding")
+    run_root = Path(argv[argv.index("--run-root") + 1])
+    artifact_path = run_root / "artifact.json"
+    verification = json.loads(artifact_path.read_text())
+    original = Path(verification["installed_updater_identity_receipt_path"])
+    forged = tmp_path / "caller-created-identity.json"
+    forged.write_bytes(original.read_bytes())
+    verification["installed_updater_identity_receipt_path"] = str(forged.resolve())
+    verification["installed_updater_identity_receipt_sha256"] = hashlib.sha256(
+        forged.read_bytes()
+    ).hexdigest()
+    artifact_path.write_bytes(canonical_bytes(verification))
+
+    rc = main(argv)
+
+    assert rc == 2
+    assert "artifact verification hash mismatch" in capsys.readouterr().err
+
+
+def test_cli_resume_reports_blocked_recovery(tmp_path: Path, capsys, monkeypatch) -> None:
+    class BoundStore:
+        root = tmp_path
+        run_id = "resume-blocked"
+
+        @staticmethod
+        def _read_state() -> dict[str, str]:
+            return {
+                "candidate_sha256": "1" * 64,
+                "execution_config_sha256": "2" * 64,
+                "qualified_commit": "3" * 40,
+                "qualified_tree": "4" * 40,
+                "phase": "HANDOFF_BLOCKED_RECOVERY",
+            }
+
+    monkeypatch.setattr(cli_module.RunStore, "open", lambda _root: BoundStore())
+    monkeypatch.setattr(cli_module, "_read_object", lambda _path: {})
+    monkeypatch.setattr(cli_module, "_execution_config", lambda _value: {})
+    monkeypatch.setattr(
+        cli_module,
+        "_continue",
+        lambda _store, _config: {
+            "status": "HANDOFF_BLOCKED_RECOVERY",
+            "completion": False,
+            "activation": "NOT_RUN",
+        },
+    )
+
+    rc = main(["resume", "--run-root", str(tmp_path)])
+    output = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert output["verdict"] == "BLOCKED"
+    assert output["state"] == "HANDOFF_BLOCKED_RECOVERY"
 
 
 @pytest.mark.live_system_guard_bypass

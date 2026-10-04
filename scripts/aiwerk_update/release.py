@@ -10,6 +10,7 @@ import stat
 import subprocess
 from typing import Any
 
+from .artifact import _installed_identity_receipt_path
 from .contract import _atomic_write, canonical_bytes
 
 
@@ -28,6 +29,19 @@ def _required_digest(value: Any, label: str) -> str:
     return value
 
 
+def installed_identity_probe_code() -> str:
+    return (
+        "import importlib.metadata,json,sys;"
+        "from pathlib import Path;"
+        "import aiwerk_runtime_updater as package;"
+        "dist=importlib.metadata.distribution('aiwerk-runtime-updater');"
+        "print(json.dumps({'prefix':sys.prefix,'executable':sys.executable,"
+        "'package':str(Path(package.__file__).resolve().parent),"
+        "'distribution':str(Path(dist.locate_file('')).resolve())},"
+        "sort_keys=True,separators=(',',':')))"
+    )
+
+
 def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
     paths = verification.get("proof_receipts")
     kinds = {
@@ -44,10 +58,14 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
     identity_receipt_sha256 = verification.get(
         "installed_updater_identity_receipt_sha256"
     )
+    expected_identity_receipt_path = _installed_identity_receipt_path(
+        Path(str(verification.get("artifact_root", "")))
+    )
     if (
         not isinstance(installed_root, str)
         or not Path(installed_root).is_absolute()
         or not identity_receipt_path.is_absolute()
+        or identity_receipt_path != expected_identity_receipt_path
         or identity_receipt_path.is_symlink()
         or not identity_receipt_path.is_file()
         or not isinstance(identity_receipt_sha256, str)
@@ -102,6 +120,12 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
     execution_fields = (
         "installed_updater_root",
         "installed_updater_python",
+        "target_config_path",
+        "target_config_sha256",
+        "predecessor_config_path",
+        "predecessor_config_sha256",
+        "predecessor_root",
+        "publication_sha256",
         "identity_probe_argv",
         "identity_probe_exit_code",
         "identity_probe_output_path",
@@ -139,6 +163,51 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
         }
     ) != 1:
         raise ReleaseError("persisted execution proof identity mismatch")
+
+    common_value = documents["installed_update_check"][1]
+    root = Path(str(common_value["installed_updater_root"]))
+    python = Path(str(common_value["installed_updater_python"]))
+    target_config = Path(str(common_value["target_config_path"]))
+    predecessor_config = Path(str(common_value["predecessor_config_path"]))
+    predecessor_root = Path(str(common_value["predecessor_root"]))
+    artifact_root = Path(str(verification.get("artifact_root", "")))
+    for path, digest, label in (
+        (target_config, common_value["target_config_sha256"], "target config"),
+        (
+            predecessor_config,
+            common_value["predecessor_config_sha256"],
+            "predecessor config",
+        ),
+        (
+            artifact_root / "publication.json",
+            common_value["publication_sha256"],
+            "publication",
+        ),
+    ):
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or path.resolve(strict=True) != path
+            or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+        ):
+            raise ReleaseError(f"persisted execution proof {label} binding mismatch")
+    if (
+        not predecessor_root.is_absolute()
+        or predecessor_root.is_symlink()
+        or not predecessor_root.is_dir()
+        or predecessor_root.resolve(strict=True) != predecessor_root
+    ):
+        raise ReleaseError("persisted execution proof predecessor root mismatch")
+    expected_identity_argv = [
+        str(python),
+        "-I",
+        "-B",
+        "-c",
+        installed_identity_probe_code(),
+    ]
+    if common_value["identity_probe_argv"] != expected_identity_argv:
+        raise ReleaseError("persisted native argv mismatch: identity probe")
 
     receipt_roots = {Path(str(paths[name])).parent for name in kinds}
     if len(receipt_roots) != 1:
@@ -208,6 +277,34 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
         raise ReleaseError("retained native output identity probe mismatch")
 
     check = documents["installed_update_check"][1]
+    expected_check_argv = [
+        str(python),
+        "-I",
+        "-B",
+        "-m",
+        "aiwerk_runtime_updater.cli",
+        "--lock-path",
+        str(run_root / "native-check.lock"),
+        "update",
+        "--check",
+        "--version",
+        str(verification.get("release_id")),
+        "--config",
+        str(target_config),
+        "--expect-updater-sha256",
+        str(verification.get("installed_updater_source_identity")),
+        "--expect-publication-sha256",
+        str(common_value["publication_sha256"]),
+        "--expect-archive-sha256",
+        str(verification.get("archive_sha256")),
+        "--expect-archive-size",
+        str(verification.get("archive_size")),
+        "--receipt-stdout",
+        "--request-dir",
+        str(run_root / "native-requests"),
+    ]
+    if check.get("argv") != expected_check_argv:
+        raise ReleaseError("persisted native argv mismatch: update check")
     try:
         _required_digest(check.get("stdout_sha256"), "installed update-check stdout")
     except ReleaseError as exc:
@@ -240,6 +337,19 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
     ):
         raise ReleaseError("persisted update-check receipt is not an exact AVAILABLE result")
     target = documents["extracted_target_preflight"][1]
+    expected_target_argv = [
+        str(python),
+        "-I",
+        "-B",
+        "-m",
+        "aiwerk_runtime_updater.artifact_preflight",
+        "--config",
+        str(target_config),
+        "--release-root",
+        str(artifact_root / "runtime"),
+    ]
+    if target.get("argv") != expected_target_argv:
+        raise ReleaseError("persisted native argv mismatch: extracted target")
     try:
         _required_digest(target.get("stdout_sha256"), "extracted-target stdout")
     except ReleaseError as exc:
@@ -267,6 +377,32 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
     ):
         raise ReleaseError("persisted extracted-target receipt mismatch")
     recovery = documents["recovery"][1]
+    expected_target_bridge_argv = [
+        str(python),
+        "-I",
+        "-B",
+        "-m",
+        "aiwerk_runtime_updater.systemd_bridge_render",
+        "--config",
+        str(target_config),
+        "--verify-installed-root",
+        str(artifact_root / "runtime"),
+    ]
+    expected_predecessor_bridge_argv = [
+        str(python),
+        "-I",
+        "-B",
+        "-m",
+        "aiwerk_runtime_updater.systemd_bridge_render",
+        "--config",
+        str(predecessor_config),
+        "--verify-installed-root",
+        str(predecessor_root),
+    ]
+    if recovery.get("target_bridge_argv") != expected_target_bridge_argv:
+        raise ReleaseError("persisted native argv mismatch: target bridge")
+    if recovery.get("predecessor_bridge_argv") != expected_predecessor_bridge_argv:
+        raise ReleaseError("persisted native argv mismatch: predecessor bridge")
     for field in (
         "target_bridge_stdout_sha256",
         "predecessor_bridge_stdout_sha256",

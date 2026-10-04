@@ -86,6 +86,10 @@ class RunStore:
             raise StateError("request authority hash mismatch")
         if authority_sha != state.get("authority_sha256"):
             raise StateError("repository authority hash mismatch")
+        if "artifact_verification_sha256" in state:
+            _artifact, artifact_sha = self._canonical_object("artifact.json")
+            if artifact_sha != state.get("artifact_verification_sha256"):
+                raise StateError("artifact verification hash mismatch")
         if "candidate_sha256" not in state:
             return
         candidate, candidate_sha = self._canonical_object("candidate.json")
@@ -261,6 +265,32 @@ class RunStore:
         state["phase"] = "EXECUTING"
         self._write_state(state)
         self._append_event("execution-started", {})
+
+    def bind_artifact_verification(self, verification: dict[str, Any]) -> None:
+        state = self._read_state()
+        if state["phase"] != "EXECUTING" or self.next_stage() != "artifact":
+            raise StateError("artifact binding requires the artifact stage")
+        if "artifact_verification_sha256" in state:
+            raise StateError("artifact verification is already bound")
+        actual, artifact_sha = self._canonical_object("artifact.json")
+        if actual != verification:
+            raise StateError("artifact verification bytes differ from builder result")
+        state["artifact_verification_sha256"] = artifact_sha
+        self._write_state(state)
+        self._append_event(
+            "artifact-verification-bound",
+            {"artifact_verification_sha256": artifact_sha},
+        )
+
+    def verify_artifact_verification(self) -> dict[str, Any]:
+        state = self._read_state()
+        expected = state.get("artifact_verification_sha256")
+        if not isinstance(expected, str):
+            raise StateError("artifact verification is not builder-bound")
+        artifact, actual = self._canonical_object("artifact.json")
+        if actual != expected:
+            raise StateError("artifact verification hash mismatch")
+        return artifact
 
     def complete_stage(self, stage: str) -> None:
         if stage not in _STAGES[1:-1]:

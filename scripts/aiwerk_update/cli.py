@@ -16,6 +16,7 @@ from .artifact import (
     ArtifactBuildConfig,
     ArtifactError,
     ExternalRuntimeArtifactBuilder,
+    _installed_identity_receipt_path,
     _installed_updater_identities,
 )
 from .contract import ContractError, _atomic_write, canonical_bytes, canonical_sha256
@@ -27,7 +28,7 @@ from .source import (
 )
 from .state import RunStore, StateError
 from .publication import GitHubClient, GitHubPublisher, PublicationError
-from .release import ReleaseError
+from .release import ReleaseError, installed_identity_probe_code
 from .workflow import execute_update
 
 
@@ -320,17 +321,18 @@ def _resume(args: argparse.Namespace) -> int:
         raise StateError("run is not execution-bound and cannot be resumed")
     config = _execution_config(_read_object(store.root / "execution-config.json"))
     result = _continue(store, config)
+    blocked = result.get("status") == "HANDOFF_BLOCKED_RECOVERY"
     _emit(
         {
             "run_id": store.run_id,
             "run_root": str(store.root),
             "state": store._read_state()["phase"],
-            "verdict": "PASS",
+            "verdict": "BLOCKED" if blocked else "PASS",
             "handoff": result,
         },
         as_json=True,
     )
-    return 0
+    return 1 if blocked else 0
 
 
 def _evidence(args: argparse.Namespace) -> int:
@@ -411,13 +413,10 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         raise StateError(f"installed updater interpreter unavailable: {exc}") from exc
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise StateError("installed updater interpreter is not executable")
-    verification_path = run_root / "artifact.json"
-    verification_raw = verification_path.read_bytes()
-    verification = json.loads(verification_raw)
+    store = RunStore.open(run_root)
+    verification = store.verify_artifact_verification()
     if (
-        not isinstance(verification, dict)
-        or verification_raw != canonical_bytes(verification)
-        or verification.get("kind") != "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION"
+        verification.get("kind") != "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION"
         or verification.get("verdict") != "PASS"
         or verification.get("artifact_root") != str(artifact_root)
     ):
@@ -443,9 +442,13 @@ def _prove_handoff(args: argparse.Namespace) -> int:
     identity_receipt_sha256 = verification.get(
         "installed_updater_identity_receipt_sha256"
     )
+    expected_identity_receipt_path = _installed_identity_receipt_path(artifact_root).resolve(
+        strict=True
+    )
     if (
         verification.get("installed_updater_root") != str(installed_updater_root)
         or not identity_receipt_path.is_absolute()
+        or identity_receipt_path.resolve(strict=True) != expected_identity_receipt_path
         or identity_receipt_path.is_symlink()
         or not identity_receipt_path.is_file()
         or not isinstance(identity_receipt_sha256, str)
@@ -485,6 +488,7 @@ def _prove_handoff(args: argparse.Namespace) -> int:
     publication_path = artifact_root / "publication.json"
     publication_raw = publication_path.read_bytes()
     publication_sha256 = hashlib.sha256(publication_raw).hexdigest()
+    config_sha256: dict[Path, str] = {}
     for path in (config, predecessor_config):
         raw = path.read_bytes()
         value = json.loads(raw)
@@ -492,6 +496,7 @@ def _prove_handoff(args: argparse.Namespace) -> int:
             raise StateError("recovery configuration is not canonical JSON")
         if value.get("migration_class") != "forward_only":
             raise StateError("recovery proof requires the exact forward_only policy")
+        config_sha256[path] = hashlib.sha256(raw).hexdigest()
 
     def persist_stdout(
         name: str,
@@ -533,16 +538,7 @@ def _prove_handoff(args: argparse.Namespace) -> int:
             )
         return result, execution
 
-    probe_code = (
-        "import importlib.metadata,json,sys;"
-        "from pathlib import Path;"
-        "import aiwerk_runtime_updater as package;"
-        "dist=importlib.metadata.distribution('aiwerk-runtime-updater');"
-        "print(json.dumps({'prefix':sys.prefix,'executable':sys.executable,"
-        "'package':str(Path(package.__file__).resolve().parent),"
-        "'distribution':str(Path(dist.locate_file('')).resolve())},"
-        "sort_keys=True,separators=(',',':')))"
-    )
+    probe_code = installed_identity_probe_code()
     identity_argv = [str(updater_python), "-I", "-B", "-c", probe_code]
     identity_probe = subprocess.run(
         identity_argv,
@@ -652,6 +648,12 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
         "installed_updater_root": str(installed_updater_root),
         "installed_updater_python": str(updater_python),
+        "target_config_path": str(config),
+        "target_config_sha256": config_sha256[config],
+        "predecessor_config_path": str(predecessor_config),
+        "predecessor_config_sha256": config_sha256[predecessor_config],
+        "predecessor_root": str(predecessor_root),
+        "publication_sha256": publication_sha256,
         "identity_probe_argv": identity_execution["argv"],
         "identity_probe_exit_code": identity_execution["exit_code"],
         "identity_probe_output_path": identity_execution["output_path"],

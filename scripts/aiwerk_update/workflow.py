@@ -505,13 +505,14 @@ def execute_update(
             },
         )
         _atomic_write(store.root / "artifact.json", canonical_bytes(verification))
+        store.bind_artifact_verification(verification)
         store.complete_stage("artifact")
         paused = _checkpoint(store, "artifact", stop_after)
         if paused:
             return paused
 
     if store.next_stage() == "handoff":
-        verification = _read_json(store.root / "artifact.json")
+        verification = store.verify_artifact_verification()
         if verification.get("kind") == "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION":
             verification = dict(verification)
             verification["proof_receipts"] = {
