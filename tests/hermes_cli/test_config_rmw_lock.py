@@ -44,7 +44,8 @@ def _race_second_writer_into_first_writers_save(monkeypatch, first, second, time
     erases ``first``'s mutation. With the RMW lock ``second`` blocks before its load, ``first``'s
     wait times out, and the two writes serialize. Returns ``(first_response, second_response)``."""
     import hermes_cli.config as cfg_mod
-    import hermes_cli.web_server as web_server
+    import hermes_cli.web_routers.config_env as config_env_router
+    import hermes_cli.web_routers.models as models_router
 
     real_save, real_load = cfg_mod.save_config, cfg_mod.load_config
     first_at_save, second_loaded = threading.Event(), threading.Event()
@@ -67,10 +68,9 @@ def _race_second_writer_into_first_writers_save(monkeypatch, first, second, time
             second_loaded.set()
         return cfg
 
-    monkeypatch.setattr(cfg_mod, "load_config", spied_load)
-    monkeypatch.setattr(cfg_mod, "save_config", gated_save)
-    monkeypatch.setattr(web_server, "load_config", spied_load)
-    monkeypatch.setattr(web_server, "save_config", gated_save)
+    for router in (config_env_router, models_router):
+        monkeypatch.setattr(router, "load_config", spied_load)
+        monkeypatch.setattr(router, "save_config", gated_save)
 
     results: list = [None, None]
     threads = [threading.Thread(target=lambda: results.__setitem__(0, first())),
