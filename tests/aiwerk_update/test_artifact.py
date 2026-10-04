@@ -17,6 +17,7 @@ from scripts.aiwerk_update.artifact import (
     ArtifactBuildConfig,
     ArtifactError,
     ExternalRuntimeArtifactBuilder,
+    _installed_updater_identities,
     verify_artifact_package,
 )
 from scripts.aiwerk_update.contract import canonical_bytes
@@ -206,7 +207,7 @@ def test_verify_artifact_package_rejects_payload_aux_path_overlap(tmp_path: Path
         verify_artifact_package(root, expected_commit=commit, expected_git_tree=git_tree)
 
 
-def test_external_builder_binds_selected_installed_updater_on_fresh_and_reuse(
+def test_external_builder_reuse_rejects_wheel_only_identity_drift(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source"
@@ -263,12 +264,19 @@ def test_external_builder_binds_selected_installed_updater_on_fresh_and_reuse(
     dist_info = installed_updater / "aiwerk_runtime_updater-2.24.0.dist-info"
     dist_info.mkdir()
     record = dist_info / "RECORD"
+    direct_url = dist_info / "direct_url.json"
+    direct_url.write_bytes(b'{"url":"file:///original"}\n')
     cli_raw = (package / "cli.py").read_bytes()
     cli_digest = base64.urlsafe_b64encode(hashlib.sha256(cli_raw).digest()).rstrip(b"=").decode()
+    direct_url_digest = base64.urlsafe_b64encode(
+        hashlib.sha256(direct_url.read_bytes()).digest()
+    ).rstrip(b"=").decode()
     record.write_text(
         f"aiwerk_runtime_updater/cli.py,sha256={cli_digest},{len(cli_raw)}\n"
+        f"aiwerk_runtime_updater-2.24.0.dist-info/direct_url.json,sha256={direct_url_digest},{direct_url.stat().st_size}\n"
         "aiwerk_runtime_updater-2.24.0.dist-info/RECORD,,\n"
     )
+    original_installed_identities = _installed_updater_identities(installed_updater)
     commands: list[tuple[str, ...]] = []
     inventory_sha = "9" * 64
     built_identity: dict[str, str] = {}
@@ -308,9 +316,8 @@ def test_external_builder_binds_selected_installed_updater_on_fresh_and_reuse(
             "installed_updater_source_identity": expected_installed_updater_source_identity,
             "installed_updater_wheel_identity": expected_installed_updater_wheel_identity,
         }
-        if built_identity and measured != built_identity:
-            raise ArtifactError("installed updater identity mismatch")
-        built_identity.update(measured)
+        if not built_identity:
+            built_identity.update(measured)
         return {
             "schema_version": 1,
             "kind": "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION",
@@ -371,8 +378,19 @@ def test_external_builder_binds_selected_installed_updater_on_fresh_and_reuse(
             "detector_sha256": {"supply-chain": "7" * 64, "osv": "8" * 64},
         },
     ) == receipt
-    record.write_bytes(b"aiwerk_runtime_updater/cli.py,changed,\n")
-    with pytest.raises(ArtifactError, match="installed (?:updater identity|RECORD) mismatch"):
+    direct_url.write_bytes(b'{"url":"file:///wheel-only-drift"}\n')
+    drifted_direct_url_digest = base64.urlsafe_b64encode(
+        hashlib.sha256(direct_url.read_bytes()).digest()
+    ).rstrip(b"=").decode()
+    record.write_text(
+        f"aiwerk_runtime_updater/cli.py,sha256={cli_digest},{len(cli_raw)}\n"
+        f"aiwerk_runtime_updater-2.24.0.dist-info/direct_url.json,sha256={drifted_direct_url_digest},{direct_url.stat().st_size}\n"
+        "aiwerk_runtime_updater-2.24.0.dist-info/RECORD,,\n"
+    )
+    drifted_installed_identities = _installed_updater_identities(installed_updater)
+    assert drifted_installed_identities[0] == original_installed_identities[0]
+    assert drifted_installed_identities[1] != original_installed_identities[1]
+    with pytest.raises(ArtifactError, match="installed updater wheel identity mismatch"):
         builder.build_verified(
             source_repo=source,
             source_commit=commit,

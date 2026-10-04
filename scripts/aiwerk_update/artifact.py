@@ -17,7 +17,7 @@ import tomllib
 from typing import Any, Callable
 import zipfile
 
-from .contract import canonical_bytes
+from .contract import _atomic_write, canonical_bytes
 
 
 class ArtifactError(RuntimeError):
@@ -149,6 +149,52 @@ def _installed_updater_identities(root: Path) -> tuple[str, str]:
         {"schema": 1, "kind": "aiwerk-installed-wheel", "entries": wheel_entries}
     )
     return hashlib.sha256(source_manifest).hexdigest(), hashlib.sha256(wheel_manifest).hexdigest()
+
+
+def _installed_identity_receipt_path(output: Path) -> Path:
+    return output.parent / f".{output.name}.installed-updater-identity.json"
+
+
+def _installed_identity_receipt(
+    *,
+    output: Path,
+    source_commit: str,
+    source_tree: str,
+    source_identity: str,
+    wheel_identity: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
+        "artifact_root": str(output),
+        "source_commit": source_commit,
+        "source_git_tree": source_tree,
+        "installed_updater_source_identity": source_identity,
+        "installed_updater_wheel_identity": wheel_identity,
+    }
+
+
+def _verify_installed_identity_receipt(
+    path: Path,
+    *,
+    expected: dict[str, Any],
+) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ArtifactError("installed updater identity receipt unavailable")
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"installed updater identity receipt invalid: {exc}") from exc
+    if not isinstance(value, dict) or raw != canonical_bytes(value) or value != expected:
+        if isinstance(value, dict) and (
+            value.get("installed_updater_source_identity")
+            == expected["installed_updater_source_identity"]
+            and value.get("installed_updater_wheel_identity")
+            != expected["installed_updater_wheel_identity"]
+        ):
+            raise ArtifactError("installed updater wheel identity mismatch")
+        raise ArtifactError("installed updater identity receipt mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,11 +358,23 @@ class ExternalRuntimeArtifactBuilder:
             self.config.installed_updater_root
         )
         output = output.absolute()
+        identity_receipt_path = _installed_identity_receipt_path(output)
+        identity_receipt = _installed_identity_receipt(
+            output=output,
+            source_commit=source_commit,
+            source_tree=source_tree,
+            source_identity=installed_source_identity,
+            wheel_identity=installed_wheel_identity,
+        )
         if output.is_symlink():
             raise ArtifactError("artifact output cannot be a symlink")
         if output.exists():
             if not output.is_dir():
                 raise ArtifactError("artifact output exists with wrong type")
+            _verify_installed_identity_receipt(
+                identity_receipt_path,
+                expected=identity_receipt,
+            )
             return self.verifier(
                 output,
                 expected_commit=source_commit,
@@ -324,6 +382,8 @@ class ExternalRuntimeArtifactBuilder:
                 expected_installed_updater_source_identity=installed_source_identity,
                 expected_installed_updater_wheel_identity=installed_wheel_identity,
             )
+        if identity_receipt_path.exists() or identity_receipt_path.is_symlink():
+            raise ArtifactError("installed updater identity receipt already exists")
         if not isinstance(evidence, dict) or set(evidence) != {
             "qualification_sha256",
             "detector_sha256",
@@ -509,6 +569,11 @@ class ExternalRuntimeArtifactBuilder:
         self.runner(tuple(argv), source_repo)
         if self._git(source_repo, "status", "--porcelain=v1", "--untracked-files=no"):
             raise ArtifactError("artifact tools modified tracked source bytes")
+        _atomic_write(identity_receipt_path, canonical_bytes(identity_receipt))
+        _verify_installed_identity_receipt(
+            identity_receipt_path,
+            expected=identity_receipt,
+        )
         return self.verifier(
             output,
             expected_commit=source_commit,

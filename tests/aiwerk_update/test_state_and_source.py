@@ -137,7 +137,7 @@ def test_run_store_resume_uses_same_run_and_first_incomplete_stage(tmp_path: Pat
     assert len((store.root / "events.jsonl").read_text().splitlines()) == 4
 
 
-def test_run_store_finishes_in_handoff_ready_terminal_state(tmp_path: Path) -> None:
+def test_finish_handoff_rejects_prestart_containment_only_recovery(tmp_path: Path) -> None:
     store = RunStore.create(
         tmp_path,
         run_id="20261002T220000Z-base-target",
@@ -149,23 +149,26 @@ def test_run_store_finishes_in_handoff_ready_terminal_state(tmp_path: Path) -> N
     for stage in ("control", "product", "publication", "artifact"):
         store.complete_stage(stage)
 
-    store.finish_handoff(
-        {
-            "status": "HANDOFF_READY",
-            "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
-            "installed_updater_source_identity": "1" * 64,
-            "installed_updater_wheel_identity": "2" * 64,
-            "installed_update_check_receipt_sha256": "3" * 64,
-            "extracted_target_preflight_receipt_sha256": "4" * 64,
-            "recovery_receipt_sha256": "5" * 64,
-        }
-    )
+    with pytest.raises(StateError, match="recovery|handoff"):
+        store.finish_handoff(
+            {
+                "status": "HANDOFF_READY",
+                "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
+                "installed_updater_source_identity": "1" * 64,
+                "installed_updater_wheel_identity": "2" * 64,
+                "installed_update_check_receipt_sha256": "3" * 64,
+                "extracted_target_preflight_receipt_sha256": "4" * 64,
+                "recovery_receipt_sha256": "5" * 64,
+                "recovery_disposition": "FORWARD_ONLY_PRESTART_RECOVERY_PROVED",
+                "post_start_policy": "CONTAINMENT_ONLY",
+            }
+        )
 
     state = json.loads((store.root / "state.json").read_text())
-    assert state["phase"] == "HANDOFF_READY"
-    assert store.next_stage() is None
-    assert json.loads((store.root / "final.json").read_text())["status"] == "HANDOFF_READY"
-    assert (store.root / "manifest.sha256").is_file()
+    assert state["phase"] == "EXECUTING"
+    assert not (store.root / "local-handoff.json").exists()
+    assert not (store.root / "final.json").exists()
+    assert not (store.root / "manifest.sha256").exists()
 
 
 def test_finish_handoff_rejects_activation_blocked_or_unproven_identity(
@@ -191,11 +194,11 @@ def test_finish_handoff_rejects_activation_blocked_or_unproven_identity(
         "extracted_target_preflight_receipt_sha256": "4" * 64,
         "recovery_receipt_sha256": "5" * 64,
     }
-    with pytest.raises(StateError, match="identity|proof|handoff"):
+    with pytest.raises(StateError, match="post-failure recovery"):
         executing_store("missing-proof").finish_handoff(
             {"status": "HANDOFF_READY", "activation": "NOT_RUN"}
         )
-    with pytest.raises(StateError, match="blocked|activation|handoff"):
+    with pytest.raises(StateError, match="post-failure recovery"):
         executing_store("activation-blocked").finish_handoff(
             {
                 "status": "HANDOFF_READY",
@@ -205,14 +208,15 @@ def test_finish_handoff_rejects_activation_blocked_or_unproven_identity(
         )
 
     complete = executing_store("complete-proof")
-    complete.finish_handoff(
-        {
-            "status": "HANDOFF_READY",
-            "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
-            **proof,
-        }
-    )
-    assert json.loads((complete.root / "state.json").read_text())["phase"] == "HANDOFF_READY"
+    with pytest.raises(StateError, match="post-failure recovery"):
+        complete.finish_handoff(
+            {
+                "status": "HANDOFF_READY",
+                "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
+                **proof,
+            }
+        )
+    assert json.loads((complete.root / "state.json").read_text())["phase"] == "EXECUTING"
 
 
 def test_run_store_open_rejects_bound_authority_candidate_or_config_tamper(

@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -376,14 +377,16 @@ def _evidence(args: argparse.Namespace) -> int:
 
 def _prove_handoff(args: argparse.Namespace) -> int:
     run_root = Path(args.run_root)
-    updater_python = Path(args.updater_python)
+    if args.updater_python is not None or args.installed_updater_root is None:
+        raise StateError("installed updater root is required; arbitrary updater Python is rejected")
+    installed_updater_root = Path(args.installed_updater_root)
     config = Path(args.config)
     artifact_root = Path(args.artifact_root)
     predecessor_config = Path(args.predecessor_config)
     predecessor_root = Path(args.predecessor_root)
     for label, path, directory in (
         ("run root", run_root, True),
-        ("updater Python", updater_python, False),
+        ("installed updater root", installed_updater_root, True),
         ("target config", config, False),
         ("artifact root", artifact_root, True),
         ("predecessor config", predecessor_config, False),
@@ -392,6 +395,16 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         resolved = path.resolve(strict=True)
         if path.is_symlink() or path.absolute() != resolved or (resolved.is_dir() != directory):
             raise StateError(f"{label} must be a physical canonical {'directory' if directory else 'file'}")
+    interpreters = sorted((installed_updater_root / "bin").glob("python3.*"))
+    if len(interpreters) != 1:
+        raise StateError("installed updater root must contain exactly one versioned Python interpreter")
+    updater_python = interpreters[0]
+    try:
+        executable = updater_python.resolve(strict=True)
+    except OSError as exc:
+        raise StateError(f"installed updater interpreter unavailable: {exc}") from exc
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise StateError("installed updater interpreter is not executable")
     verification_path = run_root / "artifact.json"
     verification_raw = verification_path.read_bytes()
     verification = json.loads(verification_raw)
@@ -447,6 +460,49 @@ def _prove_handoff(args: argparse.Namespace) -> int:
                 f"native handoff proof failed: {module}: rc={result.returncode}: {result.stderr[-1000:]}"
             )
         return result
+
+    probe_code = (
+        "import json,sys;"
+        "from pathlib import Path;"
+        "import aiwerk_runtime_updater as package;"
+        "from aiwerk_runtime_updater.source import installed_wheel_identity,source_identity;"
+        "print(json.dumps({'prefix':sys.prefix,'package':str(Path(package.__file__).resolve().parent),"
+        "'source_identity':source_identity()[0],'wheel_identity':installed_wheel_identity()[0]},"
+        "sort_keys=True,separators=(',',':')))"
+    )
+    identity_probe = subprocess.run(
+        [str(updater_python), "-I", "-B", "-c", probe_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+        close_fds=True,
+        check=False,
+    )
+    if identity_probe.returncode != 0:
+        raise StateError(
+            f"installed updater identity probe failed: rc={identity_probe.returncode}: "
+            f"{identity_probe.stderr[-1000:]}"
+        )
+    try:
+        identity_value = json.loads(identity_probe.stdout)
+        package_root = Path(identity_value["package"])
+        package_root.relative_to(installed_updater_root)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise StateError("installed updater identity probe output mismatch") from exc
+    if (
+        identity_value.get("prefix") != str(installed_updater_root)
+        or identity_value.get("source_identity")
+        != verification["installed_updater_source_identity"]
+        or identity_value.get("wheel_identity")
+        != verification["installed_updater_wheel_identity"]
+        or package_root.name != "aiwerk_runtime_updater"
+    ):
+        raise StateError("installed updater interpreter or package identity mismatch")
+    identity_probe_sha256 = hashlib.sha256(identity_probe.stdout.encode()).hexdigest()
 
     check_result = native(
         "aiwerk_runtime_updater.cli",
@@ -514,6 +570,9 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         "source_git_tree": verification["source_git_tree"],
         "installed_updater_source_identity": verification["installed_updater_source_identity"],
         "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
+        "installed_updater_root": str(installed_updater_root),
+        "installed_updater_python": str(updater_python),
+        "identity_probe_stdout_sha256": identity_probe_sha256,
     }
     receipts = {
         "installed-update-check.json": {
@@ -540,9 +599,9 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         "recovery-proof.json": {
             **common,
             "kind": "AIWERK_RECOVERY_PROOF_RECEIPT",
-            "status": "PASS",
+            "status": "BLOCKED",
             "release_id": verification["release_id"],
-            "disposition": "FORWARD_ONLY_PRESTART_RECOVERY_PROVED",
+            "disposition": "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN",
             "migration_class": "forward_only",
             "native_rollback_supported": False,
             "post_start_policy": "CONTAINMENT_ONLY",
@@ -559,7 +618,14 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         raise StateError("handoff proof receipt already exists")
     for name, value in receipts.items():
         _atomic_write(run_root / name, canonical_bytes(value))
-    _emit({"status": "PROOFS_READY", "run_root": str(run_root)}, as_json=True)
+    _emit(
+        {
+            "status": "HANDOFF_BLOCKED",
+            "reason": "EXECUTABLE_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN",
+            "run_root": str(run_root),
+        },
+        as_json=True,
+    )
     return 0
 
 
@@ -608,7 +674,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     prove = sub.add_parser("prove-handoff")
     prove.add_argument("--run-root", required=True)
-    prove.add_argument("--updater-python", required=True)
+    prove.add_argument("--updater-python")
+    prove.add_argument("--installed-updater-root")
     prove.add_argument("--config", required=True)
     prove.add_argument("--artifact-root", required=True)
     prove.add_argument("--predecessor-config", required=True)

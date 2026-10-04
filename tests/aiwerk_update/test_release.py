@@ -71,6 +71,9 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
         "source_git_tree": verification["source_git_tree"],
         "installed_updater_source_identity": verification["installed_updater_source_identity"],
         "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
+        "installed_updater_root": str(tmp_path / "installed-updater"),
+        "installed_updater_python": str(tmp_path / "installed-updater/bin/python3.12"),
+        "identity_probe_stdout_sha256": "6" * 64,
     }
     documents = {
         "installed_update_check": {
@@ -81,6 +84,7 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
             "release_id": verification["release_id"],
             "archive_sha256": verification["archive_sha256"],
             "archive_size": verification["archive_size"],
+            "stdout_sha256": "7" * 64,
         },
         "extracted_target_preflight": {
             **common,
@@ -89,19 +93,23 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
             "exit_code": 0,
             "release_id": verification["release_id"],
             "target_root": str(artifact_root / "runtime"),
+            "version_output": "Hermes Agent v0.21.1",
+            "stdout_sha256": "8" * 64,
         },
         "recovery": {
             **common,
             "kind": "AIWERK_RECOVERY_PROOF_RECEIPT",
-            "status": "PASS",
+            "status": "BLOCKED",
             "release_id": verification["release_id"],
-            "disposition": "FORWARD_ONLY_PRESTART_RECOVERY_PROVED",
+            "disposition": "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN",
             "migration_class": "forward_only",
             "native_rollback_supported": False,
             "post_start_policy": "CONTAINMENT_ONLY",
             "target_bridge_verified": True,
             "predecessor_bridge_verified": True,
             "units_verified": True,
+            "target_bridge_stdout_sha256": "9" * 64,
+            "predecessor_bridge_stdout_sha256": "a" * 64,
         },
     }
     paths = {}
@@ -182,7 +190,7 @@ def test_local_handoff_never_authorizes_activation_or_switches_root(tmp_path: Pa
         write_local_handoff(output, release_root=other, verification=receipt)
 
 
-def test_artifact_package_handoff_is_nonactivating_and_hash_bound(tmp_path: Path) -> None:
+def test_artifact_handoff_rejects_synthetic_execution_receipts(tmp_path: Path) -> None:
     package = tmp_path / "package"
     package.mkdir()
     verification = {
@@ -205,16 +213,13 @@ def test_artifact_package_handoff_is_nonactivating_and_hash_bound(tmp_path: Path
     }
     verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
 
-    handoff = write_artifact_handoff(
-        tmp_path / "handoff.json",
-        artifact_root=package,
-        verification=verification,
-    )
-
-    assert handoff["status"] == "HANDOFF_READY"
-    assert handoff["artifact_root"] == str(package.resolve())
-    assert handoff["activation"].startswith("NOT_RUN")
-    assert handoff["service_restart"] == "NOT_RUN"
+    with pytest.raises(ReleaseError, match="execution proof|recovery"):
+        write_artifact_handoff(
+            tmp_path / "handoff.json",
+            artifact_root=package,
+            verification=verification,
+        )
+    assert not (tmp_path / "handoff.json").exists()
 
 
 def test_artifact_handoff_requires_identity_check_target_and_recovery_receipts(
@@ -262,34 +267,10 @@ def test_artifact_handoff_requires_identity_check_target_and_recovery_receipts(
         )
 
     verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
-    handoff = write_artifact_handoff(
-        tmp_path / "identity-bound-handoff.json",
-        artifact_root=package,
-        verification=verification,
-    )
-    proof_hashes = {
-        "installed_update_check_receipt_sha256": hashlib.sha256(
-            Path(verification["proof_receipts"]["installed_update_check"]).read_bytes()
-        ).hexdigest(),
-        "extracted_target_preflight_receipt_sha256": hashlib.sha256(
-            Path(verification["proof_receipts"]["extracted_target_preflight"]).read_bytes()
-        ).hexdigest(),
-        "recovery_receipt_sha256": hashlib.sha256(
-            Path(verification["proof_receipts"]["recovery"]).read_bytes()
-        ).hexdigest(),
-    }
-    assert {field: handoff[field] for field in identity_fields} == {
-        field: verification[field] for field in identity_fields
-    }
-    assert {field: handoff[field] for field in proof_hashes} == proof_hashes
-
-    check_path = Path(verification["proof_receipts"]["installed_update_check"])
-    check = json.loads(check_path.read_bytes())
-    check["status"] = "PASS"
-    check_path.write_bytes(canonical_bytes(check))
-    with pytest.raises(ReleaseError, match="exact AVAILABLE"):
+    with pytest.raises(ReleaseError, match="execution proof|recovery"):
         write_artifact_handoff(
-            tmp_path / "caller-pass-only.json",
+            tmp_path / "identity-bound-handoff.json",
             artifact_root=package,
             verification=verification,
         )
+    assert not (tmp_path / "identity-bound-handoff.json").exists()

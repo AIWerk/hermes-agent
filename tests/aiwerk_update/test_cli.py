@@ -5,13 +5,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import venv
 
 import pytest
 
 from scripts.aiwerk_update.cli import build_parser, main
 from scripts.aiwerk_update.contract import canonical_bytes
 from scripts.aiwerk_update.source import capture_git_authority
-from scripts.aiwerk_update.state import RunStore
+from scripts.aiwerk_update.state import RunStore, StateError
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -209,25 +210,26 @@ def test_cli_exposes_resume_and_verifies_terminal_evidence(tmp_path: Path, capsy
     store.begin_execution()
     for stage in ("control", "product", "publication", "artifact"):
         store.complete_stage(stage)
-    store.finish_handoff(
-        {
-            "status": "HANDOFF_READY",
-            "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
-            "installed_updater_source_identity": "1" * 64,
-            "installed_updater_wheel_identity": "2" * 64,
-            "installed_update_check_receipt_sha256": "3" * 64,
-            "extracted_target_preflight_receipt_sha256": "4" * 64,
-            "recovery_receipt_sha256": "5" * 64,
-        }
-    )
+    with pytest.raises(StateError, match="post-failure recovery"):
+        store.finish_handoff(
+            {
+                "status": "HANDOFF_READY",
+                "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
+                "installed_updater_source_identity": "1" * 64,
+                "installed_updater_wheel_identity": "2" * 64,
+                "installed_update_check_receipt_sha256": "3" * 64,
+                "extracted_target_preflight_receipt_sha256": "4" * 64,
+                "recovery_receipt_sha256": "5" * 64,
+            }
+        )
 
     rc = main(["evidence", "--run-root", str(store.root)])
     evidence = json.loads(capsys.readouterr().out)
 
     assert rc == 0
-    assert evidence["phase"] == "HANDOFF_READY"
-    assert evidence["manifest_present"] is True
-    assert "final.json" in evidence["verified_files"]
+    assert evidence["phase"] == "EXECUTING"
+    assert evidence["manifest_present"] is False
+    assert "final.json" not in evidence["verified_files"]
     parsed = build_parser().parse_args(["resume", "--run-root", str(store.root)])
     assert parsed.command == "resume"
 
@@ -301,26 +303,77 @@ def _producer_fixture(tmp_path: Path, *, available: bool = True) -> list[str]:
     ]
 
 
+def _bound_producer_fixture(tmp_path: Path) -> list[str]:
+    tmp_path.mkdir()
+    argv = _producer_fixture(tmp_path)
+    updater_root = tmp_path / "installed-updater"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(updater_root)
+    site_packages = next(updater_root.glob("lib/python*/site-packages"))
+    package = site_packages / "aiwerk_runtime_updater"
+    package.mkdir()
+    (package / "__init__.py").write_text("\n")
+    (package / "source.py").write_text(
+        "def source_identity(): return ('" + "1" * 64 + "', b'source')\n"
+        "def installed_wheel_identity(): return ('" + "2" * 64 + "', b'wheel')\n"
+    )
+    (package / "cli.py").write_text(
+        "import json\n"
+        "if __name__ == '__main__':\n"
+        " print(json.dumps({'status':'AVAILABLE','release_id':'"
+        + "a" * 40
+        + "','archive_sha256':'"
+        + "e" * 64
+        + "','archive_size':123,'migration_class':'forward_only'},sort_keys=True,separators=(',',':')))\n"
+    )
+    (package / "artifact_preflight.py").write_text(
+        "if __name__ == '__main__': print('Hermes Agent v0.21.1')\n"
+    )
+    (package / "systemd_bridge_render.py").write_text("\n")
+    dist_info = site_packages / "aiwerk_runtime_updater-2.24.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: aiwerk-runtime-updater\nVersion: 2.24.0\n"
+    )
+    (dist_info / "RECORD").write_text("aiwerk_runtime_updater-2.24.0.dist-info/RECORD,,\n")
+    updater_index = argv.index("--updater-python")
+    del argv[updater_index : updater_index + 2]
+    argv.extend(("--installed-updater-root", str(updater_root)))
+    return argv
+
+
 @pytest.mark.live_system_guard_bypass
-def test_cli_produces_identity_bound_handoff_receipts_from_native_commands(
+def test_prove_handoff_requires_exact_installed_updater_interpreter_and_package(
     tmp_path: Path, capsys
 ) -> None:
     argv = _producer_fixture(tmp_path)
 
     rc = main(argv)
-    output = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
     run_root = Path(argv[argv.index("--run-root") + 1])
 
-    assert rc == 0
-    assert output["status"] == "PROOFS_READY"
-    check = json.loads((run_root / "installed-update-check.json").read_bytes())
-    target = json.loads((run_root / "extracted-target-preflight.json").read_bytes())
-    recovery = json.loads((run_root / "recovery-proof.json").read_bytes())
-    assert check["status"] == "AVAILABLE" and check["exit_code"] == 0
-    assert target["status"] == "PASS" and target["target_root"].endswith("/runtime")
-    assert recovery["disposition"] == "FORWARD_ONLY_PRESTART_RECOVERY_PROVED"
-    assert recovery["native_rollback_supported"] is False
-    assert recovery["post_start_policy"] == "CONTAINMENT_ONLY"
+    assert rc == 2
+    assert "installed updater root" in captured.err
+    assert not (run_root / "installed-update-check.json").exists()
+    assert not (run_root / "extracted-target-preflight.json").exists()
+    assert not (run_root / "recovery-proof.json").exists()
+
+    bound_argv = _bound_producer_fixture(tmp_path / "bound")
+    bound_rc = main(bound_argv)
+    bound_output = json.loads(capsys.readouterr().out)
+    bound_run_root = Path(bound_argv[bound_argv.index("--run-root") + 1])
+    assert bound_rc == 0
+    assert bound_output["status"] == "HANDOFF_BLOCKED"
+    assert bound_output["reason"] == "EXECUTABLE_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+    check = json.loads((bound_run_root / "installed-update-check.json").read_bytes())
+    target = json.loads((bound_run_root / "extracted-target-preflight.json").read_bytes())
+    recovery = json.loads((bound_run_root / "recovery-proof.json").read_bytes())
+    assert check["installed_updater_root"].endswith("/installed-updater")
+    assert len(check["identity_probe_stdout_sha256"]) == 64
+    assert len(check["stdout_sha256"]) == 64
+    assert target["version_output"] == "Hermes Agent v0.21.1"
+    assert len(target["stdout_sha256"]) == 64
+    assert recovery["status"] == "BLOCKED"
+    assert recovery["disposition"] == "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
 
 
 @pytest.mark.live_system_guard_bypass
@@ -333,7 +386,7 @@ def test_cli_rejects_synthetic_or_mismatched_native_receipts(
     run_root = Path(argv[argv.index("--run-root") + 1])
 
     assert rc == 2
-    assert "AVAILABLE" in capsys.readouterr().err
+    assert "installed updater root" in capsys.readouterr().err
     assert not (run_root / "installed-update-check.json").exists()
     assert not (run_root / "extracted-target-preflight.json").exists()
     assert not (run_root / "recovery-proof.json").exists()

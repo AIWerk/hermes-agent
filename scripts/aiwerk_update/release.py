@@ -61,7 +61,44 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
             if value.get(field) != verification.get(field):
                 raise ReleaseError(f"persisted proof receipt identity mismatch: {name}")
         documents[name] = raw, value
+    execution_fields = (
+        "installed_updater_root",
+        "installed_updater_python",
+        "identity_probe_stdout_sha256",
+    )
+    for name, (_raw, value) in documents.items():
+        if any(field not in value for field in execution_fields):
+            raise ReleaseError(f"persisted execution proof incomplete: {name}")
+        root = Path(str(value["installed_updater_root"]))
+        python = Path(str(value["installed_updater_python"]))
+        if (
+            not root.is_absolute()
+            or not python.is_absolute()
+            or python.parent != root / "bin"
+            or not isinstance(value["identity_probe_stdout_sha256"], str)
+            or len(value["identity_probe_stdout_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in value["identity_probe_stdout_sha256"]
+            )
+        ):
+            raise ReleaseError(f"persisted execution proof malformed: {name}")
+    if len(
+        {
+            (
+                value["installed_updater_root"],
+                value["installed_updater_python"],
+                value["identity_probe_stdout_sha256"],
+            )
+            for _raw, value in documents.values()
+        }
+    ) != 1:
+        raise ReleaseError("persisted execution proof identity mismatch")
     check = documents["installed_update_check"][1]
+    try:
+        _required_digest(check.get("stdout_sha256"), "installed update-check stdout")
+    except ReleaseError as exc:
+        raise ReleaseError("persisted execution proof incomplete: update-check stdout") from exc
     if (
         check.get("status") != "AVAILABLE"
         or check.get("exit_code") != 0
@@ -71,17 +108,33 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
     ):
         raise ReleaseError("persisted update-check receipt is not an exact AVAILABLE result")
     target = documents["extracted_target_preflight"][1]
+    try:
+        _required_digest(target.get("stdout_sha256"), "extracted-target stdout")
+    except ReleaseError as exc:
+        raise ReleaseError("persisted execution proof incomplete: extracted-target stdout") from exc
+    version_output = target.get("version_output")
     if (
-        target.get("status") != "PASS"
+        not isinstance(version_output, str)
+        or not version_output.startswith("Hermes Agent v")
+        or target.get("status") != "PASS"
         or target.get("exit_code") != 0
         or target.get("release_id") != verification.get("release_id")
         or target.get("target_root") != str(Path(str(verification["artifact_root"])) / "runtime")
     ):
         raise ReleaseError("persisted extracted-target receipt mismatch")
     recovery = documents["recovery"][1]
+    for field in (
+        "target_bridge_stdout_sha256",
+        "predecessor_bridge_stdout_sha256",
+    ):
+        try:
+            _required_digest(recovery.get(field), field)
+        except ReleaseError as exc:
+            raise ReleaseError(f"persisted execution proof incomplete: {field}") from exc
     if (
-        recovery.get("status") != "PASS"
-        or recovery.get("disposition") != "FORWARD_ONLY_PRESTART_RECOVERY_PROVED"
+        recovery.get("status") != "BLOCKED"
+        or recovery.get("disposition")
+        != "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
         or recovery.get("migration_class") != "forward_only"
         or recovery.get("native_rollback_supported") is not False
         or recovery.get("post_start_policy") != "CONTAINMENT_ONLY"
@@ -90,16 +143,10 @@ def _verified_proof_hashes(verification: dict[str, Any]) -> dict[str, str]:
         or recovery.get("units_verified") is not True
         or recovery.get("release_id") != verification.get("release_id")
     ):
-        raise ReleaseError("persisted forward-only recovery proof is incomplete")
-    return {
-        "installed_update_check_receipt_sha256": hashlib.sha256(
-            documents["installed_update_check"][0]
-        ).hexdigest(),
-        "extracted_target_preflight_receipt_sha256": hashlib.sha256(
-            documents["extracted_target_preflight"][0]
-        ).hexdigest(),
-        "recovery_receipt_sha256": hashlib.sha256(documents["recovery"][0]).hexdigest(),
-    }
+        raise ReleaseError("persisted forward-only recovery assessment is invalid")
+    raise ReleaseError(
+        "executable post-failure predecessor recovery remains unproven; HANDOFF_READY rejected"
+    )
 
 
 def _sha256(path: Path) -> str:
