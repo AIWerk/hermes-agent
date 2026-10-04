@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -280,8 +281,42 @@ class RunStore:
         state = self._read_state()
         if state["phase"] != "EXECUTING" or self.next_stage() != "handoff":
             raise StateError("handoff can finish only after artifact completion")
-        raise StateError(
-            "HANDOFF_READY requires separately qualified executable post-failure recovery"
+        if (
+            handoff.get("status") != "HANDOFF_BLOCKED_RECOVERY"
+            or handoff.get("completion") is not False
+            or handoff.get("activation") != "NOT_RUN"
+            or handoff.get("recovery_disposition")
+            != "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+        ):
+            raise StateError(
+                "HANDOFF_READY requires separately qualified executable post-failure recovery"
+            )
+        final = {
+            "schema_version": 1,
+            "kind": "AIWERK_UPDATE_FINAL",
+            "run_id": self.run_id,
+            "status": "HANDOFF_BLOCKED_RECOVERY",
+            "completion": False,
+            "activation": "NOT_RUN",
+            "recovery_disposition": handoff["recovery_disposition"],
+        }
+        _atomic_write(self.root / "final.json", canonical_bytes(final))
+        state["phase"] = "HANDOFF_BLOCKED_RECOVERY"
+        self._write_state(state)
+        self._append_event(
+            "handoff-blocked-recovery",
+            {"recovery_disposition": handoff["recovery_disposition"]},
+        )
+        manifest_rows = []
+        for path in sorted(self.root.iterdir()):
+            if not path.is_file() or path.name == "manifest.sha256":
+                continue
+            manifest_rows.append(
+                f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+            )
+        _atomic_write(
+            self.root / "manifest.sha256",
+            ("\n".join(manifest_rows) + "\n").encode("utf-8"),
         )
 
     def next_stage(self) -> str | None:

@@ -171,6 +171,47 @@ def test_finish_handoff_rejects_prestart_containment_only_recovery(tmp_path: Pat
     assert not (store.root / "manifest.sha256").exists()
 
 
+def test_finish_handoff_persists_blocked_recovery_without_handoff_ready(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(
+        tmp_path,
+        run_id="blocked-recovery",
+        request={"through": "local-handoff", "source_publication": True},
+        authority={"base_commit": A, "target_commit": B},
+    )
+    store.record_preflight({"verdict": "PASS", "failures": []})
+    store.begin_execution()
+    for stage in ("control", "product", "publication", "artifact"):
+        store.complete_stage(stage)
+
+    store.finish_handoff(
+        {
+            "schema_version": 1,
+            "kind": "AIWERK_LOCAL_ACTIVATION_HANDOFF",
+            "status": "HANDOFF_BLOCKED_RECOVERY",
+            "completion": False,
+            "activation": "NOT_RUN",
+            "recovery_disposition": (
+                "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+            ),
+        }
+    )
+
+    final = json.loads((store.root / "final.json").read_text())
+    state = json.loads((store.root / "state.json").read_text())
+    events = [json.loads(line) for line in (store.root / "events.jsonl").read_text().splitlines()]
+    assert final["kind"] == "AIWERK_UPDATE_FINAL"
+    assert final["status"] == "HANDOFF_BLOCKED_RECOVERY"
+    assert final["completion"] is False
+    assert final["activation"] == "NOT_RUN"
+    assert state["phase"] == "HANDOFF_BLOCKED_RECOVERY"
+    assert (store.root / "manifest.sha256").is_file()
+    assert not (store.root / "local-handoff.json").exists()
+    assert all(event["kind"] != "handoff-ready" for event in events)
+    assert events[-1]["kind"] == "handoff-blocked-recovery"
+
+
 def test_finish_handoff_rejects_activation_blocked_or_unproven_identity(
     tmp_path: Path,
 ) -> None:

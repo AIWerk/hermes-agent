@@ -17,6 +17,7 @@ from scripts.aiwerk_update.artifact import (
     ArtifactBuildConfig,
     ArtifactError,
     ExternalRuntimeArtifactBuilder,
+    _installed_identity_receipt,
     _installed_updater_identities,
     verify_artifact_package,
 )
@@ -205,6 +206,34 @@ def test_verify_artifact_package_rejects_payload_aux_path_overlap(tmp_path: Path
 
     with pytest.raises(ArtifactError, match="overlap"):
         verify_artifact_package(root, expected_commit=commit, expected_git_tree=git_tree)
+
+
+def test_external_builder_receipt_binds_installed_root_and_original_identity(
+    tmp_path: Path,
+) -> None:
+    installed_root = tmp_path / "installed-updater"
+    installed_root.mkdir()
+    output = tmp_path / "artifact"
+
+    receipt = _installed_identity_receipt(
+        output=output,
+        installed_updater_root=installed_root,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        source_identity="1" * 64,
+        wheel_identity="2" * 64,
+    )
+
+    assert receipt == {
+        "schema_version": 1,
+        "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
+        "artifact_root": str(output),
+        "installed_updater_root": str(installed_root.resolve()),
+        "source_commit": "a" * 40,
+        "source_git_tree": "b" * 40,
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+    }
 
 
 def test_external_builder_reuse_rejects_wheel_only_identity_drift(

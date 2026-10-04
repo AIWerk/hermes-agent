@@ -12,7 +12,12 @@ import subprocess
 import sys
 from typing import Sequence
 
-from .artifact import ArtifactBuildConfig, ArtifactError, ExternalRuntimeArtifactBuilder
+from .artifact import (
+    ArtifactBuildConfig,
+    ArtifactError,
+    ExternalRuntimeArtifactBuilder,
+    _installed_updater_identities,
+)
 from .contract import ContractError, _atomic_write, canonical_bytes, canonical_sha256
 from .preflight import Probe, RepositoryQualifier, collect_preflight, repository_preflight_probes
 from .source import (
@@ -272,17 +277,18 @@ def _run(args: argparse.Namespace) -> int:
     if execution_config is None:
         raise StateError("execution configuration was not bound")
     final = _continue(store, execution_config)
+    blocked = final.get("status") == "HANDOFF_BLOCKED_RECOVERY"
     _emit(
         {
             "run_id": run_id,
             "run_root": str(store.root),
             "state": store._read_state()["phase"],
-            "verdict": "PASS",
+            "verdict": "BLOCKED" if blocked else "PASS",
             "handoff": final,
         },
         as_json=True,
     )
-    return 0
+    return 1 if blocked else 0
 
 
 def _resolve_run_root(args: argparse.Namespace) -> Path:
@@ -431,6 +437,51 @@ def _prove_handoff(args: argparse.Namespace) -> int:
             raise StateError(f"artifact verification identity malformed: {field}")
     if not isinstance(verification.get("archive_size"), int) or verification["archive_size"] < 1:
         raise StateError("artifact verification archive size malformed")
+    identity_receipt_path = Path(
+        str(verification.get("installed_updater_identity_receipt_path", ""))
+    )
+    identity_receipt_sha256 = verification.get(
+        "installed_updater_identity_receipt_sha256"
+    )
+    if (
+        verification.get("installed_updater_root") != str(installed_updater_root)
+        or not identity_receipt_path.is_absolute()
+        or identity_receipt_path.is_symlink()
+        or not identity_receipt_path.is_file()
+        or not isinstance(identity_receipt_sha256, str)
+        or len(identity_receipt_sha256) != 64
+    ):
+        raise StateError("installed updater root is not builder-bound")
+    identity_receipt_raw = identity_receipt_path.read_bytes()
+    if hashlib.sha256(identity_receipt_raw).hexdigest() != identity_receipt_sha256:
+        raise StateError("builder-bound installed updater identity receipt hash mismatch")
+    try:
+        identity_receipt = json.loads(identity_receipt_raw)
+    except json.JSONDecodeError as exc:
+        raise StateError("builder-bound installed updater identity receipt invalid") from exc
+    if (
+        not isinstance(identity_receipt, dict)
+        or identity_receipt_raw != canonical_bytes(identity_receipt)
+        or identity_receipt.get("schema_version") != 1
+        or identity_receipt.get("kind") != "AIWERK_INSTALLED_UPDATER_IDENTITY"
+        or identity_receipt.get("artifact_root") != str(artifact_root)
+        or identity_receipt.get("installed_updater_root") != str(installed_updater_root)
+        or identity_receipt.get("source_commit") != verification["source_commit"]
+        or identity_receipt.get("source_git_tree") != verification["source_git_tree"]
+        or identity_receipt.get("installed_updater_source_identity")
+        != verification["installed_updater_source_identity"]
+        or identity_receipt.get("installed_updater_wheel_identity")
+        != verification["installed_updater_wheel_identity"]
+    ):
+        raise StateError("installed updater root is not builder-bound")
+    measured_source_identity, measured_wheel_identity = _installed_updater_identities(
+        installed_updater_root
+    )
+    if (
+        measured_source_identity != verification["installed_updater_source_identity"]
+        or measured_wheel_identity != verification["installed_updater_wheel_identity"]
+    ):
+        raise StateError("independently measured installed updater identity mismatch")
     publication_path = artifact_root / "publication.json"
     publication_raw = publication_path.read_bytes()
     publication_sha256 = hashlib.sha256(publication_raw).hexdigest()
@@ -442,9 +493,29 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         if value.get("migration_class") != "forward_only":
             raise StateError("recovery proof requires the exact forward_only policy")
 
-    def native(module: str, *argv: str) -> subprocess.CompletedProcess[str]:
+    def persist_stdout(
+        name: str,
+        result: subprocess.CompletedProcess[str],
+        argv: list[str],
+    ) -> dict[str, object]:
+        path = run_root / name
+        if path.exists() or path.is_symlink():
+            raise StateError(f"native output already exists: {name}")
+        raw = result.stdout.encode("utf-8")
+        _atomic_write(path, raw)
+        return {
+            "argv": argv,
+            "exit_code": result.returncode,
+            "output_path": str(path.resolve(strict=True)),
+            "stdout_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    def native(
+        output_name: str, module: str, *argv: str
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        command = [str(updater_python), "-I", "-B", "-m", module, *argv]
         result = subprocess.run(
-            [str(updater_python), "-I", "-B", "-m", module, *argv],
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -455,23 +526,26 @@ def _prove_handoff(args: argparse.Namespace) -> int:
             close_fds=True,
             check=False,
         )
+        execution = persist_stdout(output_name, result, command)
         if result.returncode != 0:
             raise StateError(
                 f"native handoff proof failed: {module}: rc={result.returncode}: {result.stderr[-1000:]}"
             )
-        return result
+        return result, execution
 
     probe_code = (
-        "import json,sys;"
+        "import importlib.metadata,json,sys;"
         "from pathlib import Path;"
         "import aiwerk_runtime_updater as package;"
-        "from aiwerk_runtime_updater.source import installed_wheel_identity,source_identity;"
-        "print(json.dumps({'prefix':sys.prefix,'package':str(Path(package.__file__).resolve().parent),"
-        "'source_identity':source_identity()[0],'wheel_identity':installed_wheel_identity()[0]},"
+        "dist=importlib.metadata.distribution('aiwerk-runtime-updater');"
+        "print(json.dumps({'prefix':sys.prefix,'executable':sys.executable,"
+        "'package':str(Path(package.__file__).resolve().parent),"
+        "'distribution':str(Path(dist.locate_file('')).resolve())},"
         "sort_keys=True,separators=(',',':')))"
     )
+    identity_argv = [str(updater_python), "-I", "-B", "-c", probe_code]
     identity_probe = subprocess.run(
-        [str(updater_python), "-I", "-B", "-c", probe_code],
+        identity_argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -482,6 +556,9 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         close_fds=True,
         check=False,
     )
+    identity_execution = persist_stdout(
+        "installed-updater-identity-probe.stdout", identity_probe, identity_argv
+    )
     if identity_probe.returncode != 0:
         raise StateError(
             f"installed updater identity probe failed: rc={identity_probe.returncode}: "
@@ -490,21 +567,21 @@ def _prove_handoff(args: argparse.Namespace) -> int:
     try:
         identity_value = json.loads(identity_probe.stdout)
         package_root = Path(identity_value["package"])
+        distribution_root = Path(identity_value["distribution"])
         package_root.relative_to(installed_updater_root)
+        distribution_root.relative_to(installed_updater_root)
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise StateError("installed updater identity probe output mismatch") from exc
     if (
         identity_value.get("prefix") != str(installed_updater_root)
-        or identity_value.get("source_identity")
-        != verification["installed_updater_source_identity"]
-        or identity_value.get("wheel_identity")
-        != verification["installed_updater_wheel_identity"]
+        or identity_value.get("executable") != str(updater_python)
         or package_root.name != "aiwerk_runtime_updater"
+        or package_root.parent != distribution_root
     ):
         raise StateError("installed updater interpreter or package identity mismatch")
-    identity_probe_sha256 = hashlib.sha256(identity_probe.stdout.encode()).hexdigest()
 
-    check_result = native(
+    check_result, check_execution = native(
+        "installed-update-check.stdout",
         "aiwerk_runtime_updater.cli",
         "--lock-path",
         str(run_root / "native-check.lock"),
@@ -539,7 +616,8 @@ def _prove_handoff(args: argparse.Namespace) -> int:
     }
     if check_value != expected_check:
         raise StateError("native update check did not return the exact AVAILABLE result")
-    target_result = native(
+    target_result, target_execution = native(
+        "extracted-target-preflight.stdout",
         "aiwerk_runtime_updater.artifact_preflight",
         "--config",
         str(config),
@@ -549,14 +627,16 @@ def _prove_handoff(args: argparse.Namespace) -> int:
     target_output = target_result.stdout.strip()
     if not target_output.startswith("Hermes Agent v"):
         raise StateError("native extracted-target preflight output mismatch")
-    target_bridge = native(
+    _target_bridge, target_bridge_execution = native(
+        "target-systemd-bridge.stdout",
         "aiwerk_runtime_updater.systemd_bridge_render",
         "--config",
         str(config),
         "--verify-installed-root",
         str(artifact_root / "runtime"),
     )
-    predecessor_bridge = native(
+    _predecessor_bridge, predecessor_bridge_execution = native(
+        "predecessor-systemd-bridge.stdout",
         "aiwerk_runtime_updater.systemd_bridge_render",
         "--config",
         str(predecessor_config),
@@ -572,29 +652,36 @@ def _prove_handoff(args: argparse.Namespace) -> int:
         "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
         "installed_updater_root": str(installed_updater_root),
         "installed_updater_python": str(updater_python),
-        "identity_probe_stdout_sha256": identity_probe_sha256,
+        "identity_probe_argv": identity_execution["argv"],
+        "identity_probe_exit_code": identity_execution["exit_code"],
+        "identity_probe_output_path": identity_execution["output_path"],
+        "identity_probe_stdout_sha256": identity_execution["stdout_sha256"],
     }
     receipts = {
         "installed-update-check.json": {
             **common,
             "kind": "AIWERK_INSTALLED_UPDATE_CHECK_RECEIPT",
             "status": "AVAILABLE",
-            "exit_code": 0,
+            "exit_code": check_execution["exit_code"],
+            "argv": check_execution["argv"],
+            "output_path": check_execution["output_path"],
             "release_id": verification["release_id"],
             "archive_sha256": verification["archive_sha256"],
             "archive_size": verification["archive_size"],
             "migration_class": "forward_only",
-            "stdout_sha256": hashlib.sha256(check_result.stdout.encode()).hexdigest(),
+            "stdout_sha256": check_execution["stdout_sha256"],
         },
         "extracted-target-preflight.json": {
             **common,
             "kind": "AIWERK_EXTRACTED_TARGET_PREFLIGHT_RECEIPT",
             "status": "PASS",
-            "exit_code": 0,
+            "exit_code": target_execution["exit_code"],
+            "argv": target_execution["argv"],
+            "output_path": target_execution["output_path"],
             "release_id": verification["release_id"],
             "target_root": str(artifact_root / "runtime"),
             "version_output": target_output,
-            "stdout_sha256": hashlib.sha256(target_result.stdout.encode()).hexdigest(),
+            "stdout_sha256": target_execution["stdout_sha256"],
         },
         "recovery-proof.json": {
             **common,
@@ -608,10 +695,14 @@ def _prove_handoff(args: argparse.Namespace) -> int:
             "target_bridge_verified": True,
             "predecessor_bridge_verified": True,
             "units_verified": True,
-            "target_bridge_stdout_sha256": hashlib.sha256(target_bridge.stdout.encode()).hexdigest(),
-            "predecessor_bridge_stdout_sha256": hashlib.sha256(
-                predecessor_bridge.stdout.encode()
-            ).hexdigest(),
+            "target_bridge_argv": target_bridge_execution["argv"],
+            "target_bridge_output_path": target_bridge_execution["output_path"],
+            "target_bridge_stdout_sha256": target_bridge_execution["stdout_sha256"],
+            "predecessor_bridge_argv": predecessor_bridge_execution["argv"],
+            "predecessor_bridge_output_path": predecessor_bridge_execution["output_path"],
+            "predecessor_bridge_stdout_sha256": predecessor_bridge_execution[
+                "stdout_sha256"
+            ],
         },
     }
     if any((run_root / name).exists() or (run_root / name).is_symlink() for name in receipts):

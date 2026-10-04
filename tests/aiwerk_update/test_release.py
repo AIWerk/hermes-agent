@@ -11,6 +11,7 @@ import pytest
 from scripts.aiwerk_update.contract import canonical_bytes
 from scripts.aiwerk_update.release import (
     ReleaseError,
+    _verified_proof_hashes,
     inventory_release,
     verify_release,
     write_artifact_handoff,
@@ -64,6 +65,34 @@ def _artifact(tmp_path: Path) -> tuple[Path, Path, str, str]:
 def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
     artifact_root = Path(verification["artifact_root"])
     (artifact_root / "runtime").mkdir(exist_ok=True)
+    outputs = {
+        "installed-updater-identity-probe.stdout": canonical_bytes(
+            {
+                "prefix": str(tmp_path / "installed-updater"),
+                "executable": str(tmp_path / "installed-updater/bin/python3.12"),
+                "package": str(
+                    tmp_path
+                    / "installed-updater/lib/python3.12/site-packages/aiwerk_runtime_updater"
+                ),
+                "distribution": str(tmp_path / "installed-updater/lib/python3.12/site-packages"),
+            }
+        ),
+        "installed-update-check.stdout": canonical_bytes(
+            {
+                "status": "AVAILABLE",
+                "release_id": verification["release_id"],
+                "archive_sha256": verification["archive_sha256"],
+                "archive_size": verification["archive_size"],
+                "migration_class": "forward_only",
+            }
+        ),
+        "extracted-target-preflight.stdout": b"Hermes Agent v0.21.1\n",
+        "target-systemd-bridge.stdout": b"target bridge\n",
+        "predecessor-systemd-bridge.stdout": b"predecessor bridge\n",
+    }
+    for name, raw in outputs.items():
+        (tmp_path / name).write_bytes(raw)
+    identity_output = tmp_path / "installed-updater-identity-probe.stdout"
     common = {
         "schema_version": 1,
         "artifact_root": str(artifact_root),
@@ -73,7 +102,16 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
         "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
         "installed_updater_root": str(tmp_path / "installed-updater"),
         "installed_updater_python": str(tmp_path / "installed-updater/bin/python3.12"),
-        "identity_probe_stdout_sha256": "6" * 64,
+        "identity_probe_argv": [
+            str(tmp_path / "installed-updater/bin/python3.12"),
+            "-I",
+            "-B",
+            "-c",
+            "identity-probe",
+        ],
+        "identity_probe_exit_code": 0,
+        "identity_probe_output_path": str(identity_output),
+        "identity_probe_stdout_sha256": hashlib.sha256(identity_output.read_bytes()).hexdigest(),
     }
     documents = {
         "installed_update_check": {
@@ -84,7 +122,11 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
             "release_id": verification["release_id"],
             "archive_sha256": verification["archive_sha256"],
             "archive_size": verification["archive_size"],
-            "stdout_sha256": "7" * 64,
+            "argv": ["python", "-m", "aiwerk_runtime_updater.cli", "update", "--check"],
+            "output_path": str(tmp_path / "installed-update-check.stdout"),
+            "stdout_sha256": hashlib.sha256(
+                (tmp_path / "installed-update-check.stdout").read_bytes()
+            ).hexdigest(),
         },
         "extracted_target_preflight": {
             **common,
@@ -94,7 +136,11 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
             "release_id": verification["release_id"],
             "target_root": str(artifact_root / "runtime"),
             "version_output": "Hermes Agent v0.21.1",
-            "stdout_sha256": "8" * 64,
+            "argv": ["python", "-m", "aiwerk_runtime_updater.artifact_preflight"],
+            "output_path": str(tmp_path / "extracted-target-preflight.stdout"),
+            "stdout_sha256": hashlib.sha256(
+                (tmp_path / "extracted-target-preflight.stdout").read_bytes()
+            ).hexdigest(),
         },
         "recovery": {
             **common,
@@ -108,8 +154,30 @@ def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
             "target_bridge_verified": True,
             "predecessor_bridge_verified": True,
             "units_verified": True,
-            "target_bridge_stdout_sha256": "9" * 64,
-            "predecessor_bridge_stdout_sha256": "a" * 64,
+            "target_bridge_argv": [
+                "python",
+                "-m",
+                "aiwerk_runtime_updater.systemd_bridge_render",
+                "--config",
+                "target",
+            ],
+            "target_bridge_output_path": str(tmp_path / "target-systemd-bridge.stdout"),
+            "target_bridge_stdout_sha256": hashlib.sha256(
+                (tmp_path / "target-systemd-bridge.stdout").read_bytes()
+            ).hexdigest(),
+            "predecessor_bridge_argv": [
+                "python",
+                "-m",
+                "aiwerk_runtime_updater.systemd_bridge_render",
+                "--config",
+                "predecessor",
+            ],
+            "predecessor_bridge_output_path": str(
+                tmp_path / "predecessor-systemd-bridge.stdout"
+            ),
+            "predecessor_bridge_stdout_sha256": hashlib.sha256(
+                (tmp_path / "predecessor-systemd-bridge.stdout").read_bytes()
+            ).hexdigest(),
         },
     }
     paths = {}
@@ -213,13 +281,66 @@ def test_artifact_handoff_rejects_synthetic_execution_receipts(tmp_path: Path) -
     }
     verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
 
-    with pytest.raises(ReleaseError, match="execution proof|recovery"):
+    with pytest.raises(ReleaseError, match="execution proof|recovery|identity receipt"):
         write_artifact_handoff(
             tmp_path / "handoff.json",
             artifact_root=package,
             verification=verification,
         )
     assert not (tmp_path / "handoff.json").exists()
+
+
+def test_artifact_handoff_rejects_missing_or_tampered_retained_native_output(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    verification = {
+        "artifact_root": str(package.resolve()),
+        "source_commit": "a" * 40,
+        "source_git_tree": "b" * 40,
+        "release_id": "a" * 40,
+        "archive_sha256": "e" * 64,
+        "archive_size": 123,
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+    }
+    installed_root = tmp_path / "installed-updater"
+    installed_root.mkdir()
+    identity_receipt = canonical_bytes(
+        {
+            "schema_version": 1,
+            "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
+            "artifact_root": verification["artifact_root"],
+            "installed_updater_root": str(installed_root),
+            "source_commit": verification["source_commit"],
+            "source_git_tree": verification["source_git_tree"],
+            "installed_updater_source_identity": verification[
+                "installed_updater_source_identity"
+            ],
+            "installed_updater_wheel_identity": verification[
+                "installed_updater_wheel_identity"
+            ],
+        }
+    )
+    identity_receipt_path = tmp_path / "installed-updater-identity.json"
+    identity_receipt_path.write_bytes(identity_receipt)
+    verification.update(
+        installed_updater_root=str(installed_root),
+        installed_updater_identity_receipt_path=str(identity_receipt_path),
+        installed_updater_identity_receipt_sha256=hashlib.sha256(
+            identity_receipt
+        ).hexdigest(),
+    )
+    verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
+    (tmp_path / "installed-update-check.stdout").write_bytes(b"tampered\n")
+
+    with pytest.raises(ReleaseError, match="retained native output"):
+        _verified_proof_hashes(verification)
+
+    (tmp_path / "installed-update-check.stdout").unlink()
+    with pytest.raises(ReleaseError, match="retained native output"):
+        _verified_proof_hashes(verification)
 
 
 def test_artifact_handoff_requires_identity_check_target_and_recovery_receipts(
@@ -267,7 +388,7 @@ def test_artifact_handoff_requires_identity_check_target_and_recovery_receipts(
         )
 
     verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
-    with pytest.raises(ReleaseError, match="execution proof|recovery"):
+    with pytest.raises(ReleaseError, match="execution proof|recovery|identity receipt"):
         write_artifact_handoff(
             tmp_path / "identity-bound-handoff.json",
             artifact_root=package,

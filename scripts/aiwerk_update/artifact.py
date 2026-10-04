@@ -158,6 +158,7 @@ def _installed_identity_receipt_path(output: Path) -> Path:
 def _installed_identity_receipt(
     *,
     output: Path,
+    installed_updater_root: Path,
     source_commit: str,
     source_tree: str,
     source_identity: str,
@@ -167,6 +168,7 @@ def _installed_identity_receipt(
         "schema_version": 1,
         "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
         "artifact_root": str(output),
+        "installed_updater_root": str(installed_updater_root.resolve(strict=True)),
         "source_commit": source_commit,
         "source_git_tree": source_tree,
         "installed_updater_source_identity": source_identity,
@@ -195,6 +197,23 @@ def _verify_installed_identity_receipt(
         ):
             raise ArtifactError("installed updater wheel identity mismatch")
         raise ArtifactError("installed updater identity receipt mismatch")
+
+
+def _bind_installed_identity_receipt(
+    verification: dict[str, Any],
+    *,
+    receipt_path: Path,
+    installed_updater_root: Path,
+) -> dict[str, Any]:
+    if not isinstance(verification, dict):
+        raise ArtifactError("artifact verifier result must be an object")
+    result = dict(verification)
+    result.update(
+        installed_updater_root=str(installed_updater_root.resolve(strict=True)),
+        installed_updater_identity_receipt_path=str(receipt_path.resolve(strict=True)),
+        installed_updater_identity_receipt_sha256=_sha_file(receipt_path),
+    )
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +380,7 @@ class ExternalRuntimeArtifactBuilder:
         identity_receipt_path = _installed_identity_receipt_path(output)
         identity_receipt = _installed_identity_receipt(
             output=output,
+            installed_updater_root=self.config.installed_updater_root,
             source_commit=source_commit,
             source_tree=source_tree,
             source_identity=installed_source_identity,
@@ -375,12 +395,17 @@ class ExternalRuntimeArtifactBuilder:
                 identity_receipt_path,
                 expected=identity_receipt,
             )
-            return self.verifier(
+            verification = self.verifier(
                 output,
                 expected_commit=source_commit,
                 expected_git_tree=source_tree,
                 expected_installed_updater_source_identity=installed_source_identity,
                 expected_installed_updater_wheel_identity=installed_wheel_identity,
+            )
+            return _bind_installed_identity_receipt(
+                verification,
+                receipt_path=identity_receipt_path,
+                installed_updater_root=self.config.installed_updater_root,
             )
         if identity_receipt_path.exists() or identity_receipt_path.is_symlink():
             raise ArtifactError("installed updater identity receipt already exists")
@@ -574,12 +599,17 @@ class ExternalRuntimeArtifactBuilder:
             identity_receipt_path,
             expected=identity_receipt,
         )
-        return self.verifier(
+        verification = self.verifier(
             output,
             expected_commit=source_commit,
             expected_git_tree=source_tree,
             expected_installed_updater_source_identity=installed_source_identity,
             expected_installed_updater_wheel_identity=installed_wheel_identity,
+        )
+        return _bind_installed_identity_receipt(
+            verification,
+            receipt_path=identity_receipt_path,
+            installed_updater_root=self.config.installed_updater_root,
         )
 
 

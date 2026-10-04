@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import venv
 
 import pytest
 
+from scripts.aiwerk_update.artifact import _installed_updater_identities
 from scripts.aiwerk_update.cli import build_parser, main
 from scripts.aiwerk_update.contract import canonical_bytes
 from scripts.aiwerk_update.source import capture_git_authority
@@ -341,6 +344,93 @@ def _bound_producer_fixture(tmp_path: Path) -> list[str]:
     return argv
 
 
+def _builder_bound_producer_fixture(tmp_path: Path) -> list[str]:
+    argv = _bound_producer_fixture(tmp_path)
+    updater_root = Path(argv[argv.index("--installed-updater-root") + 1])
+    site_packages = next(updater_root.glob("lib/python*/site-packages"))
+    package = site_packages / "aiwerk_runtime_updater"
+    dist_info = site_packages / "aiwerk_runtime_updater-2.24.0.dist-info"
+    (package / "source.py").write_text("# identity is measured by trusted artifact code\n")
+    members = [
+        path
+        for path in sorted([*package.glob("*.py"), dist_info / "METADATA"])
+        if path.is_file()
+    ]
+    rows = []
+    for path in members:
+        raw = path.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
+        rows.append(
+            f"{path.relative_to(site_packages).as_posix()},sha256={digest},{len(raw)}"
+        )
+    rows.append("aiwerk_runtime_updater-2.24.0.dist-info/RECORD,,")
+    (dist_info / "RECORD").write_text("\n".join(rows) + "\n")
+    source_identity, wheel_identity = _installed_updater_identities(updater_root)
+    run_root = Path(argv[argv.index("--run-root") + 1])
+    artifact_path = run_root / "artifact.json"
+    verification = json.loads(artifact_path.read_text())
+    identity_receipt_path = tmp_path / "installed-updater-identity.json"
+    identity_receipt = {
+        "schema_version": 1,
+        "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
+        "artifact_root": verification["artifact_root"],
+        "installed_updater_root": str(updater_root.resolve()),
+        "source_commit": verification["source_commit"],
+        "source_git_tree": verification["source_git_tree"],
+        "installed_updater_source_identity": source_identity,
+        "installed_updater_wheel_identity": wheel_identity,
+    }
+    identity_raw = canonical_bytes(identity_receipt)
+    identity_receipt_path.write_bytes(identity_raw)
+    verification.update(
+        installed_updater_source_identity=source_identity,
+        installed_updater_wheel_identity=wheel_identity,
+        installed_updater_root=str(updater_root.resolve()),
+        installed_updater_identity_receipt_path=str(identity_receipt_path.resolve()),
+        installed_updater_identity_receipt_sha256=hashlib.sha256(identity_raw).hexdigest(),
+    )
+    artifact_path.write_bytes(canonical_bytes(verification))
+    return argv
+
+
+@pytest.mark.live_system_guard_bypass
+def test_prove_handoff_rejects_self_attested_fake_installed_package(
+    tmp_path: Path, capsys
+) -> None:
+    argv = _bound_producer_fixture(tmp_path / "fake")
+
+    rc = main(argv)
+
+    assert rc == 2
+    assert "builder-bound" in capsys.readouterr().err
+
+
+@pytest.mark.live_system_guard_bypass
+def test_prove_handoff_accepts_builder_bound_independently_measured_root(
+    tmp_path: Path, capsys
+) -> None:
+    argv = _builder_bound_producer_fixture(tmp_path / "bound-root")
+
+    rc = main(argv)
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    output = json.loads(captured.out)
+    run_root = Path(argv[argv.index("--run-root") + 1])
+
+    assert rc == 0
+    assert output["status"] == "HANDOFF_BLOCKED"
+    for name in (
+        "installed-updater-identity-probe.stdout",
+        "installed-update-check.stdout",
+        "extracted-target-preflight.stdout",
+        "target-systemd-bridge.stdout",
+        "predecessor-systemd-bridge.stdout",
+    ):
+        path = run_root / name
+        assert path.is_file()
+        assert not path.is_symlink()
+
+
 @pytest.mark.live_system_guard_bypass
 def test_prove_handoff_requires_exact_installed_updater_interpreter_and_package(
     tmp_path: Path, capsys
@@ -357,7 +447,7 @@ def test_prove_handoff_requires_exact_installed_updater_interpreter_and_package(
     assert not (run_root / "extracted-target-preflight.json").exists()
     assert not (run_root / "recovery-proof.json").exists()
 
-    bound_argv = _bound_producer_fixture(tmp_path / "bound")
+    bound_argv = _builder_bound_producer_fixture(tmp_path / "bound")
     bound_rc = main(bound_argv)
     bound_output = json.loads(capsys.readouterr().out)
     bound_run_root = Path(bound_argv[bound_argv.index("--run-root") + 1])
