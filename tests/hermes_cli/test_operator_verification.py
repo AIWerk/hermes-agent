@@ -1482,14 +1482,26 @@ def test_verification_result_enforces_requested_role_and_binding():
     assert not result.is_valid(now=150, session_id="s1", interface="cli", requested_role="admin")
 
 
-def test_terminal_tool_passes_session_id_to_operator_block_check():
-    import inspect
-
+def test_terminal_tool_passes_session_id_to_operator_block_check(monkeypatch):
+    import hermes_cli.operator_verification as verification
     import tools.terminal_tool as terminal_tool
 
-    src = inspect.getsource(terminal_tool.terminal_tool)
-    assert "operator_verification_block_reason_for_command(" in src
-    assert "session_id=session_id" in src
+    seen = {}
+
+    def check(command, *, session_id=None, **_kwargs):
+        seen.update(command=command, session_id=session_id)
+        return None
+
+    monkeypatch.setattr(verification, "operator_verification_block_reason_for_command", check)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *args, **kwargs: {"approved": True},
+    )
+    terminal_tool._run_approval_guards(
+        "printf ok", "local", {}, force=False, session_id="session-exact"
+    )
+    assert seen == {"command": "printf ok", "session_id": "session-exact"}
 
 
 def _bound_result(*, role="operator", requested_role="operator"):

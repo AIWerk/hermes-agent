@@ -323,10 +323,15 @@ def test_honcho_turn_sync_withholds_secret_without_external_honcho(monkeypatch):
     stored = []
 
     class Session:
-        def add_message(self, role, content):
+        def add_message(self, role, content, author_peer_id=None):
+            del author_peer_id
             stored.append((role, content))
 
     class Manager:
+        def resolve_author_peer_id(self, session_key, author_id, author_name=None, is_bot=False):
+            del session_key, author_id, author_name, is_bot
+            return None
+
         def get_or_create(self, session_key):
             assert session_key == "test-session"
             return Session()

@@ -50,6 +50,7 @@ from tools.terminal_tool_config import (
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
     _create_environment,
+    _record_unavailable_reason, terminal_backend_unavailable_reason,  # noqa: F401 — re-exported
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
@@ -161,8 +162,8 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands. The host OS, shell, and t
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds and fixed waits.
+Background: set background=true (returns a session_id) only for commands that must keep running independently after this tool call returns; add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. Do not start sleep, timers, cooldowns, delays, or polling loops with background=true — to wait a fixed time, run the wait as a normal foreground command with a high enough timeout. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
 PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
@@ -273,6 +274,35 @@ def clear_session_cwd(session_key: str) -> None:
         _session_cwd.pop(session_key, None)
 
 
+def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
+    """Cwd to write into a LIVE cached env, or None to leave it untouched.
+
+    On container backends a raw host path (a desktop/TUI session registering its
+    workspace, e.g. ``C:\\Users\\me`` or ``/Users/me/workspace``) cannot be the
+    in-sandbox workdir: every file-tools ``_exec`` wrapper does
+    ``builtin cd -- <env.cwd> || exit 126``, so a host cwd poisons all later
+    file operations with an unrelated ``cd:`` error. The creation paths already
+    sanitize this (``_is_unusable_container_cwd`` guards); the live-env write
+    here is the one remaining unsanitized site. When the host path is the one
+    mounted at ``/workspace`` (docker cwd passthrough), the session's directory
+    is still reachable — remap instead of discarding, mirroring the env-creation
+    remap in ``terminal_tool()``. Non-container backends apply the override
+    verbatim (ACP project-root switching must keep working).
+    """
+    env_type = getattr(env, "env_type", None)
+    if not env_type or not _is_container_backend(env_type):
+        return new_cwd
+    if not _is_unusable_container_cwd(new_cwd):
+        return new_cwd
+    host_mount = getattr(env, "host_cwd", None)
+    if isinstance(host_mount, str) and host_mount:
+        candidate = os.path.abspath(os.path.expanduser(new_cwd))
+        mounted = os.path.abspath(os.path.expanduser(host_mount))
+        if candidate == mounted:
+            return "/workspace"
+    return None
+
+
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """Register per-task sandbox overrides (``docker_image``/``modal_image``/
     ``singularity_image``/``daytona_image``, ``env_type``, ``cwd``) before the
@@ -281,7 +311,9 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     A ``cwd`` override takes effect immediately: it becomes the session's
     recorded cwd (until a ``cd`` changes it) and any live env's cwd is updated
     too, so env-side seeding stays consistent (ACP switching project root
-    mid-session via ``session/load``).
+    mid-session via ``session/load``). The session record keeps the RAW path
+    (host workspaces are tracked there on purpose); only the live-env write is
+    sanitized, since a host cwd can never be a container workdir.
     """
     _task_env_overrides[task_id] = overrides
 
@@ -295,7 +327,9 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         with _env_lock:
             env = _active_environments.get(task_id) or _active_environments.get(container_id)
         if env is not None and getattr(env, "cwd", None) is not None:
-            env.cwd = new_cwd
+            sanitized = _sanitize_cwd_for_live_env(env, new_cwd)
+            if sanitized is not None:
+                env.cwd = sanitized
 
 
 def clear_task_env_overrides(task_id: str):
@@ -397,6 +431,30 @@ def _docker_session_isolation_enabled() -> bool:
     return _session_scope().docker_session_isolated
 
 
+def _routed_home_task_key(profile_scoped: bool) -> Optional[str]:
+    """Key for a session-less task serving a routed (non-launch) profile home, else None.
+
+    A multiplexed host runs every profile's cron jobs without a session key; collapsing them all onto
+    ``"default"`` made profile B's cron tool calls reuse the environment the launch profile's job
+    created (its ``.env`` residue, its bridged ``TERMINAL_*``, its shell), so B ran with A's settings.
+    Persistent Docker keys the profile name exactly like B's session-bound work, so B keeps ONE
+    container instead of a second one per home path.
+    """
+    from hermes_constants import get_hermes_home_override, profile_name_for_home
+    from tools.environments.local import _is_routed_home
+
+    override = get_hermes_home_override()
+    if not override or not _is_routed_home(override):
+        return None
+    profile = profile_name_for_home(override) if profile_scoped else None
+    if profile:
+        return "default" if profile == "default" else f"profile:{profile}"
+    try:
+        return f"home:{os.path.realpath(override)}"
+    except OSError:
+        return f"home:{override}"
+
+
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """Map a tool-call ``task_id`` to the ``_active_environments`` key. Order matters —
     earlier branches are authoritative where they apply:
@@ -412,9 +470,10 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        default-profile gateway sessions share ONE container; other backends key
        ``session:<key>`` so switching profiles can't reuse another profile's
        SSHEnvironment on the wrong host.
-    4. No session key (CLI): ``shared:<key>`` when opted in (else a CLI run of a
-       keyed profile would split from its gateway sessions), else ``"default"``,
-       which subagent ids collapse onto to share the parent's container.
+    4. No session key (CLI, cron): ``shared:<key>`` when opted in (else a CLI run of a
+       keyed profile would split from its gateway sessions); a routed multiplexed profile
+       keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
+       else ``"default"``, which subagent ids collapse onto to share the parent's container.
     """
     if task_id and _has_isolation_overrides(task_id):
         return task_id
@@ -437,7 +496,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         # ONE container/cache slot (and sandbox dir) regardless of profile name (#84671).
         return f"shared:{shared}"
     if not session_key:
-        return "default"
+        return _routed_home_task_key(scope.docker_profile_scoped) or "default"
     if not scope.docker_profile_scoped:
         return f"session:{session_key}"
     profile = _current_session_profile() or "default"
@@ -541,11 +600,24 @@ def _ensure_terminal_env_bridged() -> None:
     suppresses the bridge entirely: writing scope values into the process-global
     env would re-create the first-writer-wins cross-profile leak the scope fixes.
 
+    Ambient ``os.environ`` is the *launch* profile's authority only. Under a
+    context-local ``HERMES_HOME`` override (multiplexed dashboard / gateway
+    secondary profile), this bridge is a no-op — otherwise the first unscoped
+    call under that override would latch the secondary profile's ``terminal.*``
+    into process-global env and poison later unscoped launch-profile turns
+    (#107422 residual of #68559). Routed profiles must bind a terminal scope
+    instead (same rule as ``env_loader._reapply_terminal_config_bridge``).
+
     terminal_tool reads ALL terminal settings from os.environ (TERMINAL_*). See #61115, #65696.
     """
     from tools.terminal_scope import get_terminal_scope
 
     if get_terminal_scope() is not None:
+        return
+    # Never write a secondary profile's terminal.* into process-global env.
+    from hermes_constants import get_hermes_home_override
+
+    if get_hermes_home_override() is not None:
         return
     global _terminal_config_bridge_attempted
     if _terminal_config_bridge_attempted:
@@ -835,10 +907,27 @@ class _ApprovalVerdict:
     approved_run: bool = False
 
 
-def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
+def _run_approval_guards(
+    command: str,
+    env_type: str,
+    config: Dict[str, Any],
+    *,
+    force: bool,
+    session_id: Optional[str] = None,
+) -> _ApprovalVerdict:
     """Run tirith + dangerous-command guards; ``force`` skips them entirely.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
+    from hermes_cli.operator_verification import operator_verification_block_reason_for_command
+
+    if operator_block := operator_verification_block_reason_for_command(
+        command, session_id=session_id
+    ):
+        raise _Rejected(_error_json(
+            operator_block,
+            status="operator_verification_required",
+            reason="operator_verification",
+        ))
     if force:
         return _ApprovalVerdict(approved_run=True)
     approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
@@ -853,12 +942,19 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
                 smart_denied=approval.get("smart_denied", False),
                 allow_permanent=approval.get("allow_permanent", True),
             ))
+        if approval.get("status") == "policy_blocked":
+            raise _Rejected(_error_json(
+                approval.get("message", "Command blocked by policy."),
+                status="policy_blocked",
+                reason=approval.get("reason", "command_policy"),
+            ))
         desc = approval.get("description", "command flagged")
         fallback_msg = (
             f"Command denied: {desc}. "
             "Use the approval prompt to allow it, or rephrase the command."
         )
-        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked"))
+        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked",
+                                    **({"user_summary": approval["user_summary"]} if approval.get("user_summary") else {})))
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
         return _ApprovalVerdict(
@@ -1113,6 +1209,12 @@ def _run_foreground(
     )
 
 
+# Floor for the pre-exec guard's share of the command deadline: a short command timeout
+# (1s in tests, a few seconds in practice) must not turn the guard's own cold-start cost
+# (module imports, git probes under load) into a refusal; the wedge it bounds lasted an hour.
+_PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
+
+
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
     workdir: Optional[str], session_key: str,
@@ -1180,6 +1282,8 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    _completion_output_chars: int = 0,
+    heartbeat: int = 0,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1190,7 +1294,11 @@ def terminal_tool(
     background-only flags: on conflict watch_patterns is dropped. watch_patterns
     is hard rate-limited (1 notification / 15s / process) and auto-disabled
     after repeated strikes or a lifetime cap, promoting to notify_on_complete —
-    use it only for rare one-shot signals on long-lived processes.
+    use it only for rare one-shot signals on long-lived processes. ``heartbeat`` (seconds,
+    background-only, implies notify_on_complete) emits a "still running + output since last
+    time" event every N seconds so the agent stays current on a long job without polling.
+    ``_completion_output_chars`` (internal) sizes the completion notification's output for a
+    spawner whose output is the payload (a bot DM's reply); 0 keeps the usual tail.
     ``_host_local`` forces the local backend for Hermes-owned control-plane
     children (kept in a separate env cache from the configured backend).
     """
@@ -1208,285 +1316,42 @@ def terminal_tool(
 
         session_key = get_current_session_key(default="") or (task_id or "")
 
-        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop|uninstall targeting hermes-gateway) must never run inside the
-        # gateway process itself. The restart would SIGTERM the gateway, which
-        # kills this very subprocess before it can complete — the service may
-        # never restart. This mirrors the `hermes gateway restart` guard in
-        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
-        # but applies unconditionally (force=True cannot help here).
-        # Gate on the SUPERVISED-gateway probe, not the raw _HERMES_GATEWAY
-        # marker: gateway.run sets it at import time, so it leaks into every
-        # process that merely imports gateway.run (hermes serve --isolated,
-        # CLI, web server) which are NOT the gateway and must be able to
-        # restart it. A plain foreground `hermes gateway run` (env set, PID
-        # owned, no supervisor) now also PASSES this guard: intentional and
-        # harmless, since without a supervisor there is no KeepAlive to turn a
-        # self-restart into a respawn loop.
-        from tools.process_registry import _is_supervised_gateway_process
+        # The supervised-gateway identity probe ends in a kernel process query
+        # (psutil create_time) that has wedged for the better part of an hour on
+        # macOS; ``env.execute`` is already behind ``run_bounded_sync`` but this
+        # chain ran ahead of it, so the tool call never returned and the cron
+        # slot stayed occupied (#111922). Share the command's own deadline. A
+        # guard that never rendered a verdict fails CLOSED: these checks apply
+        # unconditionally (``force`` cannot bypass them), so the command is
+        # refused with a retryable error instead of running unguarded.
+        from agent.deadline import run_bounded_sync
+        from tools.interrupt import acting_for_tid
 
-        if _is_supervised_gateway_process():
-            from cron.lifecycle_guard import (
-                _MAX_REFERENCED_SCRIPT_BYTES,
-                contains_gateway_lifecycle_command_or_referenced_script,
-                contains_launchctl_submit_command,
-                is_safe_named_transient_gateway_restart,
-                lifecycle_scan_root_within_budget,
-            )
-            if lifecycle_scan_root_within_budget(command) and contains_launchctl_submit_command(command):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: launchctl submit/bootstrap registers a persistent "
-                        "KeepAlive job and is unsafe from inside the gateway process. "
-                        "Use Hermes cron for one-shot delayed work, or install an "
-                        "explicit LaunchAgent from a separate shell."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-            guard_cwd_base = get_session_cwd(session_key)
-            if guard_cwd_base is None:
-                guard_cwd_base = getattr(env, "cwd", None) or cwd
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=guard_cwd_base,
-                session_key=session_key,
-                env_type=env_type,
-            )
-
-            def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to a bounded ``env.execute('head -c ... < path')`` read.
-                """
-                if env is None:
-                    return None
-                try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
-                            data = local_path.read_bytes()
-                            if len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-                                if b"\x00" in data:
-                                    # Binary (ELF/Mach-O/PE), not a shell script:
-                                    # feeding its decoded bytes back into the guard
-                                    # tokenizes machine code into bogus NUL-bearing
-                                    # paths and crashes the scanner (#77703). Mirror
-                                    # lifecycle_guard._read_referenced_script and
-                                    # treat it as nothing to scan.
-                                    return None
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                # Bound the read at the source with `head -c` so an oversized
-                # file (e.g. a 166MB ELF invoked by absolute path) never
-                # crosses the wire — `cat` of such a binary previously pinned
-                # the gateway's tool thread on a superlinear shlex scan for
-                # 30+ minutes. One byte over the guard's budget is enough for
-                # lifecycle_guard's sanitizer to fail the oversized case
-                # closed, mirroring the local-read semantics. The `< path`
-                # redirect keeps leading-dash paths out of argv (same form as
-                # tools/image_source.py).
-                try:
-                    result = env.execute(
-                        f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}"
-                    )
-                    if result.get("returncode", -1) == 0:
-                        output = result.get("output", "")
-                        if output and "\x00" in output:
-                            # Binary content from a remote read: skip for the
-                            # same reason as the local branch above (#77703).
-                            return None
-                        return output
-                except Exception:
-                    pass
-                return None
-
-            if not lifecycle_scan_root_within_budget(command):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: command or referenced script cannot restart, stop, or "
-                        "uninstall the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-
-            if (
-                not is_safe_named_transient_gateway_restart(command)
-                and contains_gateway_lifecycle_command_or_referenced_script(
-                    command,
-                    cwd=guard_cwd,
-                    read_remote_script=_read_script_in_env,
-                )
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: command or referenced script cannot restart, stop, or "
-                        "uninstall the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-
-        # Validate before the source guard resolves an explicit workdir.
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
-
-        # Windows-only: NTFS locks loaded module files, so rewriting the local
-        # checkout backing this interpreter can corrupt the running process.
-        # POSIX keeps old inodes alive for open handles, so the guard is off
-        # there. Remote backends cannot reach that checkout.
-        if env_type == "local":
-            from tools.self_repo_guard import (
-                detect_self_repo_git_mutation,
-                guard_active,
-            )
-
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-            )
-            _self_repo_hit, _self_repo_msg = (
-                detect_self_repo_git_mutation(command, guard_cwd)
-                if guard_active()
-                else (False, None)
-            )
-            if _self_repo_hit:
-                logger.warning(
-                    "Blocked self-repo git mutation (command: %s)",
-                    _safe_command_preview(command),
-                )
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": _self_repo_msg,
-                    "status": "blocked",
-                }, ensure_ascii=False)
-
-        # Pre-exec security checks (tirith + dangerous command detection)
-        # Skip check if force=True (user has confirmed they want to run it)
-        approval_note = None
-        # True when the user explicitly approved this run (or pre-confirmed via
-        # force).  Drives the clean-interrupt-slate clear before env.execute so
-        # an approved command can't be SIGINT-killed by a bit that landed during
-        # the approval-wait (see clear_current_thread_interrupt).
-        _approved_run = bool(force)
-        if not force:
-            approval = _check_all_guards(
-                command, env_type,
-                has_host_access=_docker_has_host_access(_get_env_config()),
-            )
-            if not approval["approved"]:
-                # Check if this is an approval_required (gateway ask mode)
-                if approval.get("status") == "pending_approval":
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": "",
-                        "status": "pending_approval",
-                        "approval_pending": True,
-                        "command": approval.get("command", command),
-                        "description": approval.get("description", "command flagged"),
-                        "pattern_key": approval.get("pattern_key", ""),
-                        "smart_denied": approval.get("smart_denied", False),
-                        "allow_permanent": approval.get("allow_permanent", True),
-                    }, ensure_ascii=False)
-                if approval.get("status") == "policy_blocked":
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": approval.get("message", "blocked by command policy"),
-                        "status": "policy_blocked",
-                        "reason": approval.get("reason", "command_policy"),
-                    }, ensure_ascii=False)
-                # Command was blocked
-                desc = approval.get("description", "command flagged")
-                fallback_msg = (
-                    f"Command denied: {desc}. "
-                    "Use the approval prompt to allow it, or rephrase the command."
-                )
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": approval.get("message", fallback_msg),
-                    "status": "blocked"
-                }, ensure_ascii=False)
-            # Track whether approval was explicitly granted by the user
-            if approval.get("user_approved"):
-                desc = approval.get("description", "flagged as dangerous")
-                approval_note = f"Command required approval ({desc}) and was approved by the user."
-                _approved_run = True
-            elif approval.get("smart_approved"):
-                desc = approval.get("description", "flagged as dangerous")
-                approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
-
+        # The guard chain runs on the deadline worker; keep it answerable to /stop
+        # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
+        guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+        _acting_token = acting_for_tid.set(threading.current_thread().ident)
         try:
-            from hermes_cli.operator_verification import (
-                current_operator_verification_subject,
-                operator_verification_block_reason_for_command,
-                required_operator_role_for_command,
+            bounded_guard = run_bounded_sync(
+                lambda: _pre_exec_block(
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                ),
+                guard_timeout,
+                label="terminal.pre-exec-guard",
             )
-            required_role = required_operator_role_for_command(command)
-            trusted_subject = current_operator_verification_subject(
-                required_role, session_id=session_id
-            ) or {}
-            operator_block = operator_verification_block_reason_for_command(
-                command,
-                session_id=session_id,
-                interface=trusted_subject.get("interface", ""),
-                provenance=trusted_subject.get("provenance", ""),
-                actor_id=trusted_subject.get("actor_id", ""),
-                requested_role=required_role,
-            )
-        except Exception:
-            operator_block = "Operator verification policy could not be evaluated; failing closed."
-        if operator_block:
-            return json.dumps({
-                "output": "",
-                "exit_code": -1,
-                "error": operator_block,
-                "status": "operator_verification_required",
-                "requires_operator_verification": True,
-            }, ensure_ascii=False)
-
-        # Prepare command for execution
-        pty_disabled_reason = None
-        effective_pty = pty
-        if pty and _command_requires_pipe_stdin(command):
-            effective_pty = False
-            pty_disabled_reason = (
-                "PTY disabled for this command because it expects piped stdin/EOF "
-                "(for example gh auth login --with-token). For local background "
-                "processes, call process(action='close') after writing so it receives "
-                "EOF."
-            )
+        finally:
+            acting_for_tid.reset(_acting_token)
+        if bounded_guard.timed_out:
+            raise _Rejected(_error_json(
+                f"Terminal pre-execution guard did not finish within {guard_timeout}s "
+                "(process-identity probe wedged); the command was not run. Retry the call.",
+                status="error",
+            ))
+        # Pre-exec security checks (tirith + dangerous command detection);
+        # force=True means the user already confirmed.
+        verdict = _run_approval_guards(
+            command, env_type, plan.config, force=force, session_id=session_id
+        )
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
@@ -1498,8 +1363,10 @@ def terminal_tool(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
-                watch_patterns=watch_patterns, approval_note=approval_note,
+                watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
+                completion_output_chars=_completion_output_chars,
+                heartbeat_seconds=heartbeat,
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
@@ -1507,7 +1374,7 @@ def terminal_tool(
         return _run_foreground(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
-            workdir=workdir, approval_note=approval_note, clear_interrupt=_approved_run,
+            workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
         )
     except _Rejected as r:
         return r.result_json
@@ -1518,13 +1385,15 @@ def terminal_tool(
 
 
 def check_terminal_requirements() -> bool:
-    """Check if all requirements for the terminal tool are met."""
+    """Check if all requirements for the terminal tool are met. The reason for a failure is kept for
+    :func:`terminal_backend_unavailable_reason` (CLI startup notice / doctor)."""
     try:
         config = _get_env_config()
         checker = _REQUIREMENT_CHECKERS.get(config["env_type"], _check_plugin_requirements)
         return checker(config)
     except Exception as e:
         logger.error("Terminal requirements check failed: %s", e, exc_info=True)
+        _record_unavailable_reason(f"the requirements check failed: {e}")
         return False
 
 
@@ -1565,6 +1434,11 @@ TERMINAL_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
                 ]
+            },
+            "heartbeat": {
+                "type": "integer",
+                "minimum": 60,
+                "description": "With background=true: also notify every N seconds (min 60) with the output since the last notice. For long jobs you must react to mid-run (merge trains, full suites); implies notify=true."
             }
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
@@ -1576,6 +1450,8 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
+    from agent.terminal_approval_batch import validate_prepared_terminal
+    validate_prepared_terminal(args)
     # Models sometimes send execute_code's ``code`` here; name the stray
     # argument and the right tool instead of failing on command=None.
     if "command" not in args and "code" in args:
@@ -1591,11 +1467,14 @@ def _handle_terminal(args, **kw):
     notify = args.get("notify")
     notify_on_complete = args.get("notify_on_complete", False)
     watch_patterns = args.get("watch_patterns")
+    heartbeat = args.get("heartbeat") or 0
+    if not isinstance(heartbeat, int) or isinstance(heartbeat, bool) or heartbeat < 0:
+        return tool_error("heartbeat must be a whole number of seconds (min 60).")
     if not args.get("background", False):
-        if notify or watch_patterns or notify_on_complete:
+        if notify or watch_patterns or notify_on_complete or heartbeat:
             return tool_error(
-                "notify only applies to background commands (foreground "
-                "results return directly). Either drop notify, or run as "
+                "notify/heartbeat only apply to background commands (foreground "
+                "results return directly). Either drop them, or run as "
                 "terminal(command=..., background=true, notify=...)."
             )
         if args.get("pty", False):
@@ -1617,6 +1496,8 @@ def _handle_terminal(args, **kw):
                 "notify must be true/false (notify on exit) or a list of "
                 "strings (notify on output pattern match)."
             )
+    if heartbeat:
+        notify_on_complete = True  # the heartbeat rides the completion delivery path
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -1627,6 +1508,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        heartbeat=heartbeat,
     )
 
 

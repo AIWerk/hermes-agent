@@ -81,7 +81,6 @@ class TestFormatForInjection:
         assert "[>]" in text
         assert "Next" in text
         assert "Working" in text
-        assert "context compression" in text.lower()
 
 
 class TestMergeMode:

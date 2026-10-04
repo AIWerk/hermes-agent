@@ -33,7 +33,7 @@ def extract_bearer(request: Request) -> str:
 def is_safe_next_path(path: str) -> bool:
     """Same-origin post-login target: rejects non-relative and protocol-relative (``//evil``)
     values, the auth routes themselves, and every ``/api`` path."""
-    if not path.startswith("/") or path.startswith("//"):
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
         return False
     if any(path == p or path.startswith(p) for p in _NEXT_DENY_PREFIXES):
         return False

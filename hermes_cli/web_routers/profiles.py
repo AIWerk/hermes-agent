@@ -12,6 +12,7 @@ so a test's ``monkeypatch.setattr(<owning module>, "_helper", ...)`` keeps worki
 import contextlib
 import copy
 import functools
+from hermes_cli.web_read_coalescing import coalesced_read
 import inspect
 import json
 import logging
@@ -27,18 +28,24 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 
 from hermes_cli.web_deps import late
-from hermes_cli.web_server_config import _apply_main_model_assignment, _normalize_main_model_assignment
+from hermes_cli.config import get_process_hermes_home
+from hermes_cli.profiles import ProfileIdentitySettlementPending
+from hermes_cli.web_server_config import (
+    _apply_main_model_assignment, _normalize_main_model_assignment, _validated_main_model_selection,
+)
 from hermes_cli.web_server_gateway import _strip_session_list_rows
+from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
 from hermes_cli.web_server_profiles import (
     _fallback_profile_dicts, _hub_action_name, _write_profile_mcp_servers,
 )
 from hermes_cli.web_server_sessions import _open_session_db_at_path
+from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
 from starlette.concurrency import run_in_threadpool
 from hermes_cli.web_models import (
     ProfileCreate, ProfileActiveUpdate, ProfileExport, ProfileImport, ProfileRename,
     ProfileSoulUpdate, ProfileDescriptionUpdate, ProfileModelUpdate, ProfileDescribeAuto,
     SessionPrScanBody)
-from hermes_cli.web_server_profiles import _hermes_home_scope
+from hermes_cli.web_server_profiles import _config_profile_scope, _hermes_home_scope
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -83,18 +90,103 @@ def _session_list_row_visible(db: Any, row: Dict[str, Any], actor: Dict[str, Any
 
     return _session_list_row_visible_to_cui_actor(db, row, actor)
 
+def _profile_to_dict(info) -> Dict[str, Any]:
+    attr = functools.partial(getattr, info)
+    return {
+        "name": attr("name", ""), "path": str(attr("path", "")),
+        "is_default": bool(attr("is_default", False)),
+        "model": attr("model", None), "provider": attr("provider", None),
+        "has_env": bool(attr("has_env", False)),
+        "skill_count": int(attr("skill_count", 0) or 0),
+        "gateway_running": bool(attr("gateway_running", False)),
+        "description": attr("description", "") or "",
+        "description_auto": bool(attr("description_auto", False)),
+        "display_name": attr("display_name", "") or "",
+        "bot_title": attr("bot_title", "") or "",
+        "distribution_name": attr("distribution_name", None),
+        "distribution_version": attr("distribution_version", None),
+        "distribution_source": attr("distribution_source", None),
+        "has_alias": attr("alias_path", None) is not None, "role": attr("role", None)}
+
 
 def _restricted_actor_denied(actor: Dict[str, Any] | None) -> None:
     if actor and actor.get("_restricted"):
         raise HTTPException(status_code=403, detail="Authenticated identity is not available")
 
 
+def _scope_profile_name(path: Path) -> Optional[str]:
+    """Map a profile directory onto the query name ``_config_profile_scope`` expects: None for
+    the process home (current-profile semantics: launch secret scope, no home override),
+    ``"default"`` for the default root (its basename -- ``.hermes`` or a custom root -- is not a
+    profile name; launched from ``profiles/<name>`` the root is a *different* profile), the
+    directory name for ``profiles/<name>``."""
+    from hermes_constants import get_default_hermes_root
+    resolved = path.resolve()
+    if resolved == get_process_hermes_home().resolve():
+        return None
+    if resolved == get_default_hermes_root().resolve():
+        return "default"
+    return path.name
+
+
+def _write_profile_model(profile_dir: Path, provider: str, model: str, validate_in: Optional[Path] = None) -> None:
+    """Write the main model assignment into ``profile_dir``'s config.yaml (HERMES_HOME-scoped)
+    through the same validated /model shape as ``POST /api/model/set``.
+
+    ``validate_in`` is the home whose ``providers:``/``.env``/catalog vouch for the pick (default:
+    ``profile_dir`` itself). Profile-create passes the dashboard's own home: the picker that offered
+    the model read THAT catalog, and a just-created profile has no credentials yet, so validating
+    in the empty profile rejected every non-env provider (anthropic, ollama, custom).
+
+    Both spans enter ``_config_profile_scope`` (home + secret scope), matching ``/api/model/set``:
+    once the dashboard has served a secondary profile, ``switch_model``'s ``key_env`` probe goes
+    through ``get_secret``, which fails closed without a scope and reports the provider as
+    unconnected (UnscopedSecretError class, #114676)."""
+    from hermes_cli.config import load_config, save_config
+    with _config_profile_scope(_scope_profile_name(validate_in or profile_dir)):
+        provider, model = _normalize_main_model_assignment(provider, model)
+        result = _validated_main_model_selection(load_config(), provider, model)
+    with _config_profile_scope(_scope_profile_name(profile_dir)), _CONFIG_MUTATION_LOCK:  # RMW span
+        cfg = load_config()
+        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), result)
+        save_config(cfg)
+
+
+def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
+    """Disable every installed skill in ``profile_dir`` not in ``keep``; returns how many were
+    newly disabled. Profiles manage activation via a *disabled* list (everything installed is
+    active by default); the builder's skill step has "replace" semantics. Hub skills are
+    installed separately via subprocess and are active on install."""
+    from hermes_cli.config import load_config
+    from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
+    keep_set = {s.strip() for s in keep if s and s.strip()}
+    with _hermes_home_scope(profile_dir), _CONFIG_MUTATION_LOCK:  # RMW span
+        skills_root = profile_dir / "skills"
+        installed = ([md.parent.name for md in skills_root.rglob("SKILL.md")]
+                     if skills_root.is_dir() else [])
+        cfg = load_config()
+        disabled = get_disabled_skills(cfg)
+        newly = 0
+        for name in installed:
+            if name not in keep_set and name not in disabled:
+                disabled.add(name)
+                newly += 1
+        if newly:
+            save_disabled_skills(cfg, disabled)
+    return newly
+
+# Returned by the offloaded file readers below to mean "the file is not there", which a plain
+# ``None`` cannot express: ``desktop.json`` may legitimately hold the document ``null``.
 _MISSING = object()
 
 
 @contextlib.contextmanager
 def _profile_errors(log_msg: str, *args, not_found=(FileNotFoundError,),
                     bad_request=(ValueError,)):
+    """Map hermes_cli.profiles exceptions to HTTP: ``not_found`` -> 404, ``bad_request`` -> 400
+    (in that order), anything else is logged with ``log_msg`` -> 500. HTTPException passes, and so
+    does ``ProfileIdentitySettlementPending`` — a typed partial success the calling endpoint (the
+    delete route) owns; it must not flatten into the generic 500."""
     try:
         yield
     except HTTPException:
@@ -103,6 +195,8 @@ def _profile_errors(log_msg: str, *args, not_found=(FileNotFoundError,),
         raise HTTPException(status_code=404, detail=str(e))
     except bad_request as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except ProfileIdentitySettlementPending:
+        raise
     except Exception as e:
         _log.exception(log_msg, *args)
         raise HTTPException(status_code=500, detail=str(e))
@@ -123,16 +217,16 @@ def _best_effort(log_msg: str, *args, fn, default=None):
         return default
 
 
-def _profile_targets(log_label: str, *, lightweight: bool) -> List[Tuple[str, Path]]:
+def _profile_targets(log_label: str) -> List[Tuple[str, Path]]:
+    """(name, home) for every profile, falling back to ``default`` alone. Uses
+    ``profiles_to_serve`` (pure directory read) instead of ``list_profiles``, which parses
+    config/meta and probes gateways per profile — every caller here is a polled sidebar
+    fan-out that only needs name/path (#114041)."""
     from hermes_cli import profiles as profiles_mod
     try:
-        targets = (
-            list(profiles_mod.profiles_to_serve(multiplex=True))
-            if lightweight
-            else [(info.name, info.path) for info in profiles_mod.list_profiles()]
-        )
+        targets = list(profiles_mod.profiles_to_serve(multiplex=True, include_standalone=True, include_parked=True))
     except Exception:
-        _log.exception("%s: list_profiles failed", log_label)
+        _log.exception("%s: profile enumeration failed", log_label)
         targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
@@ -161,6 +255,8 @@ def _read_profile_db(name: str, home, errors: Optional[List[Dict[str, str]]],
         db = _open_session_db_at_path(db_path, read_only=True)
         return fn(db)
     except Exception as exc:
+        # An open that dies on a damaged file never reaches SessionDB's read helpers.
+        note_storage_error(db_path, exc)
         _warn_profile_read_error(name, exc)
         if errors is not None:
             errors.append({"profile": name, "error": str(exc)})
@@ -170,9 +266,16 @@ def _read_profile_db(name: str, home, errors: Optional[List[Dict[str, str]]],
             db.close()
 
 
-# Bounded cache lifetime for the expensive sidebar scan. Short enough that the
-# UI never shows meaningfully stale data, long enough to coalesce the desktop's
-# reconnect/focus/change poll bursts into one scan.
+def _corrupt_profile_stores(targets) -> Dict[str, str]:
+    """``{profile: "corrupt"}`` for every scanned profile whose state.db this process has latched
+    as structurally corrupt (``hermes_state_health``). Lets Desktop tell an empty or partial list
+    from a damaged store, including when some reads still succeed (#72046)."""
+    return {name: STORAGE_CORRUPT for name, home in targets
+            if storage_state(Path(home) / "state.db") == STORAGE_CORRUPT}
+
+
+# Sidebar scan cache TTL: short enough that the UI never shows meaningfully stale data, long
+# enough to coalesce the desktop's reconnect/focus/change poll bursts into one scan.
 _SIDEBAR_CACHE_TTL_SECONDS = 5.0
 _SIDEBAR_CACHE_MAX_ENTRIES = 32
 _SIDEBAR_PROFILE_CACHE_MAX_ENTRIES = 256
@@ -463,6 +566,7 @@ def get_profiles_sessions(
         "limit": limit,
         "offset": offset,
         "errors": errors,
+        "storage": _corrupt_profile_stores(targets),
     }
 
 
@@ -503,19 +607,12 @@ def get_profiles_sessions_sidebar(
     _restricted_actor_denied(actor)
     customer_actor = actor if actor and not actor.get("_restricted") else None
     from hermes_cli import profiles as profiles_mod
-
     from hermes_cli.dashboard_auth.profile_access import http_decision
     decision = http_decision.get()
     if decision is not None:
         targets = [(decision.target_profile, profiles_mod.get_profile_dir(decision.target_profile))]
     else:
-        try:
-            targets = profiles_mod.profiles_to_serve(multiplex=True)
-        except Exception:
-            _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
-            targets = []
-    if not targets:
-        targets.append(("default", profiles_mod.get_profile_dir("default")))
+        targets = _profile_targets("GET /api/profiles/sessions/sidebar")
 
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
@@ -567,9 +664,11 @@ def get_profiles_sessions_sidebar(
             offset=0,
         )
 
+    scanned = []
     for name, home in targets:
         if recents_scope != "all" and name != recents_scope:
             continue
+        scanned.append((name, home))
         db_path = Path(home) / "state.db"
         if not db_path.exists():
             continue
@@ -643,8 +742,7 @@ def get_profiles_sessions_sidebar(
         # profile per refresh it costs nothing beyond the rows already
         # read. Discount pinned back-fills — they arrive past the LIMIT
         # and would otherwise fake a full page on a short list.
-        unpinned_count = sum(1 for s in profile_rows if not s.get("pinned"))
-        recents_truncated[name] = unpinned_count >= recents_cap
+        recents_truncated[name] = len(profile_rows) >= recents_cap
         recents_rows.extend(_tag(profile_rows, name))
         profile_totals[name] = slices["usage"]
         cron_rows.extend(_tag(profile_cron_rows, name))
@@ -679,6 +777,7 @@ def get_profiles_sessions_sidebar(
             "total": len(messaging_rows),
         },
         "errors": errors,
+        "storage": _corrupt_profile_stores(scanned),
     }
 
 
@@ -740,6 +839,7 @@ def _merge_profile_tree(
 
 
 @sessions_router.get("/api/profiles/projects/tree")
+@_sidebar_singleflight_cache
 def get_profiles_projects_tree(
     request: Request, preview_limit: int = 3, session_limit: int = 2000
 ):
@@ -779,7 +879,7 @@ def get_profiles_projects_tree(
     scoped_session_ids: List[str] = []
     errors: List[Dict[str, str]] = []
 
-    for name, home in _profile_targets("GET /api/profiles/projects/tree", lightweight=True):
+    for name, home in _profile_targets("GET /api/profiles/projects/tree"):
         def _read(db, name=name, home=home):
             with _hermes_home_scope(home):
                 tree, _active_id = build_project_tree(
@@ -840,7 +940,7 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody, request: Reque
                 # Oldest-first, so a later `gh pr create` (the replacement PR) wins.
                 found[pr["session_id"]] = {"number": parsed[0], "url": parsed[1]}
 
-    for name, home in _profile_targets("POST /api/profiles/sessions/pull-requests", lightweight=False):
+    for name, home in _profile_targets("POST /api/profiles/sessions/pull-requests"):
         _read_profile_db(name, home, None, _read)
 
     # ``scanned``: every id looked at, so the caller can remember "nothing there".
@@ -850,24 +950,34 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody, request: Reque
     }
 
 
-@router.get("/api/profiles")
-async def list_profiles_endpoint():
-    from hermes_cli.dashboard_auth.profile_access import http_decision
-    decision = http_decision.get()
-    if decision is not None:
-        return {"profiles": [{"name": name, "is_default": name == decision.default_profile}
-                             for name in decision._policy._profiles
-                             if decision._policy.allows(decision.tenant_id, decision.actor_id,
-                                                        name, "profile.discover")
-                             and "profile.discover" in decision._policy._grants.get(
-                                 (decision.tenant_id, decision.actor_id, name), ())]}
+@functools.partial(coalesced_read, thread_runner=lambda func: run_in_threadpool(func))
+def _read_profiles():
     from hermes_cli import profiles as profiles_mod
     try:
-        profiles = await run_in_threadpool(profiles_mod.list_profiles)
+        # Polled by the Desktop on every focus/roster tick: never walk skill trees in-request.
+        profiles = profiles_mod.list_profiles(lazy_skill_count=True)
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
+
+
+@router.get("/api/profiles")
+async def list_profiles_endpoint():
+    from hermes_cli.dashboard_auth.profile_access import http_decision
+    decision = http_decision.get()
+    if decision is None:
+        return await _read_profiles()
+    # Authorization must precede all per-profile filesystem/config reads.  The policy already
+    # names the discoverable profiles, so return the bounded roster directly.
+    visible = sorted(
+        profile
+        for (tenant, actor, profile), actions in decision._policy._grants.items()
+        if tenant == decision.tenant_id
+        and actor == decision.actor_id
+        and "profile.discover" in actions
+    )
+    return {"profiles": [{"name": name} for name in visible]}
 
 
 @router.post("/api/profiles")
@@ -888,7 +998,8 @@ async def create_profile_endpoint(body: ProfileCreate):
                          bad_request=(ValueError, FileExistsError, FileNotFoundError)):
         path = profiles_mod.create_profile(
             name=body.name, clone_from=clone_from, clone_all=body.clone_all,
-            clone_config=clone_config, no_skills=body.no_skills, description=body.description)
+            clone_config=clone_config, no_skills=body.no_skills, description=body.description,
+            clone_channels=body.clone_channels)
         # Match the CLI flow: fresh named profiles get the bundled skills (cloning already
         # copied the source's; no_skills wrote the opt-out marker so seeding no-ops) and a
         # ~/.local/bin wrapper when the alias is safe.
@@ -901,9 +1012,22 @@ async def create_profile_endpoint(body: ProfileCreate):
     # the whole create — the user can fix it from the dashboard or `<profile> setup`.
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
+    # Validate against THIS dashboard's home (the catalog the picker offered), not the empty
+    # new profile; the write still lands in the new profile. A rejection is reported (not just
+    # logged) so the dialog can say WHY the model was not set.
+    model_error = ""
+
+    def _set_model() -> bool:
+        nonlocal model_error
+        try:
+            _write_profile_model(path, provider, model, validate_in=get_process_hermes_home())
+        except HTTPException as exc:
+            model_error = str(exc.detail)
+            return False
+        return True
+
     model_set = bool(provider and model) and _best_effort(
-        "Setting model for new profile %s failed", body.name,
-        fn=lambda: (_write_profile_model(path, provider, model), True)[1], default=False)
+        "Setting model for new profile %s failed", body.name, fn=_set_model, default=False)
     mcp_written = _best_effort(
         "Writing MCP servers for new profile %s failed", body.name, default=0,
         fn=lambda: _write_profile_mcp_servers(path, body.mcp_servers)) if body.mcp_servers else 0
@@ -924,7 +1048,7 @@ async def create_profile_endpoint(body: ProfileCreate):
             fn=lambda: _spawn_install(ident))}
         for ident in ((i or "").strip() for i in body.hub_skills) if ident]
 
-    return {"ok": True, "name": body.name, "path": str(path), "model_set": model_set,
+    return {"ok": True, "name": body.name, "path": str(path), "model_set": model_set, "model_error": model_error,
             "mcp_written": mcp_written, "skills_disabled": skills_disabled,
             "hub_installs": hub_installs}
 
@@ -1024,12 +1148,21 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
 @router.delete("/api/profiles/{name}")
 async def delete_profile_endpoint(name: str):
     """The dashboard collects the user's confirmation in its own dialog, so ``yes=True``
-    always skips the CLI's interactive prompt."""
+    always skips the CLI's interactive prompt.
+
+    A delete whose identity settlement stays pending answers ``ok`` with ``settlement_pending``
+    and the retry command: the profile directory is already gone, and folding that state into
+    the generic 500 made a dashboard client read a completed delete as a failure (its retry
+    then 404'd)."""
     from hermes_cli import profiles as profiles_mod
-    with _profile_errors("DELETE /api/profiles/%s failed", name):
-        # Polls a running gateway's PID for up to 10 s, then rmtree()s the directory; on the
-        # loop that parks every request past the desktop's 10 s WebSocket ready-probe.
-        path = await run_in_threadpool(profiles_mod.delete_profile, name, yes=True)
+    try:
+        with _profile_errors("DELETE /api/profiles/%s failed", name):
+            # Polls a running gateway's PID for up to 10 s, then rmtree()s the directory; on the
+            # loop that parks every request past the desktop's 10 s WebSocket ready-probe.
+            path = await run_in_threadpool(profiles_mod.delete_profile, name, yes=True)
+    except ProfileIdentitySettlementPending as exc:
+        return {"ok": True, "path": str(exc.path), "identity_settled": False,
+                "settlement_pending": True, "retry_command": exc.retry_command}
     return {"ok": True, "path": str(path)}
 
 

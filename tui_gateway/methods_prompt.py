@@ -187,7 +187,7 @@ def _typed_stop_phrase_response(rid, text):
     return _ok(rid, {"voice_stopped": True})
 
 
-_HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation"}
+_HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation", "member_id"}
 
 
 def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback):
@@ -218,11 +218,10 @@ def _legacy_group_fence_error(rid, session, params):
         hosted = probe_hosted_room(default_db_path(), room_id=room_id)
         peer = False
         if not hosted:
-            from hermes_constants import named_profile_home
-            session_profile_home = named_profile_home(str(session.get("profile_home") or ""))
+            from hermes_constants import profile_name_for_home
             peer = probe_peer_room_reservation(
                 default_db_path(), room_id=room_id, target_profile=(
-                    (session_profile_home.name if session_profile_home is not None else "")
+                    profile_name_for_home(session.get("profile_home"))
                     or str(params.get("profile") or "").strip()
                     or str(_current_profile_name() or "default").strip()))
     except RoomProbeUnavailableError:
@@ -454,9 +453,9 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
                     "turn so memory and DB stay aligned: %s",
                     sid, ordinal, exc, exc_info=True)
                 return _err(rid, 5008, f"failed to persist history truncation: {exc}"), {}
-            # Survivors were re-inserted as NEW rows: surface the fresh ids so the client
-            # rebinds its cached rowIds (else a second rewind refuses with 4018).  None
-            # entries: the client must drop its cached id for that turn.
+            # Surface the survivors' live ids so the client rebinds its cached rowIds
+            # (a strict-prefix cut keeps them unchanged since #82956; a divergent
+            # rewrite mints new rows).  None entries: the client must drop that turn's id.
             if requested_rebind_ids is None:
                 fields["survivor_user_row_ids"] = [
                     _message_row_id(truncated[i]) for i in _history_user_indices(truncated)]
@@ -474,33 +473,58 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
     return None, fields
 
 
-def _persist_session_row_for_submit(rid, session):
+def _storage_error_data(failure, raw) -> dict:
+    """Machine-readable error data: ``code`` lets a GUI pick a "Run doctor" / "Retry" action."""
+    from hermes_state_user_copy import storage_failure_details
+    return {"code": failure.code, "cause": failure.cause, "details": storage_failure_details(raw)}
+
+
+def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
     """Lazily persist the DB row now that the user sent a message (a branch becomes real
-    here); the error reply is the only user-visible signal (desktop maps it to a toast)."""
+    here), then the message itself (#111868: a freeze during the first build must leave a
+    resumable transcript); the error reply is the only user-visible signal (desktop maps it to a toast)."""
+    from hermes_state_user_copy import describe_storage_failure
     try:
         if _ensure_session_db_row(session) is False:
-            return _err(
+            failure = describe_storage_failure(_db_error)
+            error = _err(
                 rid, 5072,
-                "session storage unavailable: "
-                f"{_db_error or 'state.db could not be opened'} — the message "
-                "was not saved; repair state.db and try again")
-        _persist_branch_seed(session)
+                f"Session storage is unavailable, so this message was not saved. Cause: {failure.gloss}. "
+                f"{failure.action} Then send your message again.",
+                data=_storage_error_data(failure, _db_error))
+        else:
+            _persist_branch_seed(session)
+            _persist_submit_user_row(session, text, display_kind)
+            return None
     except Exception as exc:
-        from hermes_state_errors import is_disk_full_error
-        with session["history_lock"]:
-            session["running"] = False
-            session["last_active"] = time.time()
-            _clear_inflight_turn(session)
-        if is_disk_full_error(exc):
-            return _err(
+        failure = describe_storage_failure(exc)
+        if failure.code == "disk_full":
+            error = _err(
                 rid, 5070,
-                "disk full: session storage could not be written — free some disk space and try again")
-        logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
-        return _err(rid, 5071, f"session storage could not be written: {exc}")
-    return None
+                "Session storage could not be written, so this message was not saved: the disk is full. "
+                "Free some disk space, then send your message again.",
+                data=_storage_error_data(failure, exc))
+        else:
+            logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
+            error = _err(
+                rid, 5071,
+                f"Session storage could not be written, so this message was not saved. Cause: {failure.gloss}. "
+                f"{failure.action} Then send your message again.",
+                data=_storage_error_data(failure, exc))
+    # No turn thread will start, so neither resume nor the busy queue may see
+    # this rejected prompt as live. Release the slot a turn would normally own.
+    with session["history_lock"]:
+        session["running"] = False
+        session["last_active"] = time.time()
+        session.pop("_hosted_room_task", None)
+        _clear_inflight_turn(session)
+        _release_active_session_slot(session)
+    return error
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback):
+def _run_after_agent_ready(
+    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
+):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
@@ -529,8 +553,8 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
                 else "Session no longer running before the agent was ready")})
             return
     _run_prompt_submit(
-        rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback)
+        rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
 
 
 _TRUNCATION_PARAMS = (
@@ -538,11 +562,13 @@ _TRUNCATION_PARAMS = (
 
 
 def _lock_in_submit_turn(
-    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task):
+    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
-    with session["history_lock"]:
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
@@ -562,7 +588,7 @@ def _lock_in_submit_turn(
         session["last_active"] = time.time()
         if hosted_task is not None:
             session["_hosted_room_task"] = dict(hosted_task)
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(session, text, display_kind=display_kind)
     return None, fields
 
 
@@ -580,6 +606,9 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4004, "could not build learn prompt")
     return _methods["prompt.submit"](rid, {**params, "text": text})
 
+# Per-turn client surfaces that carry a model-bound note (session_notifications._surface_note).
+_CLIENT_SURFACES = frozenset({"hud", "voice-live"})
+
 
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
@@ -590,6 +619,12 @@ def _(rid, params: dict) -> dict:
     # Off-screen sends (widget intents) type the row so no client renders a bubble;
     # whitelisted to "hidden" — this RPC must not mint kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    title_preview = params.get("title_preview")
+    display_metadata = (
+        {"title_preview": title_preview[:1000]}
+        if isinstance(title_preview, str) and title_preview.strip()
+        else None
+    )
     if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
         return stopped
     if params.get("interrupted"):
@@ -599,6 +634,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    from tools.bot_relay import DeliveryAuthor
+
+    # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
+    raw_author = params.get("_turn_author")
+    if raw_author is not None and not isinstance(raw_author, DeliveryAuthor):
+        return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
+    turn_author = raw_author.author if raw_author is not None else None
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
@@ -608,13 +650,18 @@ def _(rid, params: dict) -> dict:
     if err is not None:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        return _err(rid, 4090, limit_message)
+        reason = getattr(limit_message, "reason", None)
+        return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None)
     auto_reset = _rotate_cui_session_if_expired(sid, session)
-    # Which desktop window this message was typed into. Rewritten on every
-    # submit, because one session can be driven from the app window and the HUD
-    # in turn: a stale "hud" would tell the model the user is still floating
-    # over another app when they are back in Hermes.
-    session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    session["client_surface"] = (
+        params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
+    )
+    voice_context = params.get("voice_context")
+    session["voice_live_context"] = (
+        voice_context[:6000]
+        if session["client_surface"] == "voice-live" and isinstance(voice_context, str)
+        else ""
+    )
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
     if has_truncation and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
@@ -642,13 +689,13 @@ def _(rid, params: dict) -> dict:
     if internal_hosted_submit and turn_isolation:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
     # Re-bind to the current transport: streaming must stay on the active websocket even
-    # if a disconnect/fallback moved the session to stdio.
+    # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
+    # socket that already closed cannot cancel the orphan reap without coming back (#116464).
     with _session_resume_lock:
         if (refusal := _reattach_refusal(rid, sid, session)) is not None:
             return refusal
         if (t := current_transport()) is not None:
-            session["transport"] = t
-            _cancel_ws_orphan_reap(sid)
+            _rebind_live_transport(sid, session, t)
     # Claim the turn against a possibly-running session (busy/queued reply, else fall
     # through once ``running`` is observed False).  The provider interrupt happens after
     # history_lock is released (a non-interruptible tool may hold it); if the old turn
@@ -661,458 +708,32 @@ def _(rid, params: dict) -> dict:
             if internal_hosted_submit:
                 return _err(rid, 4091, "hosted room member session is busy")
             busy_transport = t or session.get("transport")
+        if has_truncation:
+            # A rewind/edit/restore/regenerate must land as a truncation, never as a
+            # steered correction or a plain follow-up queued to run after the live
+            # turn — either would silently drop the history cut the user asked for.
+            # Signal busy so the caller's own interrupt-then-retry loop (already
+            # built for exactly this race — see desktop's `runRewindSubmit`) waits
+            # for `running` to clear and resubmits with the truncation intact.
+            return _err(rid, 4009, "session busy")
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")))
+            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
     requested_rebind_ids = (
-        {
-            row_id
-            for row_id in raw_rebind_ids
-            if isinstance(row_id, int) and not isinstance(row_id, bool)
-        }
-        if isinstance(raw_rebind_ids, list)
-        else None
-    )
-    survivor_user_row_ids = None
-    survivor_row_id_map = None
-    with session["history_lock"]:
-        # A watch session's run lives in the PARENT turn, so its own running
-        # flag is False — without this, typing mid-run builds a second agent
-        # racing the in-flight child on the same stored session (interleaved
-        # transcript, stale fork). After the run completes, submitting is fine:
-        # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
-            return _err(rid, 4009, "subagent still running — wait for it to finish")
-        truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-        truncate_message_id = params.get("truncate_before_message_id")
-        truncate_row_id = params.get("truncate_before_row_id")
-        if (
-            is_truthy_value(params.get("confirm_truncate"))
-            and truncate_user_ordinal is None
-            and truncate_message_id is None
-            and truncate_row_id is None
-        ):
-            return _err(
-                rid,
-                4004,
-                "confirm_truncate requires truncate_before_user_ordinal, truncate_before_message_id, or truncate_before_row_id",
-            )
-        if (
-            truncate_user_ordinal is not None
-            or truncate_message_id is not None
-            or truncate_row_id is not None
-        ):
-            history = _history_without_ephemeral_scaffolding(
-                session.get("history", [])
-            )
-
-            # Malformed params refuse first (4004), regardless of consent —
-            # the historical ordinal-path precedence.
-            target_row_id = None
-            if truncate_row_id is not None:
-                target_row_id, err = _coerce_truncate_int(
-                    rid, truncate_row_id, "truncate_before_row_id"
-                )
-                if err is not None:
-                    return err
-            client_ordinal = None
-            if truncate_user_ordinal is not None:
-                client_ordinal, err = _coerce_truncate_int(rid, truncate_user_ordinal)
-                if err is not None:
-                    return err
-
-            # An ordinal/id alone is not consent. A client that carries a leftover
-            # ordinal into an ORDINARY submit sends a request that is
-            # indistinguishable, field by field, from a real rewind — same
-            # method, same shape, an in-range target — and the cut it asks for
-            # is a destructive replace_messages() the user never requested
-            # (#80763: 296 -> 52 messages, 244 durable rows gone). Only the
-            # client knows whether this submit is a rewind/edit/regenerate, so
-            # it has to say so; refuse the cut when it doesn't. Consent is
-            # checked BEFORE target resolution: an unconfirmed (leaked-state)
-            # request must refuse with 4029 without paying the durable
-            # transcript read or heal-stamping live history dicts that
-            # row-id resolution performs.
-            if not is_truthy_value(params.get("confirm_truncate")):
-                logger.warning(
-                    "prompt.submit: REFUSED unconfirmed truncation of session %s "
-                    "(%d messages held; ordinal=%s, row_id=%s, message_id=%s). "
-                    "The client attached truncation parameters without "
-                    "confirm_truncate — likely stale truncation parameters on "
-                    "an ordinary submit.",
-                    sid,
-                    len(history),
-                    client_ordinal,
-                    target_row_id,
-                    truncate_message_id,
-                )
-                return _err(
-                    rid,
-                    4029,
-                    "truncation parameters require confirm_truncate=true; "
-                    "an ordinary prompt.submit must not drop session history "
-                    "(update your Hermes client if a rewind was intended)",
-                )
-            # Desktop/TUI ordinals count the full displayed lineage. After
-            # compression, session["history"] holds only the tip segment while
-            # display_history_prefix holds the immutable ancestor display rows
-            # still shown in the transcript (#82462 / #69107). Count the
-            # ancestor user turns once so every comparison between a client
-            # ordinal and a tip-relative ordinal below can translate, instead
-            # of loading ancestors into the tip (which would duplicate
-            # compressed history on later resumes).
-            prefix_user_count = len(
-                _history_user_indices(
-                    session.get("display_history_prefix") or []
-                )
-            )
-
-            user_indices = _history_user_indices(history)
-
-            def _stale_target_data(resolved_ordinal=None):
-                # Structured recovery fields for clients (#82462): Desktop
-                # resyncs + retries on a stale target, and shows an explicit
-                # "compressed away" state when segment_ordinal < 0 (the target
-                # only exists in the immutable ancestor prefix).
-                segment = (
-                    client_ordinal - prefix_user_count
-                    if client_ordinal is not None
-                    else resolved_ordinal
-                )
-                return {
-                    "user_turn_count": len(user_indices),
-                    "ordinal": client_ordinal,
-                    "segment_ordinal": segment,
-                    "prefix_user_count": prefix_user_count,
-                }
-
-            ordinal = None
-
-            if target_row_id is not None:
-                # Durable address first — never degrade a missing row_id into a
-                # client ordinal cut (#82959 / #82766 review). Unknown id refuses
-                # without touching data; stale ordinal with a *resolved* row_id
-                # is a separate 4030 mismatch below.
-                found_match = _resolve_truncate_row_id(
-                    session, history, target_row_id
-                )
-
-                if found_match is None:
-                    logger.warning(
-                        "prompt.submit: target row_id %d not found for session %s "
-                        "(in-memory + durable); refusing truncation without fallback",
-                        target_row_id,
-                        sid,
-                    )
-                    return _err(
-                        rid,
-                        4018,
-                        "target user message is no longer in session history",
-                        data=_stale_target_data(),
-                    )
-
-                msg_ordinal, _ = found_match
-                ordinal, err = _reconcile_client_ordinal(
-                    rid, sid, client_ordinal, msg_ordinal,
-                    "truncate_before_row_id", target_row_id,
-                    prefix_user_count=prefix_user_count,
-                )
-                if err is not None:
-                    return err
-            elif truncate_message_id is not None:
-                msg_id_str = str(truncate_message_id)
-                found_match = None
-                for u_ord, h_idx in enumerate(user_indices):
-                    msg = history[h_idx]
-                    if msg.get("id") == msg_id_str or msg.get("message_id") == msg_id_str:
-                        found_match = (u_ord, h_idx)
-                        break
-
-                if found_match is None:
-                    # Fail closed: a supplied message_id that does not resolve
-                    # must not fall back to a (possibly stale) ordinal. Desktop
-                    # clients should send truncate_before_row_id instead.
-                    logger.warning(
-                        "prompt.submit: target message_id %s not found in history "
-                        "for session %s; refusing truncation without fallback",
-                        msg_id_str,
-                        sid,
-                    )
-                    return _err(
-                        rid,
-                        4018,
-                        "target user message is no longer in session history",
-                        data=_stale_target_data(),
-                    )
-
-                msg_ordinal, _ = found_match
-                ordinal, err = _reconcile_client_ordinal(
-                    rid, sid, client_ordinal, msg_ordinal,
-                    "truncate_before_message_id", msg_id_str,
-                    prefix_user_count=prefix_user_count,
-                )
-                if err is not None:
-                    return err
-            else:
-                # Client ordinals count the full displayed lineage; translate
-                # into the tip segment before the bounds check (#82462). An
-                # ancestor-only target (segment_ordinal < 0) is not editable
-                # from this continuation segment — same stale-target refusal,
-                # with the structured fields so the client can tell the
-                # "compressed away" case apart from plain drift.
-                segment_ordinal = client_ordinal - prefix_user_count
-                if segment_ordinal < 0 or segment_ordinal >= len(user_indices):
-                    return _err(
-                        rid,
-                        4018,
-                        "target user message is no longer in session history",
-                        data=_stale_target_data(),
-                    )
-                # Durability is a state.db property, not an optional annotation
-                # on the live copy. Resume/reload paths historically omitted
-                # _row_id stamps, which made an ordinal-only request look safe
-                # even though it could destructively replace a long transcript.
-                # If the durable state cannot be read, fail closed too: absence
-                # of proof is not proof that this is an ephemeral conversation.
-                has_stamped_user = any(
-                    _message_row_id(history[h_idx]) is not None
-                    for h_idx in user_indices
-                )
-                durable_history = (
-                    []
-                    if has_stamped_user
-                    else _load_durable_truncation_history(session, sid)
-                )
-                if has_stamped_user or durable_history is None or durable_history:
-                    logger.warning(
-                        "prompt.submit: REFUSED ordinal-only truncation of durable "
-                        "session %s (ordinal=%d); truncate_before_row_id required",
-                        sid,
-                        client_ordinal,
-                    )
-                    return _err(
-                        rid,
-                        4004,
-                        "ordinal-only truncation is unsafe for durable session history; "
-                        "include truncate_before_row_id",
-                    )
-                ordinal = segment_ordinal
-
-            # Reject out-of-range ordinals on BOTH ends. A negative value would
-            # otherwise sail past the upper-bound check and hit Python's negative
-            # indexing below (user_indices[-1] -> the LAST user turn), silently
-            # truncating history to everything before it and persisting that loss
-            # via replace_messages — an unrecoverable overwrite of the session DB.
-            if ordinal < 0 or ordinal >= len(user_indices):
-                return _err(
-                    rid,
-                    4018,
-                    "target user message is no longer in session history",
-                    data=_stale_target_data(resolved_ordinal=ordinal),
-                )
-            from agent.context_compressor import history_before_user_originated_turn
-
-            truncated, _live_view = history_before_user_originated_turn(
-                history, user_indices[ordinal]
-            )
-            # Second gate, on top of confirm_truncate: ordinal 0 resolves to
-            # history[:0] == [] and replace_messages() DELETEs every durable
-            # row. A confirmed rewind that happens to erase the whole
-            # transcript still needs its own opt-in (legitimate restore/
-            # regenerate of the first user turn).
-            if (
-                not truncated
-                and history
-                and not is_truthy_value(params.get("confirm_empty_truncate"))
-            ):
-                logger.warning(
-                    "prompt.submit: REFUSED empty truncation of session %s "
-                    "(%d messages would be wiped; ordinal=%d).",
-                    sid,
-                    len(history),
-                    ordinal,
-                )
-                return _err(
-                    rid,
-                    4028,
-                    "truncation would erase the entire session transcript; "
-                    "resubmit with confirm_empty_truncate=true if this is intended",
-                )
-            # Info for routine rewind/edit cuts; warning only when the client
-            # explicitly opts into wiping the whole transcript.
-            log_fn = logger.warning if not truncated else logger.info
-            log_fn(
-                "prompt.submit: truncating session %s history %d -> %d messages "
-                "(ordinal=%d)",
-                sid,
-                len(history),
-                len(truncated),
-                ordinal,
-            )
-            # Write-before-memory (mirrors gateway hygiene / manual /compress):
-            # persist the truncated transcript first. If replace_messages fails
-            # after we already rewrote session["history"], the turn still runs
-            # against the short list while state.db keeps the old tail. The
-            # agent flush is append-only for history-dict identities, so the
-            # new exchange is appended on top of the "undone" turns — durable
-            # zombie history on resume, and the edit/regenerate never sticks.
-            # Fail closed: refuse the turn and leave memory/DB unchanged.
-            #
-            # _session_db, not _get_db(): the truncation has to land in the db
-            # that owns this session's row. A profile session (app-global
-            # remote mode) keeps its transcript in its own profile's state.db,
-            # so writing through the launch handle both loses the edit — resume
-            # reopens the profile db and resurrects the undone turns — and
-            # copies the transcript into a foreign profile under this session's
-            # id when that profile happens to hold a row for it. Fail-closed
-            # only holds if the handle we check is the one that owns the row.
-            with _session_db(session) as db:
-                if db is not None:
-                    try:
-                        # active_only=True: replace only the live (active=1)
-                        # rows. In-place compaction (#38763) keeps the
-                        # pre-compaction transcript as active=0/compacted=1
-                        # rows under this same session key; a bare
-                        # replace_messages() would DELETE that durable archive
-                        # on every edit/regenerate — the same bug class #80216
-                        # fixed for /retry. On an uncompacted session all rows
-                        # are active=1, so this is behaviorally identical to
-                        # the full replace.
-                        # archive_dropped: a rewind overwrites turns the user
-                        # may not have meant to drop, and this write is the
-                        # last step before they are gone — three reported
-                        # incidents ended here with nothing to restore from
-                        # (#70516, #80763, #82756). Soft-archiving keeps them
-                        # on disk (active=0) and in the FTS index, so a
-                        # mis-aimed cut is recoverable instead of terminal.
-                        # The live transcript is unchanged.
-                        # Fall back to session id when session_key is NULL —
-                        # CLI-origin sessions created before the session_key
-                        # default fix have no key, and replace_messages(None)
-                        # triggers an FK violation.
-                        truncation_key = session.get("session_key") or sid
-                        old_active_row_ids = {
-                            row_id
-                            for message in history
-                            if isinstance(
-                                (row_id := _message_row_id(message)), int
-                            )
-                        }
-                        if requested_rebind_ids is not None:
-                            # Row-id fallback can resolve a durable target even
-                            # when the live list is too misaligned to stamp safely,
-                            # and alternation repair can merge a physical user;user
-                            # pair while preserving only the first row id. Read the
-                            # authoritative un-repaired pre-write active-id set so
-                            # a rewritten row is never mistaken for an untouched
-                            # archived/ancestor row by the bounded client map.
-                            durable_rebind_history = (
-                                _load_durable_truncation_history(
-                                    session,
-                                    truncation_key,
-                                    repair_alternation=False,
-                                )
-                            )
-                            if durable_rebind_history is None:
-                                raise RuntimeError(
-                                    "could not load durable row identities for truncation"
-                                )
-                            old_active_row_ids.update(
-                                row_id
-                                for message in durable_rebind_history
-                                if isinstance(
-                                    (row_id := _message_row_id(message)), int
-                                )
-                            )
-                        old_survivor_row_ids = [
-                            _message_row_id(message) for message in truncated
-                        ]
-                        db.replace_messages(
-                            truncation_key,
-                            truncated,
-                            active_only=True,
-                            archive_dropped=True,
-                            reject_active_turn_lease=True,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "prompt.submit: replace_messages failed for session %s "
-                            "(ordinal=%d); refusing turn so memory and DB stay "
-                            "aligned: %s",
-                            sid,
-                            ordinal,
-                            exc,
-                            exc_info=True,
-                        )
-                        return _err(
-                            rid,
-                            5008,
-                            f"failed to persist history truncation: {exc}",
-                        )
-                    # replace_messages re-inserted the surviving prefix as NEW
-                    # rows and stamped fresh _row_id values onto these same
-                    # dicts. Surface the surviving user-turn ids (in
-                    # visible-user-ordinal order) so the client can rebind its
-                    # cached rowId stamps — otherwise a second rewind targeting
-                    # an older surviving turn sends the pre-rewind id and the
-                    # fail-closed resolver refuses it with 4018 (#83202 review:
-                    # consecutive-rewind staleness). Ordinal order matches the
-                    # client's visible-user filter the same way truncate
-                    # ordinals already do. Entries are None when a row somehow
-                    # has no stamp — the client must drop its cached id for
-                    # that turn rather than keep a stale one.
-                    survivor_user_row_ids = [
-                        _message_row_id(truncated[i])
-                        for i in _history_user_indices(truncated)
-                    ]
-                    if requested_rebind_ids is not None:
-                        survivor_row_id_map = {
-                            str(old_row_id): new_row_id
-                            for old_row_id, new_row_id in zip(
-                                old_survivor_row_ids,
-                                (
-                                    _message_row_id(message)
-                                    for message in truncated
-                                ),
-                            )
-                            if isinstance(old_row_id, int)
-                            and isinstance(new_row_id, int)
-                            and old_row_id in requested_rebind_ids
-                        }
-                        for dropped_row_id in requested_rebind_ids.intersection(
-                            old_active_row_ids
-                        ):
-                            survivor_row_id_map.setdefault(
-                                str(dropped_row_id), None
-                            )
-            session["history"] = truncated
-            session["history_version"] = int(session.get("history_version", 0)) + 1
-        if uploaded_images:
-            session.setdefault("attached_images", []).extend(uploaded_images)
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
-        session["last_active"] = time.time()
-        if internal_hosted_submit:
-            session["_hosted_room_task"] = dict(hosted_task)
-        _start_inflight_turn(session, text)
-
+        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
+        if isinstance(raw_rebind_ids, list) else None)
+    err, survivor_fields = _lock_in_submit_turn(
+        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+    if err is not None:
+        return err
     if turn_isolation:
-        survivor_fields = {
-            **(
-                {"survivor_user_row_ids": survivor_user_row_ids}
-                if survivor_user_row_ids is not None and requested_rebind_ids is None
-                else {}
-            ),
-            **(
-                {"survivor_row_id_map": survivor_row_id_map}
-                if survivor_row_id_map is not None
-                else {}
-            ),
-        }
+        if turn_author:
+            logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
+                         turn_author.get("id"))
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind)
+            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -1128,14 +749,18 @@ def _(rid, params: dict) -> dict:
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
-    if (err := _persist_session_row_for_submit(rid, session)) is not None:
+    if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
         return err
+    # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.
+    staged_user = session.get("_submit_user_row") or {}
+    if isinstance(staged_user.get("_row_id"), int):
+        survivor_fields["user_row_id"] = staged_user["_row_id"]
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback),
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
@@ -1144,17 +769,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
-            **(
-                {"survivor_user_row_ids": survivor_user_row_ids}
-                if survivor_user_row_ids is not None
-                and requested_rebind_ids is None
-                else {}
-            ),
-            **(
-                {"survivor_row_id_map": survivor_row_id_map}
-                if survivor_row_id_map is not None
-                else {}
-            ),
+            **survivor_fields,
             **(
                 {
                     "auto_reset": True,
@@ -1448,24 +1063,17 @@ def _spawn_side_agent(
 
     def run():
         session_tokens = _set_session_context(task_id, cwd=(cwd or _session_cwd(session)))
-        # Bug #50233: ephemeral agent threads don't inherit the session's HERMES_HOME override (the
-        # ContextVar set on the session-create thread doesn't propagate here), so a background turn under a
-        # non-default profile would run against the wrong home. Re-bind the override for the duration of
-        # this turn, exactly as the normal prompt turn does, and restore it afterward.
-        # Bug #50233: ephemeral preview-restart agent threads don't inherit the session's HERMES_HOME
-        # override (the ContextVar set on the session-create thread doesn't propagate here). Re-bind it for
-        # the duration of the turn, mirroring the normal prompt turn, then restore it. NOTE: we deliberately
-        # do NOT close this agent through task-wide process cleanup — the whole point of preview.restart is
-        # to leave a background server running under this task_id, and AIAgent.close() would kill every
-        # process for the task_id and tear down the very server the restart just started.
-        profile_home = session.get("profile_home")
-        home_token = set_hermes_home_override(profile_home) if profile_home else None
+        # Bug #50233: ephemeral agent threads don't inherit the session's ContextVar scopes (set on the
+        # session-create thread), so a side turn under a non-default profile ran against the wrong home.
+        # Bind the profile's home + secrets + terminal policy for the whole body, exactly as a prompt turn
+        # does: home alone left terminal_tool on the launch process's ambient TERMINAL_* (a docker
+        # secondary's background/btw/preview agent ran local). NOTE: we deliberately do NOT close this
+        # agent through task-wide process cleanup — the whole point of preview.restart is to leave a
+        # background server running under this task_id, and AIAgent.close() would kill every process for
+        # the task_id and tear down the very server the restart just started.
         try:
-            try:
+            with _session_profile_runtime_scope(session):
                 text = body()
-            finally:
-                if home_token is not None:
-                    reset_hermes_home_override(home_token)
             _emit(event, parent, {"task_id": task_id, **extra, "text": text})
         except Exception as e:
             _emit(event, parent, {"task_id": task_id, **extra, "text": f"error: {e}"})
@@ -1474,7 +1082,8 @@ def _spawn_side_agent(
                 cleanup()
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    if _start_session_work(run, name=f"side-agent-{task_id}") is None:
+        return _err(rid, 5035, "backend is retiring; reconnect to continue")
     return _ok(rid, {"task_id": task_id})
 
 
@@ -1508,8 +1117,10 @@ def _(rid, params: dict) -> dict:
 
     def body():
         from run_agent import AIAgent
-        result = AIAgent(**_background_agent_kwargs(session["agent"], task_id)).run_conversation(
-            user_message=text, task_id=task_id)
+        kwargs = _background_agent_kwargs(session["agent"], task_id)
+        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
+            result = AIAgent(**{**kwargs, "session_db": session_db}).run_conversation(
+                user_message=text, task_id=task_id)
         response = _final_response_text(result)
         if startup_payload is not None:
             try:
@@ -1541,7 +1152,7 @@ def _(rid, params: dict) -> dict:
     snapshot = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
     main_runtime = {
         k: getattr(agent, k, None)
-        for k in ("model", "provider", "base_url", "api_key", "api_mode")}
+        for k in ("model", "provider", "base_url", "api_key", "api_mode", "session_id")}
 
     def body():
         from agent.side_question import answer_side_question
@@ -1634,25 +1245,47 @@ def _(rid, params: dict) -> dict:
         cwd=preview_cwd, cleanup=cleanup)
 
 
-# ── late-answer RPCs for tool-driven UI cards ───────────────────────────────
-# allow_expired=True everywhere: a tool's bounded wait can expire (its _pending entry
-# popped) while the card is still visible; a late answer must not surface the raw 4009.
+# ── batch clarify locks ─────────────────────────────────────────────────────
+# A batch ``clarify`` server request is answered one question at a time: each lock is a normal RPC
+# (update-in-place, editable until every qid is locked); the LAST lock resolves the request itself.
+# A cancel-all is the plain response frame with no ``answers``.
 
 
-@method("clarify.respond")
+@method("clarify.lock")
 def _(rid, params: dict) -> dict:
-    if proxied := _respond_compute_host_clarify(rid, params):
+    request_id = str(params.get("request_id") or "")
+    question_id = str(params.get("question_id") or "")
+    if not request_id or not question_id:
+        return _err(rid, 4002, "request_id and question_id required")
+    answer = params.get("answer", "")
+    answer = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+    if (proxied := _lock_compute_host_clarify(rid, request_id, question_id, answer)) is not None:
         return proxied
-    return _respond(rid, params, "answer", allow_expired=True)
+    from tui_gateway import server_requests
+    try:
+        remaining = server_requests.lock_answer(request_id, question_id, answer)
+    except ValueError as e:
+        return _err(rid, 4002, str(e))
+    if remaining is None:
+        # The wait already ended (timeout / cancel) while the card was still visible: not an error.
+        return _ok(rid, {"status": "expired"})
+    return _ok(rid, {"status": "ok", "remaining": remaining})
 
 
-_LATE_RESPOND_KEYS = {
-    "terminal.read.respond": "text", "preview.read.respond": "text", "preview.act.respond": "text",
-    "window.read.respond": "text", "tour.respond": "text", "mcp.setup.respond": "result",
-    "sudo.respond": "password", "secret.respond": "value"}
-for _name, _key in _LATE_RESPOND_KEYS.items():
-    method(_name)(lambda rid, params, _k=_key: _respond(rid, params, _k, allow_expired=True))
-del _name, _key
+@method("request.answer")
+def _(rid, params: dict) -> dict:
+    """Answer an open server→client request from a client that did not receive it (a Bot Mode room
+    window answering a member's prompt mirrored from its resume snapshot). The response-frame path is
+    the norm; this is the proxy for it. ``expired`` when the request already ended."""
+    request_id = str(params.get("id") or "")
+    result = params.get("result")
+    if not request_id or not isinstance(result, dict):
+        return _err(rid, 4002, "id and an object result required")
+    from tui_gateway import server_requests
+    frame = {"jsonrpc": "2.0", "id": request_id, "result": result}
+    if server_requests.resolve_response(frame) or _relay_compute_host_response(frame):
+        return _ok(rid, {"status": "ok"})
+    return _ok(rid, {"status": "expired"})
 
 
 # ── approvals ───────────────────────────────────────────────────────────────

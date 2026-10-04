@@ -651,6 +651,7 @@ def test_config_put_cannot_disable_or_retarget_fixed_policy(gated_app, tmp_path,
 
     home = tmp_path / ".hermes"
     (home / "profiles" / "stub-home").mkdir(parents=True)
+    (home / "profiles" / "stub-home" / "config.yaml").write_text("{}\n")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -664,7 +665,7 @@ def test_config_put_cannot_disable_or_retarget_fixed_policy(gated_app, tmp_path,
     _enable_profile_membership(monkeypatch, policy_path)
     saved = []
     monkeypatch.setattr(config_routes, "read_raw_config", lambda: {})
-    monkeypatch.setattr(config_routes, "save_config", lambda config: saved.append(config))
+    monkeypatch.setattr(config_routes, "save_config", lambda config, **_kwargs: saved.append(config))
     _complete_stub_login(gated_app)
 
     mutation = gated_app.put("/api/config", json={"config": {"dashboard": {

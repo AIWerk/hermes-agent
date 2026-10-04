@@ -15,32 +15,34 @@ from gateway.session import SessionSource
 from hermes_constants import get_hermes_home, hermes_home_key
 
 
-def test_registered_handlers_keep_immutable_profile_state_key(
+def test_registered_handlers_resolve_the_invoking_profile_state_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools import mcp_tool_handlers as handlers
+    from tools.mcp_tool_scope import _server_key
 
-    key_a = (hermes_home_key(tmp_path / "profiles" / "a"), "shared")
-    key_b = (hermes_home_key(tmp_path / "profiles" / "b"), "shared")
+    homes = [tmp_path / "profiles" / name for name in ("a", "b")]
+    for home in homes:
+        home.mkdir(parents=True)
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
     seen = []
 
     def capture(server_name, _timeout):
-        from tools import mcp_tool
-
-        seen.append(mcp_tool._server_state_key(server_name))
+        seen.append(_server_key(server_name))
         return None, "not-connected"
 
     monkeypatch.setattr(handlers, "_acquire_call_server", capture)
-    handler_a = handlers._make_tool_handler(
-        "shared", "read", 1.0, state_key=key_a
-    )
-    handler_b = handlers._make_tool_handler(
-        "shared", "read", 1.0, state_key=key_b
-    )
-
-    assert handler_a({}) == "not-connected"
-    assert handler_b({}) == "not-connected"
-    assert seen == [key_a, key_b]
+    handler = handlers._make_tool_handler("shared", "read", 1.0)
+    expected = []
+    for home in homes:
+        token = set_hermes_home_override(home)
+        try:
+            expected.append((hermes_home_key(home), "shared"))
+            assert handler({}) == "not-connected"
+        finally:
+            reset_hermes_home_override(token)
+    assert seen == expected
 
 
 def test_profile_secondary_mcp_files_are_not_first_profile_wins(
@@ -53,8 +55,7 @@ def test_profile_secondary_mcp_files_are_not_first_profile_wins(
     homes = [tmp_path / "a", tmp_path / "b"]
     for home in homes:
         home.mkdir()
-    monkeypatch.setattr(config, "_mcp_stderr_log_fhs", {})
-    monkeypatch.setattr(config, "_mcp_stderr_log_fh", None)
+    monkeypatch.setattr(config, "_mcp_stderr_log_fh", {})
 
     log_paths = []
     lock_paths = []
@@ -73,7 +74,7 @@ def test_profile_secondary_mcp_files_are_not_first_profile_wins(
     assert lock_paths == [home / ".mcp-discovery.lock" for home in homes]
     assert log_paths[0] != log_paths[1]
     assert lock_paths[0] != lock_paths[1]
-    for handle in config._mcp_stderr_log_fhs.values():
+    for handle in config._mcp_stderr_log_fh.values():
         handle.close()
 
 
@@ -139,8 +140,8 @@ def test_partial_config_removal_retires_cache_only_lazy_server(
     monkeypatch.setattr(
         discovery._lifecycle,
         "shutdown_mcp_servers",
-        lambda *, scope=None, server_names=None: shutdown_calls.append(
-            (scope, server_names)
+        lambda *, scope=None, names=None: shutdown_calls.append(
+            (scope, names)
         ),
     )
     monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: False)
@@ -168,7 +169,7 @@ def test_disabling_live_server_triggers_targeted_shutdown(
     monkeypatch.setattr(
         discovery._lifecycle,
         "shutdown_mcp_servers",
-        lambda *, scope=None, server_names=None: calls.append((scope, server_names)),
+        lambda *, scope=None, names=None: calls.append((scope, names)),
     )
     monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: False)
 
@@ -189,7 +190,7 @@ def test_empty_config_discovery_tears_down_current_profile(monkeypatch) -> None:
     monkeypatch.setattr(
         discovery._lifecycle,
         "shutdown_mcp_servers",
-        lambda *, scope=None, server_names=None: calls.append((scope, server_names)),
+        lambda *, scope=None, names=None: calls.append((scope, names)),
     )
 
     assert discovery.discover_mcp_tools() == []
@@ -217,7 +218,7 @@ def test_removed_pre_adoption_claim_cannot_resurrect(
     monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
     monkeypatch.setattr(lifecycle._loop, "_stop_mcp_loop", lambda **_kwargs: True)
 
-    lifecycle.shutdown_mcp_servers(scope=scope, server_names={"removed"})
+    lifecycle.shutdown_mcp_servers(scope=scope, names={"removed"})
 
     assert key not in mcp_tool._server_connect_claims
     assert discovery._adopt_server("removed", server) is False
@@ -260,7 +261,7 @@ def test_named_shutdown_clears_removed_failed_state_only(
     monkeypatch.setattr(mcp_tool, "_server_connect_failures", {removed: 1, kept: 2})
     monkeypatch.setattr(lifecycle._loop, "_stop_mcp_loop", lambda **_kwargs: True)
 
-    lifecycle.shutdown_mcp_servers(scope=scope, server_names={"removed"})
+    lifecycle.shutdown_mcp_servers(scope=scope, names={"removed"})
 
     assert removed not in mcp_tool._server_connect_errors
     assert removed not in mcp_tool._server_connect_retry_after
@@ -297,7 +298,7 @@ def test_scoped_shutdown_clears_only_own_same_named_state(
     monkeypatch.setattr(
         mcp_tool,
         "_mcp_tool_server_names",
-        {(scope_a, "mcp__shared__a"): key_a, (scope_b, "mcp__shared__b"): key_b},
+        {"mcp__shared__a": "shared", "mcp__shared__b": "shared"},
     )
     monkeypatch.setattr(lifecycle._loop, "_stop_mcp_loop", lambda **_kwargs: True)
 
@@ -320,7 +321,11 @@ def test_scoped_shutdown_clears_only_own_same_named_state(
         assert key_b in mapping
     assert mcp_tool._server_connecting == {key_b}
     assert mcp_tool._parallel_safe_servers == {key_b}
-    assert set(mcp_tool._mcp_tool_server_names) == {(scope_b, "mcp__shared__b")}
+    # Provenance is plain tool->server in the upstream registry contract and remains
+    # while another scoped connection with the same server name is live.
+    assert set(mcp_tool._mcp_tool_server_names) == {
+        "mcp__shared__a", "mcp__shared__b"
+    }
 
 
 def test_same_named_server_policy_state_is_profile_scoped(
@@ -436,7 +441,7 @@ async def test_gateway_boot_discovers_mcp_under_every_profile_home(
 
     monkeypatch.setattr(
         "hermes_cli.profiles.profiles_to_serve",
-        lambda multiplex, profile_allowlist=None: homes,
+        lambda multiplex: homes,
     )
     monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", fake_discover)
 
@@ -524,6 +529,238 @@ def test_scoped_mcp_deregister_keeps_alias_owned_by_other_profile() -> None:
 
     assert reg.get_toolset_alias_target("shared") == "mcp-shared"
     assert reg.snapshot_registration("mcp__shared__echo", scope="/home/p2") is not None
+
+@pytest.mark.asyncio
+async def test_reload_mcp_formats_scoped_connection_keys_before_refreshing_cached_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Connection-ledger tuple keys are internal; reload reports server names and completes refresh."""
+    from gateway.run import GatewayRunner
+    from tools import mcp_tool
+    from tools import mcp_tool_discovery as _mcp_discovery
+    from tools import mcp_tool_lifecycle as _mcp_lifecycle
+
+    launch_scope = hermes_home_key(tmp_path / "default")
+    worker_home = tmp_path / "profiles" / "worker"
+    worker_home.mkdir(parents=True)
+    worker_scope = hermes_home_key(worker_home)
+    launch_key = (launch_scope, "default-srv")
+    worker_key = (worker_scope, "worker-srv")
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._resolve_profile_home_for_source = MagicMock(return_value=worker_home)
+    runner._mcp_reload_refresh_cached_agents = MagicMock()
+    runner._async_session_store = SimpleNamespace(
+        get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
+    )
+
+    monkeypatch.setattr(mcp_tool, "_servers", {launch_key: object(), worker_key: object()})
+    monkeypatch.setattr(
+        mcp_tool, "_server_scope_keys",
+        {launch_key: launch_scope, worker_key: worker_scope},
+    )
+    monkeypatch.setattr(_mcp_lifecycle, "shutdown_mcp_servers", lambda **_kwargs: None)
+    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda: [])
+
+    event = MessageEvent(
+        text="/reload-mcp", message_id="m1",
+        source=SessionSource(
+            platform=Platform.TELEGRAM, user_id="u1", chat_id="c1",
+            chat_type="dm", profile="worker",
+        ),
+    )
+    result = await runner._execute_mcp_reload(event)
+
+    assert "MCP reload failed" not in result
+    assert "worker-srv" in result
+    assert "default-srv" not in result
+    runner._mcp_reload_refresh_cached_agents.assert_called_once_with(True, "worker")
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shared connection remains visible when its peer profile reloads MCP."""
+    from gateway.run import GatewayRunner
+    from tools import mcp_tool
+    from tools import mcp_tool_discovery as _mcp_discovery
+    from tools import mcp_tool_lifecycle as _mcp_lifecycle
+
+    worker_home = tmp_path / "profiles" / "worker"
+    worker_home.mkdir(parents=True)
+    worker_scope = hermes_home_key(worker_home)
+    launch_scope = hermes_home_key(tmp_path / "default")
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._resolve_profile_home_for_source = MagicMock(return_value=worker_home)
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._async_session_store = SimpleNamespace(
+        get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
+    )
+
+    live_server = SimpleNamespace(session=object(), _config={}, _tools=[], tool_timeout=30,
+                                  initialize_result=None, _registered_tool_names=[])
+    monkeypatch.setattr(mcp_tool, "_servers", {"shared": live_server})
+    monkeypatch.setattr(mcp_tool, "_server_scope_keys", {"shared": launch_scope})
+    monkeypatch.setattr(mcp_tool, "_server_tool_scopes", {"shared": {launch_scope}}, raising=False)
+    monkeypatch.setattr(mcp_tool, "_server_connecting", set())
+    monkeypatch.setattr(mcp_tool, "_server_connect_errors", {})
+    monkeypatch.setattr(mcp_tool, "_lazy_server_configs", {})
+    monkeypatch.setattr(mcp_tool, "_mcp_registry_scope", lambda: worker_scope)
+
+    def fake_discover() -> list[str]:
+        from tools import mcp_tool_registration as _mcp_registration
+        _mcp_registration.register_connected_into_current_scope({"shared": {}})
+        return ["mcp__shared__tool"]
+
+    monkeypatch.setattr(_mcp_lifecycle, "shutdown_mcp_servers", lambda **_kwargs: None)
+    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", fake_discover)
+
+    event = MessageEvent(
+        text="/reload-mcp", message_id="m1",
+        source=SessionSource(
+            platform=Platform.TELEGRAM, user_id="u1", chat_id="c1",
+            chat_type="dm", profile="worker",
+        ),
+    )
+    result = await runner._execute_mcp_reload(event)
+
+    assert "No MCP servers connected." not in result
+    assert "shared" in result
+    assert mcp_tool._server_scope_keys["shared"] == launch_scope
+    assert mcp_tool._server_tool_scopes["shared"] == {launch_scope, worker_scope}
+
+
+@pytest.mark.parametrize("worker_cfg", [
+    {"url": "https://worker.example/mcp"},                                   # different route
+    {"url": "https://default.example/mcp", "headers": {"Authorization": "Bearer worker"}},  # same route, other credentials
+    {"url": "https://default.example/mcp", "env": {"API_TOKEN": "worker"}},
+])
+def test_scope_visibility_rejects_a_foreign_or_differently_authenticated_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_cfg: dict
+) -> None:
+    """A profile may only see a live connection whose route AND credentials match its own config;
+    otherwise it would call tools as the owning profile's identity."""
+    from tools import mcp_tool
+    from tools import mcp_tool_registration as _mcp_registration
+
+    worker_scope = hermes_home_key(tmp_path / "worker")
+    launch_scope = hermes_home_key(tmp_path / "default")
+    live_server = SimpleNamespace(session=object(), _config={"url": "https://default.example/mcp"})
+    monkeypatch.setattr(mcp_tool, "_servers", {"shared": live_server})
+    monkeypatch.setattr(mcp_tool, "_server_scope_keys", {"shared": launch_scope})
+    monkeypatch.setattr(mcp_tool, "_server_tool_scopes", {"shared": {launch_scope}}, raising=False)
+    monkeypatch.setattr(mcp_tool, "_mcp_registry_scope", lambda: worker_scope)
+
+    assert _mcp_registration.register_connected_into_current_scope({"shared": worker_cfg}) == 0
+    assert mcp_tool._server_tool_scopes["shared"] == {launch_scope}
+
+
+def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent.secret_scope import set_multiplex_active
+    from hermes_constants import (
+        hermes_home_key,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from tools import mcp_tool
+    from tools import mcp_tool_config as _mcp_config
+    from tools import mcp_tool_discovery as _mcp_discovery
+    from tools.registry import registry
+
+    worker_home = tmp_path / "profiles" / "worker"
+    launch_home = tmp_path / "default"
+    worker_home.mkdir(parents=True)
+    launch_home.mkdir()
+    worker_token = set_hermes_home_override(worker_home)
+    previous_multiplex = set_multiplex_active(True)
+    worker_scope = hermes_home_key()
+    launch_scope = hermes_home_key(launch_home)
+    tool = SimpleNamespace(
+        name="echo",
+        description="Echo a value",
+        inputSchema={"type": "object", "properties": {}},
+        annotations=None,
+    )
+    server = SimpleNamespace(
+        name="shared",
+        session=object(),
+        _tools=[tool],
+        tool_timeout=30,
+        _registered_tool_names=[],
+        _config={},
+        initialize_result=None,
+    )
+    owner_tool_name = "mcp__shared__echo"
+    registry.register(
+        owner_tool_name,
+        "mcp-shared",
+        {"name": owner_tool_name, "description": "Echo a value", "type": "object"},
+        lambda **_kwargs: None,
+        scope=launch_scope,
+    )
+    registry.register_toolset_alias("shared", "mcp-shared")
+    server._registered_tool_names = [owner_tool_name]
+    with mcp_tool._lock:
+        saved = {
+            "_servers": dict(mcp_tool._servers),
+            "_server_scope_keys": dict(mcp_tool._server_scope_keys),
+            "_server_tool_scopes": dict(mcp_tool._server_tool_scopes),
+            "_mcp_tool_server_names": dict(mcp_tool._mcp_tool_server_names),
+        }
+        mcp_tool._servers.clear()
+        mcp_tool._server_scope_keys.clear()
+        mcp_tool._server_tool_scopes.clear()
+        mcp_tool._mcp_tool_server_names.clear()
+        mcp_tool._servers["shared"] = server
+        mcp_tool._server_scope_keys["shared"] = launch_scope
+        mcp_tool._server_tool_scopes["shared"] = {launch_scope}
+
+    try:
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: True)
+        monkeypatch.setattr(_mcp_config, "_filter_suspicious_mcp_servers", lambda servers: servers)
+        assert _mcp_discovery.register_mcp_servers({"shared": {}})
+        tool_names = registry.get_tool_names_for_toolset("mcp-shared")
+        assert tool_names
+        assert callable(registry.get_entry(tool_names[0]).handler)
+
+        # Changing the worker route removes only the worker overlay; the shared
+        # live connection and launch owner remain intact.
+        assert _mcp_discovery.register_mcp_servers(
+            {"shared": {"url": "https://worker.example/mcp"}}
+        ) == []
+        assert registry.get_tool_names_for_toolset("mcp-shared") == []
+        with mcp_tool._lock:
+            assert mcp_tool._server_scope_keys["shared"] == launch_scope
+            assert mcp_tool._server_tool_scopes["shared"] == {launch_scope}
+            assert mcp_tool._servers["shared"] is server
+        assert registry.snapshot_registration(owner_tool_name, scope=launch_scope) is not None
+        assert registry.get_toolset_alias_target("shared") == "mcp-shared"
+
+        # Removing the server from the worker config has the same scoped cleanup.
+        assert _mcp_discovery.register_mcp_servers({}) == []
+        assert registry.get_tool_names_for_toolset("mcp-shared") == []
+        with mcp_tool._lock:
+            assert mcp_tool._server_scope_keys["shared"] == launch_scope
+            assert mcp_tool._server_tool_scopes["shared"] == {launch_scope}
+            assert mcp_tool._servers["shared"] is server
+    finally:
+        for tool_name in list(registry.get_tool_names_for_toolset("mcp-shared")):
+            registry.deregister(tool_name, scope=worker_scope)
+        registry.deregister(owner_tool_name, scope=launch_scope)
+        with mcp_tool._lock:
+            for name, value in saved.items():
+                target = getattr(mcp_tool, name)
+                target.clear()
+                target.update(value)
+        set_multiplex_active(previous_multiplex)
+        reset_hermes_home_override(worker_token)
 
 
 def test_deregister_scope_kwarg_targets_overlay_and_keeps_plugin_confinement() -> None:

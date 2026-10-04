@@ -22,9 +22,10 @@ from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_server_sessions import _session_latest_descendant
 from hermes_cli.web_models import (
     BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
-from hermes_cli.web_routers._common import log as _log, http_failure
+from hermes_cli.web_routers._common import CORRUPT_STORE_DETAIL, log as _log, destructive_profile, http_failure
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import is_transient_sqlite_error
+from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
 
 list_router = APIRouter()
 search_router = APIRouter()
@@ -41,6 +42,9 @@ _project_cui_message_rows_public = late("_project_cui_message_rows_public")
 _project_session_list_rows_public = late("_project_session_list_rows_public")
 _sanitize_public_message_value = late("_sanitize_public_message_value")
 _session_visible_to_cui_actor = late("_session_visible_to_cui_actor")
+
+_open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.web_server_sessions")
+_session_db_path_for_profile = late("_session_db_path_for_profile", "hermes_cli.web_server_sessions")
 
 _NOT_FOUND = "Session not found"
 
@@ -287,7 +291,8 @@ def get_sessions(
                 _strip_session_list_rows(sessions)
             if actor and not actor.get("_restricted"):
                 sessions = _project_session_list_rows_public(sessions)
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            storage = {row_profile: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {}
+            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset, "storage": storage}
         finally:
             db.close()
     except HTTPException:
@@ -304,6 +309,14 @@ def get_sessions(
                 if transient
                 else "Internal server error"),
         ) from exc
+    except sqlite3.DatabaseError as exc:
+        # A damaged store is unavailable, not empty and not an internal error (#72046).
+        db_path = _session_db_path_for_profile(profile)
+        if not (note_storage_error(db_path, exc) or is_malformed_db_error(exc)):
+            _log.exception("GET /api/sessions failed")
+            raise HTTPException(status_code=500, detail="Internal server error") from exc
+        _log.error("GET /api/sessions: state.db at %s is corrupt: %s", db_path, exc)
+        raise HTTPException(status_code=503, detail=dict(CORRUPT_STORE_DETAIL)) from exc
     except Exception:
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -337,8 +350,9 @@ async def search_sessions(
     if not q or not q.strip():
         return {"results": []}
     with http_failure("GET /api/sessions/search failed", 500, detail="Search failed"):
-        db = _open_session_db_for_profile(profile, read_only=True)
-        try:
+        row_profile = _serving_profile(profile)
+
+        def _search(db):
             safe_limit = max(1, min(int(limit or 20), 100))
             source_filter = source or None
             source_list = _csv(sources)
@@ -400,6 +414,8 @@ async def search_sessions(
                 sid = lineage_tip(root)
                 payload["session_id"] = sid
                 payload["lineage_root"] = root
+                payload["profile"] = row_profile
+                payload["is_default_profile"] = row_profile == "default"
                 try:
                     row = db.get_session_rich_row(sid)
                 except Exception:
@@ -430,9 +446,13 @@ async def search_sessions(
                 seen[root] = payload
 
             def hit_payload(row: dict, snippet: str, role, session_started) -> dict:
+                # `last_active` rides only on id-match rows (sessions table); FTS
+                # hits have no row recency and leave it null so the desktop can
+                # fall back to session_started instead of inventing one.
                 return {
                     "snippet": snippet, "role": role, "source": row.get("source"),
-                    "model": row.get("model"), "session_started": session_started}
+                    "model": row.get("model"), "session_started": session_started,
+                    "last_active": row.get("last_active")}
 
             # Direct ID matches first (pasted ids never appear in message text).
             id_fetch_limit = safe_limit
@@ -484,8 +504,8 @@ async def search_sessions(
                         result["preview"] = _sanitize_public_message_value(result.get("preview"))
                 results = _project_session_list_rows_public(results)
             return {"results": results}
-        finally:
-            db.close()
+
+        return await asyncio.to_thread(_with_db, profile, _search, read_only=True)
 
 
 @manage_router.post("/api/sessions/bulk-delete")
@@ -505,7 +525,9 @@ async def bulk_delete_sessions_endpoint(request: Request, body: BulkDeleteSessio
     actor = _cui_actor_context_from_request(request)
     _restricted_actor_denied(actor)
     profile = _customer_profile(body.profile, actor)
-    if actor and not actor.get("_restricted"):
+    if not (actor and not actor.get("_restricted")):
+        profile = destructive_profile(profile, "POST /api/sessions/bulk-delete")
+    else:
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             for session_id in body.ids:
@@ -573,7 +595,8 @@ async def delete_empty_sessions_endpoint(request: Request, profile: Optional[str
     if actor and not actor.get("_restricted"):
         raise HTTPException(status_code=403, detail="Delete empty sessions is not available to this actor")
     deleted = await asyncio.to_thread(
-        _with_db, profile, lambda db: db.delete_empty_sessions(), read_only=False)
+        _with_db, destructive_profile(profile, "DELETE /api/sessions/empty"),
+        lambda db: db.delete_empty_sessions(), read_only=False)
     return {"ok": True, "deleted": deleted}
 
 
@@ -598,7 +621,7 @@ async def get_session_stats(request: Request, profile: Optional[str] = None):
             pass
         return out
 
-    return _with_db(profile, _stats, read_only=True)
+    return await asyncio.to_thread(_with_db, profile, _stats, read_only=True)
 
 
 @manage_router.get("/api/sessions/{session_id}")
@@ -622,7 +645,7 @@ async def get_session_detail(request: Request, session_id: str, profile: Optiona
             return _project_session_detail_public(session)
         return session
 
-    return _with_db(profile, _detail, read_only=True)
+    return await asyncio.to_thread(_with_db, profile, _detail, read_only=True)
 
 
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
@@ -650,13 +673,57 @@ async def get_session_latest_descendant(request: Request, session_id: str, profi
         "changed": bool(path and latest != path[0])}
 
 
-def _project_for_display(messages: list) -> list:
-    """Replace compaction summaries with their display-only projection."""
+def _stored_tool_call_labels(message: dict) -> dict:
+    from agent.display import tool_labels_for_call
+    from tools.tool_labels import BRIDGE_TOOL_NAMES
+
+    out = {}
+    for call in message.get("tool_calls") or ():
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        call_id, name = str(call.get("id") or ""), str(fn.get("name") or "")
+        if not call_id or name not in BRIDGE_TOOL_NAMES:
+            continue
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            args = {}
+        labels = [label.as_payload() for label in tool_labels_for_call(name, args if isinstance(args, dict) else {})]
+        if labels:
+            out[call_id] = labels
+    return out
+
+
+def _with_tool_call_labels(message: dict) -> dict:
+    labels = _stored_tool_call_labels(message)
+    return {**message, "tool_call_labels": labels} if labels else message
+
+
+def _history_profile_home(profile):
+    if profile:
+        return _cron_profile_home(profile)[1]
+    # An omitted profile reads this process's DB (including custom HERMES_HOME),
+    # not necessarily the registered default profile used by cron routes.
+    from hermes_cli.config import get_hermes_home
+
+    return get_hermes_home()
+
+
+def _project_for_display(messages: list, *, home=None) -> list:
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
+    from agent.history_commentary import project_history_commentary
+    from agent.turn_failure_copy import untyped_failed_turn_display_kind
 
     projected_messages = []
     for message in messages:
+        message = _with_tool_call_labels(message)
+        # Same read-side typing as session.resume (tui_gateway/session_history.py).
+        failed_turn = not message.get("display_kind") and untyped_failed_turn_display_kind(
+            message.get("role"), message.get("content"))
+        if failed_turn:
+            message = {**message, "display_kind": failed_turn}
         if not is_compaction_summary_message(message):
             projected_messages.append(message)
             continue
@@ -672,7 +739,7 @@ def _project_for_display(messages: list) -> list:
             projected["display_content"] = display_view.get("content")
             projected.pop("display_kind", None)
         projected_messages.append(projected)
-    return projected_messages
+    return project_history_commentary(projected_messages, home=home)
 
 
 @manage_router.get("/api/sessions/{session_id}/messages")
@@ -708,16 +775,80 @@ async def get_session_messages(
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     sid, _limit, messages = result
-    projected_messages = _project_for_display(messages)
+    projected_messages = await asyncio.to_thread(
+        _project_for_display, messages, home=_history_profile_home(profile))
     if actor and not actor.get("_restricted"):
         projected_messages = _project_cui_message_rows_public(projected_messages)
     return {
         "session_id": sid,
+        # The same stamp list rows carry, so the Desktop keys a page under the
+        # owner it already routes the session by.
+        "profile": _serving_profile(profile),
         "messages": projected_messages,
         "pagination": {
             "limit": _limit, "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
             "returned": len(projected_messages)}}
+
+
+def _timeline_session_id(db, session_id: str, owner: str) -> str:
+    # Durable jump addresses are exact ids, never title/prefix guesses. A NULL
+    # legacy owner belongs to this profile's store, just like /messages pages.
+    def owned(sid):
+        row = db._read_one("SELECT profile_name FROM sessions WHERE id = ?", (sid,))
+        return row is not None and row["profile_name"] in (None, owner)
+
+    if not owned(session_id):
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    sid = db.resolve_resume_session_id(session_id)
+    if not owned(sid):
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    return sid
+
+
+@manage_router.get("/api/sessions/{session_id}/timeline")
+async def get_session_timeline(
+    session_id: str, profile: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=500), after_row_id: int = Query(0, ge=0),
+):
+    """Prompt metadata only, including compacted display history (never rewind rows).
+
+    ``next_cursor`` is a stable logical first-row id; pass it as ``after_row_id``.
+    Entry ``row_id`` addresses the current representative for /messages/around.
+    """
+    from hermes_state_timeline import get_session_timeline as read_timeline
+
+    owner = _serving_profile(profile)
+
+    def _read(db):
+        sid = _timeline_session_id(db, session_id, owner)
+        return {"session_id": sid, "profile": owner,
+                **read_timeline(db, sid, limit=limit, after_row_id=after_row_id)}
+
+    return await asyncio.to_thread(_with_db, profile, _read, read_only=True)
+
+
+@manage_router.get("/api/sessions/{session_id}/messages/around")
+async def get_session_messages_around(
+    session_id: str, row_id: int = Query(..., ge=1), profile: Optional[str] = None,
+    limit: int = Query(120, ge=1, le=120),
+):
+    """Bounded display page starting at a timeline prompt; no intervening payloads."""
+    from hermes_state_timeline import get_session_messages_around as read_around
+
+    owner = _serving_profile(profile)
+
+    def _read(db):
+        sid = _timeline_session_id(db, session_id, owner)
+        page = read_around(db, sid, row_id, limit=limit)
+        if page is None:
+            raise HTTPException(status_code=404, detail="Prompt not found")
+        return {"session_id": sid, "profile": owner, **page}
+
+    result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
+    result["messages"] = await asyncio.to_thread(
+        _project_for_display, result["messages"], home=_history_profile_home(profile))
+    return result
 
 
 @manage_router.delete("/api/sessions/{session_id}")
@@ -815,7 +946,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename, request:
         result["title"] = db.get_session_title(sid) or ""
         return result
 
-    return _with_db(profile, _update, read_only=False)
+    return await asyncio.to_thread(_with_db, profile, _update, read_only=False)
 
 
 def _compact_json(obj) -> str:
@@ -875,6 +1006,11 @@ async def export_session_endpoint(request: Request, session_id: str, profile: Op
 @manage_router.post("/api/sessions/prune")
 async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
+    if not body.dry_run:
+        # Same destructive rule as the rest of the family; a dry run deletes nothing, so it
+        # keeps working unnamed (it is the preview the confirm dialog reads).
+        body = body.model_copy(update={
+            "profile": destructive_profile(body.profile, "POST /api/sessions/prune")})
     return await asyncio.to_thread(_prune_sessions, body)
 
 
