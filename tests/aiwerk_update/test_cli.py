@@ -472,40 +472,88 @@ def test_prove_handoff_rejects_caller_forged_builder_identity_receipt(
     assert "artifact verification hash mismatch" in capsys.readouterr().err
 
 
-def test_cli_resume_reports_blocked_recovery(tmp_path: Path, capsys, monkeypatch) -> None:
-    class BoundStore:
-        root = tmp_path
-        run_id = "resume-blocked"
-
-        @staticmethod
-        def _read_state() -> dict[str, str]:
-            return {
-                "candidate_sha256": "1" * 64,
-                "execution_config_sha256": "2" * 64,
-                "qualified_commit": "3" * 40,
-                "qualified_tree": "4" * 40,
-                "phase": "HANDOFF_BLOCKED_RECOVERY",
-            }
-
-    monkeypatch.setattr(cli_module.RunStore, "open", lambda _root: BoundStore())
-    monkeypatch.setattr(cli_module, "_read_object", lambda _path: {})
-    monkeypatch.setattr(cli_module, "_execution_config", lambda _value: {})
-    monkeypatch.setattr(
-        cli_module,
-        "_continue",
-        lambda _store, _config: {
+def _blocked_execution_bound_store(tmp_path: Path) -> RunStore:
+    repo = tmp_path / "candidate-source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Updater Test")
+    _git(repo, "config", "user.email", "noreply@github.com")
+    (repo / "candidate.txt").write_text("candidate\n")
+    _git(repo, "add", "candidate.txt")
+    _git(repo, "commit", "-q", "-m", "candidate")
+    commit = _git(repo, "rev-parse", "HEAD")
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    store = RunStore.create(
+        tmp_path / "refreshes",
+        run_id="real-blocked",
+        request={"through": "local-handoff", "source_publication": True},
+        authority={"base_commit": "a" * 40, "target_commit": "b" * 40},
+    )
+    repo.rename(store.root / "candidate")
+    candidate = {
+        "status": "CANDIDATE_READY",
+        "candidate_commit": commit,
+        "candidate_tree": tree,
+    }
+    config = {"schema_version": 1, "repository": "AIWerk/hermes-agent"}
+    (store.root / "candidate.json").write_bytes(canonical_bytes(candidate))
+    (store.root / "execution-config.json").write_bytes(canonical_bytes(config))
+    store.record_preflight({"verdict": "PASS", "failures": []})
+    store.bind_execution_inputs(
+        candidate=candidate,
+        execution_config=config,
+        qualified_commit=commit,
+        qualified_tree=tree,
+    )
+    store.begin_execution()
+    for stage in ("control", "product", "publication", "artifact"):
+        store.complete_stage(stage)
+    store.finish_handoff(
+        {
             "status": "HANDOFF_BLOCKED_RECOVERY",
             "completion": False,
             "activation": "NOT_RUN",
-        },
+            "recovery_disposition": (
+                "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+            ),
+        }
+    )
+    return store
+
+
+def test_cli_resume_real_blocked_terminal_without_continue(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _blocked_execution_bound_store(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "_continue",
+        lambda *_args, **_kwargs: pytest.fail("terminal blocked resume called _continue"),
     )
 
-    rc = main(["resume", "--run-root", str(tmp_path)])
+    rc = main(["resume", "--run-root", str(store.root)])
     output = json.loads(capsys.readouterr().out)
 
     assert rc == 1
     assert output["verdict"] == "BLOCKED"
     assert output["state"] == "HANDOFF_BLOCKED_RECOVERY"
+    assert output["handoff"]["status"] == "HANDOFF_BLOCKED_RECOVERY"
+    assert output["handoff"]["completion"] is False
+    assert output["handoff"]["activation"] == "NOT_RUN"
+
+
+def test_cli_resume_rejects_inconsistent_blocked_terminal(
+    tmp_path: Path, capsys
+) -> None:
+    store = _blocked_execution_bound_store(tmp_path)
+    final = json.loads((store.root / "final.json").read_text())
+    final["completion"] = True
+    (store.root / "final.json").write_bytes(canonical_bytes(final))
+
+    rc = main(["resume", "--run-root", str(store.root)])
+
+    assert rc == 2
+    assert "blocked terminal evidence" in capsys.readouterr().err
 
 
 @pytest.mark.live_system_guard_bypass

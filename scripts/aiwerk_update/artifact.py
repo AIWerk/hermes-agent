@@ -389,24 +389,7 @@ class ExternalRuntimeArtifactBuilder:
         if output.is_symlink():
             raise ArtifactError("artifact output cannot be a symlink")
         if output.exists():
-            if not output.is_dir():
-                raise ArtifactError("artifact output exists with wrong type")
-            _verify_installed_identity_receipt(
-                identity_receipt_path,
-                expected=identity_receipt,
-            )
-            verification = self.verifier(
-                output,
-                expected_commit=source_commit,
-                expected_git_tree=source_tree,
-                expected_installed_updater_source_identity=installed_source_identity,
-                expected_installed_updater_wheel_identity=installed_wheel_identity,
-            )
-            return _bind_installed_identity_receipt(
-                verification,
-                receipt_path=identity_receipt_path,
-                installed_updater_root=self.config.installed_updater_root,
-            )
+            raise ArtifactError("untrusted pre-existing artifact output")
         if identity_receipt_path.exists() or identity_receipt_path.is_symlink():
             raise ArtifactError("installed updater identity receipt already exists")
         if not isinstance(evidence, dict) or set(evidence) != {

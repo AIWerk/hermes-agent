@@ -9,10 +9,12 @@ import tarfile
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 import zipfile
 
 import pytest
 
+from scripts.aiwerk_update import artifact as artifact_module
 from scripts.aiwerk_update.artifact import (
     ArtifactBuildConfig,
     ArtifactError,
@@ -236,7 +238,53 @@ def test_external_builder_receipt_binds_installed_root_and_original_identity(
     }
 
 
-def test_external_builder_reuse_rejects_wheel_only_identity_drift(
+def test_external_builder_rejects_precreated_self_consistent_output_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installed_root = tmp_path / "installed-updater"
+    installed_root.mkdir()
+    output = tmp_path / "artifact"
+    output.mkdir()
+    source_identity = "1" * 64
+    wheel_identity = "2" * 64
+    identity_receipt = _installed_identity_receipt(
+        output=output,
+        installed_updater_root=installed_root,
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        source_identity=source_identity,
+        wheel_identity=wheel_identity,
+    )
+    artifact_module._installed_identity_receipt_path(output).write_bytes(
+        canonical_bytes(identity_receipt)
+    )
+    monkeypatch.setattr(
+        artifact_module,
+        "_installed_updater_identities",
+        lambda _root: (source_identity, wheel_identity),
+    )
+    builder = object.__new__(ExternalRuntimeArtifactBuilder)
+    builder.config = SimpleNamespace(installed_updater_root=installed_root)
+    builder.verifier = lambda *_args, **_kwargs: {
+        "verdict": "PASS",
+        "installed_updater_source_identity": source_identity,
+        "installed_updater_wheel_identity": wheel_identity,
+    }
+
+    with pytest.raises(ArtifactError, match="untrusted pre-existing artifact output"):
+        builder.build_verified(
+            source_repo=tmp_path,
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+            output=output,
+            evidence={
+                "qualification_sha256": "3" * 64,
+                "detector_sha256": {"supply-chain": "4" * 64, "osv": "5" * 64},
+            },
+        )
+
+
+def test_external_builder_build_binds_identity_and_rejects_direct_output_reuse(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source"
@@ -397,16 +445,17 @@ def test_external_builder_reuse_rejects_wheel_only_identity_drift(
     assert len(receipt["installed_updater_source_identity"]) == 64
     assert len(receipt["installed_updater_wheel_identity"]) == 64
     assert receipt["installed_updater_source_identity"] != receipt["installed_updater_wheel_identity"]
-    assert builder.build_verified(
-        source_repo=source,
-        source_commit=commit,
-        source_tree=tree,
-        output=tmp_path / "artifact",
-        evidence={
-            "qualification_sha256": "6" * 64,
-            "detector_sha256": {"supply-chain": "7" * 64, "osv": "8" * 64},
-        },
-    ) == receipt
+    with pytest.raises(ArtifactError, match="untrusted pre-existing artifact output"):
+        builder.build_verified(
+            source_repo=source,
+            source_commit=commit,
+            source_tree=tree,
+            output=tmp_path / "artifact",
+            evidence={
+                "qualification_sha256": "6" * 64,
+                "detector_sha256": {"supply-chain": "7" * 64, "osv": "8" * 64},
+            },
+        )
     direct_url.write_bytes(b'{"url":"file:///wheel-only-drift"}\n')
     drifted_direct_url_digest = base64.urlsafe_b64encode(
         hashlib.sha256(direct_url.read_bytes()).digest()
@@ -419,7 +468,7 @@ def test_external_builder_reuse_rejects_wheel_only_identity_drift(
     drifted_installed_identities = _installed_updater_identities(installed_updater)
     assert drifted_installed_identities[0] == original_installed_identities[0]
     assert drifted_installed_identities[1] != original_installed_identities[1]
-    with pytest.raises(ArtifactError, match="installed updater wheel identity mismatch"):
+    with pytest.raises(ArtifactError, match="untrusted pre-existing artifact output"):
         builder.build_verified(
             source_repo=source,
             source_commit=commit,

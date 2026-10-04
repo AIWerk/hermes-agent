@@ -308,6 +308,42 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _blocked_terminal_result(store: RunStore, state: dict) -> dict:
+    path = store.root / "final.json"
+    if path.is_symlink() or not path.is_file():
+        raise StateError("blocked terminal evidence is unavailable")
+    try:
+        raw = path.read_bytes()
+        result = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"blocked terminal evidence is invalid: {exc}") from exc
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "status",
+        "completion",
+        "activation",
+        "recovery_disposition",
+    }
+    if (
+        not isinstance(result, dict)
+        or raw != canonical_bytes(result)
+        or set(result) != expected_keys
+        or result.get("schema_version") != 1
+        or result.get("kind") != "AIWERK_UPDATE_FINAL"
+        or result.get("run_id") != store.run_id
+        or result.get("status") != "HANDOFF_BLOCKED_RECOVERY"
+        or result.get("completion") is not False
+        or result.get("activation") != "NOT_RUN"
+        or result.get("recovery_disposition")
+        != "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+        or state.get("phase") != "HANDOFF_BLOCKED_RECOVERY"
+    ):
+        raise StateError("blocked terminal evidence differs from durable run state")
+    return result
+
+
 def _resume(args: argparse.Namespace) -> int:
     store = RunStore.open(_resolve_run_root(args))
     state = store._read_state()
@@ -319,8 +355,11 @@ def _resume(args: argparse.Namespace) -> int:
     }
     if not required_bindings <= set(state):
         raise StateError("run is not execution-bound and cannot be resumed")
-    config = _execution_config(_read_object(store.root / "execution-config.json"))
-    result = _continue(store, config)
+    if state.get("phase") == "HANDOFF_BLOCKED_RECOVERY":
+        result = _blocked_terminal_result(store, state)
+    else:
+        config = _execution_config(_read_object(store.root / "execution-config.json"))
+        result = _continue(store, config)
     blocked = result.get("status") == "HANDOFF_BLOCKED_RECOVERY"
     _emit(
         {
