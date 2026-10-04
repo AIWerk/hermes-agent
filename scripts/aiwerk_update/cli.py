@@ -6,12 +6,19 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 from typing import Sequence
 
-from .artifact import ArtifactBuildConfig, ArtifactError, ExternalRuntimeArtifactBuilder
+from .artifact import (
+    ArtifactBuildConfig,
+    ArtifactError,
+    ExternalRuntimeArtifactBuilder,
+    _installed_identity_receipt_path,
+    _installed_updater_identities,
+)
 from .contract import ContractError, _atomic_write, canonical_bytes, canonical_sha256
 from .preflight import Probe, RepositoryQualifier, collect_preflight, repository_preflight_probes
 from .source import (
@@ -21,7 +28,7 @@ from .source import (
 )
 from .state import RunStore, StateError
 from .publication import GitHubClient, GitHubPublisher, PublicationError
-from .release import ReleaseError
+from .release import ReleaseError, installed_identity_probe_code
 from .workflow import execute_update
 
 
@@ -271,17 +278,18 @@ def _run(args: argparse.Namespace) -> int:
     if execution_config is None:
         raise StateError("execution configuration was not bound")
     final = _continue(store, execution_config)
+    blocked = final.get("status") == "HANDOFF_BLOCKED_RECOVERY"
     _emit(
         {
             "run_id": run_id,
             "run_root": str(store.root),
             "state": store._read_state()["phase"],
-            "verdict": "PASS",
+            "verdict": "BLOCKED" if blocked else "PASS",
             "handoff": final,
         },
         as_json=True,
     )
-    return 0
+    return 1 if blocked else 0
 
 
 def _resolve_run_root(args: argparse.Namespace) -> Path:
@@ -300,6 +308,42 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _blocked_terminal_result(store: RunStore, state: dict) -> dict:
+    path = store.root / "final.json"
+    if path.is_symlink() or not path.is_file():
+        raise StateError("blocked terminal evidence is unavailable")
+    try:
+        raw = path.read_bytes()
+        result = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"blocked terminal evidence is invalid: {exc}") from exc
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "status",
+        "completion",
+        "activation",
+        "recovery_disposition",
+    }
+    if (
+        not isinstance(result, dict)
+        or raw != canonical_bytes(result)
+        or set(result) != expected_keys
+        or result.get("schema_version") != 1
+        or result.get("kind") != "AIWERK_UPDATE_FINAL"
+        or result.get("run_id") != store.run_id
+        or result.get("status") != "HANDOFF_BLOCKED_RECOVERY"
+        or result.get("completion") is not False
+        or result.get("activation") != "NOT_RUN"
+        or result.get("recovery_disposition")
+        != "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+        or state.get("phase") != "HANDOFF_BLOCKED_RECOVERY"
+    ):
+        raise StateError("blocked terminal evidence differs from durable run state")
+    return result
+
+
 def _resume(args: argparse.Namespace) -> int:
     store = RunStore.open(_resolve_run_root(args))
     state = store._read_state()
@@ -311,19 +355,23 @@ def _resume(args: argparse.Namespace) -> int:
     }
     if not required_bindings <= set(state):
         raise StateError("run is not execution-bound and cannot be resumed")
-    config = _execution_config(_read_object(store.root / "execution-config.json"))
-    result = _continue(store, config)
+    if state.get("phase") == "HANDOFF_BLOCKED_RECOVERY":
+        result = _blocked_terminal_result(store, state)
+    else:
+        config = _execution_config(_read_object(store.root / "execution-config.json"))
+        result = _continue(store, config)
+    blocked = result.get("status") == "HANDOFF_BLOCKED_RECOVERY"
     _emit(
         {
             "run_id": store.run_id,
             "run_root": str(store.root),
             "state": store._read_state()["phase"],
-            "verdict": "PASS",
+            "verdict": "BLOCKED" if blocked else "PASS",
             "handoff": result,
         },
         as_json=True,
     )
-    return 0
+    return 1 if blocked else 0
 
 
 def _evidence(args: argparse.Namespace) -> int:
@@ -374,6 +422,345 @@ def _evidence(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prove_handoff(args: argparse.Namespace) -> int:
+    run_root = Path(args.run_root)
+    if args.updater_python is not None or args.installed_updater_root is None:
+        raise StateError("installed updater root is required; arbitrary updater Python is rejected")
+    installed_updater_root = Path(args.installed_updater_root)
+    config = Path(args.config)
+    artifact_root = Path(args.artifact_root)
+    predecessor_config = Path(args.predecessor_config)
+    predecessor_root = Path(args.predecessor_root)
+    for label, path, directory in (
+        ("run root", run_root, True),
+        ("installed updater root", installed_updater_root, True),
+        ("target config", config, False),
+        ("artifact root", artifact_root, True),
+        ("predecessor config", predecessor_config, False),
+        ("predecessor root", predecessor_root, True),
+    ):
+        resolved = path.resolve(strict=True)
+        if path.is_symlink() or path.absolute() != resolved or (resolved.is_dir() != directory):
+            raise StateError(f"{label} must be a physical canonical {'directory' if directory else 'file'}")
+    interpreters = sorted((installed_updater_root / "bin").glob("python3.*"))
+    if len(interpreters) != 1:
+        raise StateError("installed updater root must contain exactly one versioned Python interpreter")
+    updater_python = interpreters[0]
+    try:
+        executable = updater_python.resolve(strict=True)
+    except OSError as exc:
+        raise StateError(f"installed updater interpreter unavailable: {exc}") from exc
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise StateError("installed updater interpreter is not executable")
+    store = RunStore.open(run_root)
+    verification = store.verify_artifact_verification()
+    if (
+        verification.get("kind") != "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION"
+        or verification.get("verdict") != "PASS"
+        or verification.get("artifact_root") != str(artifact_root)
+    ):
+        raise StateError("artifact verification is unavailable or mismatched")
+    for field, size in (
+        ("source_commit", 40),
+        ("source_git_tree", 40),
+        ("release_id", 40),
+        ("archive_sha256", 64),
+        ("installed_updater_source_identity", 64),
+        ("installed_updater_wheel_identity", 64),
+    ):
+        value = verification.get(field)
+        if not isinstance(value, str) or len(value) != size or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise StateError(f"artifact verification identity malformed: {field}")
+    if not isinstance(verification.get("archive_size"), int) or verification["archive_size"] < 1:
+        raise StateError("artifact verification archive size malformed")
+    identity_receipt_path = Path(
+        str(verification.get("installed_updater_identity_receipt_path", ""))
+    )
+    identity_receipt_sha256 = verification.get(
+        "installed_updater_identity_receipt_sha256"
+    )
+    expected_identity_receipt_path = _installed_identity_receipt_path(artifact_root).resolve(
+        strict=True
+    )
+    if (
+        verification.get("installed_updater_root") != str(installed_updater_root)
+        or not identity_receipt_path.is_absolute()
+        or identity_receipt_path.resolve(strict=True) != expected_identity_receipt_path
+        or identity_receipt_path.is_symlink()
+        or not identity_receipt_path.is_file()
+        or not isinstance(identity_receipt_sha256, str)
+        or len(identity_receipt_sha256) != 64
+    ):
+        raise StateError("installed updater root is not builder-bound")
+    identity_receipt_raw = identity_receipt_path.read_bytes()
+    if hashlib.sha256(identity_receipt_raw).hexdigest() != identity_receipt_sha256:
+        raise StateError("builder-bound installed updater identity receipt hash mismatch")
+    try:
+        identity_receipt = json.loads(identity_receipt_raw)
+    except json.JSONDecodeError as exc:
+        raise StateError("builder-bound installed updater identity receipt invalid") from exc
+    if (
+        not isinstance(identity_receipt, dict)
+        or identity_receipt_raw != canonical_bytes(identity_receipt)
+        or identity_receipt.get("schema_version") != 1
+        or identity_receipt.get("kind") != "AIWERK_INSTALLED_UPDATER_IDENTITY"
+        or identity_receipt.get("artifact_root") != str(artifact_root)
+        or identity_receipt.get("installed_updater_root") != str(installed_updater_root)
+        or identity_receipt.get("source_commit") != verification["source_commit"]
+        or identity_receipt.get("source_git_tree") != verification["source_git_tree"]
+        or identity_receipt.get("installed_updater_source_identity")
+        != verification["installed_updater_source_identity"]
+        or identity_receipt.get("installed_updater_wheel_identity")
+        != verification["installed_updater_wheel_identity"]
+    ):
+        raise StateError("installed updater root is not builder-bound")
+    measured_source_identity, measured_wheel_identity = _installed_updater_identities(
+        installed_updater_root
+    )
+    if (
+        measured_source_identity != verification["installed_updater_source_identity"]
+        or measured_wheel_identity != verification["installed_updater_wheel_identity"]
+    ):
+        raise StateError("independently measured installed updater identity mismatch")
+    publication_path = artifact_root / "publication.json"
+    publication_raw = publication_path.read_bytes()
+    publication_sha256 = hashlib.sha256(publication_raw).hexdigest()
+    config_sha256: dict[Path, str] = {}
+    for path in (config, predecessor_config):
+        raw = path.read_bytes()
+        value = json.loads(raw)
+        if not isinstance(value, dict) or raw != canonical_bytes(value):
+            raise StateError("recovery configuration is not canonical JSON")
+        if value.get("migration_class") != "forward_only":
+            raise StateError("recovery proof requires the exact forward_only policy")
+        config_sha256[path] = hashlib.sha256(raw).hexdigest()
+
+    def persist_stdout(
+        name: str,
+        result: subprocess.CompletedProcess[str],
+        argv: list[str],
+    ) -> dict[str, object]:
+        path = run_root / name
+        if path.exists() or path.is_symlink():
+            raise StateError(f"native output already exists: {name}")
+        raw = result.stdout.encode("utf-8")
+        _atomic_write(path, raw)
+        return {
+            "argv": argv,
+            "exit_code": result.returncode,
+            "output_path": str(path.resolve(strict=True)),
+            "stdout_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    def native(
+        output_name: str, module: str, *argv: str
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        command = [str(updater_python), "-I", "-B", "-m", module, *argv]
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            close_fds=True,
+            check=False,
+        )
+        execution = persist_stdout(output_name, result, command)
+        if result.returncode != 0:
+            raise StateError(
+                f"native handoff proof failed: {module}: rc={result.returncode}: {result.stderr[-1000:]}"
+            )
+        return result, execution
+
+    probe_code = installed_identity_probe_code()
+    identity_argv = [str(updater_python), "-I", "-B", "-c", probe_code]
+    identity_probe = subprocess.run(
+        identity_argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+        close_fds=True,
+        check=False,
+    )
+    identity_execution = persist_stdout(
+        "installed-updater-identity-probe.stdout", identity_probe, identity_argv
+    )
+    if identity_probe.returncode != 0:
+        raise StateError(
+            f"installed updater identity probe failed: rc={identity_probe.returncode}: "
+            f"{identity_probe.stderr[-1000:]}"
+        )
+    try:
+        identity_value = json.loads(identity_probe.stdout)
+        package_root = Path(identity_value["package"])
+        distribution_root = Path(identity_value["distribution"])
+        package_root.relative_to(installed_updater_root)
+        distribution_root.relative_to(installed_updater_root)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise StateError("installed updater identity probe output mismatch") from exc
+    if (
+        identity_value.get("prefix") != str(installed_updater_root)
+        or identity_value.get("executable") != str(updater_python)
+        or package_root.name != "aiwerk_runtime_updater"
+        or package_root.parent != distribution_root
+    ):
+        raise StateError("installed updater interpreter or package identity mismatch")
+
+    check_result, check_execution = native(
+        "installed-update-check.stdout",
+        "aiwerk_runtime_updater.cli",
+        "--lock-path",
+        str(run_root / "native-check.lock"),
+        "update",
+        "--check",
+        "--version",
+        verification["release_id"],
+        "--config",
+        str(config),
+        "--expect-updater-sha256",
+        verification["installed_updater_source_identity"],
+        "--expect-publication-sha256",
+        publication_sha256,
+        "--expect-archive-sha256",
+        verification["archive_sha256"],
+        "--expect-archive-size",
+        str(verification["archive_size"]),
+        "--receipt-stdout",
+        "--request-dir",
+        str(run_root / "native-requests"),
+    )
+    try:
+        check_value = json.loads(check_result.stdout)
+    except json.JSONDecodeError as exc:
+        raise StateError("native update check output is not JSON") from exc
+    expected_check = {
+        "status": "AVAILABLE",
+        "release_id": verification["release_id"],
+        "archive_sha256": verification["archive_sha256"],
+        "archive_size": verification["archive_size"],
+        "migration_class": "forward_only",
+    }
+    if check_value != expected_check:
+        raise StateError("native update check did not return the exact AVAILABLE result")
+    target_result, target_execution = native(
+        "extracted-target-preflight.stdout",
+        "aiwerk_runtime_updater.artifact_preflight",
+        "--config",
+        str(config),
+        "--release-root",
+        str(artifact_root / "runtime"),
+    )
+    target_output = target_result.stdout.strip()
+    if not target_output.startswith("Hermes Agent v"):
+        raise StateError("native extracted-target preflight output mismatch")
+    _target_bridge, target_bridge_execution = native(
+        "target-systemd-bridge.stdout",
+        "aiwerk_runtime_updater.systemd_bridge_render",
+        "--config",
+        str(config),
+        "--verify-installed-root",
+        str(artifact_root / "runtime"),
+    )
+    _predecessor_bridge, predecessor_bridge_execution = native(
+        "predecessor-systemd-bridge.stdout",
+        "aiwerk_runtime_updater.systemd_bridge_render",
+        "--config",
+        str(predecessor_config),
+        "--verify-installed-root",
+        str(predecessor_root),
+    )
+    common = {
+        "schema_version": 1,
+        "artifact_root": str(artifact_root),
+        "source_commit": verification["source_commit"],
+        "source_git_tree": verification["source_git_tree"],
+        "installed_updater_source_identity": verification["installed_updater_source_identity"],
+        "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
+        "installed_updater_root": str(installed_updater_root),
+        "installed_updater_python": str(updater_python),
+        "target_config_path": str(config),
+        "target_config_sha256": config_sha256[config],
+        "predecessor_config_path": str(predecessor_config),
+        "predecessor_config_sha256": config_sha256[predecessor_config],
+        "predecessor_root": str(predecessor_root),
+        "publication_sha256": publication_sha256,
+        "identity_probe_argv": identity_execution["argv"],
+        "identity_probe_exit_code": identity_execution["exit_code"],
+        "identity_probe_output_path": identity_execution["output_path"],
+        "identity_probe_stdout_sha256": identity_execution["stdout_sha256"],
+    }
+    receipts = {
+        "installed-update-check.json": {
+            **common,
+            "kind": "AIWERK_INSTALLED_UPDATE_CHECK_RECEIPT",
+            "status": "AVAILABLE",
+            "exit_code": check_execution["exit_code"],
+            "argv": check_execution["argv"],
+            "output_path": check_execution["output_path"],
+            "release_id": verification["release_id"],
+            "archive_sha256": verification["archive_sha256"],
+            "archive_size": verification["archive_size"],
+            "migration_class": "forward_only",
+            "stdout_sha256": check_execution["stdout_sha256"],
+        },
+        "extracted-target-preflight.json": {
+            **common,
+            "kind": "AIWERK_EXTRACTED_TARGET_PREFLIGHT_RECEIPT",
+            "status": "PASS",
+            "exit_code": target_execution["exit_code"],
+            "argv": target_execution["argv"],
+            "output_path": target_execution["output_path"],
+            "release_id": verification["release_id"],
+            "target_root": str(artifact_root / "runtime"),
+            "version_output": target_output,
+            "stdout_sha256": target_execution["stdout_sha256"],
+        },
+        "recovery-proof.json": {
+            **common,
+            "kind": "AIWERK_RECOVERY_PROOF_RECEIPT",
+            "status": "BLOCKED",
+            "release_id": verification["release_id"],
+            "disposition": "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN",
+            "migration_class": "forward_only",
+            "native_rollback_supported": False,
+            "post_start_policy": "CONTAINMENT_ONLY",
+            "target_bridge_verified": True,
+            "predecessor_bridge_verified": True,
+            "units_verified": True,
+            "target_bridge_argv": target_bridge_execution["argv"],
+            "target_bridge_output_path": target_bridge_execution["output_path"],
+            "target_bridge_stdout_sha256": target_bridge_execution["stdout_sha256"],
+            "predecessor_bridge_argv": predecessor_bridge_execution["argv"],
+            "predecessor_bridge_output_path": predecessor_bridge_execution["output_path"],
+            "predecessor_bridge_stdout_sha256": predecessor_bridge_execution[
+                "stdout_sha256"
+            ],
+        },
+    }
+    if any((run_root / name).exists() or (run_root / name).is_symlink() for name in receipts):
+        raise StateError("handoff proof receipt already exists")
+    for name, value in receipts.items():
+        _atomic_write(run_root / name, canonical_bytes(value))
+    _emit(
+        {
+            "status": "HANDOFF_BLOCKED",
+            "reason": "EXECUTABLE_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN",
+            "run_root": str(run_root),
+        },
+        as_json=True,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aiwerk-runtime-integrate")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -416,6 +803,16 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--refresh-root")
     evidence.add_argument("--run-id")
     evidence.set_defaults(handler=_evidence)
+
+    prove = sub.add_parser("prove-handoff")
+    prove.add_argument("--run-root", required=True)
+    prove.add_argument("--updater-python")
+    prove.add_argument("--installed-updater-root")
+    prove.add_argument("--config", required=True)
+    prove.add_argument("--artifact-root", required=True)
+    prove.add_argument("--predecessor-config", required=True)
+    prove.add_argument("--predecessor-root", required=True)
+    prove.set_defaults(handler=_prove_handoff)
     return parser
 
 

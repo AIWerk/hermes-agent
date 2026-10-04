@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,8 +8,10 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 
+import pytest
+
 from scripts.aiwerk_update.release import MANIFEST, inventory_release, verify_release
-from scripts.aiwerk_update.state import RunStore
+from scripts.aiwerk_update.state import RunStore, StateError
 from scripts.aiwerk_update.workflow import PublicationResult, execute_update
 
 
@@ -101,12 +104,22 @@ class SourceArtifactBuilder:
         (output / MANIFEST).write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
         )
-        return verify_release(
+        receipt = verify_release(
             output,
             source_repo=source_repo,
             expected_commit=source_commit,
             expected_tree=source_tree,
         )
+        receipt.update(
+            {
+                "installed_updater_source_identity": "1" * 64,
+                "installed_updater_wheel_identity": "2" * 64,
+                "installed_update_check_receipt_sha256": "3" * 64,
+                "extracted_target_preflight_receipt_sha256": "4" * 64,
+                "recovery_receipt_sha256": "5" * 64,
+            }
+        )
+        return receipt
 
 
 class LocalQualifier:
@@ -162,13 +175,52 @@ def test_execute_update_runs_control_then_product_and_stops_at_handoff(tmp_path:
         ("control", ("pyproject.toml",)),
         ("product", ("runtime.py",)),
     ]
-    assert result["status"] == "HANDOFF_READY"
-    assert result["activation"].startswith("NOT_RUN")
-    assert json.loads((store.root / "state.json").read_text())["phase"] == "HANDOFF_READY"
+    assert result["status"] == "FIXTURE_ONLY"
+    assert result["kind"] == "AIWERK_LOCAL_HANDOFF_FIXTURE"
+    assert result["activation"] == "NOT_RUN_FIXTURE_ONLY"
+    assert json.loads((store.root / "state.json").read_text())["phase"] == "EXECUTING"
+    assert store.next_stage() == "handoff"
     assert json.loads((store.root / "publication.json").read_text())["product"]["pr_url"] == "local://pull/3"
     assert json.loads((store.root / "artifact.json").read_text())["verdict"] == "PASS"
-    assert (store.root / "manifest.sha256").is_file()
+    assert not (store.root / "manifest.sha256").exists()
     assert not (store.root / "candidate" / ".git").exists()
+
+
+def test_artifact_stage_binds_verification_before_handoff(tmp_path: Path) -> None:
+    repo, base, candidate = _candidate(tmp_path)
+    store = RunStore.create(
+        tmp_path / "runs",
+        run_id="artifact-binding",
+        request={"through": "local-handoff", "source_publication": True},
+        authority={"base_commit": base, "target_commit": candidate},
+    )
+    store.record_preflight({"verdict": "PASS", "failures": []})
+    execute_update(
+        store=store,
+        candidate_repo=repo,
+        base_commit=base,
+        candidate_commit=candidate,
+        upstream_commit=candidate,
+        protected_controls={"pyproject.toml"},
+        publisher=LocalPublisher(),
+        artifact_builder=SourceArtifactBuilder(),
+        qualifier=LocalQualifier(),
+        approval_not_before=datetime(2026, 10, 2, tzinfo=timezone.utc),
+        approval_expires_at=datetime(2026, 10, 9, tzinfo=timezone.utc),
+        stop_after="artifact",
+    )
+    artifact_path = store.root / "artifact.json"
+    state = json.loads((store.root / "state.json").read_text())
+    assert state["artifact_verification_sha256"] == hashlib.sha256(
+        artifact_path.read_bytes()
+    ).hexdigest()
+    artifact = json.loads(artifact_path.read_text())
+    artifact["installed_updater_source_identity"] = "9" * 64
+    artifact_path.write_bytes(
+        (json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+    with pytest.raises(StateError, match="artifact verification hash mismatch"):
+        RunStore.open(store.root)
 
 
 def test_execute_update_resumes_after_product_publication_without_republishing(
@@ -214,4 +266,6 @@ def test_execute_update_resumes_after_product_publication_without_republishing(
     )
 
     assert len(publisher.stages) == 3
-    assert result["status"] == "HANDOFF_READY"
+    assert result["status"] == "FIXTURE_ONLY"
+    assert result["kind"] == "AIWERK_LOCAL_HANDOFF_FIXTURE"
+    assert RunStore.open(store.root).next_stage() == "handoff"

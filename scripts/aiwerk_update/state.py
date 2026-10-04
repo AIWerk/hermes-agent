@@ -86,6 +86,10 @@ class RunStore:
             raise StateError("request authority hash mismatch")
         if authority_sha != state.get("authority_sha256"):
             raise StateError("repository authority hash mismatch")
+        if "artifact_verification_sha256" in state:
+            _artifact, artifact_sha = self._canonical_object("artifact.json")
+            if artifact_sha != state.get("artifact_verification_sha256"):
+                raise StateError("artifact verification hash mismatch")
         if "candidate_sha256" not in state:
             return
         candidate, candidate_sha = self._canonical_object("candidate.json")
@@ -262,6 +266,32 @@ class RunStore:
         self._write_state(state)
         self._append_event("execution-started", {})
 
+    def bind_artifact_verification(self, verification: dict[str, Any]) -> None:
+        state = self._read_state()
+        if state["phase"] != "EXECUTING" or self.next_stage() != "artifact":
+            raise StateError("artifact binding requires the artifact stage")
+        if "artifact_verification_sha256" in state:
+            raise StateError("artifact verification is already bound")
+        actual, artifact_sha = self._canonical_object("artifact.json")
+        if actual != verification:
+            raise StateError("artifact verification bytes differ from builder result")
+        state["artifact_verification_sha256"] = artifact_sha
+        self._write_state(state)
+        self._append_event(
+            "artifact-verification-bound",
+            {"artifact_verification_sha256": artifact_sha},
+        )
+
+    def verify_artifact_verification(self) -> dict[str, Any]:
+        state = self._read_state()
+        expected = state.get("artifact_verification_sha256")
+        if not isinstance(expected, str):
+            raise StateError("artifact verification is not builder-bound")
+        artifact, actual = self._canonical_object("artifact.json")
+        if actual != expected:
+            raise StateError("artifact verification hash mismatch")
+        return artifact
+
     def complete_stage(self, stage: str) -> None:
         if stage not in _STAGES[1:-1]:
             raise StateError("invalid completion stage")
@@ -281,26 +311,32 @@ class RunStore:
         state = self._read_state()
         if state["phase"] != "EXECUTING" or self.next_stage() != "handoff":
             raise StateError("handoff can finish only after artifact completion")
-        activation = handoff.get("activation")
         if (
-            handoff.get("status") != "HANDOFF_READY"
-            or not isinstance(activation, str)
-            or not activation.startswith("NOT_RUN")
+            handoff.get("status") != "HANDOFF_BLOCKED_RECOVERY"
+            or handoff.get("completion") is not False
+            or handoff.get("activation") != "NOT_RUN"
+            or handoff.get("recovery_disposition")
+            != "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
         ):
-            raise StateError("handoff must be ready and explicitly non-activating")
-        _atomic_write(self.root / "local-handoff.json", canonical_bytes(handoff))
+            raise StateError(
+                "HANDOFF_READY requires separately qualified executable post-failure recovery"
+            )
         final = {
             "schema_version": 1,
             "kind": "AIWERK_UPDATE_FINAL",
             "run_id": self.run_id,
-            "status": "HANDOFF_READY",
+            "status": "HANDOFF_BLOCKED_RECOVERY",
+            "completion": False,
             "activation": "NOT_RUN",
+            "recovery_disposition": handoff["recovery_disposition"],
         }
         _atomic_write(self.root / "final.json", canonical_bytes(final))
-        state["completed"] = [*state.get("completed", []), "handoff"]
-        state["phase"] = "HANDOFF_READY"
+        state["phase"] = "HANDOFF_BLOCKED_RECOVERY"
         self._write_state(state)
-        self._append_event("handoff-ready", {})
+        self._append_event(
+            "handoff-blocked-recovery",
+            {"recovery_disposition": handoff["recovery_disposition"]},
+        )
         manifest_rows = []
         for path in sorted(self.root.iterdir()):
             if not path.is_file() or path.name == "manifest.sha256":

@@ -505,14 +505,25 @@ def execute_update(
             },
         )
         _atomic_write(store.root / "artifact.json", canonical_bytes(verification))
+        store.bind_artifact_verification(verification)
         store.complete_stage("artifact")
         paused = _checkpoint(store, "artifact", stop_after)
         if paused:
             return paused
 
     if store.next_stage() == "handoff":
-        verification = _read_json(store.root / "artifact.json")
+        verification = store.verify_artifact_verification()
         if verification.get("kind") == "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION":
+            verification = dict(verification)
+            verification["proof_receipts"] = {
+                "installed_update_check": str(
+                    (store.root / "installed-update-check.json").resolve()
+                ),
+                "extracted_target_preflight": str(
+                    (store.root / "extracted-target-preflight.json").resolve()
+                ),
+                "recovery": str((store.root / "recovery-proof.json").resolve()),
+            }
             handoff = write_artifact_handoff(
                 store.root / "local-handoff.json",
                 artifact_root=Path(str(verification["artifact_root"])),
@@ -524,6 +535,7 @@ def execute_update(
                 release_root=Path(str(verification["release_root"])),
                 verification=verification,
             )
+            return handoff
         store.finish_handoff(handoff)
         return handoff
 

@@ -1,6 +1,9 @@
 """Tests for the dangerous command approval module."""
 
+import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1159,6 +1162,40 @@ class TestLaunchctlGatewayLifecycle:
     label achieves the same effect as `hermes gateway stop|restart` and
     must require the same approval. See issue #33071.
     """
+
+    def test_long_harmless_padded_command_is_bounded(self):
+        child = """
+import json
+from tools.approval import detect_dangerous_command
+padding = ("# " + "x" * 96 + "\\n") * 280
+cases = {
+    "safe_long": detect_dangerous_command("printf 'ok\\n'\\n" + padding),
+    "dangerous": detect_dangerous_command(
+        "label=ai.hermes.gateway; launchctl bootout gui/501/$label"
+    ),
+    "safe_other_label": detect_dangerous_command(
+        "launchctl stop com.example.unrelated"
+    ),
+    "safe_hermes_only": detect_dangerous_command(
+        "printf 'hermes maintenance note\\n'"
+    ),
+}
+print(json.dumps(cases))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", child],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        cases = json.loads(result.stdout)
+        assert cases["safe_long"] == [False, None, None]
+        assert cases["dangerous"][0] is True
+        assert cases["safe_other_label"] == [False, None, None]
+        assert cases["safe_hermes_only"] == [False, None, None]
 
     def test_launchctl_against_hermes_label_detected(self):
         for cmd in (

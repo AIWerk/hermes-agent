@@ -8,8 +8,12 @@ import subprocess
 
 import pytest
 
+from scripts.aiwerk_update.artifact import _installed_identity_receipt_path
+from scripts.aiwerk_update.contract import canonical_bytes
 from scripts.aiwerk_update.release import (
     ReleaseError,
+    _verified_proof_hashes,
+    installed_identity_probe_code,
     inventory_release,
     verify_release,
     write_artifact_handoff,
@@ -60,6 +64,192 @@ def _artifact(tmp_path: Path) -> tuple[Path, Path, str, str]:
     return root, source_repo, commit, tree
 
 
+def _proof_receipts(tmp_path: Path, verification: dict) -> dict[str, str]:
+    artifact_root = Path(verification["artifact_root"])
+    (artifact_root / "runtime").mkdir(exist_ok=True)
+    publication = artifact_root / "publication.json"
+    if not publication.exists():
+        publication.write_bytes(canonical_bytes({"schema": 1, "kind": "aiwerk-publication"}))
+    target_config = tmp_path / "target.json"
+    predecessor_config = tmp_path / "predecessor.json"
+    config_raw = canonical_bytes({"migration_class": "forward_only"})
+    target_config.write_bytes(config_raw)
+    predecessor_config.write_bytes(config_raw)
+    predecessor_root = tmp_path / "predecessor-root"
+    predecessor_root.mkdir(exist_ok=True)
+    installed_python = tmp_path / "installed-updater/bin/python3.12"
+    outputs = {
+        "installed-updater-identity-probe.stdout": canonical_bytes(
+            {
+                "prefix": str(tmp_path / "installed-updater"),
+                "executable": str(tmp_path / "installed-updater/bin/python3.12"),
+                "package": str(
+                    tmp_path
+                    / "installed-updater/lib/python3.12/site-packages/aiwerk_runtime_updater"
+                ),
+                "distribution": str(tmp_path / "installed-updater/lib/python3.12/site-packages"),
+            }
+        ),
+        "installed-update-check.stdout": canonical_bytes(
+            {
+                "status": "AVAILABLE",
+                "release_id": verification["release_id"],
+                "archive_sha256": verification["archive_sha256"],
+                "archive_size": verification["archive_size"],
+                "migration_class": "forward_only",
+            }
+        ),
+        "extracted-target-preflight.stdout": b"Hermes Agent v0.21.1\n",
+        "target-systemd-bridge.stdout": b"target bridge\n",
+        "predecessor-systemd-bridge.stdout": b"predecessor bridge\n",
+    }
+    for name, raw in outputs.items():
+        (tmp_path / name).write_bytes(raw)
+    identity_output = tmp_path / "installed-updater-identity-probe.stdout"
+    common = {
+        "schema_version": 1,
+        "artifact_root": str(artifact_root),
+        "source_commit": verification["source_commit"],
+        "source_git_tree": verification["source_git_tree"],
+        "installed_updater_source_identity": verification["installed_updater_source_identity"],
+        "installed_updater_wheel_identity": verification["installed_updater_wheel_identity"],
+        "installed_updater_root": str(tmp_path / "installed-updater"),
+        "installed_updater_python": str(installed_python),
+        "target_config_path": str(target_config),
+        "target_config_sha256": hashlib.sha256(config_raw).hexdigest(),
+        "predecessor_config_path": str(predecessor_config),
+        "predecessor_config_sha256": hashlib.sha256(config_raw).hexdigest(),
+        "predecessor_root": str(predecessor_root),
+        "publication_sha256": hashlib.sha256(publication.read_bytes()).hexdigest(),
+        "identity_probe_argv": [
+            str(installed_python),
+            "-I",
+            "-B",
+            "-c",
+            installed_identity_probe_code(),
+        ],
+        "identity_probe_exit_code": 0,
+        "identity_probe_output_path": str(identity_output),
+        "identity_probe_stdout_sha256": hashlib.sha256(identity_output.read_bytes()).hexdigest(),
+    }
+    documents = {
+        "installed_update_check": {
+            **common,
+            "kind": "AIWERK_INSTALLED_UPDATE_CHECK_RECEIPT",
+            "status": "AVAILABLE",
+            "exit_code": 0,
+            "release_id": verification["release_id"],
+            "archive_sha256": verification["archive_sha256"],
+            "archive_size": verification["archive_size"],
+            "argv": [
+                str(installed_python),
+                "-I",
+                "-B",
+                "-m",
+                "aiwerk_runtime_updater.cli",
+                "--lock-path",
+                str(tmp_path / "native-check.lock"),
+                "update",
+                "--check",
+                "--version",
+                verification["release_id"],
+                "--config",
+                str(target_config),
+                "--expect-updater-sha256",
+                verification["installed_updater_source_identity"],
+                "--expect-publication-sha256",
+                hashlib.sha256(publication.read_bytes()).hexdigest(),
+                "--expect-archive-sha256",
+                verification["archive_sha256"],
+                "--expect-archive-size",
+                str(verification["archive_size"]),
+                "--receipt-stdout",
+                "--request-dir",
+                str(tmp_path / "native-requests"),
+            ],
+            "output_path": str(tmp_path / "installed-update-check.stdout"),
+            "stdout_sha256": hashlib.sha256(
+                (tmp_path / "installed-update-check.stdout").read_bytes()
+            ).hexdigest(),
+        },
+        "extracted_target_preflight": {
+            **common,
+            "kind": "AIWERK_EXTRACTED_TARGET_PREFLIGHT_RECEIPT",
+            "status": "PASS",
+            "exit_code": 0,
+            "release_id": verification["release_id"],
+            "target_root": str(artifact_root / "runtime"),
+            "version_output": "Hermes Agent v0.21.1",
+            "argv": [
+                str(installed_python),
+                "-I",
+                "-B",
+                "-m",
+                "aiwerk_runtime_updater.artifact_preflight",
+                "--config",
+                str(target_config),
+                "--release-root",
+                str(artifact_root / "runtime"),
+            ],
+            "output_path": str(tmp_path / "extracted-target-preflight.stdout"),
+            "stdout_sha256": hashlib.sha256(
+                (tmp_path / "extracted-target-preflight.stdout").read_bytes()
+            ).hexdigest(),
+        },
+        "recovery": {
+            **common,
+            "kind": "AIWERK_RECOVERY_PROOF_RECEIPT",
+            "status": "BLOCKED",
+            "release_id": verification["release_id"],
+            "disposition": "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN",
+            "migration_class": "forward_only",
+            "native_rollback_supported": False,
+            "post_start_policy": "CONTAINMENT_ONLY",
+            "target_bridge_verified": True,
+            "predecessor_bridge_verified": True,
+            "units_verified": True,
+            "target_bridge_argv": [
+                str(installed_python),
+                "-I",
+                "-B",
+                "-m",
+                "aiwerk_runtime_updater.systemd_bridge_render",
+                "--config",
+                str(target_config),
+                "--verify-installed-root",
+                str(artifact_root / "runtime"),
+            ],
+            "target_bridge_output_path": str(tmp_path / "target-systemd-bridge.stdout"),
+            "target_bridge_stdout_sha256": hashlib.sha256(
+                (tmp_path / "target-systemd-bridge.stdout").read_bytes()
+            ).hexdigest(),
+            "predecessor_bridge_argv": [
+                str(installed_python),
+                "-I",
+                "-B",
+                "-m",
+                "aiwerk_runtime_updater.systemd_bridge_render",
+                "--config",
+                str(predecessor_config),
+                "--verify-installed-root",
+                str(predecessor_root),
+            ],
+            "predecessor_bridge_output_path": str(
+                tmp_path / "predecessor-systemd-bridge.stdout"
+            ),
+            "predecessor_bridge_stdout_sha256": hashlib.sha256(
+                (tmp_path / "predecessor-systemd-bridge.stdout").read_bytes()
+            ).hexdigest(),
+        },
+    }
+    paths = {}
+    for name, document in documents.items():
+        path = tmp_path / f"{name}.json"
+        path.write_bytes(canonical_bytes(document))
+        paths[name] = str(path.resolve())
+    return paths
+
+
 def test_inventory_and_verify_bind_exact_files_commit_and_tree(tmp_path: Path) -> None:
     root, source_repo, commit, tree = _artifact(tmp_path)
 
@@ -107,12 +297,22 @@ def test_local_handoff_never_authorizes_activation_or_switches_root(tmp_path: Pa
     receipt = verify_release(
         root, source_repo=source_repo, expected_commit=commit, expected_tree=tree
     )
+    receipt.update(
+        {
+            "installed_updater_source_identity": "1" * 64,
+            "installed_updater_wheel_identity": "2" * 64,
+            "installed_update_check_receipt_sha256": "3" * 64,
+            "extracted_target_preflight_receipt_sha256": "4" * 64,
+            "recovery_receipt_sha256": "5" * 64,
+        }
+    )
     output = tmp_path / "local-handoff.json"
 
     handoff = write_local_handoff(output, release_root=root, verification=receipt)
 
-    assert handoff["status"] == "HANDOFF_READY"
-    assert handoff["activation"] == "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME"
+    assert handoff["status"] == "FIXTURE_ONLY"
+    assert handoff["kind"] == "AIWERK_LOCAL_HANDOFF_FIXTURE"
+    assert handoff["activation"] == "NOT_RUN_FIXTURE_ONLY"
     assert json.loads(output.read_text()) == handoff
     other = tmp_path / "other-release"
     other.mkdir()
@@ -120,7 +320,7 @@ def test_local_handoff_never_authorizes_activation_or_switches_root(tmp_path: Pa
         write_local_handoff(output, release_root=other, verification=receipt)
 
 
-def test_artifact_package_handoff_is_nonactivating_and_hash_bound(tmp_path: Path) -> None:
+def test_artifact_handoff_rejects_synthetic_execution_receipts(tmp_path: Path) -> None:
     package = tmp_path / "package"
     package.mkdir()
     verification = {
@@ -135,15 +335,175 @@ def test_artifact_package_handoff_is_nonactivating_and_hash_bound(tmp_path: Path
         "release_manifest_sha256": "d" * 64,
         "archive_sha256": "e" * 64,
         "archive_size": 123,
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+        "installed_update_check_receipt_sha256": "3" * 64,
+        "extracted_target_preflight_receipt_sha256": "4" * 64,
+        "recovery_receipt_sha256": "5" * 64,
     }
+    verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
 
-    handoff = write_artifact_handoff(
-        tmp_path / "handoff.json",
-        artifact_root=package,
-        verification=verification,
+    with pytest.raises(ReleaseError, match="execution proof|recovery|identity receipt"):
+        write_artifact_handoff(
+            tmp_path / "handoff.json",
+            artifact_root=package,
+            verification=verification,
+        )
+    assert not (tmp_path / "handoff.json").exists()
+
+
+def test_artifact_handoff_rejects_missing_or_tampered_retained_native_output(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    verification = {
+        "artifact_root": str(package.resolve()),
+        "source_commit": "a" * 40,
+        "source_git_tree": "b" * 40,
+        "release_id": "a" * 40,
+        "archive_sha256": "e" * 64,
+        "archive_size": 123,
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+    }
+    installed_root = tmp_path / "installed-updater"
+    installed_root.mkdir()
+    identity_receipt = canonical_bytes(
+        {
+            "schema_version": 1,
+            "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
+            "artifact_root": verification["artifact_root"],
+            "installed_updater_root": str(installed_root),
+            "source_commit": verification["source_commit"],
+            "source_git_tree": verification["source_git_tree"],
+            "installed_updater_source_identity": verification[
+                "installed_updater_source_identity"
+            ],
+            "installed_updater_wheel_identity": verification[
+                "installed_updater_wheel_identity"
+            ],
+        }
+    )
+    identity_receipt_path = _installed_identity_receipt_path(package)
+    identity_receipt_path.write_bytes(identity_receipt)
+    verification.update(
+        installed_updater_root=str(installed_root),
+        installed_updater_identity_receipt_path=str(identity_receipt_path),
+        installed_updater_identity_receipt_sha256=hashlib.sha256(
+            identity_receipt
+        ).hexdigest(),
+    )
+    verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
+    (tmp_path / "installed-update-check.stdout").write_bytes(b"tampered\n")
+
+    with pytest.raises(ReleaseError, match="retained native output"):
+        _verified_proof_hashes(verification)
+
+    (tmp_path / "installed-update-check.stdout").unlink()
+    with pytest.raises(ReleaseError, match="retained native output"):
+        _verified_proof_hashes(verification)
+
+
+def test_release_rejects_fabricated_native_argv(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    installed_root = tmp_path / "installed-updater"
+    installed_root.mkdir()
+    verification = {
+        "artifact_root": str(package.resolve()),
+        "source_commit": "a" * 40,
+        "source_git_tree": "b" * 40,
+        "release_id": "a" * 40,
+        "archive_sha256": "e" * 64,
+        "archive_size": 123,
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+    }
+    identity_receipt = canonical_bytes(
+        {
+            "schema_version": 1,
+            "kind": "AIWERK_INSTALLED_UPDATER_IDENTITY",
+            "artifact_root": verification["artifact_root"],
+            "installed_updater_root": str(installed_root),
+            "source_commit": verification["source_commit"],
+            "source_git_tree": verification["source_git_tree"],
+            "installed_updater_source_identity": verification[
+                "installed_updater_source_identity"
+            ],
+            "installed_updater_wheel_identity": verification[
+                "installed_updater_wheel_identity"
+            ],
+        }
+    )
+    identity_receipt_path = _installed_identity_receipt_path(package)
+    identity_receipt_path.write_bytes(identity_receipt)
+    verification.update(
+        installed_updater_root=str(installed_root),
+        installed_updater_identity_receipt_path=str(identity_receipt_path),
+        installed_updater_identity_receipt_sha256=hashlib.sha256(
+            identity_receipt
+        ).hexdigest(),
+    )
+    verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
+    check_path = Path(verification["proof_receipts"]["installed_update_check"])
+    check = json.loads(check_path.read_text())
+    check["argv"] = ["python", "-m", "aiwerk_runtime_updater.cli", "forged"]
+    check_path.write_bytes(canonical_bytes(check))
+
+    with pytest.raises(ReleaseError, match="native argv"):
+        _verified_proof_hashes(verification)
+
+
+def test_artifact_handoff_requires_identity_check_target_and_recovery_receipts(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    verification = {
+        "schema_version": 1,
+        "kind": "AIWERK_IMMUTABLE_ARTIFACT_VERIFICATION",
+        "verdict": "PASS",
+        "artifact_root": str(package.resolve()),
+        "source_commit": "a" * 40,
+        "source_git_tree": "b" * 40,
+        "source_inventory_sha256": "c" * 64,
+        "release_id": "a" * 40,
+        "release_manifest_sha256": "d" * 64,
+        "archive_sha256": "e" * 64,
+        "archive_size": 123,
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+        "installed_update_check_receipt_sha256": "3" * 64,
+        "extracted_target_preflight_receipt_sha256": "4" * 64,
+        "recovery_receipt_sha256": "5" * 64,
+    }
+    identity_fields = (
+        "installed_updater_source_identity",
+        "installed_updater_wheel_identity",
     )
 
-    assert handoff["status"] == "HANDOFF_READY"
-    assert handoff["artifact_root"] == str(package.resolve())
-    assert handoff["activation"].startswith("NOT_RUN")
-    assert handoff["service_restart"] == "NOT_RUN"
+    for field in identity_fields:
+        incomplete = dict(verification)
+        incomplete.pop(field)
+        with pytest.raises(ReleaseError, match="incomplete"):
+            write_artifact_handoff(
+                tmp_path / f"missing-{field}.json",
+                artifact_root=package,
+                verification=incomplete,
+            )
+    with pytest.raises(ReleaseError, match="persisted proof receipts"):
+        write_artifact_handoff(
+            tmp_path / "hashes-only.json",
+            artifact_root=package,
+            verification=verification,
+        )
+
+    verification["proof_receipts"] = _proof_receipts(tmp_path, verification)
+    with pytest.raises(ReleaseError, match="execution proof|recovery|identity receipt"):
+        write_artifact_handoff(
+            tmp_path / "identity-bound-handoff.json",
+            artifact_root=package,
+            verification=verification,
+        )
+    assert not (tmp_path / "identity-bound-handoff.json").exists()

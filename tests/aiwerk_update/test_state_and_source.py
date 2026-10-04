@@ -137,7 +137,7 @@ def test_run_store_resume_uses_same_run_and_first_incomplete_stage(tmp_path: Pat
     assert len((store.root / "events.jsonl").read_text().splitlines()) == 4
 
 
-def test_run_store_finishes_in_handoff_ready_terminal_state(tmp_path: Path) -> None:
+def test_finish_handoff_rejects_prestart_containment_only_recovery(tmp_path: Path) -> None:
     store = RunStore.create(
         tmp_path,
         run_id="20261002T220000Z-base-target",
@@ -149,13 +149,115 @@ def test_run_store_finishes_in_handoff_ready_terminal_state(tmp_path: Path) -> N
     for stage in ("control", "product", "publication", "artifact"):
         store.complete_stage(stage)
 
-    store.finish_handoff({"status": "HANDOFF_READY", "activation": "NOT_RUN"})
+    with pytest.raises(StateError, match="recovery|handoff"):
+        store.finish_handoff(
+            {
+                "status": "HANDOFF_READY",
+                "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
+                "installed_updater_source_identity": "1" * 64,
+                "installed_updater_wheel_identity": "2" * 64,
+                "installed_update_check_receipt_sha256": "3" * 64,
+                "extracted_target_preflight_receipt_sha256": "4" * 64,
+                "recovery_receipt_sha256": "5" * 64,
+                "recovery_disposition": "FORWARD_ONLY_PRESTART_RECOVERY_PROVED",
+                "post_start_policy": "CONTAINMENT_ONLY",
+            }
+        )
 
     state = json.loads((store.root / "state.json").read_text())
-    assert state["phase"] == "HANDOFF_READY"
-    assert store.next_stage() is None
-    assert json.loads((store.root / "final.json").read_text())["status"] == "HANDOFF_READY"
+    assert state["phase"] == "EXECUTING"
+    assert not (store.root / "local-handoff.json").exists()
+    assert not (store.root / "final.json").exists()
+    assert not (store.root / "manifest.sha256").exists()
+
+
+def test_finish_handoff_persists_blocked_recovery_without_handoff_ready(
+    tmp_path: Path,
+) -> None:
+    store = RunStore.create(
+        tmp_path,
+        run_id="blocked-recovery",
+        request={"through": "local-handoff", "source_publication": True},
+        authority={"base_commit": A, "target_commit": B},
+    )
+    store.record_preflight({"verdict": "PASS", "failures": []})
+    store.begin_execution()
+    for stage in ("control", "product", "publication", "artifact"):
+        store.complete_stage(stage)
+
+    store.finish_handoff(
+        {
+            "schema_version": 1,
+            "kind": "AIWERK_LOCAL_ACTIVATION_HANDOFF",
+            "status": "HANDOFF_BLOCKED_RECOVERY",
+            "completion": False,
+            "activation": "NOT_RUN",
+            "recovery_disposition": (
+                "FORWARD_ONLY_POSTFAILURE_PREDECESSOR_RECOVERY_UNPROVEN"
+            ),
+        }
+    )
+
+    final = json.loads((store.root / "final.json").read_text())
+    state = json.loads((store.root / "state.json").read_text())
+    events = [json.loads(line) for line in (store.root / "events.jsonl").read_text().splitlines()]
+    assert final["kind"] == "AIWERK_UPDATE_FINAL"
+    assert final["status"] == "HANDOFF_BLOCKED_RECOVERY"
+    assert final["completion"] is False
+    assert final["activation"] == "NOT_RUN"
+    assert state["phase"] == "HANDOFF_BLOCKED_RECOVERY"
     assert (store.root / "manifest.sha256").is_file()
+    assert not (store.root / "local-handoff.json").exists()
+    assert all(event["kind"] != "handoff-ready" for event in events)
+    assert events[-1]["kind"] == "handoff-blocked-recovery"
+
+
+def test_finish_handoff_rejects_activation_blocked_or_unproven_identity(
+    tmp_path: Path,
+) -> None:
+    def executing_store(name: str) -> RunStore:
+        store = RunStore.create(
+            tmp_path,
+            run_id=name,
+            request={"through": "local-handoff", "source_publication": True},
+            authority={"base_commit": A, "target_commit": B},
+        )
+        store.record_preflight({"verdict": "PASS", "failures": []})
+        store.begin_execution()
+        for stage in ("control", "product", "publication", "artifact"):
+            store.complete_stage(stage)
+        return store
+
+    proof = {
+        "installed_updater_source_identity": "1" * 64,
+        "installed_updater_wheel_identity": "2" * 64,
+        "installed_update_check_receipt_sha256": "3" * 64,
+        "extracted_target_preflight_receipt_sha256": "4" * 64,
+        "recovery_receipt_sha256": "5" * 64,
+    }
+    with pytest.raises(StateError, match="post-failure recovery"):
+        executing_store("missing-proof").finish_handoff(
+            {"status": "HANDOFF_READY", "activation": "NOT_RUN"}
+        )
+    with pytest.raises(StateError, match="post-failure recovery"):
+        executing_store("activation-blocked").finish_handoff(
+            {
+                "status": "HANDOFF_READY",
+                "activation": "NOT_RUN_ACTIVATION_BLOCKED",
+                **proof,
+            }
+        )
+
+    complete = executing_store("complete-proof")
+    with pytest.raises(StateError, match="post-failure recovery"):
+        complete.finish_handoff(
+            {
+                "status": "HANDOFF_READY",
+                "activation": "NOT_RUN_REQUIRES_SEPARATE_ATTILA_GO_AND_JEROME",
+                **proof,
+            }
+        )
+    assert json.loads((complete.root / "state.json").read_text())["phase"] == "EXECUTING"
 
 
 def test_run_store_open_rejects_bound_authority_candidate_or_config_tamper(
